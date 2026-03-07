@@ -194,6 +194,7 @@ Options:
   --workdir PATH  Host directory to mount at /workdir (default: cwd)
   --openai        Use OpenAI mode (device auth)
   --auth          Force OpenAI login flow
+  --update        Update @openai/codex in the container before launch
   --temp          Create a throwaway container (auto-removed after exit)
   --read-only     Mount workdir as read-only (requires new container)
   --shell         Start a shell (default shell) instead of default CMD
@@ -599,11 +600,12 @@ run_mode() {
   local shell="$4"
   local openai="$5"
   local auth="$6"
-  local cpu="$7"
-  local mem="$8"
-  local read_only="$9"
-  local workdir="${10}"
-  shift 10
+  local update="$7"
+  local cpu="$8"
+  local mem="$9"
+  local read_only="${10}"
+  local workdir="${11}"
+  shift 11
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
@@ -615,6 +617,13 @@ run_mode() {
     cmd=("${DEFAULT_CODEX_CMD[@]}")
     if [ "$auth" -eq 1 ] || ! ensure_keychain; then
       run_auth_flow "$image" "$(default_name "$AUTH_NAME_PREFIX")"
+    fi
+  fi
+  if [ "$update" -eq 1 ]; then
+    if [ -n "$pre_exec" ]; then
+      pre_exec="openai_update_pre_exec"
+    else
+      pre_exec="update_codex_pre_exec"
     fi
   fi
 
@@ -636,11 +645,29 @@ openai_post_exec() {
   sync_openai_auth_from_container "$name"
 }
 
+update_codex_pre_exec() {
+  local name="$1"
+  local cmd='npm install -g @openai/codex --omit=dev --no-fund --no-audit'
+  echo "Updating @openai/codex in container: $name" >&2
+  if "$CONTAINER_CMD" exec -it -u 0 "$name" sh -lc "$cmd"; then
+    return 0
+  fi
+  warn "Root-level update failed for $name; retrying as container user"
+  "$CONTAINER_CMD" exec -it "$name" sh -lc "$cmd"
+}
+
+openai_update_pre_exec() {
+  local name="$1"
+  update_codex_pre_exec "$name"
+  openai_pre_exec "$name"
+}
+
 run_cmd() {
   local name=""
   local image=""
   local openai=0
   local auth=0
+  local update=0
   local temp=0
   local shell=0
   local read_only=0
@@ -658,6 +685,7 @@ run_cmd() {
       --workdir) workdir="$2"; shift 2 ;;
       --openai) openai=1; shift ;;
       --auth) auth=1; shift ;;
+      --update) update=1; shift ;;
       --temp) temp=1; shift ;;
       --read-only) read_only=1; shift ;;
       --shell) shell=1; shell_set=1; shift ;;
@@ -698,7 +726,7 @@ run_cmd() {
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
   fi
 
-  run_mode "$name" "$image" "$temp" "$shell" "$openai" "$auth" "$cpu" "$mem" "$read_only" "$workdir" ${cmd_override[@]+"${cmd_override[@]}"}
+  run_mode "$name" "$image" "$temp" "$shell" "$openai" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" ${cmd_override[@]+"${cmd_override[@]}"}
 }
 
 auth_cmd() {

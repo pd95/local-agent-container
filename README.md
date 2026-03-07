@@ -72,6 +72,9 @@ codexctl run --temp
 # OpenAI mode (auto-auth if needed)
 codexctl run --openai
 
+# Update codex package in the running container
+codexctl run --update
+
 # Start a shell inside the container
 codexctl run --shell
 
@@ -84,6 +87,8 @@ Note: `codexctl build` produces the `codex`, `codex-python`, `codex-swift`, and 
 Note: `--cmd` consumes the remaining arguments and cannot be combined with `--shell`, so place it last. If you pass a single quoted string containing spaces, it runs via `$CODEX_SHELL -lc`. This same behavior applies to `codexctl exec`.
 
 Note: `CODEX_SHELL` is an environment variable to override the default shell used by `run --shell` and `exec` (default is `bash`). You can also set `DEFAULT_SHELL` in `codexctl` for a static default.
+
+Note: `--update` upgrades `@openai/codex` inside the target container before starting. This is convenient for quick refreshes of a specific container, while `codexctl build --rebuild` remains the persistent way to refresh image content.
 
 Note: The `--rebuild`, `--refresh-base`, and `--pull-base` options are for occasional refreshes when you want to pick up newer Codex or base image updates. See the build cache section below for guidance.
 
