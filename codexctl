@@ -237,6 +237,18 @@ sanitize_container_name() {
   echo "$sanitized"
 }
 
+sanitize_image_name() {
+  local raw="$1"
+  local sanitized
+  sanitized="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9._/-' '-')"
+  sanitized="${sanitized#-}"
+  sanitized="${sanitized%-}"
+  if [ -z "$sanitized" ]; then
+    sanitized="codex-backup"
+  fi
+  echo "$sanitized"
+}
+
 usage() {
   cat <<'EOF'
 Usage: codexctl <command> [options]
@@ -918,7 +930,7 @@ upgrade_cmd() {
   [ -e "$workdir" ] || die "Preserved /workdir source does not exist: $workdir"
   [ -d "$workdir" ] || die "Preserved /workdir source is not a directory: $workdir"
   if [ -z "$backup_image" ]; then
-    backup_image="$(sanitize_container_name "${name}-backup-$(date -u +%Y%m%d%H%M%S)")"
+    backup_image="$(sanitize_image_name "${name}-backup-$(date -u +%Y%m%d%H%M%S)")"
   fi
 
   local backup_dir

@@ -38,6 +38,16 @@ codexctl exec --name codex-upgrade-live -- cat /home/coder/.codex/live-upgrade-s
 
 Expected output includes `live-upgrade-ok`, and the container should still appear in `container ls` after the upgrade.
 
+Mixed-case container names should also upgrade cleanly, with a lowercased backup image reference:
+
+```bash
+codexctl run --name codex-Upgrade-Smoke --image codex --workdir testing/codex --cmd bash -lc 'mkdir -p /home/coder/.codex && echo mixed-case-ok >/home/coder/.codex/mixed-case.txt'
+codexctl upgrade --name codex-Upgrade-Smoke
+codexctl run --name codex-Upgrade-Smoke --image codex --workdir testing/codex --cmd bash -lc 'cat /home/coder/.codex/mixed-case.txt'
+```
+
+Expected output includes `mixed-case-ok`, and `codexctl upgrade` should print a backup image name similar to `codex-upgrade-smoke-backup-20260313141749`.
+
 Upgrade preflight failures should also abort before the original container is removed:
 
 ```bash
