@@ -23,5 +23,33 @@ RUN printf '%s\n' \
 ENV PATH="$VIRTUAL_ENV/bin:$PATH" \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
+RUN mkdir -p /etc/codexctl \
+ && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+ && cat > /etc/codexctl/image.md <<EOF
+You are running inside the \`codex-python\` image.
+
+Environment:
+- containerized Alpine Linux (package manager \`apk\`)
+- running as the non-root user \`coder\`
+- shared host workspace at \`/workdir\`
+- architecture: check with \`uname -m\` if needed
+
+Image metadata:
+- image: \`codex-python\`
+- built_at_utc: \`${BUILD_TIME}\`
+
+Built-in CLI tools:
+- base tools: \`bash\`, \`zsh\`, \`git\`, \`curl\`, \`file\`, \`jq\`, \`rg\`
+- programming tools: \`node\`, \`npm\`, \`python3\`, \`python\`, \`pip\`
+
+Programming environments:
+- Node.js with npm
+- Python 3
+- default virtual environment at \`/opt/venv\`, already on \`PATH\`
+
+Prefer the default \`/opt/venv\` environment for Python package installs and script execution unless the user asks for a project-local virtualenv.
+EOF
+RUN ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
+
 USER coder
 WORKDIR /workdir

@@ -740,12 +740,12 @@ run_mode() {
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
-  local cmd=("${DEFAULT_CODEX_CMD[@]}" --profile "$DEFAULT_CODEX_PROFILE")
+  local cmd=("${DEFAULT_CODEX_CMD[@]}" --profile "$DEFAULT_CODEX_PROFILE" --cd /workdir)
 
   if [ "$openai" -eq 1 ]; then
     pre_exec="openai_pre_exec"
     post_exec="openai_post_exec"
-    cmd=("${DEFAULT_CODEX_CMD[@]}")
+    cmd=("${DEFAULT_CODEX_CMD[@]}" --cd /workdir)
     if [ "$auth" -eq 1 ] || ! ensure_keychain; then
       run_auth_flow "$image" "$(default_name "$AUTH_NAME_PREFIX")"
     fi

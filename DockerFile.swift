@@ -64,6 +64,34 @@ ENV PATH=/home/coder/.local/bin:$PATH
 RUN mkdir -p /home/coder/.local/bin /home/coder/.swiftly \
  && chown -R coder:coder /home/coder/.local /home/coder/.swiftly
 
+RUN mkdir -p /etc/codexctl \
+ && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+ && cat > /etc/codexctl/image.md <<EOF
+You are running inside the \`codex-swift\` image.
+
+Environment:
+- containerized Ubuntu-based Linux (package manager \`apt-get\`, package tools \`dpkg\`)
+- running as the non-root user \`coder\`
+- shared host workspace at \`/workdir\`
+- architecture: check with \`uname -m\` if needed
+
+Image metadata:
+- image: \`codex-swift\`
+- built_at_utc: \`${BUILD_TIME}\`
+
+Built-in CLI tools:
+- base tools: \`bash\`, \`zsh\`, \`curl\`, \`file\`, \`jq\`, \`rg\`
+- programming tools: \`node\`, \`npm\`, \`make\`, \`python\`, \`swift\`, \`swift-format\`, \`swiftly\`, plus the wrapper commands \`format\` and \`lint\`
+
+Programming environments:
+- Swift on Linux
+- Node.js with npm
+- Python
+
+Assume Linux Swift toolchains and Linux build behavior. Do not assume access to macOS, Xcode, iOS SDKs, or Apple simulator frameworks inside this container.
+EOF
+RUN ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
+
 # From here on, run as coder so swiftly writes user-owned files
 USER coder
 WORKDIR /workdir

@@ -15,6 +15,24 @@ codexctl run --image codex-office --temp --workdir testing/codex-office --cmd ba
 codexctl run --image codex-swift --temp --workdir testing/codex-swift --cmd bash -lc 'zsh --version && swift --version && swift-format --version && command -v format >/dev/null && command -v lint >/dev/null'
 ```
 
+Also verify the image metadata file is present and readable:
+
+```bash
+codexctl run --image codex --temp --workdir testing/codex --cmd bash -lc 'test -f /etc/codexctl/image.md && sed -n "1,20p" /etc/codexctl/image.md'
+codexctl run --image codex-python --temp --workdir testing/codex-python --cmd bash -lc 'test -f /etc/codexctl/image.md && sed -n "1,20p" /etc/codexctl/image.md'
+codexctl run --image codex-office --temp --workdir testing/codex-office --cmd bash -lc 'test -f /etc/codexctl/image.md && sed -n "1,20p" /etc/codexctl/image.md'
+codexctl run --image codex-swift --temp --workdir testing/codex-swift --cmd bash -lc 'test -f /etc/codexctl/image.md && sed -n "1,20p" /etc/codexctl/image.md'
+```
+
+Also verify global AGENTS guidance points at the image metadata file:
+
+```bash
+codexctl run --image codex --temp --workdir testing/codex --cmd bash -lc 'test -L /home/coder/.codex/AGENTS.md && readlink /home/coder/.codex/AGENTS.md'
+codexctl run --image codex-python --temp --workdir testing/codex-python --cmd bash -lc 'test -L /home/coder/.codex/AGENTS.md && readlink /home/coder/.codex/AGENTS.md'
+codexctl run --image codex-office --temp --workdir testing/codex-office --cmd bash -lc 'test -L /home/coder/.codex/AGENTS.md && readlink /home/coder/.codex/AGENTS.md'
+codexctl run --image codex-swift --temp --workdir testing/codex-swift --cmd bash -lc 'test -L /home/coder/.codex/AGENTS.md && readlink /home/coder/.codex/AGENTS.md'
+```
+
 ## Upgrade flow
 
 Use a persistent container so there is state to preserve, then recreate it with `codexctl upgrade`.
@@ -81,6 +99,7 @@ codexctl run --image codex --temp --workdir testing/codex
 In the Codex prompt, paste:
 
 ```
+Report your current working directory first, then summarize the environment information you were given about this image.
 Create /workdir/codex-smoke.txt with the text "codex-ok".
 Then run: ls -l /workdir/codex-smoke.txt and cat the file.
 ```
@@ -94,6 +113,7 @@ codexctl run --image codex-python --temp --workdir testing/codex-python
 Prompt:
 
 ```
+Report your current working directory first, then summarize the environment information you were given about this image.
 Create /workdir/codex-python-smoke.txt with the text "python-ok".
 Then run: python -c "import sys; print(sys.executable)" and cat the file.
 ```
@@ -107,6 +127,7 @@ codexctl run --image codex-office --temp --workdir testing/codex-office
 Prompt:
 
 ```
+Report your current working directory first, then summarize the environment information you were given about this image.
 Use python to create /workdir/codex-office-smoke.docx with a single heading "office-ok".
 Then run: ls -l /workdir/codex-office-smoke.docx
 ```
@@ -120,6 +141,7 @@ codexctl run --image codex-swift --temp --workdir testing/codex-swift
 Prompt:
 
 ```
+Report your current working directory first, then summarize the environment information you were given about this image.
 Create /workdir/Hello.swift with a main that prints "swift-ok".
 Then run: swiftc /workdir/Hello.swift -o /workdir/hello && /workdir/hello
 ```

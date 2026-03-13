@@ -167,7 +167,18 @@ The Alpine-based images are layered for incremental builds: `codex` -> `codex-py
 
 The image build process uses `npm` to install the latest `openai/codex` package, and configures `git` to use "Codex CLI" and `codex@localhost` as the container user's identity when interacting with git and to use `main` as the default branch when initializing a new repository.
 
-Further the build process is going to copy the `config.toml` file into the container at `/home/coder/.codex/` so that codex will properly connect to the locally running Ollama instance on the `default` network's host IP address 192.168.64.1.
+Further the build process copies `config.toml` into the container at `/home/coder/.codex/` so that codex will properly connect to the locally running Ollama instance on the `default` network's host IP address `192.168.64.1`.
+
+Each image also writes `/etc/codexctl/image.md` during build. That file describes the image name, build time, workspace conventions, and key built-in tools/toolchains. It intentionally lives outside `/home/coder/.codex`, so `codexctl upgrade` does not treat it as user state to back up and restore.
+
+The image build also creates `~/.codex/AGENTS.md` as a symlink to `/etc/codexctl/image.md`. This follows the official Codex `AGENTS.md` discovery flow for global guidance while keeping the source metadata image-owned instead of backed up as mutable user state. `codexctl run` still starts Codex with `--cd /workdir` so the working root is explicit.
+
+The image-specific `image.md` files describe the intended toolchain focus:
+
+- `codex`: general shell and Git tooling
+- `codex-python`: Python runtime and the default `/opt/venv`
+- `codex-office`: document, PDF, spreadsheet, and report-generation tooling
+- `codex-swift`: Swift-on-Linux tooling and related platform constraints
 
 Use the following `container` commands to build the codex images `codex`, `codex-python`, `codex-swift`, and `codex-office` from the corresponding `DockerFile` (build the Alpine images in order so the bases exist):
 

@@ -32,5 +32,34 @@ RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir \
     python-docx python-pptx xlrd pdfplumber \
  && chown -R coder:coder "$VIRTUAL_ENV"
 
+RUN mkdir -p /etc/codexctl \
+ && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+ && cat > /etc/codexctl/image.md <<EOF
+You are running inside the \`codex-office\` image.
+
+Environment:
+- containerized Alpine Linux (package manager \`apk\`)
+- running as the non-root user \`coder\`
+- shared host workspace at \`/workdir\`
+- architecture: check with \`uname -m\` if needed
+
+Image metadata:
+- image: \`codex-office\`
+- built_at_utc: \`${BUILD_TIME}\`
+
+Built-in CLI tools:
+- base tools: \`bash\`, \`zsh\`, \`git\`, \`curl\`, \`file\`, \`jq\`, \`rg\`, \`fd\`
+- programming tools: \`node\`, \`npm\`, \`python3\`, \`python\`, \`pip\`
+- office / document generation/analysis: \`pandoc\`, \`tesseract\`, \`qpdf\`, \`ghostscript\`, Poppler utilities such as \`pdftotext\`
+
+Programming environments and major libraries:
+- Node.js with npm and global \`pptxgenjs\`
+- Python 3 with \`/opt/venv\` on \`PATH\`
+- document, spreadsheet, and PDF libraries including \`python-docx\`, \`python-pptx\`, \`openpyxl\`, \`xlsxwriter\`, \`pdfplumber\`, \`PyPDF\`, \`pandas\`, \`numpy\`, \`matplotlib\`, and \`reportlab\`
+
+Use this image for document conversion, PDF analysis, spreadsheet work, OCR, and report generation.
+EOF
+RUN ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
+
 USER coder
 WORKDIR /workdir
