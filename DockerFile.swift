@@ -5,7 +5,7 @@ FROM swift:latest
 RUN DEBIAN_FRONTEND=noninteractive \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        npm file curl ripgrep jq util-linux \
+        zsh npm file curl ripgrep jq util-linux \
         make \
         python-is-python3 \
   && rm -rf /var/lib/apt/lists/*

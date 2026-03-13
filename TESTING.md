@@ -9,10 +9,10 @@ command from its corresponding `testing/<image>` directory so the container only
 mounts that subtree.
 
 ```bash
-codexctl run --image codex --temp --workdir testing/codex --cmd bash -lc 'bash --version && git --version && rg --version && jq --version && codex --version'
-codexctl run --image codex-python --temp --workdir testing/codex-python --cmd bash -lc 'which python && python -c "import sys; print(sys.executable)"'
-codexctl run --image codex-office --temp --workdir testing/codex-office --cmd bash -lc 'python -c "import docx, openpyxl, reportlab; print(\"python-ok\")" && node -e "require(\"pptxgenjs\"); console.log(\"node-ok\")"'
-codexctl run --image codex-swift --temp --workdir testing/codex-swift --cmd bash -lc 'swift --version && swift-format --version && command -v format >/dev/null && command -v lint >/dev/null'
+codexctl run --image codex --temp --workdir testing/codex --cmd bash -lc 'zsh --version && bash --version && git --version && rg --version && jq --version && codex --version'
+codexctl run --image codex-python --temp --workdir testing/codex-python --cmd bash -lc 'zsh --version && which python && python -c "import sys; print(sys.executable)"'
+codexctl run --image codex-office --temp --workdir testing/codex-office --cmd bash -lc 'zsh --version && python -c "import docx, openpyxl, reportlab; print(\"python-ok\")" && node -e "require(\"pptxgenjs\"); console.log(\"node-ok\")"'
+codexctl run --image codex-swift --temp --workdir testing/codex-swift --cmd bash -lc 'zsh --version && swift --version && swift-format --version && command -v format >/dev/null && command -v lint >/dev/null'
 ```
 
 ## Upgrade flow

@@ -89,7 +89,7 @@ Note: `codexctl build` produces the `codex`, `codex-python`, `codex-swift`, and 
 
 Note: `--cmd` consumes the remaining arguments and cannot be combined with `--shell`, so place it last. If you pass a single quoted string containing spaces, it runs via `$CODEX_SHELL -lc`. This same behavior applies to `codexctl exec`.
 
-Note: `CODEX_SHELL` is an environment variable to override the default shell used by `run --shell` and `exec` (default is `bash`). You can also set `DEFAULT_SHELL` in `codexctl` for a static default.
+Note: `CODEX_SHELL` is an environment variable to override the default shell used by `run --shell` and `exec` (default is `bash`). You can also set `DEFAULT_SHELL` in `codexctl` for a static default. All default images include both `bash` and `zsh`.
 
 Note: `--update` upgrades `@openai/codex` inside the target container before starting. If the target container does not exist yet, `codexctl run --update` creates it first and then applies the update. With `--temp`, the update is ephemeral and removed when the temporary container exits. This is convenient for quick refreshes of a specific container, while `codexctl build --rebuild` remains the persistent way to refresh image content.
 
@@ -156,7 +156,7 @@ The rest of this README explains what `codexctl` does behind the scenes and how 
 
 ### Build codex container images
 
-To build the codex container images for later use, I have written four `DockerFile`s which are installing `codex`, `git` and other basic tools (`bash`, `npm`, `file`, `curl`):
+To build the codex container images for later use, I have written four `DockerFile`s which are installing `codex`, `git` and other basic tools (`bash`, `zsh`, `npm`, `file`, `curl`):
 
 - `DockerFile` for a plain Alpine Linux (~191 MB)
 - `DockerFile.python` for a Alpine based Python installation (~203 MB, built on top of `codex`)

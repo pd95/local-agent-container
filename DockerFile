@@ -3,7 +3,7 @@ FROM alpine:latest
 
 # --- Core tooling ---
 RUN apk add --no-cache \
-        bash npm file curl git ripgrep jq util-linux
+        bash zsh npm file curl git ripgrep jq util-linux
 
 # --- Codex CLI ---
 RUN npm install -g @openai/codex \
