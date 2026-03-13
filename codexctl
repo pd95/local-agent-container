@@ -232,7 +232,10 @@ is_codex_image_filter_name() {
   if is_codex_image_family "$image_filter_name"; then
     return 0
   fi
-  [[ "$image_filter_name" == codex-* ]]
+  if [[ "$image_filter_name" == codex-* ]]; then
+    return 0
+  fi
+  return 1
 }
 
 is_codex_backup_image_ref() {
@@ -263,6 +266,9 @@ image_ref_matches_filter() {
   fi
   if ! is_codex_backup_image_ref "$family"; then
     return 1
+  fi
+  if [ "$family" = "$image_filter" ]; then
+    return 0
   fi
   backup_base="$(codex_backup_base "$family")"
   if [ "$backup_base" = "$image_filter" ]; then
@@ -493,7 +499,7 @@ Options for `images`:
 
 Options for `images prune`:
   --keep N      Keep the newest N timestamp tags per family (default: 1)
-  --image NAME  Limit pruning to one image family or backup base
+  --image NAME  Limit pruning to one image family, backup base, or exact backup image ref
   --backup      Prune only backup image refs
   --dry-run     Print images that would be deleted
 EOF
@@ -505,7 +511,7 @@ Usage: codexctl images prune [options]
 
 Options:
   --keep N      Keep the newest N timestamp tags per family (default: 1)
-  --image NAME  Limit pruning to one image family or backup base
+  --image NAME  Limit pruning to one image family, backup base, or exact backup image ref
   --backup      Prune only backup image refs
   --dry-run     Print images that would be deleted
 EOF
@@ -1530,7 +1536,7 @@ upgrade_cmd() {
           echo "Stopping container: $name" >&2
           "$CONTAINER_CMD" stop "$name" >/dev/null || true
         fi
-        die "Container has ~/.codex/AGENTS.md as a regular file. Re-run with --overwrite-config to replace ~/.codex/config.toml and recreate ~/.codex/AGENTS.md as a symlink to /etc/codexctl/image.md"
+        die "Container has ~/.codex/AGENTS.md as a regular file. Re-run with --overwrite-config to replace ~/.codex/config.toml and recreate ~/.codex/AGENTS.md as a symlink to /etc/codexctl/image.md. If no valid AGENTS.md configuration already exists, use codexctl run --name $name --reset-config"
       fi
       echo "Warning: replacing regular ~/.codex/AGENTS.md and ~/.codex/config.toml in $name due to --overwrite-config" >&2
       ;;
@@ -1540,7 +1546,7 @@ upgrade_cmd() {
           echo "Stopping container: $name" >&2
           "$CONTAINER_CMD" stop "$name" >/dev/null || true
         fi
-        die "Container has ~/.codex/AGENTS.md in a non-symlink form. Re-run with --overwrite-config to recreate it as a symlink to /etc/codexctl/image.md"
+        die "Container has ~/.codex/AGENTS.md in a non-symlink form. Re-run with --overwrite-config to recreate it as a symlink to /etc/codexctl/image.md. If no valid AGENTS.md configuration already exists, use codexctl run --name $name --reset-config"
       fi
       echo "Warning: replacing non-standard ~/.codex/AGENTS.md in $name due to --overwrite-config" >&2
       ;;
@@ -1595,6 +1601,9 @@ upgrade_cmd() {
   fi
 
   echo "Upgrade complete: $name (backup image: $backup_image)" >&2
+  echo >&2
+  echo "If no valid AGENTS.md configuration already exists, reset it with: codexctl run --name $name --reset-config" >&2
+  echo "If everything works as expected, remove the backup image with: codexctl images prune --backup --image $backup_image --keep 0" >&2
 }
 
 exec_cmd() {

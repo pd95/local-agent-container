@@ -52,7 +52,7 @@ codexctl upgrade --name codex-upgrade-smoke
 codexctl run --name codex-upgrade-smoke --image codex --workdir testing/codex --cmd bash -lc 'cat /home/coder/.codex/upgrade-smoke.txt'
 ```
 
-Expected output includes `upgrade-ok`, and `codexctl upgrade` should print the backup image name it created via `container export`.
+Expected output includes `upgrade-ok`, and `codexctl upgrade` should print the backup image name it created via `container export` plus follow-up hints for `codexctl run --name codex-upgrade-smoke --reset-config` and `codexctl images prune --backup --image <backup-image> --keep 0`.
 
 For a running-container upgrade, keep the container alive before upgrading:
 
@@ -106,6 +106,7 @@ codexctl run --name codex-upgrade-agents-test --image codex --workdir testing/co
 Expected output includes:
 
 - `Error: Container has ~/.codex/AGENTS.md as a regular file. Re-run with --overwrite-config`
+- `If no valid AGENTS.md configuration already exists, use codexctl run --name codex-upgrade-agents-test --reset-config`
 - `/etc/codexctl/image.md`
 
 `run --reset-config` should restore config from the image before launching container session:
