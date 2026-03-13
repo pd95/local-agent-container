@@ -117,31 +117,17 @@ codexctl run --shell
 codexctl run --cmd bash
 ```
 
-Note: `codexctl build` produces the `codex`, `codex-python`, `codex-swift`, and `codex-office` images by default. Each build also adds immutable UTC timestamp tags such as `codex:20260313-154500`, so you can keep multiple builds side by side while `codex` continues to point at the newest local build.
+#### Quick start notes
 
-Note: `codexctl build --snapshot` adds fresh UTC timestamp tags for already existing images without rebuilding them. Use this when you want side-by-side references for testing but do not want to refresh the image contents.
-
-Note: `--cmd` consumes the remaining arguments and cannot be combined with `--shell`, so place it last. If you pass a single quoted string containing spaces, it runs via `$CODEX_SHELL -lc`. This same behavior applies to `codexctl exec`.
-
-Note: `CODEX_SHELL` is an environment variable to override the default shell used by `run --shell` and `exec` (default is `bash`). You can also set `DEFAULT_SHELL` in `codexctl` for a static default. All default images include both `bash` and `zsh`.
-
-Note: `--update` upgrades `@openai/codex` inside the target container before starting. If the target container does not exist yet, `codexctl run --update` creates it first and then applies the update. With `--temp`, the update is ephemeral and removed when the temporary container exits. This is convenient for quick refreshes of a specific container, while `codexctl build --rebuild` remains the persistent way to refresh image content.
-
-Note: `codexctl upgrade` is the persistent refresh path for an existing named container. It exports the current container to a backup image, saves `/home/coder/.codex`, removes and recreates the container from the selected image, restores the saved config, and returns the container to its previous running or stopped state. This flow is verified for both stopped containers and already running containers.
-
-Note: if an older container has `~/.codex/AGENTS.md` as a regular file instead of the expected symlink to `/etc/codexctl/image.md`, `codexctl upgrade` stops and asks you to re-run with `--overwrite-config`. That mode replaces `~/.codex/config.toml` from the upgraded image and recreates the AGENTS symlink. If no valid AGENTS configuration already exists, you can also reset it with `codexctl run --name <container> --reset-config`.
-
-Note: after a successful `codexctl upgrade`, the command prints the backup image name and reminds you that you can remove it later with `codexctl images prune --backup --image <backup-image> --keep 0` once you have confirmed the upgraded container works as expected.
-
-Note: The `--rebuild`, `--refresh-base`, and `--pull-base` options are for occasional refreshes when you want to pick up newer Codex or base image updates. See the build cache section below for guidance.
-
-Note: `codexctl` was authored by Codex itself, running inside an Apple `container` in `--openai` mode.
-
-`codexctl images` is the dedicated image-management entry point.
-It lists local `codex` image tags (`codex`, `codex-python`, `codex-swift`, `codex-office`), immutable timestamped snapshots (`codex:20260313-154500`), and upgrade backups (`codex-<name>-backup-20260313142437`) as part of normal listing and pruning.
-`container image ls` output headers are already ignored, so no `NAME:TAG` filter is required.
-Use `--latest` to show only stable and newest snapshot per family.
-Use `codexctl images prune --keep N` to drop old snapshots/backups for selected families while preserving stable tags.
+- Builds create the stable `codex`, `codex-python`, `codex-swift`, and `codex-office` tags and also add immutable UTC snapshot tags such as `codex:20260313-154500`. Use `codexctl build --snapshot` to add fresh timestamp tags to the current images without rebuilding them.
+- `--cmd` consumes the remaining arguments, cannot be combined with `--shell`, and should be placed last. If you pass one quoted string with spaces, it runs via `$CODEX_SHELL -lc`. The same behavior applies to `codexctl exec`.
+- `CODEX_SHELL` overrides the shell used by `run --shell` and `exec` (default: `bash`). You can also set `DEFAULT_SHELL` in `codexctl` for a static default. All default images include both `bash` and `zsh`.
+- `codexctl run --update` upgrades `@openai/codex` inside the target container before starting. If the container does not exist yet, it is created first. With `--temp`, the update is ephemeral; `codexctl build --rebuild` remains the persistent way to refresh image content.
+- `codexctl upgrade` is the persistent refresh path for an existing named container. It exports the current container to a backup image, preserves `/home/coder/.codex`, recreates the container from the selected image, restores the saved config, and returns the container to its previous running or stopped state.
+- If an older container has `~/.codex/AGENTS.md` as a regular file instead of the expected symlink to `/etc/codexctl/image.md`, `codexctl upgrade` stops and asks you to re-run with `--overwrite-config`. You can also reset image-owned defaults with `codexctl run --name <container> --reset-config`.
+- After a successful `codexctl upgrade`, the command prints the backup image name. Remove it later with `codexctl images prune --backup --image <backup-image> --keep 0` after you have verified the upgraded container works as expected.
+- Use `--rebuild`, `--refresh-base`, and `--pull-base` only for occasional refreshes when you want newer Codex or base image content. See the build cache section below for details.
+- `codexctl` was authored by Codex itself, running inside an Apple `container` in `--openai` mode.
 
 #### Image selection
 
@@ -168,6 +154,7 @@ When to use which image:
 ### Other useful commands
 
 ```bash
+codexctl --help          # show command overview and available subcommands/options
 codexctl auth              # run device-auth and store in Keychain
 codexctl images            # list local codex image refs
 codexctl images --backup    # list local codex backup image refs
