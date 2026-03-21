@@ -151,6 +151,14 @@ codexctl images --all
 Expected output should include local codex family refs and timestamped snapshots.
 
 ```bash
+# A fresh environment should build the image once, then detect the stable tag on repeat
+codexctl build --image codex
+codexctl build --image codex
+```
+
+Expected output should show the first command building `codex`, and the second command printing `Image already exists: codex (use --rebuild to rebuild)`.
+
+```bash
 # Create multiple upgrade backups for the same container to exercise backup-family pruning
 codexctl run --name codex-images-smoke --image codex --workdir testing/codex --cmd true
 codexctl upgrade --name codex-images-smoke

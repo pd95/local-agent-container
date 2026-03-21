@@ -216,8 +216,7 @@ image_list() {
 image_exists() {
   local image="$1"
   "$CONTAINER_CMD" image inspect "$image" >/dev/null 2>&1 && return 0
-  "$CONTAINER_CMD" inspect "$image" >/dev/null 2>&1 && return 0
-  image_list | grep -q -E "(^|[[:space:]])$image([[:space:]]|$)"
+  parse_image_list | grep -Fqx -- "$image"
 }
 
 is_codex_image_family() {
