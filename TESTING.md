@@ -160,6 +160,23 @@ codexctl build --image codex
 Expected output should show the first command building `codex`, and the second command printing `Image already exists: codex (use --rebuild to rebuild)`.
 
 ```bash
+# Custom DockerFile names should map to codex-* images and build local bases first
+cat > DockerFile.testing-build <<'EOF'
+FROM codex-office
+RUN echo testing-build >/tmp/testing-build.txt
+EOF
+
+codexctl build --image codex-testing-build
+codexctl images | grep '^codex-testing-build'
+rm DockerFile.testing-build
+```
+
+Expected behavior:
+
+- `codexctl build --image codex-testing-build` should build `codex`, `codex-python`, `codex-office`, then `codex-testing-build` when those local bases do not already exist.
+- `codexctl images` should include `codex-testing-build` and its newest timestamp tag after the build.
+
+```bash
 # Create multiple upgrade backups for the same container to exercise backup-family pruning
 codexctl run --name codex-images-smoke --image codex --workdir testing/codex --cmd true
 codexctl upgrade --name codex-images-smoke
