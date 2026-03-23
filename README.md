@@ -53,7 +53,7 @@ curl -fsS http://192.168.64.1:11434/api/version
 
 That command should return a short JSON object with Ollama's version. If it fails, fix the network path first; otherwise Codex inside the container will fail to reach Ollama.
 
-`codexctl run` performs that local-mode preflight only when starting the default Codex command. If the configured Ollama endpoint is unreachable, it checks the container's detected host gateway and prints an actionable error when the config points at the wrong address or Ollama is not exposed on that gateway. `--cmd` and `--shell` skip this check.
+`codexctl run` performs a local-mode preflight only when starting the default Codex command. If the configured Ollama endpoint is unreachable, it checks the container's detected host gateway and prints an actionable error when the config points at the wrong address or Ollama is not exposed on that gateway. `--cmd` and `--shell` skip this check.
 
 ## Use `codexctl` (recommended)
 
