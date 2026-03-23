@@ -8,7 +8,6 @@ AUTH_NAME_PREFIX="codex-openai-auth-"
 DEFAULT_SHELL="${CODEX_SHELL:-bash}"
 DEFAULT_CODEX_PROFILE="gpt-oss"
 DEFAULT_CODEX_CMD=(codex)
-CODEX_IMAGE_FAMILIES=(codex codex-python codex-swift codex-office)
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs --)
 
 resolve_script_path() {
@@ -221,7 +220,13 @@ image_exists() {
 
 is_codex_image_family() {
   case "$1" in
-    codex|codex-python|codex-swift|codex-office) return 0 ;;
+    codex) return 0 ;;
+    codex-*)
+      if is_codex_backup_image_ref "$1"; then
+        return 1
+      fi
+      return 0
+      ;;
     *) return 1 ;;
   esac
 }
@@ -332,6 +337,16 @@ parse_image_list() {
   '
 }
 
+list_codex_image_families_from_refs() {
+  local refs="$1"
+  printf '%s\n' "$refs" | while IFS= read -r ref; do
+    [ -z "$ref" ] && continue
+    if is_codex_image_family "${ref%%:*}"; then
+      echo "${ref%%:*}"
+    fi
+  done | sort -u
+}
+
 timestamp_for_image_ref() {
   local image_ref="$1"
   if [[ "$image_ref" =~ ^[^:]+:([0-9]{8}-[0-9]{6})$ ]]; then
@@ -400,7 +415,7 @@ usage_build() {
 Usage: codexctl build [--image NAME] [--rebuild] [--snapshot] [--pull-base] [--refresh-base]
 
 Options:
-  --image NAME  One of: codex, codex-python, codex-swift, codex-office (default: all)
+  --image NAME  Local image name to build (for example: codex, codex-python, codex-my-team)
   --rebuild     Rebuild images even if they already exist (disables build cache)
   --snapshot    Add a fresh UTC timestamp tag for existing images without rebuilding
   --pull-base     Pull the base image before building
@@ -408,6 +423,12 @@ Options:
 
 Each successful build keeps the stable image name (for example `codex`) and
 also adds an immutable UTC timestamp tag (for example `codex:20260313-154500`).
+Local image names follow this convention:
+  codex         -> DockerFile
+  codex-<name>  -> DockerFile.<name>
+
+When a local Dockerfile uses FROM another local codex image, codexctl builds the
+dependency chain first.
 EOF
 }
 
@@ -486,12 +507,14 @@ usage_images() {
   cat <<'EOF'
 Usage: codexctl images [options]
        codexctl images prune [options]
+       codexctl images rm [options]
 
 Commands:
   prune        Remove old timestamp-tagged Codex images
+  rm           Remove all refs for one Codex image family or backup image
 
 Options for `images`:
-  --image NAME  One of: codex, codex-python, codex-swift, codex-office, or a backup base (example: codex-upgrade-smoke from codex-upgrade-smoke-backup-20260313123456)
+  --image NAME  Codex image family, custom codex-* image, or a backup base/image
   --backup      Show only backup image refs
   --all         Include non-Codex images
   --latest      Show only stable tags and newest timestamp tag per family
@@ -500,6 +523,11 @@ Options for `images prune`:
   --keep N      Keep the newest N timestamp tags per family (default: 1)
   --image NAME  Limit pruning to one image family, backup base, or exact backup image ref
   --backup      Prune only backup image refs
+  --dry-run     Print images that would be deleted
+
+Options for `images rm`:
+  --image NAME  Remove one image family, custom codex-* image, or backup base/image
+  --backup      Remove only backup image refs
   --dry-run     Print images that would be deleted
 EOF
 }
@@ -512,6 +540,17 @@ Options:
   --keep N      Keep the newest N timestamp tags per family (default: 1)
   --image NAME  Limit pruning to one image family, backup base, or exact backup image ref
   --backup      Prune only backup image refs
+  --dry-run     Print images that would be deleted
+EOF
+}
+
+usage_images_rm() {
+  cat <<'EOF'
+Usage: codexctl images rm [options]
+
+Options:
+  --image NAME  Remove one image family, custom codex-* image, or backup base/image
+  --backup      Remove only backup image refs
   --dry-run     Print images that would be deleted
 EOF
 }
@@ -557,7 +596,8 @@ images_print_latest() {
     return 0
   fi
 
-  for family in "${CODEX_IMAGE_FAMILIES[@]}"; do
+  while IFS= read -r family; do
+    [ -z "$family" ] && continue
     if [ -n "$image_filter" ] && ! image_ref_matches_filter "$family" "$image_filter"; then
       continue
     fi
@@ -570,7 +610,7 @@ images_print_latest() {
     if [ -n "$newest" ]; then
       echo "$newest"
     fi
-  done
+  done <<< "$(list_codex_image_families_from_refs "$refs")"
 
   backup_bases="$(printf '%s\n' "$refs" | while IFS= read -r family_ref; do
     if ! is_codex_backup_image_ref "${family_ref%%:*}"; then
@@ -650,7 +690,8 @@ images_print_sorted() {
     return 0
   fi
 
-  for family in "${CODEX_IMAGE_FAMILIES[@]}"; do
+  while IFS= read -r family; do
+    [ -z "$family" ] && continue
     family_refs="$(printf '%s\n' "$refs" | awk -F: -v family="$family" '$1 == family { print }' || true)"
     if [ -n "$image_filter" ]; then
       family_refs="$(printf '%s\n' "$family_refs" | while IFS= read -r family_ref; do
@@ -665,10 +706,15 @@ images_print_sorted() {
     fi
     printf '%s\n' "$family_refs" | awk -F: '$2 ~ /^[0-9]{8}-[0-9]{6}$/ { print }' | sort -r
     printf '%s\n' "$family_refs" | awk -F: '$2 != "" && $2 !~ /^[0-9]{8}-[0-9]{6}$/ { print }'
-  done
+  done <<< "$(list_codex_image_families_from_refs "$refs")"
 
   if [ "$include_all" -eq 1 ] && [ -z "$image_filter" ]; then
-    non_family_refs="$(printf '%s\n' "$refs" | awk -F: '$1 != "codex" && $1 != "codex-python" && $1 != "codex-swift" && $1 != "codex-office" && $1 !~ /^codex-.*-backup-[0-9]{14}$/' || true)"
+    non_family_refs="$(printf '%s\n' "$refs" | while IFS= read -r ref; do
+      [ -z "$ref" ] && continue
+      if ! is_codex_image_ref "$ref"; then
+        echo "$ref"
+      fi
+    done || true)"
     if [ -n "$non_family_refs" ]; then
       printf '%s\n' "$non_family_refs"
     fi
@@ -867,10 +913,72 @@ images_prune_cmd() {
   return 0
 }
 
+images_rm_cmd() {
+  local image=""
+  local backup=0
+  local dry_run=0
+  local refs=""
+  local to_remove=""
+  local failures=0
+  local ref=""
+  local deletion_ref=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --image) image="$2"; shift 2 ;;
+      --backup) backup=1; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      --help) usage_images_rm; return 0 ;;
+      *) die "Unknown option for images rm: $1" ;;
+    esac
+  done
+  [ -n "$image" ] || die "--image is required for images rm"
+  if ! is_codex_image_filter_name "$image"; then
+    die "Unknown image: $image"
+  fi
+  require_container
+
+  refs="$(parse_image_list || true)"
+  while IFS= read -r ref; do
+    [ -z "$ref" ] && continue
+    if ! image_ref_matches_filter "$ref" "$image"; then
+      continue
+    fi
+    if [ "$backup" -eq 1 ] && ! is_codex_backup_image_ref "${ref%%:*}"; then
+      continue
+    fi
+    to_remove="${to_remove}${ref}"$'\n'
+  done <<< "$refs"
+
+  to_remove="${to_remove%$'\n'}"
+  [ -z "$to_remove" ] && echo "No images to remove" && return 0
+
+  while IFS= read -r deletion_ref; do
+    [ -z "$deletion_ref" ] && continue
+    if [ "$dry_run" -eq 1 ]; then
+      echo "Would remove image: $deletion_ref"
+      continue
+    fi
+    if remove_image_ref "$deletion_ref"; then
+      echo "Removed image: $deletion_ref"
+    else
+      echo "Failed to remove image: $deletion_ref" >&2
+      failures=$((failures + 1))
+    fi
+  done <<< "$(printf '%s\n' "$to_remove" | sort -r || true)"
+
+  if [ "$failures" -ne 0 ]; then
+    return 1
+  fi
+
+  return 0
+}
+
 images_cmd() {
   if [ "$#" -gt 0 ] && [ "${1:0:2}" != "--" ]; then
     case "$1" in
       prune) shift; images_prune_cmd "$@" ;;
+      rm) shift; images_rm_cmd "$@" ;;
       --help|-h) usage_images; return 0 ;;
       *) die "Unknown images subcommand: $1" ;;
     esac
@@ -904,6 +1012,7 @@ build_cmd() {
     no_cache="--no-cache"
   fi
   build_stamp="$(date -u +%Y%m%d-%H%M%S)"
+
   remove_image() {
     local name="$1"
     if "$CONTAINER_CMD" image rm "$name" >/dev/null 2>&1; then
@@ -916,45 +1025,165 @@ build_cmd() {
     fi
     echo "Base image not removed (may not exist or command unsupported): $name" >&2
   }
-  base_image_from_file() {
-    awk 'toupper($1) == "FROM" { print $2; exit }' "$1"
-  }
-  is_local_base_image() {
+
+  is_local_codex_build_image() {
     case "$1" in
-      codex|codex-python) return 0 ;;
+      codex|codex-*) return 0 ;;
       *) return 1 ;;
     esac
   }
+
+  dockerfile_name_for_image() {
+    local name="$1"
+    case "$name" in
+      codex) echo "DockerFile" ;;
+      codex-*) echo "DockerFile.${name#codex-}" ;;
+      *) return 1 ;;
+    esac
+  }
+
+  dockerfile_path_for_image() {
+    local name="$1"
+    local file
+    file="$(dockerfile_name_for_image "$name")" || return 1
+    echo "$SCRIPT_DIR/$file"
+  }
+
+  local_image_for_dockerfile_name() {
+    local file_name="$1"
+    case "$file_name" in
+      DockerFile) echo "codex" ;;
+      DockerFile.*) echo "codex-${file_name#DockerFile.}" ;;
+      *) return 1 ;;
+    esac
+  }
+
+  local_dockerfile_exists_for_image() {
+    local image_name="$1"
+    local file_path
+    if ! file_path="$(dockerfile_path_for_image "$image_name")"; then
+      return 1
+    fi
+    [ -f "$file_path" ]
+  }
+
+  list_local_build_images() {
+    local file_path
+    local file_name
+    local image_name
+
+    for file_path in "$SCRIPT_DIR"/DockerFile*; do
+      [ -e "$file_path" ] || continue
+      [ -f "$file_path" ] || continue
+      file_name="$(basename "$file_path")"
+      case "$file_name" in
+        DockerFile|DockerFile.*)
+          image_name="$(local_image_for_dockerfile_name "$file_name" || true)"
+          [ -n "$image_name" ] && printf '%s\n' "$image_name"
+          ;;
+      esac
+    done | sort -u
+  }
+
+  base_image_from_file() {
+    awk '
+      toupper($1) == "FROM" {
+        for (i = 2; i <= NF; i++) {
+          if ($i ~ /^--/) {
+            continue
+          }
+          print $i
+          exit
+        }
+      }
+    ' "$1"
+  }
+
   refresh_base_image() {
     local file="$1"
     local base
     base="$(base_image_from_file "$file")"
     if [ -n "$base" ]; then
-      if is_local_base_image "$base"; then
+      if local_dockerfile_exists_for_image "$base"; then
         echo "Skipping base image removal for local image: $base"
         return 0
       fi
       remove_image "$base"
     fi
   }
+
   pull_base_image() {
     local file="$1"
     local base
     base="$(base_image_from_file "$file")"
     if [ -n "$base" ]; then
-      if is_local_base_image "$base"; then
+      if local_dockerfile_exists_for_image "$base"; then
         echo "Skipping base image pull for local image: $base"
         return 0
       fi
       "$CONTAINER_CMD" image pull "$base"
     fi
   }
+
+  local build_order_lines=""
+  local build_seen_lines=""
+  local build_visiting_lines=""
+
+  list_has_line() {
+    local lines="$1"
+    local value="$2"
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$lines" | grep -Fqx -- "$value"
+  }
+
+  resolve_build_dependencies() {
+    local name="$1"
+    local file_path
+    local file_name
+    local base
+    local base_file
+
+    if list_has_line "$build_seen_lines" "$name"; then
+      return 0
+    fi
+    if list_has_line "$build_visiting_lines" "$name"; then
+      die "Cyclic local image dependency detected while resolving $name"
+    fi
+    if ! is_local_codex_build_image "$name"; then
+      die "Unknown image: $name"
+    fi
+
+    file_path="$(dockerfile_path_for_image "$name" || true)"
+    if [ -z "$file_path" ] || [ ! -f "$file_path" ]; then
+      file_name="$(dockerfile_name_for_image "$name" || true)"
+      if [ -n "$file_name" ]; then
+        die "Unknown image: $name (expected local Dockerfile: $file_name)"
+      fi
+      die "Unknown image: $name"
+    fi
+
+    build_visiting_lines="${build_visiting_lines}${name}"$'\n'
+    base="$(base_image_from_file "$file_path")"
+    if [ -n "$base" ] && is_local_codex_build_image "$base"; then
+      if ! local_dockerfile_exists_for_image "$base"; then
+        base_file="$(dockerfile_name_for_image "$base" || true)"
+        die "Missing local base image definition for $name: expected $base_file because $file_path uses FROM $base"
+      fi
+      resolve_build_dependencies "$base"
+    fi
+    build_visiting_lines="$(printf '%s\n' "$build_visiting_lines" | grep -Fvx -- "$name" || true)"
+    build_seen_lines="${build_seen_lines}${name}"$'\n'
+    build_order_lines="${build_order_lines}${name}"$'\n'
+  }
+
   build_one() {
     local name="$1"
-    local file="$2"
-    local file_path="$SCRIPT_DIR/$file"
+    local file
+    local file_path
     local context="$SCRIPT_DIR"
     local versioned_name="${name}:${build_stamp}"
+    file="$(dockerfile_name_for_image "$name")"
+    file_path="$SCRIPT_DIR/$file"
     if [ "$rebuild" -eq 0 ] && image_exists "$name"; then
       if [ "$snapshot" -eq 1 ]; then
         echo "Snapshotting existing image tags: $name, $versioned_name"
@@ -978,21 +1207,24 @@ build_cmd() {
     fi
     "$CONTAINER_CMD" image tag "$name" "$versioned_name"
   }
-  case "$image" in
-    "") build_one codex DockerFile
-        build_one codex-python DockerFile.python
-        build_one codex-office DockerFile.office
-        build_one codex-swift DockerFile.swift
-        ;;
-    codex) build_one codex DockerFile ;;
-    codex-python) build_one codex DockerFile
-        build_one codex-python DockerFile.python ;;
-    codex-swift) build_one codex-swift DockerFile.swift ;;
-    codex-office) build_one codex DockerFile
-        build_one codex-python DockerFile.python
-        build_one codex-office DockerFile.office ;;
-    *) die "Unknown image: $image" ;;
-  esac
+
+  if [ -n "$image" ]; then
+    resolve_build_dependencies "$image"
+  else
+    while IFS= read -r local_image; do
+      [ -z "$local_image" ] && continue
+      resolve_build_dependencies "$local_image"
+    done <<< "$(list_local_build_images)"
+  fi
+
+  if [ -z "$build_order_lines" ]; then
+    die "No local DockerFiles found for build"
+  fi
+
+  while IFS= read -r build_image; do
+    [ -z "$build_image" ] && continue
+    build_one "$build_image"
+  done <<< "$build_order_lines"
 }
 
 run_auth_flow() {

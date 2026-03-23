@@ -110,6 +110,9 @@ codexctl images
 # Prune old snapshot tags by family while keeping one newest (dry-run)
 codexctl images prune --keep 1 --dry-run
 
+# Remove a custom image family entirely, including its stable tag and snapshots
+codexctl images rm --image codex-custom --dry-run
+
 # Start a shell inside the container
 codexctl run --shell
 
@@ -119,7 +122,7 @@ codexctl run --cmd bash
 
 #### Quick start notes
 
-- Builds create the stable `codex`, `codex-python`, `codex-swift`, and `codex-office` tags and also add immutable UTC snapshot tags such as `codex:20260313-154500`. Use `codexctl build --snapshot` to add fresh timestamp tags to the current images without rebuilding them.
+- Builds create stable local image tags and also add immutable UTC snapshot tags such as `codex:20260313-154500`. By default `codexctl build` discovers local `DockerFile*` definitions in the repo, resolves local `FROM codex...` dependencies, and builds them in dependency order. Use `codexctl build --snapshot` to add fresh timestamp tags to the current images without rebuilding them.
 - `--cmd` consumes the remaining arguments, cannot be combined with `--shell`, and should be placed last. If you pass one quoted string with spaces, it runs via `$CODEX_SHELL -lc`. The same behavior applies to `codexctl exec`.
 - In local-model mode, the Ollama reachability preflight only runs for the default Codex startup path. `--cmd` and `--shell` skip that check so image inspection and ad hoc commands still work without a running Ollama listener.
 - `CODEX_SHELL` overrides the shell used by `run --shell` and `exec` (default: `bash`). You can also set `DEFAULT_SHELL` in `codexctl` for a static default. All default images include both `bash` and `zsh`.
@@ -127,6 +130,7 @@ codexctl run --cmd bash
 - `codexctl upgrade` is the persistent refresh path for an existing named container. It exports the current container to a backup image, preserves `/home/coder/.codex`, recreates the container from the selected image, restores the saved config, and returns the container to its previous running or stopped state.
 - If an older container has `~/.codex/AGENTS.md` as a regular file instead of the expected symlink to `/etc/codexctl/image.md`, `codexctl upgrade` stops and asks you to re-run with `--overwrite-config`. You can also reset image-owned defaults with `codexctl run --name <container> --reset-config`.
 - After a successful `codexctl upgrade`, the command prints the backup image name. Remove it later with `codexctl images prune --backup --image <backup-image> --keep 0` after you have verified the upgraded container works as expected.
+- Use `codexctl images rm --image <name>` when you want to remove an image family entirely, including the stable tag. This is the cleanup path for temporary custom images such as `codex-custom`.
 - Use `--rebuild`, `--refresh-base`, and `--pull-base` only for occasional refreshes when you want newer Codex or base image content. See the build cache section below for details.
 - `codexctl` was authored by Codex itself, running inside an Apple `container` in `--openai` mode.
 
@@ -201,6 +205,13 @@ To build the codex container images for later use, I have written four `DockerFi
 
 The Alpine-based images are layered for incremental builds: `codex` -> `codex-python` -> `codex-office`.
 
+`codexctl build` derives local image names from Dockerfile names using this convention:
+
+- `DockerFile` -> `codex`
+- `DockerFile.<name>` -> `codex-<name>`
+
+That means a custom `DockerFile.custom` becomes the local image `codex-custom`. If it starts with `FROM codex-office`, `codexctl build --image codex-custom` will automatically build `codex`, `codex-python`, `codex-office`, and then `codex-custom`.
+
 The image build process uses `npm` to install the latest `openai/codex` package, and configures `git` to use "Codex CLI" and `codex@localhost` as the container user's identity when interacting with git and to use `main` as the default branch when initializing a new repository.
 
 Further the build process copies `config.toml` into the container at `/home/coder/.codex/` so that codex will properly connect to the locally running Ollama instance on the `default` network's host IP address `192.168.64.1`, and also mirrors it into `/etc/codexctl/config.toml` so upgrade resets can source the image-owned default reliably.
@@ -234,17 +245,19 @@ container build -t codex-swift -f DockerFile.swift .
 container image tag codex-swift "codex-swift:${STAMP}"
 ```
 
-This keeps the stable image names for normal use and also creates immutable timestamped tags for A/B testing and rollback.
+This keeps the stable image names for normal use and also creates immutable timestamped tags for A/B testing and rollback. `codexctl build` automates that same dependency ordering for both the built-in images and any custom local `DockerFile.<name>` images that follow the naming convention above.
 Notes:
 - The Swift image includes `format` and `lint` wrappers for `swift-format` and initializes `swiftly` for toolchain management.
 - The Office image sets up a writable venv at `/opt/venv` and puts it on `PATH` by default.
 
 #### Build cache behavior (codexctl)
 
-- `--rebuild` disables Dockerfile layer cache (`--no-cache`). Use when Codex warns you about an outdated version and you want all new containers to start from a fresh image.
+- `--rebuild` disables Dockerfile layer cache (`--no-cache`) for every image selected by the dependency-aware build plan. Use when Codex warns you about an outdated version and you want all new containers to start from fresh images.
 - `--snapshot` creates a new timestamp tag for the current stable image without rebuilding it. Use when you want an immutable test reference for the image you already have locally.
 - `--pull-base` pulls the latest base image tag before building. Use when you want to update base images without deleting them first (preferred).
 - `--refresh-base` deletes the base image first, forcing a re-fetch on build. Use when you need a brute-force refresh; this may fail if the base image is still referenced by containers.
+- `codexctl images prune` removes only old timestamp tags. It deliberately keeps the stable image tag.
+- `codexctl images rm --image <name>` removes the whole image family, including the stable tag and all timestamp tags.
 
 ### Network configuration
 
