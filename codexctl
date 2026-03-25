@@ -416,9 +416,9 @@ Usage: codexctl build [--image NAME] [--rebuild] [--snapshot] [--pull-base] [--r
 
 Options:
   --image NAME  Local image name to build (for example: codex, codex-python, codex-my-team)
-  --rebuild     Rebuild images even if they already exist (disables build cache)
+  --rebuild     Rebuild images even if they already exist (disables build cache only; does not refresh FROM tags)
   --snapshot    Add a fresh UTC timestamp tag for existing images without rebuilding
-  --pull-base     Pull the base image before building
+  --pull-base     Pull the base image before building (preferred way to refresh remote FROM tags)
   --refresh-base  Remove the base image first so it is re-fetched
 
 Each successful build keeps the stable image name (for example `codex`) and
@@ -1182,6 +1182,7 @@ build_cmd() {
     local file_path
     local context="$SCRIPT_DIR"
     local versioned_name="${name}:${build_stamp}"
+    local base=""
     file="$(dockerfile_name_for_image "$name")"
     file_path="$SCRIPT_DIR/$file"
     if [ "$rebuild" -eq 0 ] && image_exists "$name"; then
@@ -1198,6 +1199,13 @@ build_cmd() {
     fi
     if [ "$pull_base" -eq 1 ]; then
       pull_base_image "$file_path"
+    fi
+    if [ "$rebuild" -eq 1 ] && [ "$pull_base" -eq 0 ] && [ "$refresh_base" -eq 0 ]; then
+      base="$(base_image_from_file "$file_path")"
+      if [ -n "$base" ] && ! local_dockerfile_exists_for_image "$base"; then
+        echo "Note: --rebuild disables layer cache but does not refresh remote base image tags."
+        echo "      Use --pull-base (preferred) or --refresh-base to update $base."
+      fi
     fi
     echo "Building image tags: $name, $versioned_name"
     if [ -n "$no_cache" ]; then

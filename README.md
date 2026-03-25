@@ -252,7 +252,7 @@ Notes:
 
 #### Build cache behavior (codexctl)
 
-- `--rebuild` disables Dockerfile layer cache (`--no-cache`) for every image selected by the dependency-aware build plan. Use when Codex warns you about an outdated version and you want all new containers to start from fresh images.
+- `--rebuild` disables Dockerfile layer cache (`--no-cache`) for every image selected by the dependency-aware build plan. It does not pull newer remote `FROM` tags by itself. Use `--pull-base` as well when you want newer upstream base image content.
 - `--snapshot` creates a new timestamp tag for the current stable image without rebuilding it. Use when you want an immutable test reference for the image you already have locally.
 - `--pull-base` pulls the latest base image tag before building. Use when you want to update base images without deleting them first (preferred).
 - `--refresh-base` deletes the base image first, forcing a re-fetch on build. Use when you need a brute-force refresh; this may fail if the base image is still referenced by containers.
