@@ -53,8 +53,8 @@ RUN groupadd coder \
 # Make sure HOME is correct for subsequent RUNs when we switch user
 ENV HOME=/home/coder
 
-# Copy Codex default configuration
-COPY --chown=coder:coder config.toml /home/coder/.codex/
+# Copy Codex default configuration and local model metadata config
+COPY --chown=coder:coder config.toml local_models.json /home/coder/.codex/
 
 # Swiftly paths (user-owned, so codex can install toolchains later if needed)
 ENV SWIFTLY_HOME_DIR=/home/coder/.swiftly
