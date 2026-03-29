@@ -128,7 +128,7 @@ codexctl run --cmd bash
 - `CODEX_SHELL` overrides the shell used by `run --shell` and `exec` (default: `bash`). You can also set `DEFAULT_SHELL` in `codexctl` for a static default. All default images include both `bash` and `zsh`.
 - `codexctl run --update` upgrades `@openai/codex` inside the target container before starting. If the container does not exist yet, it is created first. With `--temp`, the update is ephemeral; `codexctl build --rebuild` remains the persistent way to refresh image content.
 - `codexctl upgrade` is the persistent refresh path for an existing named container. It exports the current container to a backup image, preserves `/home/coder/.codex`, recreates the container from the selected image, restores the saved config, and returns the container to its previous running or stopped state.
-- If an older container has `~/.codex/AGENTS.md` as a regular file instead of the expected symlink to `/etc/codexctl/image.md`, `codexctl upgrade` stops and asks you to re-run with `--overwrite-config`. You can also reset image-owned defaults with `codexctl run --name <container> --reset-config`.
+- If an older container has `~/.codex/AGENTS.md` as a regular file instead of the expected symlink to `/etc/codexctl/image.md`, `codexctl upgrade` stops and asks you to re-run with `--overwrite-config`. You can also reset image-owned defaults, including `local_models.json`, with `codexctl run --name <container> --reset-config`.
 - After a successful `codexctl upgrade`, the command prints the backup image name. Remove it later with `codexctl images prune --backup --image <backup-image> --keep 0` after you have verified the upgraded container works as expected.
 - Use `codexctl images rm --image <name>` when you want to remove an image family entirely, including the stable tag. This is the cleanup path for temporary custom images such as `codex-custom`.
 - Use `--rebuild`, `--refresh-base`, and `--pull-base` only for occasional refreshes when you want newer Codex or base image content. See the build cache section below for details.
@@ -164,7 +164,7 @@ codexctl auth              # run device-auth and store in Keychain
 codexctl images            # list local codex image refs
 codexctl images --backup    # list local codex backup image refs
 codexctl upgrade           # recreate the current container from the latest image
-codexctl upgrade --overwrite-config  # reset config.toml from upgraded image and recreate ~/.codex/AGENTS.md symlink
+codexctl upgrade --overwrite-config  # reset config.toml and local_models.json from upgraded image and recreate ~/.codex/AGENTS.md symlink
 codexctl images prune --backup --keep 2 --dry-run  # preview backup pruning
 codexctl exec              # shell into running container
 codexctl ls                # list containers
@@ -214,7 +214,7 @@ That means a custom `DockerFile.custom` becomes the local image `codex-custom`. 
 
 The image build process uses `npm` to install the latest `openai/codex` package, and configures `git` to use "Codex CLI" and `codex@localhost` as the container user's identity when interacting with git and to use `main` as the default branch when initializing a new repository.
 
-Further the build process copies `config.toml` into the container at `/home/coder/.codex/` so that codex will properly connect to the locally running Ollama instance on the `default` network's host IP address `192.168.64.1`, and also mirrors it into `/etc/codexctl/config.toml` so upgrade resets can source the image-owned default reliably.
+Further the build process copies `config.toml` and `local_models.json` into the container at `/home/coder/.codex/` so that Codex can both reach the locally running Ollama instance on the `default` network's host IP address `192.168.64.1` and resolve local model metadata, and also mirrors both files into `/etc/codexctl/` so upgrade resets can source the image-owned defaults reliably.
 
 Each image also writes `/etc/codexctl/image.md` during build. That file describes the image name, build time, workspace conventions, and key built-in tools/toolchains. It intentionally lives outside `/home/coder/.codex`, so `codexctl upgrade` does not treat it as user state to back up and restore.
 

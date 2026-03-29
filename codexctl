@@ -442,7 +442,7 @@ Options:
   --workdir PATH  Host directory to mount at /workdir (default: cwd)
   --openai        Use OpenAI mode (device auth)
   --auth          Force OpenAI login flow
-  --reset-config  Replace ~/.codex/config.toml from the image and recreate ~/.codex/AGENTS.md as a symlink
+  --reset-config  Replace ~/.codex/config.toml and local_models.json from the image and recreate ~/.codex/AGENTS.md as a symlink
   --update        Update @openai/codex in the target container before launch
   --temp          Create a throwaway container (auto-removed after exit)
   --read-only     Mount workdir as read-only (requires new container)
@@ -461,7 +461,7 @@ Options:
   --name NAME         Container name (default: codex-<dir>)
   --image NAME        Image to use for recreation (default: existing container image)
   --backup-image NAME Backup image name for container export (default: <name>-backup-<timestamp>)
-  --overwrite-config  Replace ~/.codex/config.toml from the upgraded image and recreate ~/.codex/AGENTS.md as a symlink
+  --overwrite-config  Replace ~/.codex/config.toml and local_models.json from the upgraded image and recreate ~/.codex/AGENTS.md as a symlink
 EOF
 }
 
@@ -1307,7 +1307,8 @@ overwrite_codex_config() {
     die "Image does not include /etc/codexctl/config.toml for overwrite in $name"
   fi
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'cp /etc/codexctl/config.toml /home/coder/.codex/config.toml'
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md && chown -h coder:coder /home/coder/.codex/AGENTS.md && chown coder:coder /home/coder/.codex/config.toml'
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'if test -f /etc/codexctl/local_models.json; then cp /etc/codexctl/local_models.json /home/coder/.codex/local_models.json; else rm -f /home/coder/.codex/local_models.json; fi'
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md && chown -h coder:coder /home/coder/.codex/AGENTS.md && chown coder:coder /home/coder/.codex/config.toml && if test -f /home/coder/.codex/local_models.json; then chown coder:coder /home/coder/.codex/local_models.json; fi'
 }
 
 ensure_keychain() {
@@ -2020,9 +2021,9 @@ upgrade_cmd() {
           echo "Stopping container: $name" >&2
           "$CONTAINER_CMD" stop "$name" >/dev/null || true
         fi
-        die "Container has ~/.codex/AGENTS.md as a regular file. Re-run with --overwrite-config to replace ~/.codex/config.toml and recreate ~/.codex/AGENTS.md as a symlink to /etc/codexctl/image.md. If no valid AGENTS.md configuration already exists, use codexctl run --name $name --reset-config"
+        die "Container has ~/.codex/AGENTS.md as a regular file. Re-run with --overwrite-config to replace ~/.codex/config.toml and ~/.codex/local_models.json and recreate ~/.codex/AGENTS.md as a symlink to /etc/codexctl/image.md. If no valid AGENTS.md configuration already exists, use codexctl run --name $name --reset-config"
       fi
-      echo "Warning: replacing regular ~/.codex/AGENTS.md and ~/.codex/config.toml in $name due to --overwrite-config" >&2
+      echo "Warning: replacing regular ~/.codex/AGENTS.md, ~/.codex/config.toml, and ~/.codex/local_models.json in $name due to --overwrite-config" >&2
       ;;
     other)
       if [ "$overwrite_config" -eq 0 ]; then
@@ -2075,7 +2076,7 @@ upgrade_cmd() {
   echo "Restoring /home/coder/.codex into $name" >&2
   restore_codex_config "$name" "$backup_file"
   if [ "$overwrite_config" -eq 1 ]; then
-    echo "Overwriting ~/.codex/config.toml and recreating ~/.codex/AGENTS.md in $name" >&2
+    echo "Overwriting config.toml, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $name" >&2
     overwrite_codex_config "$name"
   fi
 

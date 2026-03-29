@@ -65,7 +65,7 @@ RUN mkdir -p /home/coder/.local/bin /home/coder/.swiftly \
  && chown -R coder:coder /home/coder/.local /home/coder/.swiftly
 
 RUN mkdir -p /etc/codexctl \
- && cp /home/coder/.codex/config.toml /etc/codexctl/config.toml \
+ && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
 You are running inside the \`codex-swift\` image.
