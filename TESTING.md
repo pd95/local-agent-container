@@ -25,13 +25,13 @@ codexctl run --image codex-office --temp --workdir testing/codex-office --cmd ba
 codexctl run --image codex-swift --temp --workdir testing/codex-swift --cmd bash -lc 'test -f /etc/codexctl/image.md && sed -n "1,20p" /etc/codexctl/image.md'
 ```
 
-Also verify the image-owned config is present at `/etc/codexctl/config.toml` and matches the default user config inside the image:
+Also verify the image-owned config and model metadata are present and match the default user copies inside the image:
 
 ```bash
-codexctl run --image codex --temp --workdir testing/codex --cmd bash -lc 'test -f /etc/codexctl/config.toml && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml'
-codexctl run --image codex-python --temp --workdir testing/codex-python --cmd bash -lc 'test -f /etc/codexctl/config.toml && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml'
-codexctl run --image codex-office --temp --workdir testing/codex-office --cmd bash -lc 'test -f /etc/codexctl/config.toml && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml'
-codexctl run --image codex-swift --temp --workdir testing/codex-swift --cmd bash -lc 'test -f /etc/codexctl/config.toml && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml'
+codexctl run --image codex --temp --workdir testing/codex --cmd bash -lc 'test -f /etc/codexctl/config.toml && test -f /etc/codexctl/local_models.json && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json'
+codexctl run --image codex-python --temp --workdir testing/codex-python --cmd bash -lc 'test -f /etc/codexctl/config.toml && test -f /etc/codexctl/local_models.json && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json'
+codexctl run --image codex-office --temp --workdir testing/codex-office --cmd bash -lc 'test -f /etc/codexctl/config.toml && test -f /etc/codexctl/local_models.json && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json'
+codexctl run --image codex-swift --temp --workdir testing/codex-swift --cmd bash -lc 'test -f /etc/codexctl/config.toml && test -f /etc/codexctl/local_models.json && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json'
 ```
 
 Also verify global AGENTS guidance points at the image metadata file:
@@ -110,31 +110,31 @@ Expected output includes:
 - `If no valid AGENTS.md configuration already exists, use codexctl run --name codex-upgrade-agents-test --reset-config`
 - `/etc/codexctl/image.md`
 
-`run --reset-config` should restore config from the image before launching container session:
+`run --reset-config` should restore config and local model metadata from the image before launching container session:
 
 ```bash
-codexctl run --name codex-run-reset-config --image codex --workdir testing/codex --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# legacy-config\n" >/home/coder/.codex/config.toml'
-codexctl run --name codex-run-reset-config --image codex --workdir testing/codex --reset-config --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && grep -q "trust_level = \"trusted\"" /home/coder/.codex/config.toml; then echo reset-config-ok; else exit 1; fi'
+codexctl run --name codex-run-reset-config --image codex --workdir testing/codex --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# legacy-config\n" >/home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json'
+codexctl run --name codex-run-reset-config --image codex --workdir testing/codex --reset-config --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && grep -q "trust_level = \"trusted\"" /home/coder/.codex/config.toml; then echo reset-config-ok; else exit 1; fi'
 ```
 
 Expected output after the reset run should include:
 
 - `reset-config-ok`
 
-`--overwrite-config` now sources from the upgraded image’s immutable config; verify it by changing user config, upgrading, and checking that the restored `config.toml` matches `/etc/codexctl/config.toml`:
+`--overwrite-config` now sources from the upgraded image’s immutable config and local model metadata; verify it by changing user config, removing user metadata, upgrading, and checking that both restored files match `/etc/codexctl/`:
 
 ```bash
-codexctl run --name codex-upgrade-overwrite-config-test --image codex --workdir testing/codex --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# PRE-OVERWRITE\n[ollama]\nhost = \"http://127.0.0.1:11434\"\n" > /home/coder/.codex/config.toml'
+codexctl run --name codex-upgrade-overwrite-config-test --image codex --workdir testing/codex --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# PRE-OVERWRITE\n[ollama]\nhost = \"http://127.0.0.1:11434\"\n" > /home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json'
 codexctl upgrade --name codex-upgrade-overwrite-config-test
-codexctl run --name codex-upgrade-overwrite-config-test --image codex --workdir testing/codex --cmd bash -lc 'cp /etc/codexctl/config.toml /tmp/image-config.toml && cp /home/coder/.codex/config.toml /tmp/container-config.toml && sha256sum /tmp/image-config.toml /tmp/container-config.toml'
+codexctl run --name codex-upgrade-overwrite-config-test --image codex --workdir testing/codex --cmd bash -lc 'cp /etc/codexctl/config.toml /tmp/image-config.toml && cp /home/coder/.codex/config.toml /tmp/container-config.toml && sha256sum /tmp/image-config.toml /tmp/container-config.toml && test ! -f /home/coder/.codex/local_models.json'
 codexctl upgrade --name codex-upgrade-overwrite-config-test --overwrite-config
-codexctl run --name codex-upgrade-overwrite-config-test --image codex --workdir testing/codex --cmd bash -lc 'cp /etc/codexctl/config.toml /tmp/image-config.toml && cp /home/coder/.codex/config.toml /tmp/container-config.toml && diff -q /tmp/image-config.toml /tmp/container-config.toml && grep -q "trust_level = \"trusted\"" /home/coder/.codex/config.toml'
+codexctl run --name codex-upgrade-overwrite-config-test --image codex --workdir testing/codex --cmd bash -lc 'cp /etc/codexctl/config.toml /tmp/image-config.toml && cp /home/coder/.codex/config.toml /tmp/container-config.toml && cp /etc/codexctl/local_models.json /tmp/image-models.json && cp /home/coder/.codex/local_models.json /tmp/container-models.json && diff -q /tmp/image-config.toml /tmp/container-config.toml && diff -q /tmp/image-models.json /tmp/container-models.json && grep -q "trust_level = \"trusted\"" /home/coder/.codex/config.toml'
 ```
 
 Expected output after the overwrite upgrade should show:
 
 - matching hash line for `/tmp/image-config.toml` and `/tmp/container-config.toml`
-- no diff output from `diff -q` (identical files)
+- no diff output from either `diff -q` command (identical files)
 
 ## Image management
 

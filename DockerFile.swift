@@ -53,8 +53,8 @@ RUN groupadd coder \
 # Make sure HOME is correct for subsequent RUNs when we switch user
 ENV HOME=/home/coder
 
-# Copy Codex default configuration
-COPY --chown=coder:coder config.toml /home/coder/.codex/
+# Copy Codex default configuration and local model metadata config
+COPY --chown=coder:coder config.toml local_models.json /home/coder/.codex/
 
 # Swiftly paths (user-owned, so codex can install toolchains later if needed)
 ENV SWIFTLY_HOME_DIR=/home/coder/.swiftly
@@ -65,7 +65,7 @@ RUN mkdir -p /home/coder/.local/bin /home/coder/.swiftly \
  && chown -R coder:coder /home/coder/.local /home/coder/.swiftly
 
 RUN mkdir -p /etc/codexctl \
- && cp /home/coder/.codex/config.toml /etc/codexctl/config.toml \
+ && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
 You are running inside the \`codex-swift\` image.

@@ -12,6 +12,7 @@ wire_api = "responses"
 model_provider = "myollama"
 model = "gpt-oss:20b"
 model_context_window = 131072
+model_catalog_json = "~/.codex/local_models.json"
 
 [projects."/workdir"]
 trust_level = "trusted"
