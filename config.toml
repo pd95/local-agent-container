@@ -14,5 +14,10 @@ model = "gpt-oss:20b"
 model_context_window = 131072
 model_catalog_json = "~/.codex/local_models.json"
 
+[profiles.gemma]
+model_provider = "myollama"
+model = "gemma4:26b-a4b-it-q4_K_M"
+model_context_window = 131072
+
 [projects."/workdir"]
 trust_level = "trusted"

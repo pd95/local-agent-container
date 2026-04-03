@@ -447,3 +447,5 @@ Notes:
 - The default path is `/home/coder/.codex/auth.json` unless you pass an explicit path.
 - `codexctl run --openai` and `codexctl auth` automatically sync the Keychain auth into running containers when it differs.
 - `codexctl run --openai` saves refreshed auth back to Keychain when the container reports a newer refresh time (and that field is present).
+- `codexctl run --profile <name>` sets the Codex profile used by the container.
+  Profiles are defined in `config.toml` and control which model to use.
