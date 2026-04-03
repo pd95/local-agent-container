@@ -440,7 +440,7 @@ Options:
   --name NAME     Container name (default: codex-<dir>)
   --image NAME    Image to use (default: codex)
   --workdir PATH  Host directory to mount at /workdir (default: cwd)
-  --profile NAME   Codex profile to use (default: default)
+  --profile NAME  Codex profile to use (default: gpt-oss)
   --openai        Use OpenAI mode (device auth)
   --auth          Force OpenAI login flow
   --reset-config  Replace ~/.codex/config.toml and local_models.json from the image and recreate ~/.codex/AGENTS.md as a symlink
@@ -1865,7 +1865,6 @@ local_model_update_pre_exec() {
 run_cmd() {
   local name=""
   local image=""
-  # Profile is now supplied by run_cmd via the --profile flag; this variable is no longer needed.
   local openai=0
   local auth=0
   local update=0
@@ -1892,8 +1891,8 @@ run_cmd() {
       --update) update=1; shift ;;
       --temp) temp=1; shift ;;
       --read-only) read_only=1; shift ;;
-      --shell) shell=1; shell_set=1; shift ;; 
-      --profile) profile="$2"; shift 2 ;; 
+      --shell) shell=1; shell_set=1; shift ;;
+      --profile) profile="$2"; shift 2 ;;
       --cmd) shift; cmd_override_set=1; cmd_override=("$@"); break ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
