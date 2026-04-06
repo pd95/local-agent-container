@@ -41,8 +41,19 @@ require_container() {
   command -v "$CONTAINER_CMD" >/dev/null 2>&1 || die "Missing '$CONTAINER_CMD' command"
 }
 
+require_container_backup_support() {
+  if ! "$CONTAINER_CMD" export --help 2>/dev/null | grep -Fq -- '--output'; then
+    die "Upgrade backups require a container runtime with 'container export --output <path>' support"
+  fi
+  if ! "$CONTAINER_CMD" image load --help 2>/dev/null | grep -Fq -- 'Load images from an OCI compatible tar archive'; then
+    die "Upgrade backups require a container runtime with 'container image load' support"
+  fi
+}
+
 python_exec() {
   local python_cmd=""
+  local script="$1"
+  shift
   if command -v python3 >/dev/null 2>&1; then
     python_cmd="python3"
   elif command -v python >/dev/null 2>&1; then
@@ -50,7 +61,7 @@ python_exec() {
   else
     die "Missing python (python3 or python)"
   fi
-  "$python_cmd" -c "$1"
+  "$python_cmd" -c "$script" "$@"
 }
 
 container_list_all() {
@@ -67,6 +78,120 @@ container_exists() {
 
 container_running() {
   container_list_running | grep -q -E "(^|[[:space:]])$1([[:space:]]|$)"
+}
+
+host_arch_for_oci() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    arm64|aarch64) echo arm64 ;;
+    *) echo "$(uname -m)" ;;
+  esac
+}
+
+build_backup_image_archive() {
+  local backup_image="$1"
+  local container_name="$2"
+  local export_file="$3"
+  local archive_file="$4"
+
+  mkdir -p "$(dirname -- "$archive_file")"
+  python_exec "$(cat <<'PY'
+import hashlib
+import io
+import json
+import sys
+import tarfile
+from pathlib import Path
+
+backup_image = sys.argv[1]
+container_name = sys.argv[2]
+export_file = Path(sys.argv[3])
+archive_file = Path(sys.argv[4])
+arch = sys.argv[5]
+
+layer_bytes = export_file.read_bytes()
+layer_digest = hashlib.sha256(layer_bytes).hexdigest()
+layer_size = len(layer_bytes)
+
+config = {
+    "created": "1970-01-01T00:00:00Z",
+    "architecture": arch,
+    "os": "linux",
+    "config": {},
+    "rootfs": {
+        "type": "layers",
+        "diff_ids": [f"sha256:{layer_digest}"],
+    },
+    "history": [
+        {
+            "created": "1970-01-01T00:00:00Z",
+            "created_by": f"codexctl upgrade backup from {container_name}",
+        }
+    ],
+}
+config_bytes = json.dumps(config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+config_digest = hashlib.sha256(config_bytes).hexdigest()
+
+manifest = {
+    "schemaVersion": 2,
+    "config": {
+        "mediaType": "application/vnd.oci.image.config.v1+json",
+        "digest": f"sha256:{config_digest}",
+        "size": len(config_bytes),
+    },
+    "layers": [
+        {
+            "mediaType": "application/vnd.oci.image.layer.v1.tar",
+            "digest": f"sha256:{layer_digest}",
+            "size": layer_size,
+        }
+    ],
+}
+manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
+manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+index = {
+    "schemaVersion": 2,
+    "manifests": [
+        {
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": f"sha256:{manifest_digest}",
+            "size": len(manifest_bytes),
+            "platform": {
+                "architecture": arch,
+                "os": "linux",
+            },
+            "annotations": {
+                "org.opencontainers.image.ref.name": backup_image,
+            },
+        }
+    ],
+}
+index_bytes = json.dumps(index, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+def add_file(tar, name, data, mode=0o644):
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mode = mode
+    info.mtime = 0
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    tar.addfile(info, io.BytesIO(data))
+
+with tarfile.open(archive_file, "w") as tar:
+    add_file(tar, "oci-layout", b'{"imageLayoutVersion":"1.0.0"}\n')
+    add_file(tar, "index.json", index_bytes)
+    add_file(tar, f"blobs/sha256/{config_digest}", config_bytes)
+    add_file(tar, f"blobs/sha256/{manifest_digest}", manifest_bytes)
+    add_file(tar, f"blobs/sha256/{layer_digest}", layer_bytes, mode=0o644)
+PY
+)" "$backup_image" "$container_name" "$export_file" "$archive_file" "$(host_arch_for_oci)"
+}
+
+load_backup_image_archive() {
+  local archive_file="$1"
+  "$CONTAINER_CMD" image load --input "$archive_file" >/dev/null
 }
 
 container_mount_mode() {
@@ -1990,6 +2115,9 @@ upgrade_cmd() {
   if [ "$no_backup" -eq 1 ] && [ -n "$backup_image" ]; then
     die "Cannot combine --no-backup with --backup-image"
   fi
+  if [ "$no_backup" -eq 0 ]; then
+    require_container_backup_support
+  fi
   if ! container_exists "$name"; then
     die "Container not found: $name"
   fi
@@ -2065,7 +2193,9 @@ upgrade_cmd() {
 
   if [ "$no_backup" -eq 0 ]; then
     echo "Exporting container state to image: $backup_image" >&2
-    "$CONTAINER_CMD" export --image "$backup_image" "$name"
+    "$CONTAINER_CMD" export "$name" --output "$backup_file"
+    build_backup_image_archive "$backup_image" "$name" "$backup_file" "$backup_dir/codex-backup.oci.tar"
+    load_backup_image_archive "$backup_dir/codex-backup.oci.tar"
   else
     echo "Skipping backup image export for $name" >&2
   fi

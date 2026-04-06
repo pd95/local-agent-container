@@ -11,6 +11,7 @@ extra dependencies:
 
 - `run --temp` removes the container after exit
 - named `run` keeps the container until explicit removal
+- backup-enabled `upgrade` requires a container runtime with `export --output` and `image load`
 - `upgrade --no-backup` preserves user state without creating a backup image
 - default `upgrade` creates a recovery backup image
 - upgrade preflight failures do not remove the original container

@@ -51,11 +51,61 @@ test_run_help_reports_profile_default() {
   assert_contains "--profile NAME  Codex profile to use (default: gpt-oss)"
 }
 
+test_upgrade_backup_support_check() {
+  begin_test "upgrade backup support check requires export and image load support"
+
+  load_codexctl_functions
+
+  local fake_dir
+  local fake_container
+  local old_path
+
+  fake_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-fake-container.XXXXXX")"
+  register_dir_cleanup "$fake_dir"
+  fake_container="$fake_dir/container"
+  old_path="$PATH"
+
+  cat >"$fake_container" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+case "$1" in
+  export)
+    if [ "${2:-}" = "--help" ]; then
+      cat <<'OUT'
+OVERVIEW: Export a container's filesystem as a tar archive
+OPTIONS:
+  -o, --output <output>   Pathname for the saved container filesystem
+OUT
+      exit 0
+    fi
+    ;;
+  image)
+    if [ "${2:-}" = "load" ] && [ "${3:-}" = "--help" ]; then
+      cat <<'OUT'
+OVERVIEW: Load images from an OCI compatible tar archive
+OUT
+      exit 0
+    fi
+    ;;
+esac
+
+exit 0
+EOF
+  chmod +x "$fake_container"
+
+  PATH="$fake_dir:$old_path"
+  CONTAINER_CMD=container
+
+  run_capture require_container_backup_support
+  assert_status 0
+}
 main() {
   log "Using codexctl at $CODEXCTL"
 
   test_run_profile_wires_selected_profile
   test_run_help_reports_profile_default
+  test_upgrade_backup_support_check
 
   log "PASS: all shell unit tests completed"
 }
