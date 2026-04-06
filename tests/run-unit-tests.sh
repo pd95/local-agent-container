@@ -52,7 +52,7 @@ test_run_help_reports_profile_default() {
 }
 
 test_upgrade_backup_support_check() {
-  begin_test "upgrade backup support check requires export and image load support"
+  begin_test "upgrade backup support check requires export support"
 
   load_codexctl_functions
 
@@ -69,26 +69,14 @@ test_upgrade_backup_support_check() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-case "$1" in
-  export)
-    if [ "${2:-}" = "--help" ]; then
-      cat <<'OUT'
+if [ "$1" = "export" ] && [ "${2:-}" = "--help" ]; then
+  cat <<'OUT'
 OVERVIEW: Export a container's filesystem as a tar archive
 OPTIONS:
   -o, --output <output>   Pathname for the saved container filesystem
 OUT
-      exit 0
-    fi
-    ;;
-  image)
-    if [ "${2:-}" = "load" ] && [ "${3:-}" = "--help" ]; then
-      cat <<'OUT'
-OVERVIEW: Load images from an OCI compatible tar archive
-OUT
-      exit 0
-    fi
-    ;;
-esac
+  exit 0
+fi
 
 exit 0
 EOF
