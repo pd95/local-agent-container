@@ -83,6 +83,18 @@ stop_buildkit_container() {
   fi
 }
 
+cleanup_temp_dir() {
+  local path="$1"
+
+  [ -n "$path" ] || return 0
+  [ -e "$path" ] || return 0
+
+  # Exported container files can preserve restrictive modes that prevent
+  # best-effort host cleanup on exit.
+  chmod -R u+rwX "$path" >/dev/null 2>&1 || true
+  rm -rf "$path" >/dev/null 2>&1 || true
+}
+
 build_backup_image_from_export() {
   local backup_image="$1"
   local container_name="$2"
@@ -2069,7 +2081,7 @@ upgrade_cmd() {
   export_file="$backup_dir/codex-export.tar"
   backup_root="$backup_dir/rootfs"
   backup_dockerfile="$backup_dir/Dockerfile.backup"
-  trap 'rm -rf "$backup_dir"' RETURN
+  trap 'cleanup_temp_dir "$backup_dir"' RETURN
 
   if container_running "$name"; then
     was_running=1

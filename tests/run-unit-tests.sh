@@ -220,6 +220,25 @@ test_upgrade_uses_explicit_resource_overrides() {
   [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
 }
 
+test_cleanup_temp_dir_handles_read_only_trees() {
+  begin_test "cleanup_temp_dir removes read-only extracted trees"
+
+  load_codexctl_functions
+
+  local temp_dir
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-cleanup.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+
+  mkdir -p "$temp_dir/rootfs/pkg"
+  : >"$temp_dir/rootfs/pkg/file.txt"
+  chmod 500 "$temp_dir/rootfs" "$temp_dir/rootfs/pkg"
+  chmod 400 "$temp_dir/rootfs/pkg/file.txt"
+
+  cleanup_temp_dir "$temp_dir"
+
+  [ ! -e "$temp_dir" ] || fail "Expected cleanup_temp_dir to remove $temp_dir"
+}
+
 main() {
   log "Using codexctl at $CODEXCTL"
 
@@ -229,6 +248,7 @@ main() {
   test_upgrade_backup_support_check
   test_run_rejects_resource_flags_for_existing_container
   test_upgrade_uses_explicit_resource_overrides
+  test_cleanup_temp_dir_handles_read_only_trees
 
   log "PASS: all shell unit tests completed"
 }
