@@ -12,9 +12,11 @@ extra dependencies:
 - `run --temp` removes the container after exit
 - named `run` keeps the container until explicit removal
 - `build --rebuild` stops the temporary `buildkit` support container after a successful build
+- `run` rejects `--cpu` and `--mem` for existing named containers
 - backup-enabled `upgrade` requires a container runtime with `export --output`
 - `upgrade --no-backup` preserves user state without creating a backup image
 - default `upgrade` creates a recovery backup image
+- `upgrade` accepts explicit `--cpu` and `--mem` overrides when recreating a container
 - upgrade preflight failures do not remove the original container
 - `run --reset-config` restores image-owned config, model metadata, and `AGENTS.md`
 - `upgrade --overwrite-config` restores image-owned config, model metadata, and `AGENTS.md`
@@ -96,6 +98,21 @@ codexctl rm --name codex-upgrade-smoke
 ```
 
 Expected output includes `upgrade-ok`, and `codexctl upgrade --no-backup` should report that backup export was skipped while still printing the `codexctl run --name codex-upgrade-smoke --reset-config` hint.
+
+Resource changes should go through `upgrade`, and `run` should reject them once the container already exists:
+
+```bash
+codexctl run --name codex-upgrade-resources --image codex --workdir testing/codex --cpu 2 --mem 4G --cmd true
+codexctl run --name codex-upgrade-resources --image codex --workdir testing/codex --cpu 4 --mem 8G --cmd true
+codexctl upgrade --name codex-upgrade-resources --cpu 4 --mem 8G --no-backup
+codexctl rm --name codex-upgrade-resources
+```
+
+Expected output includes:
+
+- `Error: --cpu and --mem only apply when creating a new container.`
+- `Use codexctl upgrade --name codex-upgrade-resources`
+- `Upgrade complete: codex-upgrade-resources (backup skipped)`
 
 For a running-container upgrade, keep the container alive before upgrading:
 

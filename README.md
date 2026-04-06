@@ -148,7 +148,8 @@ codexctl run --cmd bash
 - In local-model mode, the Ollama reachability preflight only runs for the default Codex startup path. `--cmd` and `--shell` skip that check so image inspection and ad hoc commands still work without a running Ollama listener.
 - `CODEX_SHELL` overrides the shell used by `run --shell` and `exec` (default: `bash`). You can also set `DEFAULT_SHELL` in `codexctl` for a static default. All default images include both `bash` and `zsh`.
 - `codexctl run --update` upgrades `@openai/codex` inside the target container before starting. If the container does not exist yet, it is created first. With `--temp`, the update is ephemeral; `codexctl build --rebuild` remains the persistent way to refresh image content.
-- `codexctl upgrade` is the persistent refresh path for an existing named container. By default it exports the current container to a backup image, preserves `/home/coder/.codex`, recreates the container from the selected image, restores the saved config, and returns the container to its previous running or stopped state. Use `--no-backup` only when you intentionally want a cleanup-friendly upgrade without keeping that recovery image.
+- `--cpu` and `--mem` on `codexctl run` only apply when creating a new container. If the named container already exists, `codexctl run` fails fast and tells you to use `codexctl upgrade` instead of silently ignoring the resource request.
+- `codexctl upgrade` is the persistent refresh path for an existing named container. By default it exports the current container to a backup image, preserves `/home/coder/.codex`, recreates the container from the selected image, restores the saved config, and returns the container to its previous running or stopped state. It also accepts `--cpu` and `--mem` when you want to change the recreated container's resource limits alongside an image change or on their own. Use `--no-backup` only when you intentionally want a cleanup-friendly upgrade without keeping that recovery image.
 - If an older container has `~/.codex/AGENTS.md` as a regular file instead of the expected symlink to `/etc/codexctl/image.md`, `codexctl upgrade` stops and asks you to re-run with `--overwrite-config`. You can also reset image-owned defaults, including `local_models.json`, with `codexctl run --name <container> --reset-config`.
 - After a successful `codexctl upgrade`, the command prints the backup image name. Remove it later with `codexctl images prune --backup --image <backup-image> --keep 0` after you have verified the upgraded container works as expected.
 - Use `codexctl images rm --image <name>` when you want to remove an image family entirely, including the stable tag. This is the cleanup path for temporary custom images such as `codex-custom`.
@@ -200,6 +201,7 @@ codexctl auth              # run device-auth and store in Keychain
 codexctl images            # list local codex image refs
 codexctl images --backup    # list local codex backup image refs
 codexctl upgrade           # recreate the current container from the latest image
+codexctl upgrade --cpu 8 --mem 16G  # recreate an existing container with updated resources
 codexctl upgrade --no-backup  # recreate without exporting a backup image first
 codexctl upgrade --overwrite-config  # reset config.toml and local_models.json from upgraded image and recreate ~/.codex/AGENTS.md symlink
 codexctl images prune --backup --keep 2 --dry-run  # preview backup pruning
@@ -213,6 +215,7 @@ Notes:
 - `--auth` only works together with `--openai`.
 - `--temp` creates a disposable container that is removed after the command exits.
 - `--read-only` mounts the workdir as read-only; codex can use its home directory or `/tmp` for scratch data. But cannot modify the workdir.
+- `--cpu` and `--mem` on `codexctl run` are create-time settings. If you pass them for an existing named container, `codexctl run` exits with an error and points you to `codexctl upgrade`.
 - The mount mode is fixed on first creation for a given container name. To switch between read-only and read-write, remove the container (e.g. `codexctl rm`) or use `--temp`/`--name` to create a fresh one.
 - `codexctl ls` only shows Codex-managed containers whose image name starts with `codex`; it hides runtime support containers such as `buildkit`.
 - After a successful `codexctl build`, the temporary `buildkit` support container is stopped so it does not linger in the runtime list.

@@ -117,6 +117,109 @@ EOF
   run_capture require_container_backup_support
   assert_status 0
 }
+
+test_run_rejects_resource_flags_for_existing_container() {
+  begin_test "run rejects --cpu/--mem for existing containers"
+
+  local fake_dir
+  local fake_container
+  local old_path
+
+  fake_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-fake-container.XXXXXX")"
+  register_dir_cleanup "$fake_dir"
+  fake_container="$fake_dir/container"
+  old_path="$PATH"
+
+  cat >"$fake_container" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "${1:-}" = "ls" ] && [ "${2:-}" = "-a" ]; then
+  cat <<'OUT'
+ID                               IMAGE
+unit-test-container              codex:latest
+OUT
+  exit 0
+fi
+
+exit 0
+EOF
+  chmod +x "$fake_container"
+
+  PATH="$fake_dir:$old_path"
+
+  run_capture "$CODEXCTL" run --name unit-test-container --workdir "$TEST_ROOT" --cpu 4 --mem 8G --cmd true
+  assert_status 1
+  assert_contains "Error: --cpu and --mem only apply when creating a new container."
+  assert_contains "codexctl upgrade --name unit-test-container --image $DEFAULT_IMAGE --cpu 4 --mem 8G"
+}
+
+test_upgrade_uses_explicit_resource_overrides() {
+  begin_test "upgrade prefers explicit --cpu/--mem over inspected values"
+
+  load_codexctl_functions
+
+  local create_args=""
+  local start_calls=0
+  local stop_calls=0
+  local rm_calls=0
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  require_container_backup_support() { return 0; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 1; }
+  image_exists() { return 0; }
+  codex_agents_state() { printf 'missing\n'; }
+  backup_codex_config() { :; }
+  restore_codex_config() { :; }
+  sanitize_image_name() { printf '%s\n' "$1"; }
+  build_backup_image_from_export() { :; }
+  date() { printf '20260406120000\n'; }
+  trap() { :; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect)
+        printf 'placeholder\n'
+        ;;
+      create)
+        shift
+        create_args="$(printf '%s\n' "$*")"
+        ;;
+      start)
+        start_calls=$((start_calls + 1))
+        ;;
+      stop)
+        stop_calls=$((stop_calls + 1))
+        ;;
+      rm)
+        rm_calls=$((rm_calls + 1))
+        ;;
+      export)
+        fail "export should not be called for --no-backup"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  container_upgrade_info() {
+    printf 'codex\t%s\trw\t2\t4G\n' "$TEST_ROOT"
+  }
+
+  run_capture upgrade_cmd --name unit-test-container --cpu 6 --mem 12G --no-backup
+  assert_status 0
+  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  printf '%s\n' "$create_args" | grep -F -- "-c 6" >/dev/null || fail "Expected create args to include overridden cpu, got: $create_args"
+  printf '%s\n' "$create_args" | grep -F -- "-m 12G" >/dev/null || fail "Expected create args to include overridden mem, got: $create_args"
+  printf '%s\n' "$create_args" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected create args to include container name, got: $create_args"
+  [ "$start_calls" -eq 2 ] || fail "Expected 2 start calls, got: $start_calls"
+  [ "$stop_calls" -eq 2 ] || fail "Expected 2 stop calls, got: $stop_calls"
+  [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
+}
+
 main() {
   log "Using codexctl at $CODEXCTL"
 
@@ -124,6 +227,8 @@ main() {
   test_run_help_reports_profile_default
   test_ls_filters_non_codex_containers
   test_upgrade_backup_support_check
+  test_run_rejects_resource_flags_for_existing_container
+  test_upgrade_uses_explicit_resource_overrides
 
   log "PASS: all shell unit tests completed"
 }
