@@ -29,6 +29,15 @@ You can point the harness at another `codexctl` binary or container runtime comm
 CODEXCTL=/path/to/codexctl CONTAINER_CMD=container bash tests/run-tests.sh
 ```
 
+## Automated shell unit tests
+
+These lightweight tests validate `codexctl` argument plumbing without needing the macOS
+`container` runtime:
+
+```bash
+bash tests/run-unit-tests.sh
+```
+
 Use the image-specific manual checks below when you need broader smoke coverage, interactive
 Codex validation, or image/toolchain verification that is not yet automated.
 

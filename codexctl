@@ -6,7 +6,7 @@ DEFAULT_IMAGE="codex"
 DEFAULT_NAME_PREFIX="codex-"
 AUTH_NAME_PREFIX="codex-openai-auth-"
 DEFAULT_SHELL="${CODEX_SHELL:-bash}"
-DEFAULT_CODEX_PROFILE="gpt-oss"
+DEFAULT_CODEX_PROFILE="${CODEX_PROFILE:-gpt-oss}"
 DEFAULT_CODEX_CMD=(codex)
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs --)
 
@@ -440,6 +440,7 @@ Options:
   --name NAME     Container name (default: codex-<dir>)
   --image NAME    Image to use (default: codex)
   --workdir PATH  Host directory to mount at /workdir (default: cwd)
+  --profile NAME  Codex profile to use (default: gpt-oss)
   --openai        Use OpenAI mode (device auth)
   --auth          Force OpenAI login flow
   --reset-config  Replace ~/.codex/config.toml and local_models.json from the image and recreate ~/.codex/AGENTS.md as a symlink
@@ -1550,11 +1551,12 @@ run_mode() {
   local read_only="${10}"
   local workdir="${11}"
   local reset_config="${12}"
-  shift 12
+  local profile="${13}"
+  shift 13
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
-  local cmd=("${DEFAULT_CODEX_CMD[@]}" --profile "$DEFAULT_CODEX_PROFILE" --cd /workdir)
+  local cmd=("${DEFAULT_CODEX_CMD[@]}" --profile "$profile" --cd /workdir)
 
   if [ "$openai" -eq 1 ]; then
     pre_exec="openai_pre_exec"
@@ -1739,7 +1741,7 @@ local_model_preflight() {
   local remediation_host=""
   local remediation=""
 
-  if ! output="$(local_model_preflight_info "$name" "$DEFAULT_CODEX_PROFILE")"; then
+  if ! output="$(local_model_preflight_info "$name" "$profile")"; then
     message="Unable to run local-model preflight inside container: $name"
     case "$mode" in
       warn) warn "$message"; return 0 ;;
@@ -1869,6 +1871,7 @@ run_cmd() {
   local temp=0
   local shell=0
   local reset_config=0
+  local profile="${DEFAULT_CODEX_PROFILE}"
   local read_only=0
   local cpu=""
   local mem=""
@@ -1889,6 +1892,7 @@ run_cmd() {
       --temp) temp=1; shift ;;
       --read-only) read_only=1; shift ;;
       --shell) shell=1; shell_set=1; shift ;;
+      --profile) profile="$2"; shift 2 ;;
       --cmd) shift; cmd_override_set=1; cmd_override=("$@"); break ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
@@ -1926,7 +1930,7 @@ run_cmd() {
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
   fi
 
-  run_mode "$name" "$image" "$temp" "$shell" "$openai" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$reset_config" ${cmd_override[@]+"${cmd_override[@]}"}
+  run_mode "$name" "$image" "$temp" "$shell" "$openai" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$reset_config" "$profile" ${cmd_override[@]+"${cmd_override[@]}"}
 }
 
 auth_cmd() {
