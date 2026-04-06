@@ -31,8 +31,9 @@ After installing both tools, open Terminal app and run the following commands:
 # Pull the default gpt-oss profile model (requires 13 GB on disk!)
 ollama pull gpt-oss:20b
 
-# Optional: pull the Gemma profile model before using --profile gemma
+# Optionally pull the Gemma and Qwen profile models for use with gemma and qwen profiles
 ollama pull gemma4:26b-a4b-it-q4_K_M
+ollama pull qwen3.5:35b-a3b-coding-nvfp4
 
 # start the container API server (required for building container images)
 container system start
@@ -95,8 +96,9 @@ codexctl build --snapshot
 # Run Codex for the current directory (persistent by default)
 codexctl run
 
-# Run Codex with the Gemma profile from config.toml
+# Run Codex with the Gemma or qwen profile from config.toml
 codexctl run --profile gemma
+codexctl run --profile qwen
 
 # Run Codex for a specific directory
 codexctl run --workdir /path/to/project
@@ -471,3 +473,10 @@ Notes:
 - `codexctl run --openai` saves refreshed auth back to Keychain when the container reports a newer refresh time (and that field is present).
 - `codexctl run --profile <name>` sets the Codex profile used by the container.
   Profiles are defined in `config.toml` and control which model to use.
+
+# Qwen Profile
+You can also use the Qwen profile for coding-specific tasks:
+```bash
+# Optional: pull the Qwen profile model before using --profile qwen
+ollama pull qwen3.5:35b-a3b-coding-nvfp4
+```

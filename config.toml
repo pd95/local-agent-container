@@ -19,5 +19,10 @@ model_provider = "myollama"
 model = "gemma4:26b-a4b-it-q4_K_M"
 model_context_window = 131072
 
+[profiles.qwen]
+model_provider = "myollama"
+model = "qwen3.5:35b-a3b-coding-nvfp4"
+model_context_window = 131072
+
 [projects."/workdir"]
 trust_level = "trusted"
