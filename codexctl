@@ -41,8 +41,16 @@ require_container() {
   command -v "$CONTAINER_CMD" >/dev/null 2>&1 || die "Missing '$CONTAINER_CMD' command"
 }
 
+require_container_backup_support() {
+  if ! "$CONTAINER_CMD" export --help 2>/dev/null | grep -Fq -- '--output'; then
+    die "Upgrade backups require a container runtime with 'container export --output <path>' support"
+  fi
+}
+
 python_exec() {
   local python_cmd=""
+  local script="$1"
+  shift
   if command -v python3 >/dev/null 2>&1; then
     python_cmd="python3"
   elif command -v python >/dev/null 2>&1; then
@@ -50,7 +58,7 @@ python_exec() {
   else
     die "Missing python (python3 or python)"
   fi
-  "$python_cmd" -c "$1"
+  "$python_cmd" -c "$script" "$@"
 }
 
 container_list_all() {
@@ -73,6 +81,22 @@ stop_buildkit_container() {
   if container_exists buildkit; then
     "$CONTAINER_CMD" stop buildkit >/dev/null 2>&1 || true
   fi
+}
+
+build_backup_image_from_export() {
+  local backup_image="$1"
+  local container_name="$2"
+  local export_file="$3"
+  local backup_root="$4"
+  local backup_dockerfile="$5"
+
+  mkdir -p "$backup_root"
+  tar -xf "$export_file" -C "$backup_root"
+  cat >"$backup_dockerfile" <<EOF
+FROM scratch
+COPY . /
+EOF
+  "$CONTAINER_CMD" build -t "$backup_image" -f "$backup_dockerfile" "$backup_root"
 }
 
 container_mount_mode() {
@@ -1998,6 +2022,9 @@ upgrade_cmd() {
   if [ "$no_backup" -eq 1 ] && [ -n "$backup_image" ]; then
     die "Cannot combine --no-backup with --backup-image"
   fi
+  if [ "$no_backup" -eq 0 ]; then
+    require_container_backup_support
+  fi
   if ! container_exists "$name"; then
     die "Container not found: $name"
   fi
@@ -2022,9 +2049,15 @@ upgrade_cmd() {
   fi
 
   local backup_dir
-  local backup_file
+  local config_backup_file
+  local export_file
+  local backup_root
+  local backup_dockerfile
   backup_dir="$(mktemp -d)"
-  backup_file="$backup_dir/codex-config.tar"
+  config_backup_file="$backup_dir/codex-config.tar"
+  export_file="$backup_dir/codex-export.tar"
+  backup_root="$backup_dir/rootfs"
+  backup_dockerfile="$backup_dir/Dockerfile.backup"
   trap 'rm -rf "$backup_dir"' RETURN
 
   if container_running "$name"; then
@@ -2064,7 +2097,7 @@ upgrade_cmd() {
   esac
 
   echo "Backing up /home/coder/.codex from $name" >&2
-  backup_codex_config "$name" "$backup_file"
+  backup_codex_config "$name" "$config_backup_file"
 
   if [ "$was_running" -eq 1 ] || [ "$started_for_backup" -eq 1 ]; then
     echo "Stopping container: $name" >&2
@@ -2073,7 +2106,8 @@ upgrade_cmd() {
 
   if [ "$no_backup" -eq 0 ]; then
     echo "Exporting container state to image: $backup_image" >&2
-    "$CONTAINER_CMD" export --image "$backup_image" "$name"
+    "$CONTAINER_CMD" export "$name" --output "$export_file"
+    build_backup_image_from_export "$backup_image" "$name" "$export_file" "$backup_root" "$backup_dockerfile"
   else
     echo "Skipping backup image export for $name" >&2
   fi
@@ -2104,7 +2138,7 @@ upgrade_cmd() {
   "$CONTAINER_CMD" start "$name" >/dev/null
 
   echo "Restoring /home/coder/.codex into $name" >&2
-  restore_codex_config "$name" "$backup_file"
+  restore_codex_config "$name" "$config_backup_file"
   if [ "$overwrite_config" -eq 1 ]; then
     echo "Overwriting config.toml, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $name" >&2
     overwrite_codex_config "$name"
