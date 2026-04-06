@@ -491,6 +491,8 @@ Usage: codexctl upgrade [options]
 Options:
   --name NAME         Container name (default: codex-<dir>)
   --image NAME        Image to use for recreation (default: existing container image)
+  --cpu NUM           CPU cores for recreated container (default: preserve existing setting)
+  --mem SIZE          Memory limit for recreated container (default: preserve existing setting)
   --backup-image NAME Backup image name for container export (default: <name>-backup-<timestamp>)
   --no-backup         Skip container export backup image creation
   --overwrite-config  Replace ~/.codex/config.toml and local_models.json from the upgraded image and recreate ~/.codex/AGENTS.md as a symlink
@@ -1961,6 +1963,9 @@ run_cmd() {
   if [ -z "$name" ] && [ "$temp" -eq 0 ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
   fi
+  if [ "$temp" -eq 0 ] && [ -n "$name" ] && container_exists "$name" && { [ -n "$cpu" ] || [ -n "$mem" ]; }; then
+    die "--cpu and --mem only apply when creating a new container. Use codexctl upgrade --name $name${image:+ --image $image}${cpu:+ --cpu $cpu}${mem:+ --mem $mem} to recreate the container with updated resources"
+  fi
 
   run_mode "$name" "$image" "$temp" "$shell" "$openai" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$reset_config" "$profile" ${cmd_override[@]+"${cmd_override[@]}"}
 }
@@ -1989,14 +1994,16 @@ auth_cmd() {
 upgrade_cmd() {
   local name=""
   local image=""
+  local cpu=""
+  local mem=""
   local backup_image=""
   local no_backup=0
   local overwrite_config=0
   local current_image=""
   local workdir=""
   local mount_mode=""
-  local cpu=""
-  local mem=""
+  local current_cpu=""
+  local current_mem=""
   local read_only=0
   local was_running=0
   local started_for_backup=0
@@ -2006,6 +2013,8 @@ upgrade_cmd() {
     case "$1" in
       --name) name="$2"; shift 2 ;;
       --image) image="$2"; shift 2 ;;
+      --cpu) cpu="$2"; shift 2 ;;
+      --mem) mem="$2"; shift 2 ;;
       --backup-image) backup_image="$2"; shift 2 ;;
       --no-backup) no_backup=1; shift ;;
       --overwrite-config) overwrite_config=1; shift ;;
@@ -2030,7 +2039,7 @@ upgrade_cmd() {
   fi
 
   inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
-  IFS=$'\t' read -r current_image workdir mount_mode cpu mem <<<"$inspect_info"
+  IFS=$'\t' read -r current_image workdir mount_mode current_cpu current_mem <<<"$inspect_info"
   [ -n "$current_image" ] || die "Unable to determine image for $name"
   [ -n "$workdir" ] || die "Unable to determine /workdir mount source for $name"
 
@@ -2041,6 +2050,8 @@ upgrade_cmd() {
   fi
 
   [ -n "$image" ] || image="$current_image"
+  [ -n "$cpu" ] || cpu="$current_cpu"
+  [ -n "$mem" ] || mem="$current_mem"
   image_exists "$image" || die "Image not found: $image"
   [ -e "$workdir" ] || die "Preserved /workdir source does not exist: $workdir"
   [ -d "$workdir" ] || die "Preserved /workdir source is not a directory: $workdir"
