@@ -13,7 +13,9 @@ load_codexctl_functions() {
   harness="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit.XXXXXX")"
   register_dir_cleanup "$harness"
 
-  sed '/^cmd="${1:-}"/,$d' "$CODEXCTL" >"$harness"
+  sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
+    -e '/^cmd="${1:-}"/,$d' \
+    "$CODEXCTL" >"$harness"
   # shellcheck source=/dev/null
   . "$harness"
 }

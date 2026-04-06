@@ -215,6 +215,7 @@ Notes:
 - `--read-only` mounts the workdir as read-only; codex can use its home directory or `/tmp` for scratch data. But cannot modify the workdir.
 - The mount mode is fixed on first creation for a given container name. To switch between read-only and read-write, remove the container (e.g. `codexctl rm`) or use `--temp`/`--name` to create a fresh one.
 - `codexctl ls` only shows Codex-managed containers whose image name starts with `codex`; it hides runtime support containers such as `buildkit`.
+- After a successful `codexctl build`, the temporary `buildkit` support container is stopped so it does not linger in the runtime list.
 - `--openai --temp` still injects Keychain auth before running the command.
 - Keychain auth is the source of truth for `--openai`; it is synced into running containers before each run.
 - After a run, if the container refresh time is newer (and present), the updated auth is saved back into Keychain.

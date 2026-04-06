@@ -69,6 +69,12 @@ container_running() {
   container_list_running | grep -q -E "(^|[[:space:]])$1([[:space:]]|$)"
 }
 
+stop_buildkit_container() {
+  if container_exists buildkit; then
+    "$CONTAINER_CMD" stop buildkit >/dev/null 2>&1 || true
+  fi
+}
+
 container_mount_mode() {
   local script
   script="$(cat <<'PY'
@@ -1235,6 +1241,8 @@ build_cmd() {
     [ -z "$build_image" ] && continue
     build_one "$build_image"
   done <<< "$build_order_lines"
+
+  stop_buildkit_container
 }
 
 run_auth_flow() {

@@ -47,6 +47,19 @@ test_named_run_persists_until_rm() {
   fi
 }
 
+test_build_rebuild_stops_buildkit() {
+  begin_test "build --rebuild stops buildkit after a successful build"
+
+  run_capture "$CODEXCTL" build --image codex --rebuild
+  assert_status 0
+  assert_contains "Building image tags: codex,"
+
+  if ! "$CONTAINER_CMD" ls -a 2>/dev/null | grep -q -E '^buildkit[[:space:]]+.*[[:space:]]stopped([[:space:]]|$)'; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    fail "Expected buildkit to be stopped after codexctl build"
+  fi
+}
+
 test_upgrade_no_backup_preserves_state() {
   begin_test "upgrade --no-backup preserves state without creating backup images"
   local name
@@ -177,6 +190,7 @@ main() {
 
   test_temp_run_removes_container
   test_named_run_persists_until_rm
+  test_build_rebuild_stops_buildkit
   test_upgrade_no_backup_preserves_state
   test_upgrade_with_backup_creates_recovery_image
   test_upgrade_preflight_failure_keeps_container
