@@ -214,6 +214,7 @@ Notes:
 - `--temp` creates a disposable container that is removed after the command exits.
 - `--read-only` mounts the workdir as read-only; codex can use its home directory or `/tmp` for scratch data. But cannot modify the workdir.
 - The mount mode is fixed on first creation for a given container name. To switch between read-only and read-write, remove the container (e.g. `codexctl rm`) or use `--temp`/`--name` to create a fresh one.
+- Backup-enabled `codexctl upgrade` requires a container runtime that supports `container export --output <path>`.
 - `--openai --temp` still injects Keychain auth before running the command.
 - Keychain auth is the source of truth for `--openai`; it is synced into running containers before each run.
 - After a run, if the container refresh time is newer (and present), the updated auth is saved back into Keychain.
