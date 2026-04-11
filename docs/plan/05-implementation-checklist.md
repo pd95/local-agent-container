@@ -1,0 +1,206 @@
+# Implementation Checklist
+
+## Objective
+
+Break the migration into concrete implementation work items that can be executed in sequence.
+
+## Track A: Runtime Contract Foundation
+
+### A1. Add Contract Files to the Codex Image
+
+Files:
+
+- `DockerFile`
+- new runtime helper files copied into the image
+
+Tasks:
+
+- add `/usr/local/bin/agent.sh`
+- add `/etc/agentctl/agent.env`
+- add `/etc/agentctl/defaults/`
+- keep current `config.toml`, `local_models.json`, and image description available
+
+Done when:
+
+- Codex image exposes `agent.sh` and `agent.env`
+- Codex still behaves exactly as before
+
+### A2. Add Contract Files to the Claude Image
+
+Files:
+
+- `DockerFile.claude`
+- new Claude runtime helper files copied into the image
+
+Tasks:
+
+- add Claude `agent.sh`
+- add Claude `agent.env`
+- stop relying on the `codex` shim after host support lands
+
+Done when:
+
+- Claude runtime can be launched through the generic contract
+
+## Track B: Host Controller Refactor
+
+### B1. Add Metadata Discovery
+
+File:
+
+- `codexctl`
+
+Tasks:
+
+- detect whether the image or running container exposes `/etc/agentctl/agent.env`
+- load metadata safely
+- fall back to legacy Codex behavior if the contract is missing
+
+Done when:
+
+- the host controller can resolve runtime metadata for Codex
+
+### B2. Replace Hardcoded Runtime Launch
+
+File:
+
+- `codexctl`
+
+Tasks:
+
+- replace hardcoded default command arrays with `agent.sh run`
+- replace hardcoded login command with `agent.sh login`
+- replace hardcoded update command with `agent.sh update`
+
+Done when:
+
+- Codex runs through `agent.sh`
+- fallback path still exists if needed
+
+### B3. Generalize Runtime State Handling
+
+File:
+
+- `codexctl`
+
+Tasks:
+
+- replace `.codex`-specific backup/restore logic with metadata-driven runtime home handling
+- replace `.codex`-specific overwrite logic with defaults-directory logic
+- preserve current upgrade behavior
+
+Done when:
+
+- backup, restore, reset, and upgrade use declared runtime paths
+
+### B4. Generalize Capability Handling
+
+File:
+
+- `codexctl`
+
+Tasks:
+
+- gate local-model preflight on runtime capability
+- gate OpenAI mode on runtime capability
+- gate update and login features on runtime capability
+
+Done when:
+
+- unsupported runtime features fail early and clearly
+
+## Track C: Auth and Keychain
+
+### C1. Replace the Fixed Keychain Script
+
+Files:
+
+- `codex-auth-keychain.sh`
+- possible rename to `agent-auth-keychain.sh`
+
+Tasks:
+
+- parameterize service name, account name, auth path, and container name
+- keep read/store/load/verify operations
+- preserve safe handling of binary or hex-returned data
+
+Done when:
+
+- the script can store and restore auth for more than one runtime
+
+### C2. Add Auth Strategy Selection
+
+File:
+
+- `codexctl`
+
+Tasks:
+
+- implement strategy dispatch based on `AGENT_AUTH_FORMAT`
+- support `json_refresh_token`
+- support `opaque_blob`
+- support `directory_tarball`
+
+Done when:
+
+- Codex uses semantic JSON sync
+- Claude can use a conservative strategy if needed
+
+## Track D: Rebrand and Compatibility
+
+### D1. Introduce `agentctl`
+
+Files:
+
+- new `agentctl`
+- compatibility wrapper `codexctl`
+
+Tasks:
+
+- expose the generic naming in the CLI
+- keep `codexctl` forwarding to `agentctl`
+
+Done when:
+
+- the new controller name is usable without breaking old workflows
+
+### D2. Rename Image Families
+
+Files:
+
+- Docker image definitions
+- docs
+
+Tasks:
+
+- move from `codex*` naming to `agent-*`
+- keep compatibility aliases if practical during migration
+
+Done when:
+
+- `agent-codex` and `agent-claude` are the preferred names
+
+## Execution Sequence
+
+Recommended sequence:
+
+1. Track A1
+2. Track B1
+3. Track B2
+4. Track C1
+5. Track C2
+6. Track B3
+7. Track B4
+8. Track A2
+9. Claude auth verification and integration
+10. Track D1
+11. Track D2
+
+## Acceptance Criteria
+
+The migration is successful when all of the following are true:
+
+- Codex works as before for build, run, auth, update, local mode, and upgrade
+- Claude launches as a first-class runtime without the `codex` shim
+- auth save and restore are metadata-driven rather than Codex-specific
+- the controller can support future runtimes through `agent.sh` and `agent.env`
