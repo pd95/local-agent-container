@@ -10,6 +10,7 @@ Recommended review order:
 4. [03-codex-compatibility.md](docs/plan/03-codex-compatibility.md)
 5. [04-claude-runtime-plan.md](docs/plan/04-claude-runtime-plan.md)
 6. [05-implementation-checklist.md](docs/plan/05-implementation-checklist.md)
+7. [06-runtime-composition-matrix.md](docs/plan/06-runtime-composition-matrix.md)
 
 Target outcome:
 

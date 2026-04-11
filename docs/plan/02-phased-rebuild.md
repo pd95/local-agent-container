@@ -67,6 +67,29 @@ Exit criteria:
 - backup and restore operate on the runtime-declared paths
 - Codex still behaves the same
 
+## Phase 2b: Compose Toolchain + Runtime Without Dockerfile Explosion
+
+Goal:
+
+- make runtime an explicit, overrideable axis while keeping one Dockerfile per toolchain
+
+Actions:
+
+- define canonical runtime suffix mapping:
+  - `<toolchain>-codex` and `<toolchain>-claude` image targets
+- update build resolver to interpret runtime suffixes and pass `AGENT_RUNTIME` into toolchain Dockerfiles
+- add runtime overlays:
+  - runtime helper scripts/env copied based on `AGENT_RUNTIME`
+- keep existing no-suffix image names as Codex defaults:
+  - `agent-python` -> `agent-python-codex`, etc.
+- allow user-maintained custom `DockerFile.<toolchain>` to inherit runtime overlays with minimal change
+
+Exit criteria:
+
+- explicit `agent-<toolchain>-claude` can be built by resolver logic without adding new per-combination Dockerfiles
+- `agent-<toolchain>` still works as legacy/default Codex path
+- no behavior regression for existing `codex` compatibility aliases
+
 ## Phase 3: Convert Claude from Shim to First-Class Runtime
 
 Goal:

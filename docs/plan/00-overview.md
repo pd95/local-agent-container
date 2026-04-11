@@ -8,6 +8,7 @@ The target state is:
 
 - Codex still works as before
 - new agent runtimes such as Claude Code can be added without shims
+- runtime is a composable dimension separate from toolchain
 - container lifecycle remains simple
 - auth storage and restore can be handled consistently on macOS through Keychain
 
@@ -22,11 +23,14 @@ Target names:
 
 Target image examples:
 
-- `agent-codex`
-- `agent-claude`
+- `agent-base`
 - `agent-python`
 - `agent-swift`
 - `agent-office`
+- `agent-base-codex` / `agent-base-claude`
+- `agent-python-codex` / `agent-python-claude`
+- `agent-office-codex` / `agent-office-claude`
+- `agent-swift-codex` / `agent-swift-claude`
 
 Migration policy:
 
@@ -54,6 +58,9 @@ The project should be split into:
 
 1. Generic container orchestration
 2. Runtime-specific agent adapters
+
+Runtime should not be coupled to toolchain images. Toolchain Dockerfiles provide languages/tooling;
+runtime overlays (`codex`, `claude`) decide the agent launcher/auth/update behavior.
 
 The generic layer handles:
 

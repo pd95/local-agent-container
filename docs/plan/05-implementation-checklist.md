@@ -180,6 +180,78 @@ Done when:
 
 - `agent-codex` and `agent-claude` are the preferred names
 
+## Track E: Runtime-Toolchain Matrix Build Strategy
+
+### E1. Add Runtime Metadata Overlays
+
+Files:
+
+- `agent-codex.env` and `agent-codex.sh` (or equivalent overlay files)
+- `agent-claude.env` and `agent-claude.sh` (or equivalent overlay files)
+- base image manifests and build docs
+
+Tasks:
+
+- define runtime-specific metadata/config bundles that apply on top of `agent-base`, `agent-python`, and `agent-swift`
+- keep runtime naming explicit in resulting image tags (for example `agent-python-codex`, `agent-python-claude`)
+- document default inference/alias behavior for runtime selection
+
+Done when:
+
+- runtime is no longer coupled to toolchain in image layout
+- adding a new runtime does not require cloning every toolchain Dockerfile
+
+### E2. Compose Toolchain Images from Base Layers
+
+Files:
+
+- existing toolchain Dockerfiles (`agent-python`, `agent-office`, `agent-swift`)
+- build orchestration script or Makefile target (as source of truth)
+
+Tasks:
+
+- update toolchain definitions so they build from `agent-base` and apply runtime overlays
+- add matrix build target (for example `agent-{toolchain}-{runtime}`) with deterministic tags and aliases
+- preserve old single-runtime image names with compatibility tags where needed
+
+Done when:
+
+- matrix builds do not require N×M hand-authored Dockerfiles
+- each matrix combination can be produced with composition inputs
+
+### E3. Controller and User-Facing Selection
+
+Files:
+
+- `agentctl` / `codexctl`
+- docs
+
+Tasks:
+
+- ensure the controller can launch and route by image tag and runtime metadata
+- add documentation for selecting codex-vs-claude runtime stacks
+- keep migration-safe aliases for previously known image names
+
+Done when:
+
+- users can switch runtime and toolchain independently with minimal rebuild steps
+
+### E4. Close Matrix Gaps and Validate Rollout
+
+Files:
+
+- matrix playbook and issue log
+
+Tasks:
+
+- enumerate supported combinations (toolchain × runtime) and validate smoke behavior for each
+- define rollback path when a runtime overlay breaks a specific toolchain
+
+Done when:
+
+- every supported matrix cell is documented and reproducibly buildable
+- rollout has a clear fallback and deprecation plan
+
 ## Execution Sequence
 
 Recommended sequence:
@@ -193,8 +265,12 @@ Recommended sequence:
 7. Track B4
 8. Track A2
 9. Claude auth verification and integration
-10. Track D1
-11. Track D2
+10. Track E1
+11. Track E2
+12. Track E3
+13. Track E4
+14. Track D1
+15. Track D2
 
 ## Acceptance Criteria
 
@@ -204,3 +280,4 @@ The migration is successful when all of the following are true:
 - Claude launches as a first-class runtime without the `codex` shim
 - auth save and restore are metadata-driven rather than Codex-specific
 - the controller can support future runtimes through `agent.sh` and `agent.env`
+- runtime/toolchain combinations are composed via matrix naming (e.g. `agent-python-claude`) without Dockerfile duplication
