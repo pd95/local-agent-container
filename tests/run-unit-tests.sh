@@ -72,6 +72,34 @@ test_run_skips_local_model_preflight_for_non_local_runtime() {
   printf '%s\n' "$captured_cmd" | grep -Fxq '__agentctl_default_runtime__ local gpt-oss' || fail "Expected runtime contract command for default profile, got: $captured_cmd"
 }
 
+test_run_openai_rejected_for_non_openai_runtime() {
+  begin_test "run --openai fails for runtimes without openai-mode support"
+
+  load_codexctl_functions
+
+  local status=0
+  local out
+  local out_file
+
+  require_container() { return 0; }
+  container_has_agent_contract() { return 0; }
+  container_supports_capability() { return 1; }
+
+  out_file="$(mktemp "${TMPDIR:-/tmp}/codexctl-openai-runtime.XXXXXX")"
+  if (openai_pre_exec unit-test-container >"$out_file" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 1 ] || fail "Expected --openai command to fail, got status $status"
+  out="$(cat "$out_file" 2>/dev/null || printf '')"
+  rm -f "$out_file"
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" | grep -Fq "Selected runtime does not support --openai mode" \
+      || fail "Expected unsupported openai-mode error, got: $out"
+  fi
+}
+
 test_run_help_reports_profile_default() {
   begin_test "run help reports the actual default profile"
 
@@ -448,6 +476,7 @@ main() {
 
   test_run_profile_wires_selected_profile
   test_run_skips_local_model_preflight_for_non_local_runtime
+  test_run_openai_rejected_for_non_openai_runtime
   test_run_help_reports_profile_default
   test_agentctl_wrapper_usage_banner
   test_agent_env_metadata_helpers
