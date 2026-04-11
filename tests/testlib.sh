@@ -72,7 +72,30 @@ container_exists() {
 }
 
 image_exists() {
-  "$CONTAINER_CMD" image inspect "$1" >/dev/null 2>&1
+  local image_ref="$1"
+  local image_list=""
+
+  if "$CONTAINER_CMD" image inspect "$image_ref" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  image_list="$("$CONTAINER_CMD" image ls 2>/dev/null || "$CONTAINER_CMD" images 2>/dev/null || true)"
+  [ -z "$image_list" ] && return 1
+  printf '%s\n' "$image_list" | awk '
+    NR == 1 { next }
+    NF >= 2 {
+      repo = $1
+      tag = $2
+      if (repo == "" || repo == "<none>" || tag == "" || tag == "<none>") {
+        next
+      }
+      if (tag == "latest") {
+        print repo
+      } else {
+        print repo ":" tag
+      }
+    }
+  ' | grep -Fqx -- "$image_ref"
 }
 
 list_backup_images() {

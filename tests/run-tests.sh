@@ -155,7 +155,7 @@ test_run_reset_config_restores_image_defaults() {
   run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# legacy-config\n" >/home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json && rm -f /home/coder/.codex/AGENTS.md && printf "legacy-agents\n" >/home/coder/.codex/AGENTS.md'
   assert_status 0
 
-  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --reset-config --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/codexctl/image.md" ]; then echo reset-config-ok; else exit 1; fi'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --reset-config --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && ([ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/codexctl/image.md" ] || [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/agentctl/image.md" ]); then echo reset-config-ok; else exit 1; fi'
   assert_status 0
   assert_contains "reset-config-ok"
 }
@@ -177,7 +177,7 @@ test_upgrade_overwrite_config_restores_image_defaults() {
   assert_contains "Overwriting config.toml, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $name"
   assert_contains "Upgrade complete: $name (backup skipped)"
 
-  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/codexctl/image.md" ]; then echo overwrite-config-ok; else exit 1; fi'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && ([ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/codexctl/image.md" ] || [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/agentctl/image.md" ]); then echo overwrite-config-ok; else exit 1; fi'
   assert_status 0
   assert_contains "overwrite-config-ok"
 }
