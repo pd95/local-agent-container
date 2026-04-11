@@ -217,6 +217,36 @@ test_image_family_aliases_support_legacy_and_tagged_names() {
   [ "$(image_family_for_runtime codex-python:20260313-154500)" = "codex-python:20260313-154500" ] || fail "Expected runtime resolver to fallback to legacy tagged family"
 }
 
+test_matrix_runtime_image_helpers() {
+  begin_test "matrix images resolve to runtime variants and their dockerfiles"
+
+  load_codexctl_functions
+
+  [ "$(image_family_preferred agent-python-claude)" = "agent-python-claude" ] || fail "Expected agent-python-claude to map to itself"
+  [ "$(image_family_preferred agent-office-claude:20260313-154500)" = "agent-office-claude:20260313-154500" ] || fail "Expected tagged matrix preferred family to preserve tag"
+  [ "$(image_family_legacy_codex agent-swift-claude)" = "codex-swift-claude" ] || fail "Expected legacy conversion for matrix name to keep toolchain+runtime"
+  [ "$(image_family_legacy_codex agent-swift-claude:20260313-154500)" = "codex-swift-claude:20260313-154500" ] || fail "Expected tagged legacy matrix conversion"
+
+  is_runtime_image_name codex || fail "Expected codex runtime name to be recognized"
+  is_runtime_image_name claude || fail "Expected claude runtime name to be recognized"
+  if is_runtime_image_name grok; then
+    fail "Expected unknown runtime to be rejected"
+  fi
+
+  [ "$(matrix_parts_for_image agent-python-claude)" = $'python\tclaude' ] || fail "Expected matrix parsing to return python/claude"
+  [ "$(matrix_parts_for_image agent-python-claude:20260313-154500)" = $'python\tclaude' ] || fail "Expected matrix parsing to ignore tag"
+  [ "$(dockerfile_name_for_image agent-python-claude)" = "DockerFile.python" ] || fail "Expected matrix image to use toolchain dockerfile"
+  if dockerfile_name_for_image agent-unknown-claude 2>/dev/null; then
+    fail "Expected unknown matrix toolchain to fail dockerfile resolution"
+  fi
+
+  image_exists() { [ "$1" = "agent-python-claude:20260313-154500" ] || return 1; }
+  [ "$(image_family_for_runtime agent-python-claude:20260313-154500)" = "agent-python-claude:20260313-154500" ] || fail "Expected runtime resolver to pick matrix image when available"
+
+  image_exists() { [ "$1" = "codex-python-claude:20260313-154500" ] || return 1; }
+  [ "$(image_family_for_runtime agent-python-claude:20260313-154500)" = "codex-python-claude:20260313-154500" ] || fail "Expected matrix runtime resolver to fall back to legacy codex image"
+}
+
 test_openai_auth_sync_opaque_format() {
   begin_test "openai auth sync path uses checksums for opaque auth formats"
 
@@ -510,6 +540,7 @@ main() {
   test_agent_env_metadata_helpers
   test_container_auth_format_helpers
   test_image_family_aliases_support_legacy_and_tagged_names
+  test_matrix_runtime_image_helpers
   test_openai_auth_sync_opaque_format
   test_codex_auth_wrapper_execs_generic_script
   test_ls_filters_non_codex_containers
