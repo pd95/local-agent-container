@@ -147,6 +147,24 @@ begin_test() {
   log "$1"
   RUN_STATUS=0
   RUN_OUTPUT=""
+  unset -f \
+    container \
+    require_container \
+    default_name \
+    run_container \
+    container_list_all \
+    container_upgrade_info \
+    image_exists \
+    container_exists \
+    container_running \
+    build_backup_image_from_export \
+    sanitize_image_name \
+    backup_codex_config \
+    restore_codex_config \
+    codex_agents_state \
+    date \
+    trap \
+    2>/dev/null || true
   if [ -n "$RUN_LOG" ] && [ -f "$RUN_LOG" ]; then
     rm -f "$RUN_LOG" >/dev/null 2>&1 || true
   fi

@@ -53,6 +53,68 @@ test_run_help_reports_profile_default() {
   assert_contains "--profile NAME  Codex profile to use (default: gpt-oss)"
 }
 
+test_agent_env_metadata_helpers() {
+  begin_test "agent metadata helpers read values from agent.env"
+
+  load_codexctl_functions
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      exec)
+        shift
+        if [ "$1" = "unit-test-container" ]; then
+          shift
+        fi
+        while [ "$#" -gt 0 ] && [[ "$1" == setpriv* || "$1" == --* ]]; do
+          shift
+        done
+        case "$1" in
+          test)
+            return 0
+            ;;
+          cat)
+            cat <<'EOF'
+AGENT_HOME_DIR=/home/coder/.codex
+AGENT_CONFIG_DIR=/home/coder/.codex
+AGENT_AUTH_PATH=/home/coder/.codex/auth.json
+AGENT_IMAGE_DEFAULTS_DIR=/etc/agentctl/defaults
+AGENT_KEYCHAIN_SERVICE=agentctl-codex-auth
+AGENT_KEYCHAIN_ACCOUNT=device-auth-openai
+AGENT_SUPPORTS_OPENAI_MODE=1
+EOF
+            ;;
+          *)
+            fail "Unexpected container exec: $*"
+            ;;
+        esac
+        ;;
+      ls)
+        cat <<'EOF'
+ID IMAGE
+unit-test-container codex:latest
+EOF
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  [ "$(container_agent_home_dir unit-test-container)" = "/home/coder/.codex" ] || fail "Expected AGENT_HOME_DIR metadata"
+  [ "$(container_agent_defaults_dir unit-test-container)" = "/etc/agentctl/defaults" ] || fail "Expected AGENT_IMAGE_DEFAULTS_DIR metadata"
+  [ "$(container_agent_keychain_service unit-test-container)" = "agentctl-codex-auth" ] || fail "Expected AGENT_KEYCHAIN_SERVICE metadata"
+  container_supports_capability unit-test-container openai-mode || fail "Expected openai-mode capability"
+}
+
+test_codex_auth_wrapper_execs_generic_script() {
+  begin_test "codex-auth-keychain wrapper delegates to the generic script"
+
+  run_capture bash -c 'SCRIPT_DIR="$(pwd)"; PATH="$SCRIPT_DIR:$PATH"; export KEYCHAIN_SERVICE_NAME=test KEYCHAIN_ACCOUNT_NAME=test; sed -n "1,5p" codex-auth-keychain.sh | grep -F "agent-auth-keychain.sh"'
+  assert_status 0
+  assert_contains "agent-auth-keychain.sh"
+}
+
 test_ls_filters_non_codex_containers() {
   begin_test "ls_cmd hides non-Codex runtime containers"
 
@@ -244,6 +306,8 @@ main() {
 
   test_run_profile_wires_selected_profile
   test_run_help_reports_profile_default
+  test_agent_env_metadata_helpers
+  test_codex_auth_wrapper_execs_generic_script
   test_ls_filters_non_codex_containers
   test_upgrade_backup_support_check
   test_run_rejects_resource_flags_for_existing_container

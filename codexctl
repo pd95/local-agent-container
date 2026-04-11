@@ -34,7 +34,7 @@ resolve_script_path() {
 
 SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
-KEYCHAIN_SCRIPT="$SCRIPT_DIR/codex-auth-keychain.sh"
+KEYCHAIN_SCRIPT="$SCRIPT_DIR/agent-auth-keychain.sh"
 
 die() {
   echo "Error: $*" >&2
@@ -1317,6 +1317,9 @@ run_auth_flow() {
   created=1
 
   "$CONTAINER_CMD" start "$auth_name"
+  if container_has_agent_contract "$auth_name" && ! container_supports_capability "$auth_name" interactive-login; then
+    die "Selected runtime does not support interactive login auth flow"
+  fi
   if container_has_agent_contract "$auth_name"; then
     "$CONTAINER_CMD" exec -it "$auth_name" "${SETPRIV_ARGS[@]}" /usr/local/bin/agent.sh login
   else
@@ -1489,27 +1492,25 @@ container_has_agent_contract() {
 
 agent_env_value_from_stdin() {
   local key="$1"
-  local script
-  script="$(cat <<'PY'
-import sys
-
-key = sys.argv[1]
-
-for raw_line in sys.stdin.read().splitlines():
-    line = raw_line.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    current_key, value = line.split("=", 1)
-    if current_key.strip() != key:
-        continue
-    value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-        value = value[1:-1]
-    print(value)
-    break
-PY
-)"
-  python_exec "$script" "$key"
+  awk -F= -v key="$key" '
+    /^[[:space:]]*#/ || /^[[:space:]]*$/ || index($0, "=") == 0 { next }
+    {
+      current_key=$1
+      sub(/^[[:space:]]+/, "", current_key)
+      sub(/[[:space:]]+$/, "", current_key)
+      if (current_key != key) {
+        next
+      }
+      value=substr($0, index($0, "=") + 1)
+      sub(/^[[:space:]]+/, "", value)
+      sub(/[[:space:]]+$/, "", value)
+      if (value ~ /^".*"$/ || value ~ /^'\''.*'\''$/) {
+        value=substr(value, 2, length(value) - 2)
+      }
+      print value
+      exit
+    }
+  '
 }
 
 container_agent_env_value() {
@@ -1578,6 +1579,21 @@ keychain_script_run() {
   local account="$2"
   shift 2
   KEYCHAIN_SERVICE_NAME="$service" KEYCHAIN_ACCOUNT_NAME="$account" "$KEYCHAIN_SCRIPT" "$@"
+}
+
+container_supports_capability() {
+  local name="$1"
+  local capability="$2"
+  local env_key=""
+  case "$capability" in
+    interactive-login) env_key="AGENT_SUPPORTS_INTERACTIVE_LOGIN" ;;
+    keychain-sync) env_key="AGENT_SUPPORTS_KEYCHAIN_SYNC" ;;
+    update) env_key="AGENT_SUPPORTS_UPDATE" ;;
+    local-model-mode) env_key="AGENT_SUPPORTS_LOCAL_MODEL_MODE" ;;
+    openai-mode) env_key="AGENT_SUPPORTS_OPENAI_MODE" ;;
+    *) return 1 ;;
+  esac
+  [ "$(container_agent_env_value "$name" "$env_key" "0")" = "1" ]
 }
 
 container_auth_path() {
@@ -1805,7 +1821,7 @@ run_mode() {
     pre_exec="openai_pre_exec"
     post_exec="openai_post_exec"
     cmd=("$DEFAULT_RUNTIME_SENTINEL" "$runtime_mode" "$profile")
-    if [ "$auth" -eq 1 ] || ! ensure_keychain; then
+    if [ "$auth" -eq 1 ] || ! ensure_keychain "$name"; then
       run_auth_flow "$image" "$(default_name "$AUTH_NAME_PREFIX")"
     fi
   else
@@ -1831,6 +1847,9 @@ run_mode() {
 
 openai_pre_exec() {
   local name="$1"
+  if container_has_agent_contract "$name" && ! container_supports_capability "$name" openai-mode; then
+    die "Selected runtime does not support --openai mode"
+  fi
   sync_openai_auth_to_container "$name"
 }
 
@@ -2079,11 +2098,17 @@ See README.md 'Local model connectivity'.${remediation}"
 
 local_model_pre_exec() {
   local name="$1"
+  if container_has_agent_contract "$name" && ! container_supports_capability "$name" local-model-mode; then
+    die "Selected runtime does not support local model mode"
+  fi
   local_model_preflight "$name" strict
 }
 
 update_codex_pre_exec() {
   local name="$1"
+  if container_has_agent_contract "$name" && ! container_supports_capability "$name" update; then
+    die "Selected runtime does not support updates through agent.sh"
+  fi
   if container_has_agent_contract "$name"; then
     echo "Updating runtime in container via agent.sh: $name" >&2
     if "$CONTAINER_CMD" exec -it "$name" "${SETPRIV_ARGS[@]}" /usr/local/bin/agent.sh update; then
