@@ -41,3 +41,6 @@ EOF
 
 RUN ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md
 RUN chown -R coder:coder /home/coder/.claude /etc/agentctl/defaults
+
+USER coder
+WORKDIR /workdir
