@@ -21,7 +21,7 @@ load_codexctl_functions() {
 }
 
 test_run_profile_wires_selected_profile() {
-  begin_test "run_cmd wires --profile into the launched codex command"
+  begin_test "run_cmd wires --profile into the launched runtime contract"
 
   load_codexctl_functions
 
@@ -42,7 +42,7 @@ test_run_profile_wires_selected_profile() {
   run_cmd --name unit-test-container --workdir "$workdir" --profile gemma
 
   [ "$captured_pre_exec" = "local_model_pre_exec" ] || fail "Expected local_model_pre_exec, got: $captured_pre_exec"
-  printf '%s\n' "$captured_cmd" | grep -Fxq 'codex --profile gemma --cd /workdir' || fail "Expected codex command to include --profile gemma, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fxq '__agentctl_default_runtime__ local gemma' || fail "Expected runtime contract command to include local mode and profile gemma, got: $captured_cmd"
 }
 
 test_run_help_reports_profile_default() {

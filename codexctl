@@ -10,6 +10,13 @@ DEFAULT_CODEX_PROFILE="${CODEX_PROFILE:-gpt-oss}"
 DEFAULT_CODEX_CMD=(codex)
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs --)
 DEFAULT_RUNTIME_SENTINEL="__agentctl_default_runtime__"
+DEFAULT_AGENT_HOME_DIR="/home/coder/.codex"
+DEFAULT_AGENT_CONFIG_DIR="/home/coder/.codex"
+DEFAULT_AGENT_AUTH_PATH="/home/coder/.codex/auth.json"
+DEFAULT_AGENT_DEFAULTS_DIR="/etc/codexctl"
+DEFAULT_AGENT_IMAGE_MD_PATH="/etc/codexctl/image.md"
+DEFAULT_KEYCHAIN_SERVICE="codex-OpenAI-auth"
+DEFAULT_KEYCHAIN_ACCOUNT="device-auth-openAI"
 
 resolve_script_path() {
   local path="$1"
@@ -1315,7 +1322,7 @@ run_auth_flow() {
   else
     "$CONTAINER_CMD" exec -it "$auth_name" bash -lc 'codex login --device-auth'
   fi
-  "$KEYCHAIN_SCRIPT" store-from-container "$auth_name" "$(container_auth_path "$auth_name")"
+  keychain_script_run "$(container_agent_keychain_service "$auth_name")" "$(container_agent_keychain_account "$auth_name")" store-from-container "$auth_name" "$(container_auth_path "$auth_name")"
   "$CONTAINER_CMD" stop "$auth_name"
   "$CONTAINER_CMD" rm "$auth_name"
   created=0
@@ -1325,36 +1332,70 @@ run_auth_flow() {
 backup_codex_config() {
   local name="$1"
   local backup_file="$2"
-  if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -d /home/coder/.codex; then
+  local home_dir
+  home_dir="$(container_agent_home_dir "$name")"
+  if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -d "$home_dir"; then
     return 0
   fi
-  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc 'cd /home/coder && tar -cf - .codex' >"$backup_file"
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -s -- "$home_dir" <<'SH' >"$backup_file"
+home_dir="$1"
+parent_dir="$(dirname "$home_dir")"
+base_name="$(basename "$home_dir")"
+cd "$parent_dir"
+tar -cf - "$base_name"
+SH
 }
 
 restore_codex_config() {
   local name="$1"
   local backup_file="$2"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'mkdir -p /home/coder && chown coder:coder /home/coder'
+  local home_dir
+  home_dir="$(container_agent_home_dir "$name")"
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -s -- "$home_dir" <<'SH'
+home_dir="$1"
+parent_dir="$(dirname "$home_dir")"
+mkdir -p "$parent_dir"
+chown coder:coder "$parent_dir"
+SH
   if [ ! -s "$backup_file" ]; then
-    "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'mkdir -p /home/coder/.codex && chown -R coder:coder /home/coder/.codex'
+    "$CONTAINER_CMD" exec -u 0 "$name" sh -s -- "$home_dir" <<'SH'
+home_dir="$1"
+mkdir -p "$home_dir"
+chown -R coder:coder "$home_dir"
+SH
     return 0
   fi
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'rm -rf /home/coder/.codex && mkdir -p /home/coder'
-  "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc 'cd /home/coder && tar -xf -' <"$backup_file"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'chown -R coder:coder /home/coder/.codex'
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -s -- "$home_dir" <<'SH'
+home_dir="$1"
+parent_dir="$(dirname "$home_dir")"
+rm -rf "$home_dir"
+mkdir -p "$parent_dir"
+SH
+  "$CONTAINER_CMD" exec -i -u 0 "$name" sh -s -- "$home_dir" <<'SH' <"$backup_file"
+home_dir="$1"
+parent_dir="$(dirname "$home_dir")"
+cd "$parent_dir"
+tar -xf -
+SH
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -s -- "$home_dir" <<'SH'
+home_dir="$1"
+chown -R coder:coder "$home_dir"
+SH
 }
 
 codex_agents_state() {
   local name="$1"
-  if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -L /home/coder/.codex/AGENTS.md; then
+  local agents_md
+  agents_md="$(container_agent_config_dir "$name")/AGENTS.md"
+  if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -L "$agents_md"; then
     echo "symlink"
     return 0
   fi
-  if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -f /home/coder/.codex/AGENTS.md; then
+  if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -f "$agents_md"; then
     echo "file"
     return 0
   fi
-  if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -e /home/coder/.codex/AGENTS.md; then
+  if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -e "$agents_md"; then
     echo "other"
     return 0
   fi
@@ -1363,18 +1404,43 @@ codex_agents_state() {
 
 overwrite_codex_config() {
   local name="$1"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'mkdir -p /home/coder/.codex'
-  if ! "$CONTAINER_CMD" exec "$name" sh -lc 'test -f /etc/codexctl/config.toml'; then
-    die "Image does not include /etc/codexctl/config.toml for overwrite in $name"
+  local config_dir
+  local defaults_dir
+  local image_md
+  config_dir="$(container_agent_config_dir "$name")"
+  defaults_dir="$(container_agent_defaults_dir "$name")"
+  image_md="$(container_agent_image_md_path "$name")"
+  if ! "$CONTAINER_CMD" exec "$name" sh -lc "test -d '$defaults_dir'"; then
+    die "Image does not include $defaults_dir for overwrite in $name"
   fi
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'cp /etc/codexctl/config.toml /home/coder/.codex/config.toml'
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'if test -f /etc/codexctl/local_models.json; then cp /etc/codexctl/local_models.json /home/coder/.codex/local_models.json; else rm -f /home/coder/.codex/local_models.json; fi'
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md && chown -h coder:coder /home/coder/.codex/AGENTS.md && chown coder:coder /home/coder/.codex/config.toml && if test -f /home/coder/.codex/local_models.json; then chown coder:coder /home/coder/.codex/local_models.json; fi'
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -s -- "$config_dir" "$defaults_dir" "$image_md" <<'SH'
+config_dir="$1"
+defaults_dir="$2"
+image_md="$3"
+mkdir -p "$config_dir"
+if test -f "$defaults_dir/config.toml"; then
+  cp "$defaults_dir/config.toml" "$config_dir/config.toml"
+fi
+if test -f "$defaults_dir/local_models.json"; then
+  cp "$defaults_dir/local_models.json" "$config_dir/local_models.json"
+else
+  rm -f "$config_dir/local_models.json"
+fi
+ln -sf "$image_md" "$config_dir/AGENTS.md"
+chown -h coder:coder "$config_dir/AGENTS.md"
+if test -f "$config_dir/config.toml"; then
+  chown coder:coder "$config_dir/config.toml"
+fi
+if test -f "$config_dir/local_models.json"; then
+  chown coder:coder "$config_dir/local_models.json"
+fi
+SH
 }
 
 ensure_keychain() {
+  local name="${1:-}"
   [ -x "$KEYCHAIN_SCRIPT" ] || die "Missing $KEYCHAIN_SCRIPT"
-  "$KEYCHAIN_SCRIPT" verify >/dev/null 2>&1
+  keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" verify >/dev/null 2>&1
 }
 
 auth_info_from_json() {
@@ -1412,7 +1478,8 @@ PY
 }
 
 keychain_auth_info() {
-  "$KEYCHAIN_SCRIPT" read | auth_info_from_json
+  local name="${1:-}"
+  keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" read | auth_info_from_json
 }
 
 container_has_agent_contract() {
@@ -1420,17 +1487,102 @@ container_has_agent_contract() {
   "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -x /usr/local/bin/agent.sh >/dev/null 2>&1
 }
 
+agent_env_value_from_stdin() {
+  local key="$1"
+  local script
+  script="$(cat <<'PY'
+import sys
+
+key = sys.argv[1]
+
+for raw_line in sys.stdin.read().splitlines():
+    line = raw_line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    current_key, value = line.split("=", 1)
+    if current_key.strip() != key:
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    print(value)
+    break
+PY
+)"
+  python_exec "$script" "$key"
+}
+
+container_agent_env_value() {
+  local name="$1"
+  local key="$2"
+  local fallback="$3"
+  local raw=""
+  local value=""
+  if container_has_agent_contract "$name"; then
+    raw="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" cat /etc/agentctl/agent.env 2>/dev/null || true)"
+    if [ -n "$raw" ]; then
+      value="$(printf '%s\n' "$raw" | agent_env_value_from_stdin "$key")"
+    fi
+  fi
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$fallback"
+  fi
+}
+
+container_agent_home_dir() {
+  local name="$1"
+  container_agent_env_value "$name" AGENT_HOME_DIR "$DEFAULT_AGENT_HOME_DIR"
+}
+
+container_agent_config_dir() {
+  local name="$1"
+  container_agent_env_value "$name" AGENT_CONFIG_DIR "$DEFAULT_AGENT_CONFIG_DIR"
+}
+
+container_agent_defaults_dir() {
+  local name="$1"
+  container_agent_env_value "$name" AGENT_IMAGE_DEFAULTS_DIR "$DEFAULT_AGENT_DEFAULTS_DIR"
+}
+
+container_agent_image_md_path() {
+  local name="$1"
+  if container_has_agent_contract "$name"; then
+    printf '%s\n' /etc/agentctl/image.md
+  else
+    printf '%s\n' "$DEFAULT_AGENT_IMAGE_MD_PATH"
+  fi
+}
+
+container_agent_keychain_service() {
+  local name="${1:-}"
+  if [ -n "$name" ] && container_exists "$name"; then
+    container_agent_env_value "$name" AGENT_KEYCHAIN_SERVICE "$DEFAULT_KEYCHAIN_SERVICE"
+    return 0
+  fi
+  printf '%s\n' "$DEFAULT_KEYCHAIN_SERVICE"
+}
+
+container_agent_keychain_account() {
+  local name="${1:-}"
+  if [ -n "$name" ] && container_exists "$name"; then
+    container_agent_env_value "$name" AGENT_KEYCHAIN_ACCOUNT "$DEFAULT_KEYCHAIN_ACCOUNT"
+    return 0
+  fi
+  printf '%s\n' "$DEFAULT_KEYCHAIN_ACCOUNT"
+}
+
+keychain_script_run() {
+  local service="$1"
+  local account="$2"
+  shift 2
+  KEYCHAIN_SERVICE_NAME="$service" KEYCHAIN_ACCOUNT_NAME="$account" "$KEYCHAIN_SCRIPT" "$@"
+}
+
 container_auth_path() {
   local name="$1"
-  local auth_path=""
-  if container_has_agent_contract "$name"; then
-    auth_path="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" /usr/local/bin/agent.sh auth-path 2>/dev/null || true)"
-  fi
-  if [ -n "$auth_path" ]; then
-    printf '%s\n' "$auth_path"
-  else
-    printf '%s\n' /home/coder/.codex/auth.json
-  fi
+  container_agent_env_value "$name" AGENT_AUTH_PATH "$DEFAULT_AGENT_AUTH_PATH"
 }
 
 container_auth_info() {
@@ -1446,13 +1598,13 @@ container_auth_info() {
 
 sync_openai_auth_to_container() {
   local name="$1"
-  if ! ensure_keychain; then
+  if ! ensure_keychain "$name"; then
     die "Missing OpenAI auth in Keychain. Run: codexctl auth"
   fi
   local keychain_info
   local keychain_token
   local keychain_refresh
-  keychain_info="$(keychain_auth_info)"
+  keychain_info="$(keychain_auth_info "$name")"
   IFS=$'\t' read -r keychain_token keychain_refresh <<<"$keychain_info"
   if [ -z "$keychain_token" ]; then
     die "Keychain auth missing refresh_token. Run: codexctl auth"
@@ -1464,14 +1616,14 @@ sync_openai_auth_to_container() {
   IFS=$'\t' read -r container_token container_refresh <<<"$container_info"
   if [ -z "$container_token" ]; then
     echo "Refreshing OpenAI auth in $name" >&2
-    "$KEYCHAIN_SCRIPT" load-to-container "$name" "$(container_auth_path "$name")"
+    keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" load-to-container "$name" "$(container_auth_path "$name")"
     return 0
   fi
   if [ "$container_token" = "$keychain_token" ] && [ "$container_refresh" = "$keychain_refresh" ]; then
     return 0
   fi
   echo "Refreshing OpenAI auth in $name" >&2
-  "$KEYCHAIN_SCRIPT" load-to-container "$name" "$(container_auth_path "$name")"
+  keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" load-to-container "$name" "$(container_auth_path "$name")"
 }
 
 sync_openai_auth_from_container() {
@@ -1484,14 +1636,14 @@ sync_openai_auth_from_container() {
   if [ -z "$container_token" ] || [ -z "$container_refresh" ]; then
     return 0
   fi
-  if ! ensure_keychain; then
+  if ! ensure_keychain "$name"; then
     echo "Keychain auth missing; skipping post-run sync from $name" >&2
     return 0
   fi
   local keychain_info
   local keychain_token
   local keychain_refresh
-  keychain_info="$(keychain_auth_info)"
+  keychain_info="$(keychain_auth_info "$name")"
   IFS=$'\t' read -r keychain_token keychain_refresh <<<"$keychain_info"
   if [ -z "$keychain_token" ]; then
     echo "Keychain auth missing refresh_token; skipping post-run sync from $name" >&2
@@ -1501,7 +1653,7 @@ sync_openai_auth_from_container() {
     return 0
   fi
   echo "Updating Keychain auth from $name" >&2
-  "$KEYCHAIN_SCRIPT" store-from-container "$name" "$(container_auth_path "$name")"
+  keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" store-from-container "$name" "$(container_auth_path "$name")"
 }
 
 run_container() {

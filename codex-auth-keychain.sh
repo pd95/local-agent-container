@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="codex-OpenAI-auth"
-ACCOUNT_NAME="device-auth-openAI"
+SERVICE_NAME="${KEYCHAIN_SERVICE_NAME:-codex-OpenAI-auth}"
+ACCOUNT_NAME="${KEYCHAIN_ACCOUNT_NAME:-device-auth-openAI}"
 CONTAINER_CMD="${CONTAINER_CMD:-container}"
 
 usage() {
