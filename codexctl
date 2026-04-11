@@ -9,6 +9,7 @@ DEFAULT_SHELL="${CODEX_SHELL:-bash}"
 DEFAULT_CODEX_PROFILE="${CODEX_PROFILE:-gpt-oss}"
 DEFAULT_CODEX_CMD=(codex)
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs --)
+DEFAULT_RUNTIME_SENTINEL="__agentctl_default_runtime__"
 
 resolve_script_path() {
   local path="$1"
@@ -1309,8 +1310,12 @@ run_auth_flow() {
   created=1
 
   "$CONTAINER_CMD" start "$auth_name"
-  "$CONTAINER_CMD" exec -it "$auth_name" bash -lc 'codex login --device-auth'
-  "$KEYCHAIN_SCRIPT" store-from-container "$auth_name"
+  if container_has_agent_contract "$auth_name"; then
+    "$CONTAINER_CMD" exec -it "$auth_name" "${SETPRIV_ARGS[@]}" /usr/local/bin/agent.sh login
+  else
+    "$CONTAINER_CMD" exec -it "$auth_name" bash -lc 'codex login --device-auth'
+  fi
+  "$KEYCHAIN_SCRIPT" store-from-container "$auth_name" "$(container_auth_path "$auth_name")"
   "$CONTAINER_CMD" stop "$auth_name"
   "$CONTAINER_CMD" rm "$auth_name"
   created=0
@@ -1410,13 +1415,33 @@ keychain_auth_info() {
   "$KEYCHAIN_SCRIPT" read | auth_info_from_json
 }
 
+container_has_agent_contract() {
+  local name="$1"
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -x /usr/local/bin/agent.sh >/dev/null 2>&1
+}
+
+container_auth_path() {
+  local name="$1"
+  local auth_path=""
+  if container_has_agent_contract "$name"; then
+    auth_path="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" /usr/local/bin/agent.sh auth-path 2>/dev/null || true)"
+  fi
+  if [ -n "$auth_path" ]; then
+    printf '%s\n' "$auth_path"
+  else
+    printf '%s\n' /home/coder/.codex/auth.json
+  fi
+}
+
 container_auth_info() {
   local name="$1"
-  if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -f /home/coder/.codex/auth.json; then
+  local auth_path
+  auth_path="$(container_auth_path "$name")"
+  if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -f "$auth_path"; then
     echo -e "\t"
     return 0
   fi
-  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" cat /home/coder/.codex/auth.json | auth_info_from_json
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" cat "$auth_path" | auth_info_from_json
 }
 
 sync_openai_auth_to_container() {
@@ -1439,14 +1464,14 @@ sync_openai_auth_to_container() {
   IFS=$'\t' read -r container_token container_refresh <<<"$container_info"
   if [ -z "$container_token" ]; then
     echo "Refreshing OpenAI auth in $name" >&2
-    "$KEYCHAIN_SCRIPT" load-to-container "$name"
+    "$KEYCHAIN_SCRIPT" load-to-container "$name" "$(container_auth_path "$name")"
     return 0
   fi
   if [ "$container_token" = "$keychain_token" ] && [ "$container_refresh" = "$keychain_refresh" ]; then
     return 0
   fi
   echo "Refreshing OpenAI auth in $name" >&2
-  "$KEYCHAIN_SCRIPT" load-to-container "$name"
+  "$KEYCHAIN_SCRIPT" load-to-container "$name" "$(container_auth_path "$name")"
 }
 
 sync_openai_auth_from_container() {
@@ -1476,7 +1501,7 @@ sync_openai_auth_from_container() {
     return 0
   fi
   echo "Updating Keychain auth from $name" >&2
-  "$KEYCHAIN_SCRIPT" store-from-container "$name"
+  "$KEYCHAIN_SCRIPT" store-from-container "$name" "$(container_auth_path "$name")"
 }
 
 run_container() {
@@ -1505,8 +1530,26 @@ run_container() {
         exit_code=$?
       fi
     else
-      if ! "$CONTAINER_CMD" exec -it "$actual_name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"; then
-        exit_code=$?
+      if [ "${#cmd[@]}" -gt 0 ] && [ "${cmd[0]}" = "$DEFAULT_RUNTIME_SENTINEL" ]; then
+        local runtime_mode="${cmd[1]:-local}"
+        local runtime_profile="${cmd[2]:-$DEFAULT_CODEX_PROFILE}"
+        if container_has_agent_contract "$actual_name"; then
+          if ! "$CONTAINER_CMD" exec -it "$actual_name" "${SETPRIV_ARGS[@]}" sh -lc "AGENTCTL_RUNTIME_MODE=\$1 CODEX_PROFILE=\$2 exec /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_profile"; then
+            exit_code=$?
+          fi
+        else
+          local legacy_cmd=("${DEFAULT_CODEX_CMD[@]}" --profile "$runtime_profile" --cd /workdir)
+          if [ "$runtime_mode" = "openai" ]; then
+            legacy_cmd=("${DEFAULT_CODEX_CMD[@]}" --cd /workdir)
+          fi
+          if ! "$CONTAINER_CMD" exec -it "$actual_name" "${SETPRIV_ARGS[@]}" "${legacy_cmd[@]}"; then
+            exit_code=$?
+          fi
+        fi
+      else
+        if ! "$CONTAINER_CMD" exec -it "$actual_name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"; then
+          exit_code=$?
+        fi
       fi
     fi
   }
@@ -1602,12 +1645,14 @@ run_mode() {
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
-  local cmd=("${DEFAULT_CODEX_CMD[@]}" --profile "$profile" --cd /workdir)
+  local runtime_mode="local"
+  local cmd=("$DEFAULT_RUNTIME_SENTINEL" "$runtime_mode" "$profile")
 
   if [ "$openai" -eq 1 ]; then
+    runtime_mode="openai"
     pre_exec="openai_pre_exec"
     post_exec="openai_post_exec"
-    cmd=("${DEFAULT_CODEX_CMD[@]}" --cd /workdir)
+    cmd=("$DEFAULT_RUNTIME_SENTINEL" "$runtime_mode" "$profile")
     if [ "$auth" -eq 1 ] || ! ensure_keychain; then
       run_auth_flow "$image" "$(default_name "$AUTH_NAME_PREFIX")"
     fi
@@ -1887,6 +1932,13 @@ local_model_pre_exec() {
 
 update_codex_pre_exec() {
   local name="$1"
+  if container_has_agent_contract "$name"; then
+    echo "Updating runtime in container via agent.sh: $name" >&2
+    if "$CONTAINER_CMD" exec -it "$name" "${SETPRIV_ARGS[@]}" /usr/local/bin/agent.sh update; then
+      return 0
+    fi
+    warn "agent.sh update failed for $name; retrying with legacy Codex update path"
+  fi
   local cmd='npm install -g @openai/codex --omit=dev --no-fund --no-audit'
   echo "Updating @openai/codex in container: $name" >&2
   if "$CONTAINER_CMD" exec -it -u 0 "$name" sh -lc "$cmd"; then

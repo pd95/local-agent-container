@@ -23,9 +23,13 @@ ENV HOME=/home/coder
 
 # Copy Codex default configuration and local model metadata config
 COPY --chown=coder:coder config.toml local_models.json /home/coder/.codex/
+COPY --chown=root:root agent.sh /usr/local/bin/agent.sh
+COPY --chown=root:root agent.env /etc/agentctl/agent.env
 
-RUN mkdir -p /etc/codexctl \
+RUN chmod 755 /usr/local/bin/agent.sh \
+ && mkdir -p /etc/codexctl /etc/agentctl/defaults \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
+ && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/agentctl/defaults/ \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
 You are running inside the \`codex\` default image.
@@ -49,6 +53,7 @@ Programming environments:
 
 Use this image for general shell work, Git operations, repository maintenance, and light scripting.
 EOF
+RUN ln -sf /etc/codexctl/image.md /etc/agentctl/image.md
 RUN ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
 
 # From here on, run as coder so swiftly writes user-owned files
