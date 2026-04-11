@@ -33,6 +33,7 @@ RUN case "$AGENT_RUNTIME" in
     ;;
 esac
 
+
 # --- Wrapper scripts (swift-format is already in swift:latest) ---
 RUN printf '%s\n' \
   '#!/usr/bin/env bash' \

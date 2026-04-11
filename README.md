@@ -246,12 +246,12 @@ The rest of this README explains what `codexctl` does behind the scenes and how 
 To build the agent container images for later use, I have written four `DockerFile`s which are installing `codex`, `git` and other basic tools (`bash`, `zsh`, `npm`, `file`, `curl`):
 
 - `DockerFile` for a plain Alpine Linux (~191 MB)
-- `DockerFile.python` for a Alpine based Python installation (~203 MB, built on top of `agent-codex`)
+- `DockerFile.python` for an Alpine based Python installation (~203 MB, built on top of `agent-${AGENT_RUNTIME}`)
 - `DockerFile.swift` for an Ubuntu based Swift installation (~1.41 GB)
-- `DockerFile.office` for Alpine + Python + Office tooling (~417 MB, built on top of `agent-python`)
+- `DockerFile.office` for Alpine + Python + Office tooling (~417 MB, built on top of `agent-${AGENT_RUNTIME}`)
 - `DockerFile.claude` for Claude Code on top of `agent-codex`
 
-The Alpine-based images are layered for incremental builds: `agent-codex` -> `agent-python` -> `agent-office`.
+The Alpine-based matrix image families are layered for incremental builds when using the default runtime: `agent-codex` -> `agent-python` -> `agent-office`, and `agent-${runtime}-claude` overlays build over `agent-${runtime}` with the same Dockerfiles.
 
 `codexctl build` derives local image names from Dockerfile names using this convention:
 

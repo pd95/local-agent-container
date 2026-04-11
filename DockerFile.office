@@ -1,14 +1,14 @@
-FROM agent-python
 ARG AGENT_RUNTIME=codex
+# For Office tooling
+FROM agent-${AGENT_RUNTIME}
 ARG AGENT_IMAGE_NAME=agent-office
 
 USER root
-COPY --chown=root:root agent-claude.sh /usr/local/bin/agent-claude.sh
-COPY --chown=root:root agent-claude.env /etc/agentctl/agent-claude.env
 
 # --- Office tooling and Python libs ---
 RUN apk add --no-cache \
     ca-certificates openssh-client \
+    python3 py3-pip py3-setuptools py3-wheel \
     fd \
     build-base python3-dev musl-dev \
     fontconfig ttf-dejavu \
@@ -17,6 +17,19 @@ RUN apk add --no-cache \
     py3-pypdf py3-pdfminer py3-mupdf \
     py3-reportlab py3-pillow py3-openpyxl py3-xlsxwriter \
     poppler-utils tesseract-ocr qpdf ghostscript pandoc-cli
+
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv --system-site-packages "$VIRTUAL_ENV" \
+ && "$VIRTUAL_ENV/bin/python" -m pip install --no-cache-dir -U pip setuptools wheel \
+ && chown -R coder:coder "$VIRTUAL_ENV"
+
+RUN printf '%s\n' \
+  'export VIRTUAL_ENV=/opt/venv' \
+  'export PATH="/opt/venv/bin:$PATH"' \
+  > /etc/profile.d/venv.sh
+
+ENV PATH="$VIRTUAL_ENV/bin:$PATH" \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # --- PPTX generator ---
 RUN npm install -g pptxgenjs \
@@ -35,18 +48,6 @@ RUN printf '%s\n' \
 RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir \
     python-docx python-pptx xlrd pdfplumber \
  && chown -R coder:coder "$VIRTUAL_ENV"
-
-RUN case "$AGENT_RUNTIME" in
-  claude)
-    npm install -g @anthropic-ai/claude-code \
-      --omit=dev \
-      --no-fund \
-      --no-audit \
-      && npm cache clean --force
-    cp /usr/local/bin/agent-claude.sh /usr/local/bin/agent.sh
-    cp /etc/agentctl/agent-claude.env /etc/agentctl/agent.env
-    ;;
-esac
 
 RUN mkdir -p /etc/codexctl \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
