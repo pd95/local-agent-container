@@ -154,7 +154,6 @@ begin_test() {
     run_container \
     container_list_all \
     container_upgrade_info \
-    image_exists \
     container_running \
     build_backup_image_from_export \
     sanitize_image_name \
