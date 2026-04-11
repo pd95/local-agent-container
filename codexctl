@@ -1639,7 +1639,10 @@ container_auth_info() {
   local auth_path
   auth_path="$(container_auth_path "$name")"
   if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -f "$auth_path"; then
-    echo -e "\t"
+    case "$format" in
+      json_refresh_token) echo -e "\t" ;;
+      *) echo -n "" ;;
+    esac
     return 0
   fi
   case "$format" in
