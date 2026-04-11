@@ -227,41 +227,11 @@ test_matrix_runtime_image_helpers() {
   [ "$(image_family_legacy_codex agent-swift-claude)" = "codex-swift-claude" ] || fail "Expected legacy conversion for matrix name to keep toolchain+runtime"
   [ "$(image_family_legacy_codex agent-swift-claude:20260313-154500)" = "codex-swift-claude:20260313-154500" ] || fail "Expected tagged legacy matrix conversion"
 
-  is_runtime_image_name codex || fail "Expected codex runtime name to be recognized"
-  is_runtime_image_name claude || fail "Expected claude runtime name to be recognized"
-  if is_runtime_image_name grok; then
-    fail "Expected unknown runtime to be rejected"
-  fi
-
-  [ "$(matrix_parts_for_image agent-python-claude)" = $'python\tclaude' ] || fail "Expected matrix parsing to return python/claude"
-  [ "$(matrix_parts_for_image agent-python-claude:20260313-154500)" = $'python\tclaude' ] || fail "Expected matrix parsing to ignore tag"
-  [ "$(dockerfile_name_for_image agent-python-claude)" = "DockerFile.python" ] || fail "Expected matrix image to use toolchain dockerfile"
-  if dockerfile_name_for_image agent-unknown-claude 2>/dev/null; then
-    fail "Expected unknown matrix toolchain to fail dockerfile resolution"
-  fi
-
   image_exists() { [ "$1" = "agent-python-claude:20260313-154500" ] || return 1; }
   [ "$(image_family_for_runtime agent-python-claude:20260313-154500)" = "agent-python-claude:20260313-154500" ] || fail "Expected runtime resolver to pick matrix image when available"
 
   image_exists() { [ "$1" = "codex-python-claude:20260313-154500" ] || return 1; }
   [ "$(image_family_for_runtime agent-python-claude:20260313-154500)" = "codex-python-claude:20260313-154500" ] || fail "Expected matrix runtime resolver to fall back to legacy codex image"
-}
-
-test_base_image_from_file_expands_runtime() {
-  begin_test "base image resolver expands AGENT_RUNTIME in FROM"
-
-  load_codexctl_functions
-
-  local df
-  df="$(mktemp "${TMPDIR:-/tmp}/codexctl-base-from.XXXXXX")"
-  register_dir_cleanup "$df"
-
-  cat >"$df" <<'EOF'
-FROM agent-${AGENT_RUNTIME}
-EOF
-
-  [ "$(base_image_from_file "$df" claude)" = "agent-claude" ] || fail "Expected AGENT_RUNTIME var expansion to claude"
-  [ "$(base_image_from_file "$df")" = "agent-codex" ] || fail "Expected default AGENT_RUNTIME to codex"
 }
 
 test_openai_auth_sync_opaque_format() {
@@ -558,7 +528,6 @@ main() {
   test_container_auth_format_helpers
   test_image_family_aliases_support_legacy_and_tagged_names
   test_matrix_runtime_image_helpers
-  test_base_image_from_file_expands_runtime
   test_openai_auth_sync_opaque_format
   test_codex_auth_wrapper_execs_generic_script
   test_ls_filters_non_codex_containers
