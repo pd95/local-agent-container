@@ -1231,6 +1231,9 @@ build_cmd() {
       return 1
     fi
     rest="${family#agent-}"
+    if [ "$rest" = "codex" ]; then
+      return 1
+    fi
     runtime="${rest##*-}"
     if ! is_runtime_image_name "$runtime"; then
       return 1
@@ -1255,7 +1258,7 @@ build_cmd() {
       return 0
     fi
     case "$name" in
-      agent|codex) echo "DockerFile" ;;
+      agent|agent-codex|codex) echo "DockerFile" ;;
       agent-*) echo "DockerFile.${name#agent-}" ;;
       codex-*) echo "DockerFile.${name#codex-}" ;;
       *) return 1 ;;
@@ -1533,53 +1536,30 @@ backup_codex_config() {
   local backup_file="$2"
   local home_dir
   home_dir="$(container_agent_home_dir "$name")"
+  local parent_dir=""
+  local base_name=""
+  parent_dir="$(dirname "$home_dir")"
+  base_name="$(basename "$home_dir")"
   if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -d "$home_dir"; then
     return 0
   fi
-  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -s -- "$home_dir" <<'SH' >"$backup_file"
-home_dir="$1"
-parent_dir="$(dirname "$home_dir")"
-base_name="$(basename "$home_dir")"
-cd "$parent_dir"
-tar -cf - "$base_name"
-SH
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -c 'cd "$1" && tar -cf - "$2"' sh "$parent_dir" "$base_name" >"$backup_file"
 }
 
 restore_codex_config() {
   local name="$1"
   local backup_file="$2"
-  local home_dir
-  home_dir="$(container_agent_home_dir "$name")"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -s -- "$home_dir" <<'SH'
-home_dir="$1"
-parent_dir="$(dirname "$home_dir")"
-mkdir -p "$parent_dir"
-chown coder:coder "$parent_dir"
-SH
+  local home_dir="${3:-$(container_agent_home_dir "$name")}"
+  local parent_dir=""
+  parent_dir="$(dirname "$home_dir")"
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'mkdir -p "$1" && chown coder:coder "$1"' sh "$parent_dir"
   if [ ! -s "$backup_file" ]; then
-    "$CONTAINER_CMD" exec -u 0 "$name" sh -s -- "$home_dir" <<'SH'
-home_dir="$1"
-mkdir -p "$home_dir"
-chown -R coder:coder "$home_dir"
-SH
+    "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'mkdir -p "$1" && chown -R coder:coder "$1"' sh "$home_dir"
     return 0
   fi
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -s -- "$home_dir" <<'SH'
-home_dir="$1"
-parent_dir="$(dirname "$home_dir")"
-rm -rf "$home_dir"
-mkdir -p "$parent_dir"
-SH
-  "$CONTAINER_CMD" exec -i -u 0 "$name" sh -s -- "$home_dir" <<'SH' <"$backup_file"
-home_dir="$1"
-parent_dir="$(dirname "$home_dir")"
-cd "$parent_dir"
-tar -xf -
-SH
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -s -- "$home_dir" <<'SH'
-home_dir="$1"
-chown -R coder:coder "$home_dir"
-SH
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'rm -rf "$1" && mkdir -p "$2"' sh "$home_dir" "$parent_dir"
+  cat "$backup_file" | "$CONTAINER_CMD" exec -i -u 0 "$name" sh -c 'cd "$1" && tar -xf -' sh "$parent_dir"
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'chown -R coder:coder "$1"' sh "$home_dir"
 }
 
 codex_agents_state() {
@@ -2748,7 +2728,7 @@ upgrade_cmd() {
   "$CONTAINER_CMD" start "$name" >/dev/null
 
   echo "Restoring ${home_dir} into $name" >&2
-  restore_codex_config "$name" "$config_backup_file"
+  restore_codex_config "$name" "$config_backup_file" "$home_dir"
   if [ "$overwrite_config" -eq 1 ]; then
     echo "Overwriting config.toml, local_models.json in ${home_dir} and recreating ${config_summary} in $name" >&2
     overwrite_codex_config "$name"
