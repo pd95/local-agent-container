@@ -68,7 +68,7 @@ RUN mkdir -p /etc/codexctl \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
-You are running inside the \`codex-swift\` image.
+You are running inside the \`agent-swift\` image.
 
 Environment:
 - containerized Ubuntu-based Linux (package manager \`apt-get\`, package tools \`dpkg\`)
@@ -77,7 +77,7 @@ Environment:
 - architecture: check with \`uname -m\` if needed
 
 Image metadata:
-- image: \`codex-swift\`
+- image: \`agent-swift\`
 - built_at_utc: \`${BUILD_TIME}\`
 
 Built-in CLI tools:

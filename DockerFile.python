@@ -1,5 +1,5 @@
 # For Python environment
-FROM codex
+FROM agent-codex
 
 USER root
 
@@ -26,7 +26,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH" \
 RUN mkdir -p /etc/codexctl \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
-You are running inside the \`codex-python\` image.
+You are running inside the \`agent-python\` image.
 
 Environment:
 - containerized Alpine Linux (package manager \`apk\`)
@@ -35,7 +35,7 @@ Environment:
 - architecture: check with \`uname -m\` if needed
 
 Image metadata:
-- image: \`codex-python\`
+- image: \`agent-python\`
 - built_at_utc: \`${BUILD_TIME}\`
 
 Built-in CLI tools:

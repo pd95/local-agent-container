@@ -2,9 +2,9 @@
 set -euo pipefail
 
 CONTAINER_CMD="${CONTAINER_CMD:-container}"
-DEFAULT_IMAGE="codex"
-DEFAULT_NAME_PREFIX="codex-"
-AUTH_NAME_PREFIX="codex-openai-auth-"
+DEFAULT_IMAGE="agent-codex"
+DEFAULT_NAME_PREFIX="agent-"
+AUTH_NAME_PREFIX="agent-openai-auth-"
 DEFAULT_SHELL="${CODEX_SHELL:-bash}"
 DEFAULT_CODEX_PROFILE="${CODEX_PROFILE:-gpt-oss}"
 DEFAULT_CODEX_CMD=(codex)
@@ -16,7 +16,7 @@ DEFAULT_AGENT_AUTH_PATH="/home/coder/.codex/auth.json"
 DEFAULT_AGENT_AUTH_FORMAT="json_refresh_token"
 DEFAULT_AGENT_DEFAULTS_DIR="/etc/codexctl"
 DEFAULT_AGENT_IMAGE_MD_PATH="/etc/codexctl/image.md"
-DEFAULT_KEYCHAIN_SERVICE="codex-OpenAI-auth"
+DEFAULT_KEYCHAIN_SERVICE="agent-openai-auth"
 DEFAULT_KEYCHAIN_ACCOUNT="device-auth-openAI"
 
 resolve_script_path() {
@@ -270,9 +270,125 @@ image_exists() {
   parse_image_list | grep -Fqx -- "$image"
 }
 
+image_family_preferred() {
+  local image="$1"
+  local family
+  local tag=""
+  local preferred_family
+
+  family="${image%%:*}"
+  if [ "$family" != "$image" ]; then
+    tag=":${image#*:}"
+  fi
+  case "$family" in
+    codex)
+      preferred_family="agent-codex"
+      ;;
+    codex-*)
+      preferred_family="agent-${family#codex-}"
+      ;;
+    agent)
+      preferred_family="agent-codex"
+      ;;
+    *)
+      preferred_family="$family"
+      ;;
+  esac
+  printf '%s\n' "${preferred_family}${tag}"
+}
+
+image_family_legacy_codex() {
+  local image="$1"
+  local family
+  local tag=""
+  local legacy_family
+
+  family="${image%%:*}"
+  if [ "$family" != "$image" ]; then
+    tag=":${image#*:}"
+  fi
+  case "$family" in
+    agent)
+      legacy_family="codex"
+      ;;
+    agent-*)
+      legacy_family="codex-${family#agent-}"
+      ;;
+    *)
+      legacy_family=""
+      ;;
+  esac
+  if [ -z "$legacy_family" ]; then
+    return 0
+  fi
+  printf '%s\n' "${legacy_family}${tag}"
+  return 0
+}
+
+image_family_for_runtime() {
+  local image="$1"
+  local preferred
+  local legacy
+
+  preferred="$(image_family_preferred "$image")"
+  if image_exists "$preferred"; then
+    printf '%s\n' "$preferred"
+    return 0
+  fi
+
+  legacy="$(image_family_legacy_codex "$preferred")"
+  if [ -n "$legacy" ] && image_exists "$legacy"; then
+    printf '%s\n' "$legacy"
+    return 0
+  fi
+
+  if image_exists "$image"; then
+    printf '%s\n' "$image"
+    return 0
+  fi
+
+  printf '%s\n' "$preferred"
+}
+
+legacy_image_ref_for_family() {
+  local image_ref="$1"
+  local family="${image_ref%%:*}"
+  local legacy_family
+  local legacy_ref
+
+  legacy_family="$(image_family_legacy_codex "$family")"
+  if [ -z "$legacy_family" ]; then
+    return 1
+  fi
+
+  if [ "$family" = "$image_ref" ]; then
+    legacy_ref="$legacy_family"
+  else
+    legacy_ref="${legacy_family}:${image_ref#*:}"
+  fi
+  printf '%s\n' "$legacy_ref"
+}
+
+tag_legacy_image_ref_alias() {
+  local image_ref="$1"
+  local legacy_image_ref
+  legacy_image_ref="$(legacy_image_ref_for_family "$image_ref" || true)"
+  if [ -z "$legacy_image_ref" ]; then
+    return 0
+  fi
+  "$CONTAINER_CMD" image tag "$image_ref" "$legacy_image_ref"
+}
+
 is_codex_image_family() {
   case "$1" in
     codex) return 0 ;;
+    agent) return 0 ;;
+    agent-*)
+      if is_codex_backup_image_ref "$1"; then
+        return 1
+      fi
+      return 0
+      ;;
     codex-*)
       if is_codex_backup_image_ref "$1"; then
         return 1
@@ -288,14 +404,14 @@ is_codex_image_filter_name() {
   if is_codex_image_family "$image_filter_name"; then
     return 0
   fi
-  if [[ "$image_filter_name" == codex-* ]]; then
+  if [[ "$image_filter_name" == codex-* || "$image_filter_name" == agent-* ]]; then
     return 0
   fi
   return 1
 }
 
 is_codex_backup_image_ref() {
-  [[ "$1" =~ ^codex-.*-backup-[0-9]{14}$ ]]
+  [[ "$1" =~ ^(codex|agent)-.*-backup-[0-9]{14}$ ]]
 }
 
 codex_backup_base() {
@@ -435,7 +551,7 @@ sanitize_image_name() {
   sanitized="${sanitized#-}"
   sanitized="${sanitized%-}"
   if [ -z "$sanitized" ]; then
-    sanitized="codex-backup"
+    sanitized="agent-backup"
   fi
   echo "$sanitized"
 }
@@ -467,19 +583,20 @@ usage_build() {
 Usage: $CLI_NAME build [--image NAME] [--rebuild] [--snapshot] [--pull-base] [--refresh-base]
 
 Options:
-  --image NAME  Local image name to build (for example: codex, codex-python, codex-my-team)
+  --image NAME  Local image name to build (for example: agent-codex, agent-python, agent-my-team)
   --rebuild     Rebuild images even if they already exist (disables build cache only; does not refresh FROM tags)
   --snapshot    Add a fresh UTC timestamp tag for existing images without rebuilding
   --pull-base     Pull the base image before building (preferred way to refresh remote FROM tags)
   --refresh-base  Remove the base image first so it is re-fetched
 
-Each successful build keeps the stable image name (for example `codex`) and
-also adds an immutable UTC timestamp tag (for example `codex:20260313-154500`).
+Each successful build keeps the stable image name (for example `agent-codex`) and
+also adds an immutable UTC timestamp tag (for example `agent-codex:20260313-154500`).
 Local image names follow this convention:
-  codex         -> DockerFile
-  codex-<name>  -> DockerFile.<name>
+  agent-codex    -> DockerFile
+  agent-<name>   -> DockerFile.<name>
+  (legacy aliases: codex and codex-<name> are supported)
 
-When a local Dockerfile uses FROM another local codex image, $CLI_NAME builds the
+When a local Dockerfile uses FROM another local image, $CLI_NAME builds the
 dependency chain first.
 EOF
 }
@@ -489,8 +606,8 @@ usage_run() {
 Usage: $CLI_NAME run [options]
 
 Options:
-  --name NAME     Container name (default: codex-<dir>)
-  --image NAME    Image to use (default: codex)
+  --name NAME     Container name (default: agent-<dir>)
+  --image NAME    Image to use (default: agent-codex)
   --workdir PATH  Host directory to mount at /workdir (default: cwd)
   --profile NAME  Codex profile to use (default: gpt-oss)
   --openai        Use OpenAI mode (device auth)
@@ -511,7 +628,7 @@ usage_upgrade() {
 Usage: $CLI_NAME upgrade [options]
 
 Options:
-  --name NAME         Container name (default: codex-<dir>)
+  --name NAME         Container name (default: agent-<dir>)
   --image NAME        Image to use for recreation (default: existing container image)
   --cpu NUM           CPU cores for recreated container (default: preserve existing setting)
   --mem SIZE          Memory limit for recreated container (default: preserve existing setting)
@@ -526,8 +643,8 @@ usage_auth() {
 Usage: $CLI_NAME auth [options]
 
 Options:
-  --name NAME   Auth container name (default: codex-openai-auth-<dir>)
-  --image NAME  Image to use (default: codex)
+  --name NAME   Auth container name (default: agent-openai-auth-<dir>)
+  --image NAME  Image to use (default: agent-codex)
 EOF
 }
 
@@ -536,7 +653,7 @@ usage_exec() {
 Usage: $CLI_NAME exec [options] [command...]
 
 Options:
-  --name NAME  Container name (default: codex-<dir>)
+  --name NAME  Container name (default: agent-<dir>)
 
 If no command is provided, exec runs the default shell.
 EOF
@@ -547,7 +664,7 @@ usage_su_exec() {
 Usage: $CLI_NAME su-exec [options] [command...]
 
 Options:
-  --name NAME  Container name (default: codex-<dir>)
+  --name NAME  Container name (default: agent-<dir>)
 
 If no command is provided, su-exec runs the default shell as root.
 EOF
@@ -570,7 +687,7 @@ Commands:
   rm           Remove all refs for one Codex image family or backup image
 
 Options for `images`:
-  --image NAME  Codex image family, custom codex-* image, or a backup base/image
+  --image NAME  Codex image family, custom agent-* image (legacy codex-* supported), or a backup base/image
   --backup      Show only backup image refs
   --all         Include non-Codex images
   --latest      Show only stable tags and newest timestamp tag per family
@@ -582,7 +699,7 @@ Options for `images prune`:
   --dry-run     Print images that would be deleted
 
 Options for `images rm`:
-  --image NAME  Remove one image family, custom codex-* image, or backup base/image
+  --image NAME  Remove one image family, custom agent-* image (legacy codex-* supported), or backup base/image
   --backup      Remove only backup image refs
   --dry-run     Print images that would be deleted
 EOF
@@ -605,7 +722,7 @@ usage_images_rm() {
 Usage: $CLI_NAME images rm [options]
 
 Options:
-  --image NAME  Remove one image family, custom codex-* image, or backup base/image
+  --image NAME  Remove one image family, custom agent-* image (legacy codex-* supported), or backup base/image
   --backup      Remove only backup image refs
   --dry-run     Print images that would be deleted
 EOF
@@ -1063,6 +1180,9 @@ build_cmd() {
     esac
   done
 
+  if [ -n "$image" ]; then
+    image="$(image_family_preferred "$image")"
+  fi
   require_container
   if [ "$rebuild" -eq 1 ]; then
     no_cache="--no-cache"
@@ -1084,6 +1204,7 @@ build_cmd() {
 
   is_local_codex_build_image() {
     case "$1" in
+      agent|agent-*) return 0 ;;
       codex|codex-*) return 0 ;;
       *) return 1 ;;
     esac
@@ -1092,7 +1213,8 @@ build_cmd() {
   dockerfile_name_for_image() {
     local name="$1"
     case "$name" in
-      codex) echo "DockerFile" ;;
+      agent|codex) echo "DockerFile" ;;
+      agent-*) echo "DockerFile.${name#agent-}" ;;
       codex-*) echo "DockerFile.${name#codex-}" ;;
       *) return 1 ;;
     esac
@@ -1108,8 +1230,8 @@ build_cmd() {
   local_image_for_dockerfile_name() {
     local file_name="$1"
     case "$file_name" in
-      DockerFile) echo "codex" ;;
-      DockerFile.*) echo "codex-${file_name#DockerFile.}" ;;
+      DockerFile) echo "agent-codex" ;;
+      DockerFile.*) echo "agent-${file_name#DockerFile.}" ;;
       *) return 1 ;;
     esac
   }
@@ -1245,6 +1367,8 @@ build_cmd() {
       if [ "$snapshot" -eq 1 ]; then
         echo "Snapshotting existing image tags: $name, $versioned_name"
         "$CONTAINER_CMD" image tag "$name" "$versioned_name"
+        tag_legacy_image_ref_alias "$name"
+        tag_legacy_image_ref_alias "$versioned_name"
         return 0
       fi
       echo "Image already exists: $name (use --rebuild to rebuild)"
@@ -1270,6 +1394,8 @@ build_cmd() {
       "$CONTAINER_CMD" build -t "$name" -f "$file_path" "$context"
     fi
     "$CONTAINER_CMD" image tag "$name" "$versioned_name"
+    tag_legacy_image_ref_alias "$name"
+    tag_legacy_image_ref_alias "$versioned_name"
   }
 
   if [ -n "$image" ]; then
@@ -1327,7 +1453,7 @@ run_auth_flow() {
   else
     "$CONTAINER_CMD" exec -it "$auth_name" bash -lc 'codex login --device-auth'
   fi
-  keychain_script_run "$(container_agent_keychain_service "$auth_name")" "$(container_agent_keychain_account "$auth_name")" store-from-container "$auth_name" "$(container_auth_path "$auth_name")"
+  keychain_script_run "$(container_agent_keychain_service "$auth_name")" "$(container_agent_keychain_account "$auth_name")" store-from-container "$auth_name" "$(container_auth_format "$auth_name")" "$(container_auth_path "$auth_name")"
   "$CONTAINER_CMD" stop "$auth_name"
   "$CONTAINER_CMD" rm "$auth_name"
   created=0
@@ -1500,10 +1626,10 @@ keychain_auth_info() {
   local format="${2:-$(container_auth_format "$name")}"
   case "$format" in
     json_refresh_token)
-      keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" read | auth_info_from_json
+      keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" read "$format" | auth_info_from_json
       ;;
     opaque_blob|directory_tarball)
-      keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" read | auth_signature
+      keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" read "$format" | auth_signature
       ;;
     *)
       die "Unsupported AGENT_AUTH_FORMAT: $format"
@@ -1632,13 +1758,40 @@ container_auth_format() {
   container_agent_env_value "$name" AGENT_AUTH_FORMAT "$DEFAULT_AGENT_AUTH_FORMAT"
 }
 
+container_auth_directory_archive() {
+  local name="$1"
+  local path="$2"
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -s -- "$path" <<'SH'
+path="$1"
+if [ ! -d "$path" ]; then
+  exit 1
+fi
+cd -- "$path"
+if tar --help 2>/dev/null | grep -q -- "--sort=name"; then
+  tar --sort=name -cf - .
+else
+  tar -cf - .
+fi
+SH
+}
+
 container_auth_info() {
   local name="$1"
   local format
   format="$(container_auth_format "$name")"
   local auth_path
   auth_path="$(container_auth_path "$name")"
-  if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -f "$auth_path"; then
+  local has_auth=1
+  if [ "$format" = "directory_tarball" ]; then
+    if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -d "$auth_path"; then
+      has_auth=0
+    fi
+  else
+    if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -f "$auth_path"; then
+      has_auth=0
+    fi
+  fi
+  if [ "$has_auth" -ne 0 ]; then
     case "$format" in
       json_refresh_token) echo -e "\t" ;;
       *) echo -n "" ;;
@@ -1649,7 +1802,10 @@ container_auth_info() {
     json_refresh_token)
       "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" cat "$auth_path" | auth_info_from_json
       ;;
-    opaque_blob|directory_tarball)
+    directory_tarball)
+      container_auth_directory_archive "$name" "$auth_path" | auth_signature
+      ;;
+    opaque_blob)
       "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" cat "$auth_path" | auth_signature
       ;;
     *)
@@ -1684,7 +1840,7 @@ sync_openai_auth_to_container() {
       IFS=$'\t' read -r container_token container_refresh <<<"$container_info"
       if [ -z "$container_token" ]; then
         echo "Refreshing OpenAI auth in $name" >&2
-        keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" load-to-container "$name" "$(container_auth_path "$name")"
+        keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" load-to-container "$name" "$format" "$(container_auth_path "$name")"
         return 0
       fi
       if [ "$container_token" = "$keychain_token" ] && [ "$container_refresh" = "$keychain_refresh" ]; then
@@ -1706,7 +1862,7 @@ sync_openai_auth_to_container() {
       ;;
   esac
   echo "Refreshing OpenAI auth in $name" >&2
-  keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" load-to-container "$name" "$(container_auth_path "$name")"
+  keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" load-to-container "$name" "$format" "$(container_auth_path "$name")"
 }
 
 sync_openai_auth_from_container() {
@@ -1765,7 +1921,7 @@ sync_openai_auth_from_container() {
       ;;
   esac
   echo "Updating Keychain auth from $name" >&2
-  keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" store-from-container "$name" "$(container_auth_path "$name")"
+  keychain_script_run "$(container_agent_keychain_service "$name")" "$(container_agent_keychain_account "$name")" store-from-container "$name" "$format" "$(container_auth_path "$name")"
 }
 
 run_container() {
@@ -2234,7 +2390,7 @@ update_codex_pre_exec() {
     if "$CONTAINER_CMD" exec -it "$name" "${SETPRIV_ARGS[@]}" /usr/local/bin/agent.sh update; then
       return 0
     fi
-    warn "agent.sh update failed for $name; retrying with legacy Codex update path"
+    warn "Runtime update via agent.sh failed for $name; retrying with legacy Codex update path"
   fi
   local cmd='npm install -g @openai/codex --omit=dev --no-fund --no-audit'
   echo "Updating @openai/codex in container: $name" >&2
@@ -2325,6 +2481,7 @@ run_cmd() {
   workdir="$(CDPATH= cd -- "$workdir" && pwd)"
 
   [ -n "$image" ] || image="$DEFAULT_IMAGE"
+  image="$(image_family_for_runtime "$image")"
   if [ -z "$name" ] && [ "$temp" -eq 0 ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
   fi
@@ -2352,6 +2509,7 @@ auth_cmd() {
   if [ -z "$name" ]; then
     name="$(default_name "$AUTH_NAME_PREFIX")"
   fi
+  image="$(image_family_for_runtime "$image")"
   run_auth_flow "$image" "$name"
   echo "Auth updated. Restart any running --openai containers to pick up the new token." >&2
 }
@@ -2430,8 +2588,8 @@ upgrade_cmd() {
   local backup_root
   local backup_dockerfile
   backup_dir="$(mktemp -d)"
-  config_backup_file="$backup_dir/codex-config.tar"
-  export_file="$backup_dir/codex-export.tar"
+  config_backup_file="$backup_dir/agent-config.tar"
+  export_file="$backup_dir/agent-export.tar"
   backup_root="$backup_dir/rootfs"
   backup_dockerfile="$backup_dir/Dockerfile.backup"
   trap 'cleanup_temp_dir "$backup_dir"' RETURN
@@ -2655,7 +2813,7 @@ ls_cmd() {
       image = $2
       sub(/^.*\//, "", image)
       sub(/[:@].*$/, "", image)
-      if (image ~ /^codex([[:alnum:]_.-]*|$)/) {
+      if (image ~ /^(agent|codex)([[:alnum:]_.-]*|$)/) {
         print
       }
     }

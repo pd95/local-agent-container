@@ -122,8 +122,8 @@ test_agent_env_metadata_helpers() {
   load_codexctl_functions
 
   CONTAINER_CMD=container
-  container() {
-    case "$1" in
+container() {
+        case "$1" in
       exec)
         shift
         if [ "$1" = "unit-test-container" ]; then
@@ -142,8 +142,8 @@ AGENT_HOME_DIR=/home/coder/.codex
 AGENT_CONFIG_DIR=/home/coder/.codex
 AGENT_AUTH_PATH=/home/coder/.codex/auth.json
 AGENT_IMAGE_DEFAULTS_DIR=/etc/agentctl/defaults
-AGENT_KEYCHAIN_SERVICE=agentctl-codex-auth
-AGENT_KEYCHAIN_ACCOUNT=device-auth-openai
+AGENT_KEYCHAIN_SERVICE=agent-openai-auth
+AGENT_KEYCHAIN_ACCOUNT=device-auth-openAI
 AGENT_SUPPORTS_OPENAI_MODE=1
 EOF
             ;;
@@ -166,7 +166,7 @@ EOF
 
   [ "$(container_agent_home_dir unit-test-container)" = "/home/coder/.codex" ] || fail "Expected AGENT_HOME_DIR metadata"
   [ "$(container_agent_defaults_dir unit-test-container)" = "/etc/agentctl/defaults" ] || fail "Expected AGENT_IMAGE_DEFAULTS_DIR metadata"
-  [ "$(container_agent_keychain_service unit-test-container)" = "agentctl-codex-auth" ] || fail "Expected AGENT_KEYCHAIN_SERVICE metadata"
+  [ "$(container_agent_keychain_service unit-test-container)" = "agent-openai-auth" ] || fail "Expected AGENT_KEYCHAIN_SERVICE metadata"
   container_supports_capability unit-test-container openai-mode || fail "Expected openai-mode capability"
 }
 
@@ -191,6 +191,30 @@ test_container_auth_format_helpers() {
   [ "$(container_auth_format unit-test-container)" = "json_refresh_token" ] || fail "Expected default auth format fallback"
   current_format="directory_tarball"
   [ "$(container_auth_format unit-test-container)" = "directory_tarball" ] || fail "Expected explicit AGENT_AUTH_FORMAT"
+}
+
+test_image_family_aliases_support_legacy_and_tagged_names() {
+  begin_test "image family helpers handle legacy names and tags"
+
+  load_codexctl_functions
+
+  [ "$(image_family_preferred codex)" = "agent-codex" ] || fail "Expected codex base family to map to agent-codex"
+  [ "$(image_family_preferred codex-python)" = "agent-python" ] || fail "Expected codex-python to map to agent-python"
+  [ "$(image_family_preferred codex-python:20260313-154500)" = "agent-python:20260313-154500" ] || fail "Expected tagged codex-python to map to tagged agent-python"
+  [ "$(image_family_preferred agent)" = "agent-codex" ] || fail "Expected agent shorthand to map to agent-codex"
+  [ "$(image_family_legacy_codex agent-python)" = "codex-python" ] || fail "Expected agent-python to map to codex-python legacy"
+  [ "$(image_family_legacy_codex agent-python:20260313-154500)" = "codex-python:20260313-154500" ] || fail "Expected tagged agent-python to map to tagged codex legacy"
+
+  image_exists() {
+    [ "$1" = "agent-python:20260313-154500" ] || return 1
+    return 0
+  }
+  [ "$(image_family_for_runtime codex-python:20260313-154500)" = "agent-python:20260313-154500" ] || fail "Expected runtime resolver to prefer tagged agent image"
+  image_exists() {
+    [ "$1" = "codex-python:20260313-154500" ] || return 1
+    return 0
+  }
+  [ "$(image_family_for_runtime codex-python:20260313-154500)" = "codex-python:20260313-154500" ] || fail "Expected runtime resolver to fallback to legacy tagged family"
 }
 
 test_openai_auth_sync_opaque_format() {
@@ -286,7 +310,7 @@ test_codex_auth_wrapper_execs_generic_script() {
 }
 
 test_ls_filters_non_codex_containers() {
-  begin_test "ls_cmd hides non-Codex runtime containers"
+  begin_test "ls_cmd hides non-agent runtime containers"
 
   load_codexctl_functions
 
@@ -296,6 +320,8 @@ test_ls_filters_non_codex_containers() {
 ID                               IMAGE                                                OS     ARCH   STATE    ADDR              CPUS  MEMORY   STARTED
 converter                        docker.io/library/debian:latest                      linux  amd64  stopped                    4     1024 MB
 buildkit                         ghcr.io/apple/container-builder-shim/builder:0.11.0  linux  arm64  running  192.168.64.10/24  2     2048 MB  2026-04-06T10:40:58Z
+agent-codex                      agent-codex:latest                                  linux  arm64  stopped                    4     1024 MB
+agent-python                     agent-python:latest                                  linux  arm64  stopped                    4     1024 MB
 codex-python                     codex-python:latest                                  linux  arm64  stopped                    4     1024 MB
 codex-local-codex-container      codex:latest                                         linux  arm64  running  192.168.64.12/24  4     1024 MB  2026-04-06T10:59:42Z
 codex-custom                     my-team/codex-custom:latest                          linux  arm64  stopped                    4     1024 MB
@@ -305,6 +331,8 @@ EOF
   run_capture ls_cmd
   assert_status 0
   assert_contains "ID                               IMAGE"
+  assert_contains "agent-codex                      agent-codex:latest"
+  assert_contains "agent-python                     agent-python:latest"
   assert_contains "codex-python                     codex-python:latest"
   assert_contains "codex-local-codex-container      codex:latest"
   assert_contains "codex-custom                     my-team/codex-custom:latest"
@@ -481,6 +509,7 @@ main() {
   test_agentctl_wrapper_usage_banner
   test_agent_env_metadata_helpers
   test_container_auth_format_helpers
+  test_image_family_aliases_support_legacy_and_tagged_names
   test_openai_auth_sync_opaque_format
   test_codex_auth_wrapper_execs_generic_script
   test_ls_filters_non_codex_containers

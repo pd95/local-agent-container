@@ -15,7 +15,7 @@ test_temp_run_removes_container() {
   name="$(unique_name temp)"
   workdir="$(new_workdir)"
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --temp --workdir "$workdir" --cmd true
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --temp --workdir "$workdir" --cmd true
   assert_status 0
 
   if container_exists "$name"; then
@@ -32,7 +32,7 @@ test_named_run_persists_until_rm() {
   workdir="$(new_workdir)"
   register_container_cleanup "$name"
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --cmd true
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd true
   assert_status 0
 
   if ! container_exists "$name"; then
@@ -50,9 +50,9 @@ test_named_run_persists_until_rm() {
 test_build_rebuild_stops_buildkit() {
   begin_test "build --rebuild stops buildkit after a successful build"
 
-  run_capture "$CODEXCTL" build --image codex --rebuild
+  run_capture "$CODEXCTL" build --image agent-codex --rebuild
   assert_status 0
-  assert_contains "Building image tags: codex,"
+  assert_contains "Building image tags: agent-codex,"
 
   if ! "$CONTAINER_CMD" ls -a 2>/dev/null | grep -q -E '^buildkit[[:space:]]+.*[[:space:]]stopped([[:space:]]|$)'; then
     printf '%s\n' "$RUN_OUTPUT" >&2
@@ -71,7 +71,7 @@ test_upgrade_no_backup_preserves_state() {
   register_container_cleanup "$name"
   backup_base="$(printf '%s\n' "${name}-backup" | tr '[:upper:]' '[:lower:]')"
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && echo upgrade-ok >/home/coder/.codex/upgrade-smoke.txt'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && echo upgrade-ok >/home/coder/.codex/upgrade-smoke.txt'
   assert_status 0
 
   run_capture "$CODEXCTL" upgrade --name "$name" --no-backup
@@ -84,7 +84,7 @@ test_upgrade_no_backup_preserves_state() {
     fail "Backup images were created unexpectedly for $name"
   fi
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --cmd bash -lc 'cat /home/coder/.codex/upgrade-smoke.txt'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'cat /home/coder/.codex/upgrade-smoke.txt'
   assert_status 0
   assert_contains "upgrade-ok"
 }
@@ -99,7 +99,7 @@ test_upgrade_with_backup_creates_recovery_image() {
   workdir="$(new_workdir)"
   register_container_cleanup "$name"
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && echo backup-ok >/home/coder/.codex/backup-smoke.txt'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && echo backup-ok >/home/coder/.codex/backup-smoke.txt'
   assert_status 0
 
   run_capture "$CODEXCTL" upgrade --name "$name"
@@ -113,7 +113,7 @@ test_upgrade_with_backup_creates_recovery_image() {
     fail "Expected backup image to exist: $backup_image"
   fi
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --cmd bash -lc 'cat /home/coder/.codex/backup-smoke.txt'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'cat /home/coder/.codex/backup-smoke.txt'
   assert_status 0
   assert_contains "backup-ok"
 }
@@ -127,7 +127,7 @@ test_upgrade_preflight_failure_keeps_container() {
   workdir="$(new_workdir)"
   register_container_cleanup "$name"
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && echo intact >/home/coder/.codex/preflight.txt'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && echo intact >/home/coder/.codex/preflight.txt'
   assert_status 0
 
   run_capture "$CODEXCTL" upgrade --name "$name" --image does-not-exist
@@ -138,7 +138,7 @@ test_upgrade_preflight_failure_keeps_container() {
     fail "Container was removed after failed upgrade: $name"
   fi
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --cmd bash -lc 'cat /home/coder/.codex/preflight.txt'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'cat /home/coder/.codex/preflight.txt'
   assert_status 0
   assert_contains "intact"
 }
@@ -152,10 +152,10 @@ test_run_reset_config_restores_image_defaults() {
   workdir="$(new_workdir)"
   register_container_cleanup "$name"
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# legacy-config\n" >/home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json && rm -f /home/coder/.codex/AGENTS.md && printf "legacy-agents\n" >/home/coder/.codex/AGENTS.md'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# legacy-config\n" >/home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json && rm -f /home/coder/.codex/AGENTS.md && printf "legacy-agents\n" >/home/coder/.codex/AGENTS.md'
   assert_status 0
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --reset-config --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/codexctl/image.md" ]; then echo reset-config-ok; else exit 1; fi'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --reset-config --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/codexctl/image.md" ]; then echo reset-config-ok; else exit 1; fi'
   assert_status 0
   assert_contains "reset-config-ok"
 }
@@ -169,7 +169,7 @@ test_upgrade_overwrite_config_restores_image_defaults() {
   workdir="$(new_workdir)"
   register_container_cleanup "$name"
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# PRE-OVERWRITE\n[ollama]\nhost = \"http://127.0.0.1:11434\"\n" >/home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json && rm -f /home/coder/.codex/AGENTS.md && printf "legacy-agents\n" >/home/coder/.codex/AGENTS.md'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# PRE-OVERWRITE\n[ollama]\nhost = \"http://127.0.0.1:11434\"\n" >/home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json && rm -f /home/coder/.codex/AGENTS.md && printf "legacy-agents\n" >/home/coder/.codex/AGENTS.md'
   assert_status 0
 
   run_capture "$CODEXCTL" upgrade --name "$name" --overwrite-config --no-backup
@@ -177,7 +177,7 @@ test_upgrade_overwrite_config_restores_image_defaults() {
   assert_contains "Overwriting config.toml, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $name"
   assert_contains "Upgrade complete: $name (backup skipped)"
 
-  run_capture "$CODEXCTL" run --name "$name" --image codex --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/codexctl/image.md" ]; then echo overwrite-config-ok; else exit 1; fi'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-codex --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/codexctl/image.md" ]; then echo overwrite-config-ok; else exit 1; fi'
   assert_status 0
   assert_contains "overwrite-config-ok"
 }

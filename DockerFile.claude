@@ -1,5 +1,5 @@
 # For Claude Code runtime
-FROM codex
+FROM agent-codex
 
 USER root
 
@@ -19,7 +19,7 @@ RUN chmod 755 /usr/local/bin/agent.sh \
  && mkdir -p /etc/agentctl/defaults \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/agentctl/image.md <<EOF
-You are running inside the \`claude\` image.
+You are running inside the \`agent-claude\` image.
 
 Environment:
 - containerized Alpine Linux (package manager \`apk\`)
@@ -28,7 +28,7 @@ Environment:
 - architecture: check with \`uname -m\` if needed
 
 Image metadata:
-- image: \`codex-claude\`
+- image: \`agent-claude\`
 - built_at_utc: \`${BUILD_TIME}\`
 
 Built-in CLI tools:

@@ -1,4 +1,4 @@
-FROM codex-python
+FROM agent-python
 
 USER root
 
@@ -35,7 +35,7 @@ RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir \
 RUN mkdir -p /etc/codexctl \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
-You are running inside the \`codex-office\` image.
+You are running inside the \`agent-office\` image.
 
 Environment:
 - containerized Alpine Linux (package manager \`apk\`)
@@ -44,7 +44,7 @@ Environment:
 - architecture: check with \`uname -m\` if needed
 
 Image metadata:
-- image: \`codex-office\`
+- image: \`agent-office\`
 - built_at_utc: \`${BUILD_TIME}\`
 
 Built-in CLI tools:
