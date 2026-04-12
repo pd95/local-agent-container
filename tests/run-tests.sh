@@ -185,17 +185,79 @@ test_upgrade_overwrite_config_restores_image_defaults() {
 main() {
   require_host_prereqs
 
+  local from_filter=""
+  local run_mode="${1:-}"
+  if [ "$run_mode" = "unit" ]; then
+    shift
+  elif [ -n "$run_mode" ]; then
+    shift
+  fi
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --from)
+        from_filter="$2"
+        shift 2
+        ;;
+      --from=*)
+        from_filter="${1#*=}"
+        shift
+        ;;
+      --help|-h)
+        echo "Usage: $0 [unit] [--from <test-name-or-index>]"
+        echo "  <test-name-or-index> matches function name, description, or 1-based test index"
+        exit 0
+        ;;
+      *)
+        fail "Unknown argument: $1"
+        ;;
+    esac
+  done
+
   log "Using codexctl at $CODEXCTL"
   log "Using container runtime command $CONTAINER_CMD"
 
-  test_temp_run_removes_container
-  test_named_run_persists_until_rm
-  test_build_rebuild_stops_buildkit
-  test_upgrade_no_backup_preserves_state
-  test_upgrade_with_backup_creates_recovery_image
-  test_upgrade_preflight_failure_keeps_container
-  test_run_reset_config_restores_image_defaults
-  test_upgrade_overwrite_config_restores_image_defaults
+  local run_from=1
+  local -a test_cases=(
+    "test_temp_run_removes_container|run --temp removes the named container"
+    "test_named_run_persists_until_rm|named run persists until explicit removal"
+    "test_build_rebuild_stops_buildkit|build --rebuild stops buildkit after a successful build"
+    "test_upgrade_no_backup_preserves_state|upgrade --no-backup preserves state without creating backup images"
+    "test_upgrade_with_backup_creates_recovery_image|upgrade creates a backup image by default"
+    "test_upgrade_preflight_failure_keeps_container|upgrade preflight failure leaves the original container intact"
+    "test_run_reset_config_restores_image_defaults|run --reset-config restores config, models, and AGENTS symlink"
+    "test_upgrade_overwrite_config_restores_image_defaults|upgrade --overwrite-config restores config, models, and AGENTS symlink"
+  )
+
+  if [ -n "$from_filter" ]; then
+    local idx=1
+    local matched=0
+    for case_entry in "${test_cases[@]}"; do
+      local test_fn="${case_entry%%|*}"
+      local test_label="${case_entry#*|}"
+      if [ "$idx" = "$from_filter" ] \
+        || [ "$test_fn" = "$from_filter" ] \
+        || [ "$test_label" = "$from_filter" ]; then
+        run_from="$idx"
+        matched=1
+        break
+      fi
+      idx=$((idx + 1))
+    done
+    if [ "$matched" -eq 0 ]; then
+      log "Could not match --from filter '$from_filter'; running full suite"
+      run_from=1
+    fi
+  fi
+
+  local idx=1
+  for case_entry in "${test_cases[@]}"; do
+    local test_fn="${case_entry%%|*}"
+    if [ "$idx" -ge "$run_from" ]; then
+      "$test_fn"
+    fi
+    idx=$((idx + 1))
+  done
 
   log "PASS: all host integration tests completed"
 }
