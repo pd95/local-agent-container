@@ -72,6 +72,63 @@ test_run_skips_local_model_preflight_for_non_local_runtime() {
   printf '%s\n' "$captured_cmd" | grep -Fxq '__agentctl_default_runtime__ local gpt-oss' || fail "Expected runtime contract command for default profile, got: $captured_cmd"
 }
 
+test_run_rejects_default_container_creation_when_legacy_container_exists() {
+  begin_test "run fails fast when only the legacy default container exists for the workdir"
+
+  load_codexctl_functions
+
+  local workdir
+  local status=0
+  local out_file
+  workdir="$(new_workdir)"
+
+  require_container() { return 0; }
+  container_exists() {
+    [ "$1" = "codex-$(basename "$workdir")" ]
+  }
+
+  out_file="$(mktemp "${TMPDIR:-/tmp}/codexctl-legacy-default.XXXXXX")"
+  if (run_cmd --workdir "$workdir" >"$out_file" 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 1 ] || fail "Expected run_cmd to fail when only legacy default exists, got status $status"
+  RUN_OUTPUT="$(cat "$out_file" 2>/dev/null || printf '')"
+  rm -f "$out_file"
+  assert_contains "Found legacy container codex-$(basename "$workdir") for this workdir"
+  assert_contains "migrate --name codex-$(basename "$workdir")"
+}
+
+test_local_model_preflight_info_defaults_missing_defaults_dir_arg() {
+  begin_test "local_model_preflight_info tolerates callers that omit defaults_dir"
+
+  load_codexctl_functions
+
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = "exec" ] || fail "Unexpected container invocation: $*"
+    shift
+    [ "$1" = "-i" ] || fail "Expected exec -i invocation, got: $*"
+    shift
+    [ "$1" = "unit-test-container" ] || fail "Expected unit-test-container, got: $1"
+    shift
+    while [ "$#" -gt 0 ] && [[ "$1" == setpriv* || "$1" == --* ]]; do
+      shift
+    done
+    [ "$1" = "sh" ] || fail "Expected shell invocation, got: $*"
+    cat >/dev/null
+  }
+
+  local status=0
+  if (local_model_preflight_info unit-test-container gpt-oss /home/coder/.codex >/dev/null 2>&1); then
+    status=0
+  else
+    status=$?
+  fi
+  [ "$status" -eq 0 ] || fail "Expected omitted defaults_dir arg to be tolerated, got status $status"
+}
+
 test_run_openai_rejected_for_non_openai_runtime() {
   begin_test "run --openai fails for runtimes without openai-mode support"
 
@@ -234,6 +291,22 @@ test_matrix_runtime_image_helpers() {
   [ "$(image_family_for_runtime agent-python-claude:20260313-154500)" = "codex-python-claude:20260313-154500" ] || fail "Expected matrix runtime resolver to fall back to legacy codex image"
 }
 
+test_legacy_migration_target_mapping() {
+  begin_test "migrate maps legacy codex images to matching agent targets"
+
+  load_codexctl_functions
+
+  [ "$(legacy_migration_target_image codex)" = "agent-codex" ] || fail "Expected codex to migrate to agent-codex"
+  [ "$(legacy_migration_target_image codex-python:latest)" = "agent-python" ] || fail "Expected codex-python to migrate to agent-python"
+  [ "$(legacy_migration_target_image codex-office)" = "agent-office" ] || fail "Expected codex-office to migrate to agent-office"
+  [ "$(legacy_migration_target_image codex-swift)" = "agent-swift" ] || fail "Expected codex-swift to migrate to agent-swift"
+  [ "$(legacy_migration_target_name codex-local-codex-container)" = "agent-local-codex-container" ] || fail "Expected codex-* name to migrate to matching agent-* name"
+
+  if legacy_migration_target_image agent-codex >/dev/null 2>&1; then
+    fail "Expected agent-codex to be rejected for migrate"
+  fi
+}
+
 test_matrix_dockerfiles_publish_runtime_metadata() {
   begin_test "matrix dockerfiles publish agentctl metadata and runtime-specific AGENTS paths"
 
@@ -251,6 +324,50 @@ test_matrix_dockerfiles_publish_runtime_metadata() {
     || fail "Expected DockerFile.swift to publish /etc/agentctl/image.md"
   grep -Fq 'claude) ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md ;;' "$TEST_ROOT/DockerFile.swift" \
     || fail "Expected DockerFile.swift to link Claude AGENTS.md into /home/coder/.claude"
+}
+
+test_migrate_cmd_plans_backup_and_forces_overwrite_config() {
+  begin_test "migrate plans host backup and upgrade --overwrite-config"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local old_pwd
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-migrate.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  old_pwd="$PWD"
+  cd "$temp_dir"
+
+  require_container() { return 0; }
+  container_exists() { [ "$1" = "codex-legacy-container" ]; }
+  image_exists() { [ "$1" = "agent-python" ]; }
+  container_upgrade_info() {
+    printf 'codex-python:latest\t%s\trw\t8\t8192 MB\n' "$temp_dir"
+  }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect)
+        cat <<EOF
+ignored
+EOF
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture migrate_cmd --name codex-legacy-container --dry-run
+  cd "$old_pwd"
+
+  assert_status 0
+  assert_contains "Migration plan for codex-legacy-container"
+  assert_contains "target name:   agent-legacy-container"
+  assert_contains "current image: codex-python:latest"
+  assert_contains "target image:  agent-python"
+  assert_contains "host backup:   $temp_dir/codex-backup/codex-legacy-container-codex-home.tar"
+  assert_contains "migrate mode:  restore ~/.codex, then overwrite config defaults"
 }
 
 test_openai_auth_sync_opaque_format() {
@@ -540,6 +657,8 @@ main() {
 
   test_run_profile_wires_selected_profile
   test_run_skips_local_model_preflight_for_non_local_runtime
+  test_run_rejects_default_container_creation_when_legacy_container_exists
+  test_local_model_preflight_info_defaults_missing_defaults_dir_arg
   test_run_openai_rejected_for_non_openai_runtime
   test_run_help_reports_profile_default
   test_agentctl_wrapper_usage_banner
@@ -547,7 +666,9 @@ main() {
   test_container_auth_format_helpers
   test_image_family_aliases_support_legacy_and_tagged_names
   test_matrix_runtime_image_helpers
+  test_legacy_migration_target_mapping
   test_matrix_dockerfiles_publish_runtime_metadata
+  test_migrate_cmd_plans_backup_and_forces_overwrite_config
   test_openai_auth_sync_opaque_format
   test_codex_auth_wrapper_execs_generic_script
   test_ls_filters_non_codex_containers

@@ -532,6 +532,11 @@ default_name() {
   echo "${prefix}$(sanitize_container_name "$(basename "$path")")"
 }
 
+legacy_name_for_default() {
+  local path="${1:-$PWD}"
+  echo "$(default_name "codex-" "$path")"
+}
+
 sanitize_container_name() {
   local raw="$1"
   local sanitized
@@ -564,6 +569,7 @@ Commands:
   build      Build Codex images
   run        Create/start a container for the current directory
   upgrade    Recreate a container from the latest image while preserving config
+  migrate    Migrate a legacy codex* container to the matching agent-* image
   auth       Run OpenAI device auth flow and store in Keychain
   exec       Exec into a running container (default: bash)
   su-exec    Exec into a running container as root (default: bash)
@@ -637,6 +643,23 @@ Options:
   --backup-image NAME Backup image name for container export (default: <name>-backup-<timestamp>)
   --no-backup         Skip container export backup image creation
   --overwrite-config  Replace ~/.codex/config.toml and local_models.json from the upgraded image and recreate ~/.codex/AGENTS.md as a symlink
+EOF
+}
+
+usage_migrate() {
+  cat <<EOF
+Usage: $CLI_NAME migrate --name NAME [--backup-dir PATH] [--dry-run]
+
+Options:
+  --name NAME       Legacy codex* container name to migrate
+  --backup-dir PATH Host directory for the extra ~/.codex tar backup (default: ./codex-backup)
+  --dry-run         Print the planned migration steps without changing anything
+
+Migration defaults:
+  - only legacy codex/codex-python/codex-office/codex-swift containers are supported
+  - legacy codex-* container names are migrated to matching agent-* names
+  - an extra host backup tar is created before migration
+  - upgrade runs with --overwrite-config so config.toml, local_models.json, and AGENTS.md are refreshed after restoring ~/.codex
 EOF
 }
 
@@ -2162,7 +2185,7 @@ local_model_preflight_info() {
   local name="$1"
   local profile="$2"
   local config_dir="$3"
-  local defaults_dir="$4"
+  local defaults_dir="${4:-}"
   if [ -z "$defaults_dir" ]; then
     defaults_dir="$DEFAULT_AGENT_DEFAULTS_DIR"
   fi
@@ -2464,6 +2487,7 @@ local_model_update_pre_exec() {
 
 run_cmd() {
   local name=""
+  local explicit_name=0
   local image=""
   local openai=0
   local auth=0
@@ -2482,7 +2506,7 @@ run_cmd() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --name) name="$2"; shift 2 ;;
+      --name) name="$2"; explicit_name=1; shift 2 ;;
       --image) image="$2"; shift 2 ;;
       --workdir) workdir="$2"; shift 2 ;;
       --openai) openai=1; shift ;;
@@ -2529,6 +2553,13 @@ run_cmd() {
   image="$(image_family_for_runtime "$image")"
   if [ -z "$name" ] && [ "$temp" -eq 0 ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
+  fi
+  if [ "$explicit_name" -eq 0 ] && [ "$temp" -eq 0 ] && [ -n "$name" ] && ! container_exists "$name"; then
+    local legacy_name=""
+    legacy_name="$(legacy_name_for_default "$workdir")"
+    if [ -n "$legacy_name" ] && [ "$legacy_name" != "$name" ] && container_exists "$legacy_name"; then
+      die "Found legacy container $legacy_name for this workdir, but no $name exists. Migrate it first with: ${CLI_NAME} migrate --name $legacy_name. Or explicitly use the legacy container with: ${CLI_NAME} run --name $legacy_name"
+    fi
   fi
   if [ "$temp" -eq 0 ] && [ -n "$name" ] && container_exists "$name" && { [ -n "$cpu" ] || [ -n "$mem" ]; }; then
     die "--cpu and --mem only apply when creating a new container. Use ${CLI_NAME} upgrade --name $name${image:+ --image $image}${cpu:+ --cpu $cpu}${mem:+ --mem $mem} to recreate the container with updated resources"
@@ -2748,6 +2779,213 @@ upgrade_cmd() {
   fi
 }
 
+legacy_migration_target_image() {
+  local image_ref="$1"
+  local family="${image_ref%%:*}"
+  case "$family" in
+    codex) echo "agent-codex" ;;
+    codex-python) echo "agent-python" ;;
+    codex-office) echo "agent-office" ;;
+    codex-swift) echo "agent-swift" ;;
+    agent-*) return 2 ;;
+    *) return 1 ;;
+  esac
+}
+
+legacy_migration_target_name() {
+  local container_name="$1"
+  case "$container_name" in
+    codex) echo "agent-codex" ;;
+    codex-*) echo "agent-${container_name#codex-}" ;;
+    *) return 1 ;;
+  esac
+}
+
+migrate_host_codex_backup() {
+  local name="$1"
+  local backup_file="$2"
+  local started_for_backup="${3:-0}"
+
+  mkdir -p "$(dirname "$backup_file")"
+  if [ -e "$backup_file" ]; then
+    die "Host backup file already exists: $backup_file"
+  fi
+
+  if [ "$started_for_backup" -eq 1 ]; then
+    echo "Starting container for host backup: $name" >&2
+    "$CONTAINER_CMD" start "$name" >/dev/null
+  fi
+
+  backup_codex_config "$name" "$backup_file"
+  [ -s "$backup_file" ] || die "Failed to create host backup for $name at $backup_file"
+  echo "Created host backup: $backup_file" >&2
+
+  if [ "$started_for_backup" -eq 1 ]; then
+    echo "Stopping container after host backup: $name" >&2
+    "$CONTAINER_CMD" stop "$name" >/dev/null
+  fi
+}
+
+migrate_cmd() {
+  local name=""
+  local backup_dir="$PWD/codex-backup"
+  local dry_run=0
+  local inspect_info=""
+  local current_image=""
+  local target_image=""
+  local target_name=""
+  local workdir=""
+  local mount_mode=""
+  local current_cpu=""
+  local current_mem=""
+  local backup_file=""
+  local started_for_backup=0
+  local read_only=0
+  local was_running=0
+  local backup_image=""
+  local backup_dir_tmp=""
+  local config_backup_file=""
+  local export_file=""
+  local backup_root=""
+  local backup_dockerfile=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name="$2"; shift 2 ;;
+      --backup-dir) backup_dir="$2"; shift 2 ;;
+      --dry-run) dry_run=1; shift ;;
+      --help) usage_migrate; return 0 ;;
+      *) die "Unknown option for migrate: $1" ;;
+    esac
+  done
+
+  require_container
+  [ -n "$name" ] || die "migrate requires --name"
+  if ! container_exists "$name"; then
+    die "Container not found: $name"
+  fi
+
+  inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
+  IFS=$'\t' read -r current_image workdir mount_mode current_cpu current_mem <<<"$inspect_info"
+  [ -n "$current_image" ] || die "Unable to determine image for $name"
+
+  if ! target_image="$(legacy_migration_target_image "$current_image")"; then
+    case "$?" in
+      2) die "Container already uses an agent image: $name ($current_image)" ;;
+      *) die "Unsupported legacy image for migrate: $current_image" ;;
+    esac
+  fi
+  target_name="$(legacy_migration_target_name "$name" || true)"
+  [ -n "$target_name" ] || die "Unsupported legacy container name for migrate: $name"
+  if [ "$target_name" != "$name" ] && container_exists "$target_name"; then
+    die "Target container already exists: $target_name"
+  fi
+
+  image_exists "$target_image" || die "Target image not found: $target_image"
+  [ -e "$workdir" ] || die "Preserved /workdir source does not exist: $workdir"
+  [ -d "$workdir" ] || die "Preserved /workdir source is not a directory: $workdir"
+  if [ "$mount_mode" = "ro" ]; then
+    read_only=1
+  elif [ "$mount_mode" != "rw" ]; then
+    die "Unable to determine mount mode for $name"
+  fi
+
+  backup_dir="$(mkdir -p "$backup_dir" && CDPATH= cd -- "$backup_dir" && pwd)"
+  backup_file="$backup_dir/${name}-codex-home.tar"
+  backup_image="$(sanitize_image_name "${target_name}-backup-$(date -u +%Y%m%d%H%M%S)")"
+
+  if [ "$dry_run" -eq 1 ]; then
+    cat <<EOF
+Migration plan for $name
+  target name:   $target_name
+  current image: $current_image
+  target image:  $target_image
+  host backup:   $backup_file
+  workdir:       $workdir
+  backup image:  $backup_image
+  migrate mode:  restore ~/.codex, then overwrite config defaults
+EOF
+    return 0
+  fi
+
+  if ! container_running "$name"; then
+    started_for_backup=1
+  else
+    was_running=1
+  fi
+  migrate_host_codex_backup "$name" "$backup_file" "$started_for_backup"
+
+  require_container_backup_support
+  backup_dir_tmp="$(mktemp -d)"
+  config_backup_file="$backup_dir_tmp/agent-config.tar"
+  export_file="$backup_dir_tmp/agent-export.tar"
+  backup_root="$backup_dir_tmp/rootfs"
+  backup_dockerfile="$backup_dir_tmp/Dockerfile.backup"
+  trap 'cleanup_temp_dir "$backup_dir_tmp"' RETURN
+
+  if [ "$was_running" -eq 0 ]; then
+    echo "Starting container for config backup: $name" >&2
+    "$CONTAINER_CMD" start "$name" >/dev/null
+    started_for_backup=1
+  else
+    started_for_backup=0
+  fi
+
+  echo "Backing up /home/coder/.codex from $name" >&2
+  backup_codex_config "$name" "$config_backup_file"
+
+  if [ "$was_running" -eq 1 ] || [ "$started_for_backup" -eq 1 ]; then
+    echo "Stopping container: $name" >&2
+    "$CONTAINER_CMD" stop "$name" >/dev/null
+  fi
+
+  echo "Exporting container state to image: $backup_image" >&2
+  "$CONTAINER_CMD" export "$name" --output "$export_file"
+  build_backup_image_from_export "$backup_image" "$name" "$export_file" "$backup_root" "$backup_dockerfile"
+
+  echo "Removing container: $name" >&2
+  "$CONTAINER_CMD" rm "$name" >/dev/null
+
+  echo "Recreating container as: $target_name" >&2
+  local create_cmd=("$CONTAINER_CMD" create -t)
+  if [ -n "$current_cpu" ]; then
+    create_cmd+=(-c "$current_cpu")
+  fi
+  if [ -n "$current_mem" ]; then
+    create_cmd+=(-m "$current_mem")
+  fi
+  local mount_opts="type=bind,src=$workdir,dst=/workdir"
+  if [ "$read_only" -eq 1 ]; then
+    mount_opts="${mount_opts},readonly"
+  fi
+  create_cmd+=(
+    --name "$target_name"
+    --mount "$mount_opts"
+    "$target_image" sh -c 'sleep infinity'
+  )
+  "${create_cmd[@]}"
+
+  echo "Starting container: $target_name" >&2
+  "$CONTAINER_CMD" start "$target_name" >/dev/null
+
+  echo "Restoring /home/coder/.codex into $target_name" >&2
+  restore_codex_config "$target_name" "$config_backup_file" "/home/coder/.codex"
+  echo "Overwriting config.toml, local_models.json in /home/coder/.codex and recreating /home/coder/.codex/AGENTS.md in $target_name" >&2
+  overwrite_codex_config "$target_name"
+
+  if [ "$was_running" -eq 0 ]; then
+    echo "Stopping container: $target_name" >&2
+    "$CONTAINER_CMD" stop "$target_name" >/dev/null
+  fi
+
+  echo "Migration complete: $name -> $target_name (backup image: $backup_image)" >&2
+  echo "Host backup: $backup_file" >&2
+  echo >&2
+  echo "If everything works as expected, remove the backup image with: ${CLI_NAME} images prune --backup --image $backup_image --keep 0" >&2
+  trap - RETURN
+  cleanup_temp_dir "$backup_dir_tmp"
+}
+
 exec_cmd() {
   local name=""
   local cmd=()
@@ -2870,6 +3108,7 @@ case "$cmd" in
   build) shift; build_cmd "$@" ;;
   run) shift; run_cmd "$@" ;;
   upgrade) shift; upgrade_cmd "$@" ;;
+  migrate) shift; migrate_cmd "$@" ;;
   auth) shift; auth_cmd "$@" ;;
   exec) shift; exec_cmd "$@" ;;
   su-exec) shift; su_exec_cmd "$@" ;;
