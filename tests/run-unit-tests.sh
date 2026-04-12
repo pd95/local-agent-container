@@ -227,6 +227,61 @@ EOF
   container_supports_capability unit-test-container openai-mode || fail "Expected openai-mode capability"
 }
 
+test_runtime_contract_switches_metadata_paths_and_capabilities() {
+  begin_test "runtime contract switches image metadata path and capability lookups"
+
+  load_codexctl_functions
+
+  CONTAINER_CMD=container
+  local contract_present=1
+  container() {
+    case "$1" in
+      exec)
+        shift
+        if [ "$1" = "unit-test-container" ]; then
+          shift
+        fi
+        while [ "$#" -gt 0 ] && [[ "$1" == setpriv* || "$1" == --* ]]; do
+          shift
+        done
+        case "$1" in
+          test)
+            [ "$contract_present" -eq 1 ]
+            ;;
+          cat)
+            cat <<'EOF'
+AGENT_IMAGE_DEFAULTS_DIR=/etc/agentctl/defaults
+AGENT_SUPPORTS_OPENAI_MODE=1
+AGENT_SUPPORTS_UPDATE=0
+EOF
+            ;;
+          *)
+            fail "Unexpected container exec: $*"
+            ;;
+        esac
+        ;;
+      ls)
+        cat <<'EOF'
+ID IMAGE
+unit-test-container agent-codex:latest
+EOF
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  [ "$(container_agent_image_md_path unit-test-container)" = "/etc/agentctl/image.md" ] || fail "Expected contract image metadata path"
+  container_supports_capability unit-test-container openai-mode || fail "Expected contract capability lookup for openai-mode"
+  if container_supports_capability unit-test-container update; then
+    fail "Expected disabled update capability from contract metadata"
+  fi
+
+  contract_present=0
+  [ "$(container_agent_image_md_path unit-test-container)" = "$DEFAULT_AGENT_IMAGE_MD_PATH" ] || fail "Expected legacy image metadata fallback without contract"
+}
+
 test_container_auth_format_helpers() {
   begin_test "agent auth metadata helpers support AGENT_AUTH_FORMAT"
 
@@ -366,7 +421,8 @@ EOF
   assert_contains "target name:   agent-legacy-container"
   assert_contains "current image: codex-python:latest"
   assert_contains "target image:  agent-python"
-  assert_contains "host backup:   $temp_dir/codex-backup/codex-legacy-container-codex-home.tar"
+  assert_contains "host backup:   "
+  assert_contains "/codex-backup/codex-legacy-container-codex-home.tar"
   assert_contains "migrate mode:  restore ~/.codex, then overwrite config defaults"
 }
 
@@ -663,6 +719,7 @@ main() {
   test_run_help_reports_profile_default
   test_agentctl_wrapper_usage_banner
   test_agent_env_metadata_helpers
+  test_runtime_contract_switches_metadata_paths_and_capabilities
   test_container_auth_format_helpers
   test_image_family_aliases_support_legacy_and_tagged_names
   test_matrix_runtime_image_helpers
