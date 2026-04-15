@@ -26,11 +26,14 @@ case "$cmd" in
   version)
     exec claude --version
     ;;
-  home-dir|config-dir)
+  home-dir)
+    printf '%s\n' /home/coder
+    ;;
+  config-dir)
     printf '%s\n' /home/coder/.claude
     ;;
   auth-path)
-    printf '%s\n' /home/coder/.claude/auth.json
+    printf '%s\n' /home/coder/.claude/.credentials.json
     ;;
   update)
     exec npm install -g @anthropic-ai/claude-code --omit=dev --no-fund --no-audit

@@ -1609,16 +1609,19 @@ overwrite_codex_config() {
   local config_dir
   local defaults_dir
   local image_md
+  local home_dir
   config_dir="$(container_agent_config_dir "$name")"
   defaults_dir="$(container_agent_defaults_dir "$name")"
   image_md="$(container_agent_image_md_path "$name")"
+  home_dir="$(container_agent_home_dir "$name")"
   if ! "$CONTAINER_CMD" exec "$name" sh -lc "test -d '$defaults_dir'"; then
     die "Image does not include $defaults_dir for overwrite in $name"
   fi
-  "$CONTAINER_CMD" exec -i -u 0 "$name" sh -s -- "$config_dir" "$defaults_dir" "$image_md" <<'SH'
+  "$CONTAINER_CMD" exec -i -u 0 "$name" sh -s -- "$config_dir" "$defaults_dir" "$image_md" "$home_dir" <<'SH'
 config_dir="$1"
 defaults_dir="$2"
 image_md="$3"
+home_dir="$4"
 mkdir -p "$config_dir"
 if test -f "$defaults_dir/config.toml"; then
   cp "$defaults_dir/config.toml" "$config_dir/config.toml"
@@ -1630,11 +1633,17 @@ else
 fi
 ln -sf "$image_md" "$config_dir/AGENTS.md"
 chown -h coder:coder "$config_dir/AGENTS.md"
+if test -f "$defaults_dir/claude.json"; then
+  cp "$defaults_dir/claude.json" "$home_dir/.claude.json"
+fi
 if test -f "$config_dir/config.toml"; then
   chown coder:coder "$config_dir/config.toml"
 fi
 if test -f "$config_dir/local_models.json"; then
   chown coder:coder "$config_dir/local_models.json"
+fi
+if test -f "$home_dir/.claude.json"; then
+  chown coder:coder "$home_dir/.claude.json"
 fi
 SH
 }

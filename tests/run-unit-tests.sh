@@ -367,18 +367,38 @@ test_matrix_dockerfiles_publish_runtime_metadata() {
 
   grep -Fq 'ln -sf /etc/codexctl/image.md /etc/agentctl/image.md' "$TEST_ROOT/DockerFile.python" \
     || fail "Expected DockerFile.python to publish /etc/agentctl/image.md"
-  grep -Fq 'claude) ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md ;;' "$TEST_ROOT/DockerFile.python" \
+  grep -Fq 'claude) mkdir -p /home/coder/.claude \' "$TEST_ROOT/DockerFile.python" \
+    || fail "Expected DockerFile.python to initialize Claude config directory"
+  grep -Fq 'ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md ;;' "$TEST_ROOT/DockerFile.python" \
     || fail "Expected DockerFile.python to link Claude AGENTS.md into /home/coder/.claude"
 
   grep -Fq 'ln -sf /etc/codexctl/image.md /etc/agentctl/image.md' "$TEST_ROOT/DockerFile.office" \
     || fail "Expected DockerFile.office to publish /etc/agentctl/image.md"
-  grep -Fq 'claude) ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md ;;' "$TEST_ROOT/DockerFile.office" \
+  grep -Fq 'claude) mkdir -p /home/coder/.claude \' "$TEST_ROOT/DockerFile.office" \
+    || fail "Expected DockerFile.office to initialize Claude config directory"
+  grep -Fq 'ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md ;;' "$TEST_ROOT/DockerFile.office" \
     || fail "Expected DockerFile.office to link Claude AGENTS.md into /home/coder/.claude"
 
   grep -Fq 'ln -sf /etc/codexctl/image.md /etc/agentctl/image.md' "$TEST_ROOT/DockerFile.swift" \
     || fail "Expected DockerFile.swift to publish /etc/agentctl/image.md"
-  grep -Fq 'claude) ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md ;;' "$TEST_ROOT/DockerFile.swift" \
+  grep -Fq 'ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md ;;' "$TEST_ROOT/DockerFile.swift" \
     || fail "Expected DockerFile.swift to link Claude AGENTS.md into /home/coder/.claude"
+}
+
+test_claude_images_publish_default_onboarding_state() {
+  begin_test "Claude-capable images publish default claude.json state"
+
+  grep -Fq 'COPY --chown=coder:coder claude.json /home/coder/.claude.json' "$TEST_ROOT/DockerFile.claude" \
+    || fail "Expected DockerFile.claude to bake in /home/coder/.claude.json"
+  grep -Fq 'cp /home/coder/.claude.json /etc/agentctl/defaults/claude.json' "$TEST_ROOT/DockerFile.claude" \
+    || fail "Expected DockerFile.claude to publish claude.json defaults"
+
+  grep -Fq 'COPY --chown=root:root claude.json /tmp/claude.json' "$TEST_ROOT/DockerFile.swift" \
+    || fail "Expected DockerFile.swift to stage claude.json for Claude runtime builds"
+  grep -Fq 'cp /tmp/claude.json /home/coder/.claude.json' "$TEST_ROOT/DockerFile.swift" \
+    || fail "Expected DockerFile.swift to install claude.json for Claude runtime builds"
+  grep -Fq 'cp /tmp/claude.json /etc/agentctl/defaults/claude.json' "$TEST_ROOT/DockerFile.swift" \
+    || fail "Expected DockerFile.swift to publish claude.json defaults for Claude runtime builds"
 }
 
 test_migrate_cmd_plans_backup_and_forces_overwrite_config() {
@@ -725,6 +745,7 @@ main() {
   test_matrix_runtime_image_helpers
   test_legacy_migration_target_mapping
   test_matrix_dockerfiles_publish_runtime_metadata
+  test_claude_images_publish_default_onboarding_state
   test_migrate_cmd_plans_backup_and_forces_overwrite_config
   test_openai_auth_sync_opaque_format
   test_codex_auth_wrapper_execs_generic_script

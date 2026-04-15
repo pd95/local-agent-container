@@ -53,7 +53,8 @@ Prefer the default \`/opt/venv\` environment for Python package installs and scr
 EOF
 RUN ln -sf /etc/codexctl/image.md /etc/agentctl/image.md \
  && case "$AGENT_RUNTIME" in \
-      claude) ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md ;; \
+      claude) mkdir -p /home/coder/.claude \
+        && ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md ;; \
       *) ln -sf /etc/agentctl/image.md /home/coder/.codex/AGENTS.md ;; \
     esac
 

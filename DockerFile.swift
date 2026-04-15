@@ -23,6 +23,7 @@ COPY --chown=root:root agent-claude.sh /usr/local/bin/agent-claude.sh
 COPY --chown=root:root agent-claude.env /etc/agentctl/agent-claude.env
 COPY --chown=root:root agent-codex.sh /usr/local/bin/agent-codex.sh
 COPY --chown=root:root agent-codex.env /etc/agentctl/agent-codex.env
+COPY --chown=root:root claude.json /tmp/claude.json
 RUN case "$AGENT_RUNTIME" in \
   claude) \
     npm install -g @anthropic-ai/claude-code \
@@ -87,8 +88,10 @@ ENV PATH=/home/coder/.local/bin:$PATH
 RUN mkdir -p /home/coder/.local/bin /home/coder/.swiftly \
  && chown -R coder:coder /home/coder/.local /home/coder/.swiftly
 
-RUN mkdir -p /etc/codexctl /etc/agentctl \
+RUN mkdir -p /etc/codexctl /etc/agentctl/defaults \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
+ && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/agentctl/defaults/ \
+ && if [ "$AGENT_RUNTIME" = "claude" ]; then cp /tmp/claude.json /home/coder/.claude.json && cp /tmp/claude.json /etc/agentctl/defaults/claude.json && chown coder:coder /home/coder/.claude.json /etc/agentctl/defaults/claude.json; fi \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
 You are running inside the \`$AGENT_IMAGE_NAME\` image.

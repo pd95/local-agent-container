@@ -73,12 +73,17 @@ test_claude_runtime_contract_smoke() {
 
   run_capture "$CODEXCTL" run --name "$name" --image agent-claude --temp --workdir "$workdir" --cmd bash -lc '
     command -v claude >/dev/null &&
-    [ "$(/usr/local/bin/agent.sh home-dir)" = "/home/coder/.claude" ] &&
+    [ "$(/usr/local/bin/agent.sh home-dir)" = "/home/coder" ] &&
     [ "$(/usr/local/bin/agent.sh config-dir)" = "/home/coder/.claude" ] &&
-    [ "$(/usr/local/bin/agent.sh auth-path)" = "/home/coder/.claude/auth.json" ] &&
+    [ "$(/usr/local/bin/agent.sh auth-path)" = "/home/coder/.claude/.credentials.json" ] &&
     [ "$(/usr/local/bin/agent.sh supports openai-mode)" = "0" ] &&
     grep -Fxq "AGENT_ID=claude" /etc/agentctl/agent.env &&
-    grep -Fxq "AGENT_HOME_DIR=/home/coder/.claude" /etc/agentctl/agent.env &&
+    grep -Fxq "AGENT_HOME_DIR=/home/coder" /etc/agentctl/agent.env &&
+    grep -Fxq "AGENT_CONFIG_DIR=/home/coder/.claude" /etc/agentctl/agent.env &&
+    grep -Fxq "AGENT_AUTH_PATH=/home/coder/.claude/.credentials.json" /etc/agentctl/agent.env &&
+    grep -Fxq "AGENT_AUTH_FORMAT=opaque_blob" /etc/agentctl/agent.env &&
+    diff -q /etc/agentctl/defaults/claude.json /home/coder/.claude.json &&
+    grep -Fq "\"hasCompletedOnboarding\": true" /home/coder/.claude.json &&
     test -L /home/coder/.claude/AGENTS.md &&
     [ "$(readlink /home/coder/.claude/AGENTS.md)" = "/etc/agentctl/image.md" ] &&
     echo claude-runtime-ok
@@ -89,6 +94,44 @@ test_claude_runtime_contract_smoke() {
   if container_exists "$name"; then
     fail "Temporary Claude container still exists: $name"
   fi
+}
+
+test_claude_reset_config_restores_image_defaults() {
+  begin_test "run --reset-config restores Claude image defaults"
+  local name
+  local workdir
+
+  name="$(unique_name claude-reset-config)"
+  workdir="$(new_workdir)"
+  register_container_cleanup "$name"
+
+  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.claude && printf "{\"custom\":true}\n" >/home/coder/.claude.json && rm -f /home/coder/.claude/AGENTS.md && printf "legacy-agents\n" >/home/coder/.claude/AGENTS.md'
+  assert_status 0
+
+  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --reset-config --cmd bash -lc 'if diff -q /etc/agentctl/defaults/claude.json /home/coder/.claude.json && test -L /home/coder/.claude/AGENTS.md && [ "$(readlink /home/coder/.claude/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo claude-reset-config-ok; else exit 1; fi'
+  assert_status 0
+  assert_contains "claude-reset-config-ok"
+}
+
+test_claude_upgrade_overwrite_config_restores_image_defaults() {
+  begin_test "upgrade --overwrite-config restores Claude image defaults"
+  local name
+  local workdir
+
+  name="$(unique_name claude-overwrite-config)"
+  workdir="$(new_workdir)"
+  register_container_cleanup "$name"
+
+  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.claude && printf "{\"custom\":true}\n" >/home/coder/.claude.json && rm -f /home/coder/.claude/AGENTS.md && printf "legacy-agents\n" >/home/coder/.claude/AGENTS.md'
+  assert_status 0
+
+  run_capture "$CODEXCTL" upgrade --name "$name" --overwrite-config --no-backup
+  assert_status 0
+  assert_contains "Upgrade complete: $name (backup skipped)"
+
+  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/agentctl/defaults/claude.json /home/coder/.claude.json && test -L /home/coder/.claude/AGENTS.md && [ "$(readlink /home/coder/.claude/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo claude-overwrite-config-ok; else exit 1; fi'
+  assert_status 0
+  assert_contains "claude-overwrite-config-ok"
 }
 
 test_upgrade_no_backup_preserves_state() {
@@ -253,6 +296,8 @@ main() {
     "test_named_run_persists_until_rm|named run persists until explicit removal"
     "test_build_rebuild_stops_buildkit|build --rebuild stops buildkit after a successful build"
     "test_claude_runtime_contract_smoke|agent-claude exposes the Claude runtime contract in a real container"
+    "test_claude_reset_config_restores_image_defaults|run --reset-config restores Claude image defaults"
+    "test_claude_upgrade_overwrite_config_restores_image_defaults|upgrade --overwrite-config restores Claude image defaults"
     "test_upgrade_no_backup_preserves_state|upgrade --no-backup preserves state without creating backup images"
     "test_upgrade_with_backup_creates_recovery_image|upgrade creates a backup image by default"
     "test_upgrade_preflight_failure_keeps_container|upgrade preflight failure leaves the original container intact"
