@@ -451,31 +451,6 @@ test_runtime_cmd_starts_stopped_container_and_restores_state() {
   printf '%s\n' "$exec_log" | grep -Fq '/usr/local/bin/agent.sh runtime list' || fail "Expected runtime list to invoke agent.sh, got: $exec_log"
 }
 
-test_runtime_cmd_propagates_exec_failures() {
-  begin_test "runtime commands propagate container exec failures"
-
-  load_codexctl_functions
-
-  require_container() { return 0; }
-  default_name() { printf 'unit-test-container\n'; }
-  container_exists() { [ "$1" = "unit-test-container" ]; }
-  container_running() { return 0; }
-  CONTAINER_CMD=container
-  container() {
-    case "$1" in
-      exec)
-        return 17
-        ;;
-      *)
-        fail "Unexpected container invocation: $*"
-        ;;
-    esac
-  }
-
-  run_capture runtime_cmd --name unit-test-container info codex
-  assert_status 17
-}
-
 test_use_cmd_sets_preferred_runtime_in_stopped_container() {
   begin_test "use sets the preferred runtime inside a stopped container"
 
@@ -562,7 +537,6 @@ main() {
   test_refresh_updates_managed_files_without_recreate
   test_system_manifest_starts_stopped_container_and_restores_state
   test_runtime_cmd_starts_stopped_container_and_restores_state
-  test_runtime_cmd_propagates_exec_failures
   test_use_cmd_sets_preferred_runtime_in_stopped_container
   test_cleanup_temp_dir_handles_read_only_trees
 

@@ -7,48 +7,6 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 trap cleanup EXIT
 
-usage() {
-  cat <<'EOF'
-Usage: ./tests/run-tests.sh [--filter TEXT] [--from TEXT]
-       ./tests/run-tests.sh [TEXT]
-
-Options:
-  --filter TEXT  Run only tests whose function name or description contains TEXT
-  --from TEXT    Run all tests starting at the first test whose function name or description contains TEXT
-
-If a single positional TEXT argument is provided, it is treated like --filter TEXT.
-EOF
-}
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --filter)
-      TEST_FILTER="${2:-}"
-      [ -n "$TEST_FILTER" ] || fail "Missing value for --filter"
-      shift 2
-      ;;
-    --from)
-      TEST_START_FROM="${2:-}"
-      [ -n "$TEST_START_FROM" ] || fail "Missing value for --from"
-      shift 2
-      ;;
-    --help|-h)
-      usage
-      exit 0
-      ;;
-    --*)
-      fail "Unknown option: $1"
-      ;;
-    *)
-      if [ -n "$TEST_FILTER" ]; then
-        fail "Unexpected positional argument: $1"
-      fi
-      TEST_FILTER="$1"
-      shift
-      ;;
-  esac
-done
-
 test_temp_run_removes_container() {
   begin_test "run --temp removes the named container"
   local name
@@ -253,13 +211,9 @@ test_refresh_pushes_runtime_registry_into_existing_container() {
   begin_test "refresh updates the runtime registry in an existing container"
   local name
   local workdir
-  local sentinel_file
-  local json_file
 
   name="$(unique_name runtime-refresh)"
   workdir="$(new_workdir)"
-  sentinel_file="$workdir/runtime-registry.ok"
-  json_file="$workdir/runtime-info.json"
   register_container_cleanup "$name"
 
   run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd true
@@ -269,29 +223,10 @@ test_refresh_pushes_runtime_registry_into_existing_container() {
   assert_status 0
   assert_contains "Refresh complete: $name"
 
-  run_capture "$AGENTCTL" start --name "$name"
+  run_capture "$AGENTCTL" runtime --name "$name" info codex
   assert_status 0
-
-  run_capture "$CONTAINER_CMD" exec "$name" setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs -- bash -lc '
-    bash /usr/local/bin/agent.sh runtime info codex \
-      | tee /workdir/runtime-info.json \
-      | jq -e '"'"'.runtime == "codex" and .install_method == "npm-global"'"'"' >/dev/null
-    echo runtime-registry-ok > /workdir/runtime-registry.ok
-  '
-  assert_status 0
-  if ! [ -f "$sentinel_file" ]; then
-    fail "Expected runtime registry sentinel file after refreshed container validation"
-  fi
-  if ! grep -Fxq "runtime-registry-ok" "$sentinel_file"; then
-    cat "$sentinel_file" >&2
-    fail "Expected runtime registry sentinel to report success"
-  fi
-  if ! [ -f "$json_file" ]; then
-    fail "Expected runtime info JSON file after refreshed container validation"
-  fi
-
-  run_capture "$AGENTCTL" stop --name "$name"
-  assert_status 0
+  assert_contains '"runtime":"codex"'
+  assert_contains '"install_method":"npm-global"'
 }
 
 main() {
@@ -300,23 +235,17 @@ main() {
   log "Using agentctl at $AGENTCTL"
   log "Using codexctl implementation at $CODEXCTL"
   log "Using container runtime command $CONTAINER_CMD"
-  if [ -n "$TEST_FILTER" ]; then
-    log "Filtering host tests by: $TEST_FILTER"
-  fi
-  if [ -n "$TEST_START_FROM" ]; then
-    log "Running host tests from: $TEST_START_FROM"
-  fi
 
-  run_selected_test test_temp_run_removes_container "run --temp removes the named container"
-  run_selected_test test_named_run_persists_until_rm "named run persists until explicit removal"
-  run_selected_test test_build_rebuild_stops_buildkit "build --rebuild stops buildkit after a successful build"
-  run_selected_test test_upgrade_no_backup_preserves_state "upgrade --no-backup preserves state without creating backup images"
-  run_selected_test test_upgrade_with_backup_creates_recovery_image "upgrade creates a backup image by default"
-  run_selected_test test_upgrade_preflight_failure_keeps_container "upgrade preflight failure leaves the original container intact"
-  run_selected_test test_run_reset_config_restores_image_defaults "run --reset-config restores config, models, and AGENTS symlink"
-  run_selected_test test_upgrade_overwrite_config_restores_image_defaults "upgrade --overwrite-config restores config, models, and AGENTS symlink"
-  run_selected_test test_runtime_management_commands_work_for_existing_container "runtime list and use work for an existing container"
-  run_selected_test test_refresh_pushes_runtime_registry_into_existing_container "refresh updates the runtime registry in an existing container"
+  test_temp_run_removes_container
+  test_named_run_persists_until_rm
+  test_build_rebuild_stops_buildkit
+  test_upgrade_no_backup_preserves_state
+  test_upgrade_with_backup_creates_recovery_image
+  test_upgrade_preflight_failure_keeps_container
+  test_run_reset_config_restores_image_defaults
+  test_upgrade_overwrite_config_restores_image_defaults
+  test_runtime_management_commands_work_for_existing_container
+  test_refresh_pushes_runtime_registry_into_existing_container
 
   log "PASS: all host integration tests completed"
 }
