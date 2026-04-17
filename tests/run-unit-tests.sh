@@ -114,6 +114,25 @@ test_run_cmd_runtime_selection_prepares_runtime_before_launch() {
   [ "$captured_mem" = "4G" ] || fail "Expected Claude bootstrap run to request 4G, got: $captured_mem"
 }
 
+test_run_cmd_warns_for_legacy_office_image() {
+  begin_test "run_cmd warns when using the legacy office image"
+
+  load_codexctl_functions
+
+  local workdir
+
+  workdir="$(new_workdir)"
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  run_container() { :; }
+
+  run_capture run_cmd --name unit-test-container --workdir "$workdir" --image agent-office --shell
+  assert_status 0
+  assert_contains "legacy compatibility image"
+  assert_contains "agent-python"
+}
+
 test_run_cmd_rejects_non_codex_profile() {
   begin_test "run_cmd rejects --profile for non-codex runtimes"
 
@@ -228,6 +247,21 @@ test_sync_runtime_auth_to_container_if_available_skips_missing_keychain() {
   run_capture sync_runtime_auth_to_container_if_available unit-test-container claude
   assert_status 0
   [ "$sync_called" -eq 0 ] || fail "Did not expect runtime auth sync without keychain auth"
+}
+
+test_auth_cmd_warns_for_legacy_office_image() {
+  begin_test "auth_cmd warns when using the legacy office image"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-auth-container\n'; }
+  run_auth_flow() { :; }
+
+  run_capture auth_cmd --image agent-office
+  assert_status 0
+  assert_contains "legacy compatibility image"
+  assert_contains "agent-python"
 }
 
 test_run_help_reports_profile_default() {

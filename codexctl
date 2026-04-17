@@ -283,6 +283,26 @@ image_family_preferred() {
   esac
 }
 
+is_legacy_compat_image_family() {
+  case "$1" in
+    agent-office|codex-office) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+warn_legacy_compat_image_usage() {
+  local image="$1"
+  local family
+
+  family="${image%%:*}"
+  if ! is_legacy_compat_image_family "$family"; then
+    return 0
+  fi
+
+  warn "Image $family is a legacy compatibility image. Phase 4 keeps only agent-plain, agent-python, and agent-swift as first-class base images."
+  warn "Prefer agent-python plus runtime installation unless you are intentionally reusing an older office-focused setup."
+}
+
 image_ref_for_runtime() {
   local image="$1"
   local preferred
@@ -1153,6 +1173,7 @@ build_cmd() {
 
   if [ -n "$image" ]; then
     image="$(image_family_preferred "$image")"
+    warn_legacy_compat_image_usage "$image"
   fi
 
   require_container
@@ -2573,6 +2594,7 @@ run_cmd() {
 
   [ -n "$image" ] || image="$DEFAULT_IMAGE"
   image="$(image_ref_for_runtime "$image")"
+  warn_legacy_compat_image_usage "$image"
   if [ -z "$name" ] && [ "$temp" -eq 0 ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
   fi
@@ -2623,6 +2645,7 @@ auth_cmd() {
     name="$(default_name "$AUTH_NAME_PREFIX")"
   fi
   image="$(image_ref_for_runtime "$image")"
+  warn_legacy_compat_image_usage "$image"
   run_auth_flow "$image" "$name" "$runtime"
   if [ "$runtime" = "$OPENAI_RUNTIME_ID" ]; then
     echo "Auth updated. Restart any running --openai containers to pick up the new token." >&2
@@ -2691,6 +2714,7 @@ upgrade_cmd() {
 
   [ -n "$image" ] || image="$current_image"
   image="$(image_ref_for_runtime "$image")"
+  warn_legacy_compat_image_usage "$image"
   [ -n "$cpu" ] || cpu="$current_cpu"
   [ -n "$mem" ] || mem="$current_mem"
   image_exists "$image" || die "Image not found: $image"
