@@ -456,6 +456,39 @@ test_bootstrap_can_create_and_bootstrap_new_alpine_container() {
   printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .capabilities.install == true' >/dev/null || fail "Expected feature info JSON for office after create+bootstrap, got: $RUN_OUTPUT"
 }
 
+test_bootstrap_works_on_existing_debian_container() {
+  begin_test "bootstrap works on an existing Debian container"
+  local name
+
+  name="$(unique_name bootstrap-debian)"
+  register_raw_container_cleanup "$name"
+
+  run_capture "$CONTAINER_CMD" create --name "$name" docker.io/library/debian:stable-slim sleep infinity
+  assert_status 0
+
+  run_capture "$CONTAINER_CMD" start "$name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" bootstrap --name "$name"
+  assert_status 0
+  assert_contains "Bootstrap complete: $name"
+
+  run_capture "$AGENTCTL" runtime --name "$name" info codex
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "npm-global"' >/dev/null || fail "Expected runtime info JSON for codex after Debian bootstrap, got: $RUN_OUTPUT"
+
+  run_capture "$AGENTCTL" feature --name "$name" info office
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .capabilities.install == true and .installed == false' >/dev/null || fail "Expected feature info JSON for office after Debian bootstrap, got: $RUN_OUTPUT"
+
+  run_capture "$AGENTCTL" refresh --name "$name"
+  assert_status 0
+  assert_contains "Refresh complete: $name"
+
+  run_capture "$CONTAINER_CMD" exec "$name" sh -lc 'test -f /etc/agentctl/bootstrap.json && test -x /usr/local/bin/agent.sh && test -f /etc/agentctl/runtimes.d/codex.json && test -f /etc/agentctl/features.d/office.json'
+  assert_status 0
+}
+
 main() {
   require_host_prereqs
 
@@ -484,6 +517,7 @@ main() {
   run_selected_test test_feature_office_install_works_on_agent_python "feature install office works on agent-python" full
   run_selected_test test_bootstrap_works_on_existing_alpine_container "bootstrap works on an existing Alpine container" full
   run_selected_test test_bootstrap_can_create_and_bootstrap_new_alpine_container "bootstrap can create and bootstrap a new Alpine container" full
+  run_selected_test test_bootstrap_works_on_existing_debian_container "bootstrap works on an existing Debian container" full
   assert_selected_tests_ran
 
   log "PASS: all host integration tests completed"

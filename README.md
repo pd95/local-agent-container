@@ -149,11 +149,14 @@ agentctl feature list
 agentctl feature info office
 agentctl feature install office
 
-# Bootstrap agentctl into an existing compatible Alpine container
+# Bootstrap agentctl into an existing compatible Alpine or Debian/Ubuntu container
 agentctl bootstrap --name existing-devbox
 
 # Create and bootstrap a new Alpine-based container from a custom image
 agentctl bootstrap --name my-alpine-devbox --image docker.io/library/alpine:latest
+
+# Bootstrap an existing Debian/Ubuntu-style container
+agentctl bootstrap --name existing-swift-devbox
 
 # Recreate a container from the latest image while preserving config
 agentctl refresh
@@ -194,7 +197,7 @@ agentctl run --cmd bash
 - `agentctl runtime update claude` now runs `claude update`.
 - `agentctl runtime reset-config claude` restores a default `~/.claude/settings.json` with `USE_BUILTIN_RIPGREP=0`.
 - `agentctl feature list`, `agentctl feature info office`, and `agentctl feature install office` now expose the first real feature-pack flow. The initial `office` feature targets `agent-python` and installs the core document/PDF/spreadsheet/OCR tooling that previously required `agent-office`.
-- `agentctl bootstrap --name <container>` is the first bring-your-own-base path. The current slice is intentionally narrow: it supports Alpine-based containers only, can either bootstrap an existing container or create one first via `--image`, installs the current managed control surface into it, and then lets you use `agentctl runtime ...`, `agentctl feature ...`, and `agentctl refresh` against that container afterward.
+- `agentctl bootstrap --name <container>` is the first bring-your-own-base path. The current slice is intentionally narrow: it supports Alpine and Debian/Ubuntu-style containers, can either bootstrap an existing container or create one first via `--image`, installs the current managed control surface into it, and then lets you use `agentctl runtime ...`, `agentctl feature ...`, and `agentctl refresh` against that container afterward.
 - refreshed and rebuilt containers now ship `/etc/profile.d/agentctl-path.sh`, so bash login shells prepend `~/.local/bin` to `PATH` and native Claude installs are available as `claude` without manual shell edits.
 - `agentctl use codex` updates the container-local preferred runtime without changing the default image selection used by `agentctl run`.
 - `agentctl run` is now runtime-neutral at the host layer. Codex still starts with its default `--cd /workdir` behavior, but that default now lives in the Codex runtime adapter instead of being forced on every runtime.
@@ -253,7 +256,7 @@ agentctl auth            # run codex device-auth and store it in Keychain
 agentctl auth --runtime codex  # explicit equivalent of the default auth flow
 agentctl auth --runtime claude  # install/login Claude in a temp auth container and store credentials in Keychain
 agentctl run --runtime claude --install-runtime  # bootstrap and launch Claude in one command
-agentctl bootstrap --name existing-devbox  # bootstrap agentctl into an existing Alpine container
+agentctl bootstrap --name existing-devbox  # bootstrap agentctl into an existing Alpine or Debian/Ubuntu container
 agentctl bootstrap --name my-alpine-devbox --image docker.io/library/alpine:latest  # create and bootstrap a custom Alpine container
 agentctl runtime list    # list installed runtimes in the current container
 agentctl runtime info codex  # inspect manifest-backed runtime metadata
