@@ -1,14 +1,10 @@
-# Agentctl on Mac
+# Local agent container on your Mac
 
 >
-> **Run Agentctl AI locally on macOS, powered by Ollama**
+> **Run agent CLIs locally on macOS, powered by Ollama**
 >
 
 This repository combines multiple open-source tools to run an agentic AI safely and privately on a Mac.
-
-Phase 1 presents `agentctl` as the primary CLI. The current branch still carries the
-older `codexctl` implementation name in some places, but the docs now treat that as a
-transition detail rather than the preferred interface.
 
 It runs OpenAI's [Codex CLI](https://github.com/openai/codex) on your Mac using Apple's Containerization tool, connecting to the locally running Ollama instance.
 
