@@ -5,6 +5,7 @@ TEST_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 AGENTCTL="${AGENTCTL:-$TEST_ROOT/agentctl}"
 CODEXCTL="${CODEXCTL:-$TEST_ROOT/codexctl}"
 CONTAINER_CMD="${CONTAINER_CMD:-container}"
+TEST_FILTER="${TEST_FILTER:-}"
 
 TEST_STATUS=0
 RUN_STATUS=0
@@ -117,6 +118,14 @@ assert_not_contains() {
   fi
 }
 
+assert_matches() {
+  local pattern="$1"
+  if ! printf '%s' "$RUN_OUTPUT" | grep -Eq -- "$pattern"; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    fail "Expected output to match regex: $pattern"
+  fi
+}
+
 extract_backup_image() {
   printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^Upgrade complete: .* (backup image: \(.*\))$/\1/p' | tail -n 1
 }
@@ -153,4 +162,27 @@ begin_test() {
     rm -f "$RUN_LOG" >/dev/null 2>&1 || true
   fi
   RUN_LOG=""
+}
+
+test_matches_filter() {
+  local name="$1"
+  local description="$2"
+
+  if [ -z "$TEST_FILTER" ]; then
+    return 0
+  fi
+
+  case "$name"$'\n'"$description" in
+    *"$TEST_FILTER"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+run_selected_test() {
+  local name="$1"
+  local description="$2"
+
+  if test_matches_filter "$name" "$description"; then
+    "$name"
+  fi
 }

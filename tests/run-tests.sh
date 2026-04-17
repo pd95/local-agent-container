@@ -7,6 +7,13 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 
 trap cleanup EXIT
 
+if [ $# -gt 1 ]; then
+  fail "Usage: $0 [TEST_FILTER]"
+fi
+if [ $# -eq 1 ]; then
+  TEST_FILTER="$1"
+fi
+
 test_temp_run_removes_container() {
   begin_test "run --temp removes the named container"
   local name
@@ -225,8 +232,8 @@ test_refresh_pushes_runtime_registry_into_existing_container() {
 
   run_capture "$AGENTCTL" runtime --name "$name" info codex
   assert_status 0
-  assert_contains '"runtime":"codex"'
-  assert_contains '"install_method":"npm-global"'
+  assert_matches '"runtime"[[:space:]]*:[[:space:]]*"codex"'
+  assert_matches '"install_method"[[:space:]]*:[[:space:]]*"npm-global"'
 }
 
 main() {
@@ -235,17 +242,20 @@ main() {
   log "Using agentctl at $AGENTCTL"
   log "Using codexctl implementation at $CODEXCTL"
   log "Using container runtime command $CONTAINER_CMD"
+  if [ -n "$TEST_FILTER" ]; then
+    log "Filtering host tests by: $TEST_FILTER"
+  fi
 
-  test_temp_run_removes_container
-  test_named_run_persists_until_rm
-  test_build_rebuild_stops_buildkit
-  test_upgrade_no_backup_preserves_state
-  test_upgrade_with_backup_creates_recovery_image
-  test_upgrade_preflight_failure_keeps_container
-  test_run_reset_config_restores_image_defaults
-  test_upgrade_overwrite_config_restores_image_defaults
-  test_runtime_management_commands_work_for_existing_container
-  test_refresh_pushes_runtime_registry_into_existing_container
+  run_selected_test test_temp_run_removes_container "run --temp removes the named container"
+  run_selected_test test_named_run_persists_until_rm "named run persists until explicit removal"
+  run_selected_test test_build_rebuild_stops_buildkit "build --rebuild stops buildkit after a successful build"
+  run_selected_test test_upgrade_no_backup_preserves_state "upgrade --no-backup preserves state without creating backup images"
+  run_selected_test test_upgrade_with_backup_creates_recovery_image "upgrade creates a backup image by default"
+  run_selected_test test_upgrade_preflight_failure_keeps_container "upgrade preflight failure leaves the original container intact"
+  run_selected_test test_run_reset_config_restores_image_defaults "run --reset-config restores config, models, and AGENTS symlink"
+  run_selected_test test_upgrade_overwrite_config_restores_image_defaults "upgrade --overwrite-config restores config, models, and AGENTS symlink"
+  run_selected_test test_runtime_management_commands_work_for_existing_container "runtime list and use work for an existing container"
+  run_selected_test test_refresh_pushes_runtime_registry_into_existing_container "refresh updates the runtime registry in an existing container"
 
   log "PASS: all host integration tests completed"
 }
