@@ -571,11 +571,17 @@ usage_bootstrap() {
 Usage: $CLI_NAME bootstrap [options]
 
 Options:
-  --name NAME  Existing container name to bootstrap (default: agent-<dir>)
+  --name NAME     Container name to bootstrap (default: agent-<dir>)
+  --image IMAGE   Create the container from IMAGE first if it does not exist
+  --workdir PATH  Host directory to mount at /workdir when creating a container
+  --cpu NUM       CPU cores for a newly created bootstrap container
+  --mem SIZE      Memory limit for a newly created bootstrap container
 
-The first bootstrap slice supports existing Alpine-based containers only.
+The first bootstrap slice supports Alpine-based containers only.
 It installs the current managed control surface into the container so that
-\`runtime\`, \`feature\`, and \`refresh\` flows can work there afterward.
+\`runtime\`, \`feature\`, and \`refresh\` flows can work there afterward. If
+you pass \`--image\` and the named container does not yet exist, agentctl will
+create it first and then bootstrap it in place.
 EOF
 }
 
@@ -1938,7 +1944,8 @@ EOF
       adduser -S -G coder -h /home/coder -s /bin/bash coder >/dev/null
     fi
     mkdir -p /home/coder/.codex /workdir /etc/codexctl /etc/claudectl /etc/agentctl /var/lib/agentctl
-    chown -R coder:coder /home/coder /workdir
+    chown -R coder:coder /home/coder
+    chown coder:coder /workdir >/dev/null 2>&1 || true
   '
 
   refresh_container_file "$name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
@@ -1970,13 +1977,22 @@ JSON
 
 bootstrap_cmd() {
   local name=""
+  local image=""
+  local workdir=""
+  local cpu=""
+  local mem=""
   local was_running=0
   local started_for_bootstrap=0
+  local created_for_bootstrap=0
   local package_manager=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
+      --image) image="$2"; shift 2 ;;
+      --workdir) workdir="$2"; shift 2 ;;
+      --cpu) cpu="$2"; shift 2 ;;
+      --mem) mem="$2"; shift 2 ;;
       --help) usage_bootstrap; return 0 ;;
       *) die "Unknown option for bootstrap: $1" ;;
     esac
@@ -1984,10 +2000,41 @@ bootstrap_cmd() {
 
   require_container
   if [ -z "$name" ]; then
-    name="$(default_name "$DEFAULT_NAME_PREFIX")"
+    if [ -z "$workdir" ]; then
+      name="$(default_name "$DEFAULT_NAME_PREFIX")"
+    else
+      name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
+    fi
   fi
-  if ! container_exists "$name"; then
-    die "Container not found: $name"
+
+  if [ -n "$workdir" ]; then
+    [ -d "$workdir" ] || die "Workdir not found: $workdir"
+    workdir="$(CDPATH= cd -- "$workdir" && pwd)"
+  else
+    workdir="$PWD"
+  fi
+
+  if container_exists "$name"; then
+    if [ -n "$image" ] || [ -n "$cpu" ] || [ -n "$mem" ]; then
+      die "--image, --cpu, and --mem only apply when bootstrap creates a new container"
+    fi
+  else
+    [ -n "$image" ] || die "Container not found: $name (pass --image to create and bootstrap a new container)"
+    echo "Creating bootstrap container..." >&2
+    local create_cmd=("$CONTAINER_CMD" create -t)
+    if [ -n "$cpu" ]; then
+      create_cmd+=(-c "$cpu")
+    fi
+    if [ -n "$mem" ]; then
+      create_cmd+=(-m "$mem")
+    fi
+    create_cmd+=(
+      --name "$name"
+      --mount "type=bind,src=$workdir,dst=/workdir"
+      "$image" sh -c 'sleep infinity'
+    )
+    "${create_cmd[@]}"
+    created_for_bootstrap=1
   fi
 
   if container_running "$name"; then
@@ -2012,6 +2059,9 @@ bootstrap_cmd() {
 
   if [ "$started_for_bootstrap" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     "$CONTAINER_CMD" stop "$name" >/dev/null
+  fi
+  if [ "$created_for_bootstrap" -eq 1 ]; then
+    echo "Bootstrap container ready: $name" >&2
   fi
   echo "Bootstrap complete: $name" >&2
 }

@@ -369,6 +369,69 @@ test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state() {
   printf '%s\n' "$exec_log" | grep -Fq "file:/etc/agentctl/image.md" || fail "Expected bootstrap to install image metadata"
 }
 
+test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
+  begin_test "bootstrap_cmd can create and bootstrap a new Alpine container"
+
+  load_codexctl_functions
+
+  local start_calls=0
+  local stop_calls=0
+  local create_log=""
+  local exec_log=""
+  local workdir
+
+  workdir="$(new_workdir)"
+
+  require_container() { return 0; }
+  container_exists() { return 1; }
+  container_running() { return 1; }
+  refresh_container_file() { exec_log="${exec_log}file:$3"$'\n'; }
+  refresh_container_tree() { exec_log="${exec_log}tree:$3"$'\n'; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create)
+        shift
+        create_log="$(printf '%s ' "$@")"
+        ;;
+      start)
+        start_calls=$((start_calls + 1))
+        ;;
+      stop)
+        stop_calls=$((stop_calls + 1))
+        ;;
+      exec)
+        shift
+        if [ "${1:-}" = "-u" ]; then
+          shift 2
+        fi
+        if [ "${1:-}" = "unit-bootstrap-container" ]; then
+          shift
+        fi
+        exec_log="${exec_log}exec:$(printf '%s ' "$@")"$'\n'
+        if [ "$*" = "sh -lc if command -v apk >/dev/null 2>&1; then echo apk; else echo unsupported; fi" ]; then
+          printf 'apk\n'
+        fi
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture bootstrap_cmd --name unit-bootstrap-container --image docker.io/library/alpine:latest --workdir "$workdir" --cpu 2 --mem 3G
+  assert_status 0
+  assert_contains "Bootstrap container ready: unit-bootstrap-container"
+  assert_contains "Bootstrap complete: unit-bootstrap-container"
+  [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
+  [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
+  printf '%s\n' "$create_log" | grep -Fq -- "--name unit-bootstrap-container" || fail "Expected create to include container name"
+  printf '%s\n' "$create_log" | grep -Fq -- "--mount type=bind,src=$workdir,dst=/workdir" || fail "Expected create to include workdir mount"
+  printf '%s\n' "$create_log" | grep -Fq -- "-c 2 -m 3G" || fail "Expected create to include cpu/mem settings"
+  printf '%s\n' "$create_log" | grep -Fq -- "docker.io/library/alpine:latest sh -c sleep infinity" || fail "Expected create to use requested image"
+  printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
+}
+
 test_bootstrap_cmd_rejects_unsupported_base() {
   begin_test "bootstrap_cmd rejects unsupported container bases"
 
@@ -442,7 +505,8 @@ test_bootstrap_help_reports_new_command() {
   run_capture "$AGENTCTL" bootstrap --help
   assert_status 0
   assert_contains "Usage: agentctl bootstrap [options]"
-  assert_contains "existing Alpine-based containers only"
+  assert_contains "--image IMAGE   Create the container from IMAGE first if it does not exist"
+  assert_contains "supports Alpine-based containers only"
 }
 
 test_system_manifest_help_reports_new_command() {
@@ -2084,6 +2148,7 @@ main() {
   test_auth_cmd_warns_for_legacy_office_image
   test_feature_cmd_installs_via_root_helper
   test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state
+  test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container
   test_bootstrap_cmd_rejects_unsupported_base
   test_agentctl_wrapper_usage_banner
   test_refresh_help_reports_new_command

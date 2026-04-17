@@ -426,6 +426,36 @@ test_bootstrap_works_on_existing_alpine_container() {
   assert_status 0
 }
 
+test_bootstrap_can_create_and_bootstrap_new_alpine_container() {
+  begin_test "bootstrap can create and bootstrap a new Alpine container"
+  local name
+  local workdir
+
+  name="$(unique_name bootstrap-create)"
+  workdir="$(new_workdir)"
+  register_raw_container_cleanup "$name"
+
+  run_capture "$AGENTCTL" bootstrap --name "$name" --image docker.io/library/alpine:latest --workdir "$workdir"
+  assert_status 0
+  assert_contains "Bootstrap container ready: $name"
+  assert_contains "Bootstrap complete: $name"
+
+  if ! container_exists "$name"; then
+    fail "Expected bootstrap-created container to exist: $name"
+  fi
+  if container_running "$name"; then
+    fail "Expected bootstrap-created container to be stopped after bootstrap: $name"
+  fi
+
+  run_capture "$AGENTCTL" runtime --name "$name" info codex
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "npm-global"' >/dev/null || fail "Expected runtime info JSON for codex after create+bootstrap, got: $RUN_OUTPUT"
+
+  run_capture "$AGENTCTL" feature --name "$name" info office
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .capabilities.install == true' >/dev/null || fail "Expected feature info JSON for office after create+bootstrap, got: $RUN_OUTPUT"
+}
+
 main() {
   require_host_prereqs
 
@@ -453,6 +483,7 @@ main() {
   run_selected_test test_runtime_info_claude_works_after_refresh_on_stopped_container "runtime info claude works after refresh when the container is stopped" smoke
   run_selected_test test_feature_office_install_works_on_agent_python "feature install office works on agent-python" full
   run_selected_test test_bootstrap_works_on_existing_alpine_container "bootstrap works on an existing Alpine container" full
+  run_selected_test test_bootstrap_can_create_and_bootstrap_new_alpine_container "bootstrap can create and bootstrap a new Alpine container" full
   assert_selected_tests_ran
 
   log "PASS: all host integration tests completed"
