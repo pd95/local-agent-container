@@ -1655,7 +1655,7 @@ refresh_cmd() {
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
   if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -x /usr/local/bin/agent.sh; then
-    "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" /usr/local/bin/agent.sh refresh >/dev/null 2>&1 || true
+    "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh refresh >/dev/null 2>&1 || true
   fi
 
   if [ "$started_for_refresh" -eq 1 ] && [ "$was_running" -eq 0 ]; then
@@ -1683,7 +1683,7 @@ run_agent_sh_in_container() {
     started_for_command=1
   fi
 
-  if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" /usr/local/bin/agent.sh "$@"; then
+  if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh "$@"; then
     status=$?
   fi
 
@@ -1795,7 +1795,7 @@ system_manifest_cmd() {
     started_for_manifest=1
   fi
 
-  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" /usr/local/bin/agent.sh system manifest
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh system manifest
 
   if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     "$CONTAINER_CMD" stop "$name" >/dev/null
@@ -1926,13 +1926,13 @@ run_mode() {
   local pre_exec=""
   local post_exec=""
   local runtime_mode="local-model"
-  local cmd=("$DEFAULT_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_DEFAULT_PROFILE=\$2 exec /usr/local/bin/agent.sh run --cd /workdir" sh "$runtime_mode" "$profile")
+  local cmd=("$DEFAULT_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_DEFAULT_PROFILE=\$2 exec bash /usr/local/bin/agent.sh run --cd /workdir" sh "$runtime_mode" "$profile")
 
   if [ "$openai" -eq 1 ]; then
     runtime_mode="openai"
     pre_exec="openai_pre_exec"
     post_exec="openai_post_exec"
-    cmd=("$DEFAULT_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_DEFAULT_PROFILE=\$2 exec /usr/local/bin/agent.sh run --cd /workdir" sh "$runtime_mode" "$profile")
+    cmd=("$DEFAULT_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_DEFAULT_PROFILE=\$2 exec bash /usr/local/bin/agent.sh run --cd /workdir" sh "$runtime_mode" "$profile")
     if [ "$auth" -eq 1 ] || ! ensure_keychain; then
       run_auth_flow "$image" "$(default_name "$AUTH_NAME_PREFIX")"
     fi
