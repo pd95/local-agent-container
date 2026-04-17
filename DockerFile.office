@@ -1,4 +1,4 @@
-FROM codex-python
+FROM agent-python
 
 USER root
 
@@ -32,10 +32,11 @@ RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir \
     python-docx python-pptx xlrd pdfplumber \
  && chown -R coder:coder "$VIRTUAL_ENV"
 
-RUN mkdir -p /etc/codexctl \
+RUN mkdir -p /etc/codexctl /etc/agentctl \
+ && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
-You are running inside the \`codex-office\` image.
+You are running inside the \`agent-office\` image.
 
 Environment:
 - containerized Alpine Linux (package manager \`apk\`)
@@ -44,7 +45,7 @@ Environment:
 - architecture: check with \`uname -m\` if needed
 
 Image metadata:
-- image: \`codex-office\`
+- image: \`agent-office\`
 - built_at_utc: \`${BUILD_TIME}\`
 
 Built-in CLI tools:
@@ -59,6 +60,7 @@ Programming environments and major libraries:
 
 Use this image for document conversion, PDF analysis, spreadsheet work, OCR, and report generation.
 EOF
+RUN ln -sf /etc/codexctl/image.md /etc/agentctl/image.md
 RUN ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
 
 USER coder

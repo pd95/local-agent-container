@@ -1,0 +1,37 @@
+{
+  "id": "codex",
+  "command": "codex",
+  "install_method": "npm-global",
+  "default_config_dir": "/etc/codexctl",
+  "capabilities": {
+    "install": true,
+    "update": true,
+    "reset_config": true,
+    "auth_login": true,
+    "auth_read": true,
+    "auth_write": true,
+    "local_model_mode": true,
+    "openai_mode": true
+  },
+  "auth_formats": [
+    "json_refresh_token"
+  ],
+  "commands": [
+    "help",
+    "run",
+    "version",
+    "refresh",
+    "runtime list",
+    "preferred get",
+    "preferred set codex",
+    "runtime info codex",
+    "runtime capabilities codex",
+    "runtime install codex",
+    "runtime update codex",
+    "runtime reset-config codex",
+    "auth login codex",
+    "auth read codex json_refresh_token",
+    "auth write codex json_refresh_token",
+    "system manifest"
+  ]
+}

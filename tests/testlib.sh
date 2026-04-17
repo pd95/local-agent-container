@@ -2,8 +2,14 @@
 set -euo pipefail
 
 TEST_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+AGENTCTL="${AGENTCTL:-$TEST_ROOT/agentctl}"
 CODEXCTL="${CODEXCTL:-$TEST_ROOT/codexctl}"
 CONTAINER_CMD="${CONTAINER_CMD:-container}"
+TEST_FILTER="${TEST_FILTER:-}"
+TEST_START_FROM="${TEST_START_FROM:-}"
+TEST_TIER="${TEST_TIER:-smoke}"
+TEST_START_ACTIVE=0
+TESTS_RUN=0
 
 TEST_STATUS=0
 RUN_STATUS=0
@@ -24,6 +30,7 @@ fail() {
 }
 
 require_host_prereqs() {
+  command -v "$AGENTCTL" >/dev/null 2>&1 || fail "Missing agentctl: $AGENTCTL"
   command -v "$CODEXCTL" >/dev/null 2>&1 || fail "Missing codexctl: $CODEXCTL"
   command -v "$CONTAINER_CMD" >/dev/null 2>&1 || fail "Missing container runtime command: $CONTAINER_CMD"
   if [ "$(uname -s)" != "Darwin" ]; then
@@ -33,7 +40,7 @@ require_host_prereqs() {
 
 unique_name() {
   local suffix="$1"
-  printf 'codexctl-test-%s-%s-%s' "$suffix" "$(date -u +%Y%m%d%H%M%S)" "$$"
+  printf 'agentctl-test-%s-%s-%s' "$suffix" "$(date -u +%Y%m%d%H%M%S)" "$$"
 }
 
 new_workdir() {
@@ -71,12 +78,16 @@ container_exists() {
   "$CONTAINER_CMD" ls -a 2>/dev/null | grep -q -E "(^|[[:space:]])$1([[:space:]]|$)"
 }
 
+container_running() {
+  "$CONTAINER_CMD" ls 2>/dev/null | grep -q -E "(^|[[:space:]])$1([[:space:]]|$)"
+}
+
 image_exists() {
   "$CONTAINER_CMD" image inspect "$1" >/dev/null 2>&1
 }
 
 list_backup_images() {
-  "$CODEXCTL" images --backup --image "$1" 2>/dev/null || true
+  "$AGENTCTL" images --backup --image "$1" 2>/dev/null || true
 }
 
 run_capture() {
@@ -115,6 +126,14 @@ assert_not_contains() {
   fi
 }
 
+assert_matches() {
+  local pattern="$1"
+  if ! printf '%s' "$RUN_OUTPUT" | grep -Eq -- "$pattern"; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    fail "Expected output to match regex: $pattern"
+  fi
+}
+
 extract_backup_image() {
   printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^Upgrade complete: .* (backup image: \(.*\))$/\1/p' | tail -n 1
 }
@@ -125,12 +144,12 @@ cleanup() {
   local path
 
   for image_ref in $CLEANUP_BACKUP_IMAGES; do
-    "$CODEXCTL" images prune --backup --image "$image_ref" --keep 0 >/dev/null 2>&1 || true
+    "$AGENTCTL" images prune --backup --image "$image_ref" --keep 0 >/dev/null 2>&1 || true
   done
 
   for name in $CLEANUP_CONTAINERS; do
     if container_exists "$name"; then
-      "$CODEXCTL" rm --name "$name" >/dev/null 2>&1 || true
+      "$AGENTCTL" rm --name "$name" >/dev/null 2>&1 || true
     fi
   done
 
@@ -151,4 +170,81 @@ begin_test() {
     rm -f "$RUN_LOG" >/dev/null 2>&1 || true
   fi
   RUN_LOG=""
+}
+
+test_matches_filter() {
+  local name="$1"
+  local description="$2"
+
+  if [ -z "$TEST_FILTER" ]; then
+    return 0
+  fi
+
+  case "$name"$'\n'"$description" in
+    *"$TEST_FILTER"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+test_matches_start_from() {
+  local name="$1"
+  local description="$2"
+
+  if [ -z "$TEST_START_FROM" ]; then
+    return 0
+  fi
+  if [ "$TEST_START_ACTIVE" -eq 1 ]; then
+    return 0
+  fi
+
+  case "$name"$'\n'"$description" in
+    *"$TEST_START_FROM"*)
+      TEST_START_ACTIVE=1
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+run_selected_test() {
+  local name="$1"
+  local description="$2"
+  local tier="${3:-smoke}"
+  local start_seconds
+  local elapsed_seconds
+
+  test_matches_start_from "$name" "$description" || return 0
+  test_matches_filter "$name" "$description" || return 0
+  case "$TEST_TIER" in
+    full) ;;
+    smoke)
+      [ "$tier" = "smoke" ] || return 0
+      ;;
+    *)
+      fail "Unknown test tier: $TEST_TIER"
+      ;;
+  esac
+
+  TESTS_RUN=$((TESTS_RUN + 1))
+  start_seconds=$SECONDS
+  "$name"
+  elapsed_seconds=$((SECONDS - start_seconds))
+  log "Completed in ${elapsed_seconds}s: $description"
+}
+
+assert_selected_tests_ran() {
+  if [ "$TESTS_RUN" -eq 0 ]; then
+    if [ -n "$TEST_FILTER" ] && [ -n "$TEST_START_FROM" ]; then
+      fail "No tests matched --from \"$TEST_START_FROM\" with filter \"$TEST_FILTER\""
+    fi
+    if [ -n "$TEST_FILTER" ]; then
+      fail "No tests matched filter: $TEST_FILTER"
+    fi
+    if [ -n "$TEST_START_FROM" ]; then
+      fail "No tests matched --from: $TEST_START_FROM"
+    fi
+    fail "No tests were executed"
+  fi
 }

@@ -1,10 +1,14 @@
-# Local Codex on Mac
+# Agentctl on Mac
 
 >
-> **Run Codex AI locally on macOS, powered by Ollama**
+> **Run Agentctl AI locally on macOS, powered by Ollama**
 >
 
 This repository combines multiple open-source tools to run an agentic AI safely and privately on a Mac.
+
+Phase 1 presents `agentctl` as the primary CLI. The current branch still carries the
+older `codexctl` implementation name in some places, but the docs now treat that as a
+transition detail rather than the preferred interface.
 
 It runs OpenAI's [Codex CLI](https://github.com/openai/codex) on your Mac using Apple's Containerization tool, connecting to the locally running Ollama instance.
 
@@ -41,7 +45,7 @@ container system start
 
 ## Local model connectivity
 
-The default `config.toml` in these images points Codex at Ollama on `http://192.168.64.1:11434/v1`. On many Apple container setups that is the host-side address visible from the container, but the actual gateway can differ. A plain default Ollama setup only listens on `localhost`, so `codexctl run` will not be able to reach it until you expose or proxy the service onto the host address visible from the container network.
+The default `config.toml` in these images points Codex at Ollama on `http://192.168.64.1:11434/v1`. On many Apple container setups that is the host-side address visible from the container, but the actual gateway can differ. A plain default Ollama setup only listens on `localhost`, so `agentctl run` will not be able to reach it until you expose or proxy the service onto the host address visible from the container network.
 
 Before your first local-model run, choose one of the network setups described in [Network configuration](#network-configuration):
 
@@ -57,19 +61,24 @@ curl -fsS http://192.168.64.1:11434/api/version
 
 That command should return a short JSON object with Ollama's version. If it fails, fix the network path first; otherwise Codex inside the container will fail to reach Ollama.
 
-`codexctl run` performs a local-mode preflight only when starting the default Codex command. If the configured Ollama endpoint is unreachable, it checks the container's detected host gateway and prints an actionable error when the config points at the wrong address or Ollama is not exposed on that gateway. `--cmd` and `--shell` skip this check.
+`agentctl run` performs a local-mode preflight only when starting the default Codex command. If the configured Ollama endpoint is unreachable, it checks the container's detected host gateway and prints an actionable error when the config points at the wrong address or Ollama is not exposed on that gateway. `--cmd` and `--shell` skip this check.
 
-## Use `codexctl` (recommended)
+## Use `agentctl` (recommended)
 
-`codexctl` is the entry point for running Codex containers. It wraps the Apple `container` CLI, handles naming, and automates OpenAI device-auth when requested.
+`agentctl` is the entry point for running containers. It wraps the Apple `container` CLI,
+handles naming, and automates OpenAI device-auth when requested. The current branch still
+uses `codexctl` as the underlying implementation binary, so some transition wording may
+remain visible in command output.
 
 The basic idea is to start a container in the directory where your sources and/or documents are located. The container ensures that `codex` can only access files in the current directory tree (this directory and its subdirectories), but still the container contains many development tools `codex` needs to be useful/efficient in its work.
 
-By installing `codexctl` somewhere in your system PATH (e.g. /usr/local/bin/ or better privately in ~/bin/), you can run a codex container in any directory you currently work, as easy as running `codexctl run`.
+By installing `agentctl` somewhere in your system PATH (e.g. `/usr/local/bin/` or better
+privately in `~/bin/`), you can run a container in any directory you currently work, as
+easy as running `agentctl run`.
 
 ```bash
-chmod 700 codexctl                            # restrict it to your user
-sudo ln -s "$PWD/codexctl" /usr/local/bin/    # link it to system directory
+chmod 700 agentctl                            # restrict it to your user
+sudo ln -s "$PWD/agentctl" /usr/local/bin/    # link it to system directory
 ```
 
 ## Testing
@@ -80,98 +89,121 @@ Run the host integration suite from the repository root on macOS:
 bash tests/run-tests.sh
 ```
 
-These tests are black-box checks around `codexctl` and Apple's `container` CLI. They must
-run on the host, not inside a Codex container. For broader manual coverage, see
+These tests are black-box checks around `agentctl` and Apple's `container` CLI. They must
+run on the host, not inside a container. For broader manual coverage, see
 `TESTING.md`.
 
 ### Quick start
 
 ```bash
 # Build images once
-codexctl build
+agentctl build
 
 # Snapshot current images without rebuilding
-codexctl build --snapshot
+agentctl build --snapshot
 
-# Run Codex for the current directory (persistent by default)
-codexctl run
+# Run the current directory (persistent by default)
+agentctl run
 
 # Run Codex with the Gemma or qwen profile from config.toml
-codexctl run --profile gemma
-codexctl run --profile qwen
+agentctl run --profile gemma
+agentctl run --profile qwen
 
 # Run Codex for a specific directory
-codexctl run --workdir /path/to/project
+agentctl run --workdir /path/to/project
 
 # Run with a specific image
-codexctl run --image codex-office
+agentctl run --image agent-office
 
 # Run a specific historical build
-codexctl run --image codex:20260313-154500
+agentctl run --image agent-plain:20260313-154500
+
+# Create or reuse a container, install Claude if needed, set it preferred, and launch it
+agentctl run --runtime claude --install-runtime
 
 # Read-only workdir mount
-codexctl run --read-only
+agentctl run --read-only
 
 # Throwaway session (container is deleted when codex is quit)
-codexctl run --temp
+agentctl run --temp
 
 # OpenAI mode (auto-auth if needed)
-codexctl run --openai
+agentctl run --openai
 
 # Update codex package in the running container
-codexctl run --update
+agentctl run --update
+
+# List or inspect runtimes in an existing container
+agentctl runtime list
+agentctl runtime info codex
+
+# Install or select the preferred runtime in an existing container
+agentctl runtime install codex
+agentctl use codex
 
 # Recreate a container from the latest image while preserving config
-codexctl upgrade
+agentctl refresh
 
 # List stable tags, timestamped snapshots, and backup images (like upgrade backups)
-codexctl images
+agentctl images
 
 # Prune old snapshot tags by family while keeping one newest (dry-run)
-codexctl images prune --keep 1 --dry-run
+agentctl images prune --keep 1 --dry-run
 
 # Remove a custom image family entirely, including its stable tag and snapshots
-codexctl images rm --image codex-custom --dry-run
+agentctl images rm --image agent-custom --dry-run
 
 # Start a shell inside the container
-codexctl run --shell
+agentctl run --shell
 
 # Run a custom command (must be last)
-codexctl run --cmd bash
+agentctl run --cmd bash
 ```
 
 #### Quick start notes
 
-- Builds create stable local image tags and also add immutable UTC snapshot tags such as `codex:20260313-154500`. By default `codexctl build` discovers local `DockerFile*` definitions in the repo, resolves local `FROM codex...` dependencies, and builds them in dependency order. Use `codexctl build --snapshot` to add fresh timestamp tags to the current images without rebuilding them.
-- Local-model runs use a Codex profile from `config.toml`. The default profile is `gpt-oss`; use `codexctl run --profile gemma` to launch the bundled Gemma profile after pulling `gemma4:26b-a4b-it-q4_K_M` into Ollama.
-- `--cmd` consumes the remaining arguments, cannot be combined with `--shell`, and should be placed last. If you pass one quoted string with spaces, it runs via `$CODEX_SHELL -lc`. The same behavior applies to `codexctl exec`.
+- Builds create stable local image tags and also add immutable UTC snapshot tags such as `agent-plain:20260313-154500`. By default `agentctl build` discovers local `DockerFile*` definitions in the repo, resolves local `FROM agent...` dependencies, and builds them in dependency order. Use `agentctl build --snapshot` to add fresh timestamp tags to the current images without rebuilding them.
+- Local-model runs use a Codex profile from `config.toml`. The default profile is `gpt-oss`; use `agentctl run --profile gemma` to launch the bundled Gemma profile after pulling `gemma4:26b-a4b-it-q4_K_M` into Ollama.
+- `--cmd` consumes the remaining arguments, cannot be combined with `--shell`, and should be placed last. If you pass one quoted string with spaces, it runs via `$CODEX_SHELL -lc`. The same behavior applies to `agentctl exec`.
+- `agentctl run --runtime <runtime>` selects the preferred runtime to launch in the target container before executing the default entrypoint. Add `--install-runtime` to install that runtime first when needed. A practical Claude bootstrap path is now just `agentctl run --runtime claude --install-runtime`.
+- When you use `agentctl run --runtime <runtime>`, agentctl now also performs best-effort pre-run auth replay from Keychain if that runtime exposes host-managed auth and a matching Keychain entry exists. This means a previously authenticated Claude runtime can come up already logged in on a fresh container without a separate manual auth write step.
+- Claude’s native installer can be OOM-killed on Linux if the container is too small. For fresh Claude bootstrap and temporary Claude auth containers, `agentctl` now defaults the create-time memory limit to `4G` unless you explicitly override it.
 - In local-model mode, the Ollama reachability preflight only runs for the default Codex startup path. `--cmd` and `--shell` skip that check so image inspection and ad hoc commands still work without a running Ollama listener.
-- `CODEX_SHELL` overrides the shell used by `run --shell` and `exec` (default: `bash`). You can also set `DEFAULT_SHELL` in `codexctl` for a static default. All default images include both `bash` and `zsh`.
-- `codexctl run --update` upgrades `@openai/codex` inside the target container before starting. If the container does not exist yet, it is created first. With `--temp`, the update is ephemeral; `codexctl build --rebuild` remains the persistent way to refresh image content.
-- `--cpu` and `--mem` on `codexctl run` only apply when creating a new container. If the named container already exists, `codexctl run` fails fast and tells you to use `codexctl upgrade` instead of silently ignoring the resource request.
-- `codexctl upgrade` is the persistent refresh path for an existing named container. By default it exports the current container to a backup image, preserves `/home/coder/.codex`, recreates the container from the selected image, restores the saved config, and returns the container to its previous running or stopped state. It also accepts `--cpu` and `--mem` when you want to change the recreated container's resource limits alongside an image change or on their own. Use `--no-backup` only when you intentionally want a cleanup-friendly upgrade without keeping that recovery image.
-- If an older container has `~/.codex/AGENTS.md` as a regular file instead of the expected symlink to `/etc/codexctl/image.md`, `codexctl upgrade` stops and asks you to re-run with `--overwrite-config`. You can also reset image-owned defaults, including `local_models.json`, with `codexctl run --name <container> --reset-config`.
-- After a successful `codexctl upgrade`, the command prints the backup image name. Remove it later with `codexctl images prune --backup --image <backup-image> --keep 0` after you have verified the upgraded container works as expected.
-- Use `codexctl images rm --image <name>` when you want to remove an image family entirely, including the stable tag. This is the cleanup path for temporary custom images such as `codex-custom`.
+- `CODEX_SHELL` overrides the shell used by `run --shell` and `exec` (default: `bash`). You can also set `DEFAULT_SHELL` in `agentctl` for a static default. All default images include both `bash` and `zsh`.
+- `agentctl run --update` upgrades `@openai/codex` inside the target container before starting. If the container does not exist yet, it is created first. With `--temp`, the update is ephemeral; `agentctl build --rebuild` remains the persistent way to refresh image content.
+- `agentctl runtime list` shows installed runtimes in the current container. `agentctl runtime info <runtime>` and `agentctl runtime capabilities <runtime>` query the in-container `agent.sh` runtime contract for a declared runtime, including explicit capability booleans and supported auth formats. The current branch fully wires `codex` and now also ships a real Claude install/update/reset-config/auth adapter.
+- Runtime metadata now lives under `/etc/agentctl/runtimes.d`, and runtime-specific handlers live under `/usr/local/lib/agentctl/runtimes`. `agentctl refresh` updates those directories in-place for existing containers.
+- `agentctl runtime install codex` installs or refreshes the Codex runtime inside an existing container and marks it as preferred for that container.
+- `agentctl runtime install claude` now runs the official native installer (`curl -fsSL https://claude.ai/install.sh | bash`) and, on Alpine, expects `libgcc`, `libstdc++`, and `ripgrep` to be present first.
+- `agentctl runtime update claude` now runs `claude update`.
+- `agentctl runtime reset-config claude` restores a default `~/.claude/settings.json` with `USE_BUILTIN_RIPGREP=0`.
+- refreshed and rebuilt containers now ship `/etc/profile.d/agentctl-path.sh`, so bash login shells prepend `~/.local/bin` to `PATH` and native Claude installs are available as `claude` without manual shell edits.
+- `agentctl use codex` updates the container-local preferred runtime without changing the default image selection used by `agentctl run`.
+- `agentctl run` is now runtime-neutral at the host layer. Codex still starts with its default `--cd /workdir` behavior, but that default now lives in the Codex runtime adapter instead of being forced on every runtime.
+- `--cpu` and `--mem` on `agentctl run` only apply when creating a new container. If the named container already exists, `agentctl run` fails fast and tells you to use `agentctl refresh` instead of silently ignoring the resource request.
+- `agentctl refresh` is the normal non-destructive update path for an existing named container. It updates `agent.sh`, the agentctl-managed default config files, runtime manifests, and runtime adapters in place, and preserves the container's running or stopped state.
+- `agentctl refresh` does not recreate the container, export backup images, or touch user-installed packages. Use `agentctl upgrade` only for the heavier recreate-and-restore flow.
+- If you want to reset image-owned defaults such as `config.toml`, `local_models.json`, or the `AGENTS.md` symlink, use `agentctl run --name <container> --reset-config` or `agentctl runtime reset-config codex`.
+- Use `agentctl images rm --image <name>` when you want to remove an image family entirely, including the stable tag. This is the cleanup path for temporary custom images such as `agent-custom`.
 - Use `--rebuild`, `--refresh-base`, and `--pull-base` only for occasional refreshes when you want newer Codex or base image content. See the build cache section below for details.
-- `codexctl` was authored by Codex itself, running inside an Apple `container` in `--openai` mode.
+- `agentctl` was authored by Codex itself, running inside an Apple `container` in `--openai` mode.
 
 #### Image selection
 
-Use `--image` when you need a specific toolchain, or set `DEFAULT_IMAGE` in `codexctl` for a permanent default.
+Use `--image` when you need a specific toolchain, or set `DEFAULT_IMAGE` in `agentctl` for a permanent default.
 
 When to use which image:
 
-- `codex`: general-purpose CLI work or small scripts without a heavy runtime.
-- `codex-python`: Python-heavy tasks, data wrangling, and libraries not in the base image.
-- `codex-swift`: Swift projects, SwiftPM builds, and Swift tooling.
-- `codex-office`: document-centric workflows (docx/xlsx/pdf parsing, report generation).
+- `agent-plain`: general-purpose CLI work or small scripts without a heavy runtime.
+- `agent-python`: Python-heavy tasks, data wrangling, and libraries not in the base image.
+- `agent-swift`: Swift projects, SwiftPM builds, and Swift tooling.
+- `agent-office`: transitional compatibility image for document-centric workflows.
 
 ### Configuration tweaks
 
-`codexctl` exposes a few top-level constants (in `codexctl`) that you can edit to adjust default behavior:
+`agentctl` exposes a few top-level constants (in `agentctl`) that you can edit to adjust default behavior:
 
-- `DEFAULT_IMAGE` (default image for `run` and `auth`, e.g. `codex`, `codex-python`, `codex-swift`, `codex-office`)
+- `DEFAULT_IMAGE` (default image for `run` and `auth`, e.g. `agent-plain`, `agent-python`, `agent-swift`, `agent-office`)
 - `DEFAULT_NAME_PREFIX` (default local container prefix)
 - `AUTH_NAME_PREFIX` (default auth container prefix)
 - `DEFAULT_SHELL` (default shell for `run --shell` and `exec`)
@@ -188,119 +220,132 @@ Local-model runs use profiles defined in `config.toml`:
 Choose a profile per run with:
 
 ```bash
-codexctl run --profile gemma
+agentctl run --profile gemma
 ```
 
-If you want Gemma to become the default local model, either set `CODEX_PROFILE=gemma` in your shell environment or change `DEFAULT_CODEX_PROFILE` in `codexctl`.
+If you want Gemma to become the default local model, either set `CODEX_PROFILE=gemma` in your shell environment or change `DEFAULT_CODEX_PROFILE` in `agentctl`.
 
 ### Other useful commands
 
 ```bash
-codexctl --help          # show command overview and available subcommands/options
-codexctl auth              # run device-auth and store in Keychain
-codexctl images            # list local codex image refs
-codexctl images --backup    # list local codex backup image refs
-codexctl upgrade           # recreate the current container from the latest image
-codexctl upgrade --cpu 8 --mem 16G  # recreate an existing container with updated resources
-codexctl upgrade --no-backup  # recreate without exporting a backup image first
-codexctl upgrade --overwrite-config  # reset config.toml and local_models.json from upgraded image and recreate ~/.codex/AGENTS.md symlink
-codexctl images prune --backup --keep 2 --dry-run  # preview backup pruning
-codexctl exec              # shell into running container
-codexctl ls                # list Codex-managed containers (hides runtime support containers like buildkit)
-codexctl rm                # remove the default container for this directory
+agentctl --help          # show command overview and available subcommands/options
+agentctl auth            # run codex device-auth and store it in Keychain
+agentctl auth --runtime codex  # explicit equivalent of the default auth flow
+agentctl auth --runtime claude  # install/login Claude in a temp auth container and store credentials in Keychain
+agentctl run --runtime claude --install-runtime  # bootstrap and launch Claude in one command
+agentctl runtime list    # list installed runtimes in the current container
+agentctl runtime info codex  # inspect manifest-backed runtime metadata
+agentctl runtime info claude  # inspect Claude runtime metadata/capabilities
+agentctl runtime capabilities codex  # inspect runtime commands/capabilities
+agentctl runtime install codex  # install/refresh Codex in the current container
+agentctl use codex       # set Codex as the preferred runtime in the current container
+agentctl images          # list local agent image refs
+agentctl images --backup # list local agent backup image refs
+agentctl refresh         # update agent.sh and runtime contract files in place
+agentctl run --name my-devbox --reset-config --cmd true  # restore image-owned defaults
+agentctl runtime reset-config codex  # restore Codex-owned defaults inside the current container
+agentctl images prune --backup --keep 2 --dry-run  # preview backup pruning
+agentctl exec            # shell into running container
+agentctl ls              # list managed containers (hides runtime support containers like buildkit)
+agentctl rm              # remove the default container for this directory
 ```
 
 Notes:
 
 - `--auth` only works together with `--openai`.
 - `--temp` creates a disposable container that is removed after the command exits.
-- `--read-only` mounts the workdir as read-only; codex can use its home directory or `/tmp` for scratch data. But cannot modify the workdir.
-- `--cpu` and `--mem` on `codexctl run` are create-time settings. If you pass them for an existing named container, `codexctl run` exits with an error and points you to `codexctl upgrade`.
-- The mount mode is fixed on first creation for a given container name. To switch between read-only and read-write, remove the container (e.g. `codexctl rm`) or use `--temp`/`--name` to create a fresh one.
-- `codexctl ls` only shows Codex-managed containers whose image name starts with `codex`; it hides runtime support containers such as `buildkit`.
-- After a successful `codexctl build`, the temporary `buildkit` support container is stopped so it does not linger in the runtime list.
-- Backup-enabled `codexctl upgrade` requires a container runtime that supports `container export --output <path>`.
+- `--read-only` mounts the workdir as read-only; agentctl can use its home directory or `/tmp` for scratch data, but cannot modify the workdir.
+- `--cpu` and `--mem` on `agentctl run` are create-time settings. If you pass them for an existing named container, `agentctl run` exits with an error and points you to `agentctl refresh`.
+- The mount mode is fixed on first creation for a given container name. To switch between read-only and read-write, remove the container (e.g. `agentctl rm`) or use `--temp`/`--name` to create a fresh one.
+- `agentctl ls` only shows managed containers whose image name starts with `agent`; it hides runtime support containers such as `buildkit`.
+- After a successful `agentctl build`, the temporary `buildkit` support container is stopped so it does not linger in the runtime list.
+- Backup-enabled `agentctl refresh` requires a container runtime that supports `container export --output <path>`.
 - `--openai --temp` still injects Keychain auth before running the command.
 - Keychain auth is the source of truth for `--openai`; it is synced into running containers before each run.
 - After a run, if the container refresh time is newer (and present), the updated auth is saved back into Keychain.
-- After `codexctl auth`, exit any running `--openai` sessions and re-run `codexctl run --openai` to pick up the new token.
+- After `agentctl auth`, exit any running `--openai` sessions and re-run `agentctl run --openai` to pick up the new token.
+- `agentctl auth --runtime <runtime>` only works for runtimes whose manifest declares `auth_login` and `auth_read` capability support plus at least one host-storable `auth_format`. In this branch, both `codex` and `claude` meet that contract.
+- Claude auth on Linux is synchronized through `~/.claude/.credentials.json`. The host-storable Claude blob now preserves the credential file plus the minimal proven replay state from `~/.claude.json`: `oauthAccount` and `hasCompletedOnboarding`. That is enough to replay auth into a fresh Claude container in current testing, while keeping the credential boundary at `.credentials.json`.
+- host-side Keychain storage is now keyed per runtime and auth format. Codex keeps the legacy `codex-OpenAI-auth` slot so existing setups continue to work unchanged.
 
 Security notes:
 
 - Containers run as a non-root `coder` user with Linux capabilities dropped.
 - `config.toml` sets `sandbox_mode = "danger-full-access"` to maximize capabilities. Codex can read/write anything in the mounted directory tree and run tools inside the container. Use only with trusted workspaces or change it to `workspace-write` for tighter guardrails.
 - Containers have full outbound network access by default. `--openai` needs outbound access; if you want to constrain networking, use host firewall rules or a restricted container network.
-- If you need root for maintenance tasks, use `codexctl su-exec` (or `container exec -u 0 ...`).
+- If you need root for maintenance tasks, use `agentctl su-exec` (or `container exec -u 0 ...`).
 - Some scripts that assume root access to system paths may fail; run them via `su-exec` or update them.
 
-The rest of this README explains what `codexctl` does behind the scenes and how to run the underlying `container` commands directly.
+The rest of this README explains what `agentctl` does behind the scenes and how to run the underlying `container` commands directly.
 
 ## Behind the scenes
 
-### Build codex container images
+### Build agent container images
 
-To build the codex container images for later use, I have written four `DockerFile`s which are installing `codex`, `git` and other basic tools (`bash`, `zsh`, `npm`, `file`, `curl`):
+To build the agent container images for later use, I have written four `DockerFile`s which are installing `agentctl`, `git` and other basic tools (`bash`, `zsh`, `npm`, `file`, `curl`):
 
-- `DockerFile` for a plain Alpine Linux (~191 MB)
-- `DockerFile.python` for a Alpine based Python installation (~203 MB, built on top of `codex`)
-- `DockerFile.swift` for an Ubuntu based Swift installation (~1.41 GB)
-- `DockerFile.office` for Alpine + Python + Office tooling (~417 MB, built on top of `codex-python`)
+- `DockerFile` for `agent-plain`, a plain Alpine Linux runtime (~191 MB)
+- `DockerFile.python` for `agent-python`, an Alpine-based Python installation (~203 MB, built on top of `agent-plain`)
+- `DockerFile.swift` for `agent-swift`, an Ubuntu-based Swift installation (~1.41 GB)
+- `DockerFile.office` for `agent-office`, a transitional Alpine + Python + Office compatibility image (~417 MB, built on top of `agent-python`)
 
-The Alpine-based images are layered for incremental builds: `codex` -> `codex-python` -> `codex-office`.
+The curated image set is `agent-plain`, `agent-python`, and `agent-swift`. The
+`agent-office` image remains available as a compatibility bridge for legacy office
+workflows, but it is not a primary curated image.
 
-`codexctl build` derives local image names from Dockerfile names using this convention:
+`agentctl build` derives local image names from Dockerfile names using this convention:
 
-- `DockerFile` -> `codex`
-- `DockerFile.<name>` -> `codex-<name>`
+- `DockerFile` -> `agent-plain`
+- `DockerFile.<name>` -> `agent-<name>`
 
-That means a custom `DockerFile.custom` becomes the local image `codex-custom`. If it starts with `FROM codex-office`, `codexctl build --image codex-custom` will automatically build `codex`, `codex-python`, `codex-office`, and then `codex-custom`.
+That means a custom `DockerFile.custom` becomes the local image `agent-custom`. If it starts with `FROM agent-office`, `agentctl build --image agent-custom` will automatically build `agent-plain`, `agent-python`, `agent-office`, and then `agent-custom`.
 
 The image build process uses `npm` to install the latest `openai/codex` package, and configures `git` to use "Codex CLI" and `codex@localhost` as the container user's identity when interacting with git and to use `main` as the default branch when initializing a new repository.
 
 Further the build process copies `config.toml` and `local_models.json` into the container at `/home/coder/.codex/` so that Codex can both reach the locally running Ollama instance on the `default` network's host IP address `192.168.64.1` and resolve local model metadata, and also mirrors both files into `/etc/codexctl/` so upgrade resets can source the image-owned defaults reliably.
 
-Each image also writes `/etc/codexctl/image.md` during build. That file describes the image name, build time, workspace conventions, and key built-in tools/toolchains. It intentionally lives outside `/home/coder/.codex`, so `codexctl upgrade` does not treat it as user state to back up and restore.
+Each image also writes `/etc/codexctl/image.md` during build. That file describes the image name, build time, workspace conventions, and key built-in tools/toolchains. It intentionally lives outside `/home/coder/.codex`, so `agentctl refresh` does not treat it as user state to back up and restore.
 
-The image build also creates `~/.codex/AGENTS.md` as a symlink to `/etc/codexctl/image.md`. This follows the official Codex `AGENTS.md` discovery flow for global guidance while keeping the source metadata image-owned instead of backed up as mutable user state. `codexctl run` still starts Codex with `--cd /workdir` so the working root is explicit.
+The image build also creates `~/.codex/AGENTS.md` as a symlink to `/etc/codexctl/image.md`. This follows the official Codex `AGENTS.md` discovery flow for global guidance while keeping the source metadata image-owned instead of backed up as mutable user state. Codex still starts with `--cd /workdir`, but that default is now injected by the Codex runtime adapter rather than the generic `agentctl run` host wrapper.
 
 The image-specific `image.md` files describe the intended toolchain focus:
 
-- `codex`: general shell and Git tooling
-- `codex-python`: Python runtime and the default `/opt/venv`
-- `codex-office`: document, PDF, spreadsheet, and report-generation tooling
-- `codex-swift`: Swift-on-Linux tooling and related platform constraints
+- `agent-plain`: general shell and Git tooling
+- `agent-python`: Python runtime and the default `/opt/venv`
+- `agent-office`: document, PDF, spreadsheet, and report-generation compatibility tooling
+- `agent-swift`: Swift-on-Linux tooling and related platform constraints
 
-Use the following `container` commands to build the codex images `codex`, `codex-python`, `codex-swift`, and `codex-office` from the corresponding `DockerFile` (build the Alpine images in order so the bases exist):
+Use the following `container` commands to build the agent images `agent-plain`, `agent-python`, `agent-office`, and `agent-swift` from the corresponding `DockerFile` (build the Alpine images in order so the bases exist):
 
 ```bash
 STAMP="$(date -u +%Y%m%d-%H%M%S)"
 
-container build -t codex -f DockerFile .
-container image tag codex "codex:${STAMP}"
+container build -t agent-plain -f DockerFile .
+container image tag agent-plain "agent-plain:${STAMP}"
 
-container build -t codex-python -f DockerFile.python .
-container image tag codex-python "codex-python:${STAMP}"
+container build -t agent-python -f DockerFile.python .
+container image tag agent-python "agent-python:${STAMP}"
 
-container build -t codex-office -f DockerFile.office .
-container image tag codex-office "codex-office:${STAMP}"
+container build -t agent-office -f DockerFile.office .
+container image tag agent-office "agent-office:${STAMP}"
 
-container build -t codex-swift -f DockerFile.swift .
-container image tag codex-swift "codex-swift:${STAMP}"
+container build -t agent-swift -f DockerFile.swift .
+container image tag agent-swift "agent-swift:${STAMP}"
 ```
 
-This keeps the stable image names for normal use and also creates immutable timestamped tags for A/B testing and rollback. `codexctl build` automates that same dependency ordering for both the built-in images and any custom local `DockerFile.<name>` images that follow the naming convention above.
+This keeps the stable image names for normal use and also creates immutable timestamped tags for A/B testing and rollback. `agentctl build` automates that same dependency ordering for both the built-in images and any custom local `DockerFile.<name>` images that follow the naming convention above.
 Notes:
 - The Swift image includes `format` and `lint` wrappers for `swift-format` and initializes `swiftly` for toolchain management.
 - The Office image sets up a writable venv at `/opt/venv` and puts it on `PATH` by default.
 
-#### Build cache behavior (codexctl)
+#### Build cache behavior (agentctl)
 
 - `--rebuild` disables Dockerfile layer cache (`--no-cache`) for every image selected by the dependency-aware build plan. It does not pull newer remote `FROM` tags by itself. Use `--pull-base` as well when you want newer upstream base image content.
 - `--snapshot` creates a new timestamp tag for the current stable image without rebuilding it. Use when you want an immutable test reference for the image you already have locally.
 - `--pull-base` pulls the latest base image tag before building. Use when you want to update base images without deleting them first (preferred).
 - `--refresh-base` deletes the base image first, forcing a re-fetch on build. Use when you need a brute-force refresh; this may fail if the base image is still referenced by containers.
-- `codexctl images prune` removes only old timestamp tags. It deliberately keeps the stable image tag.
-- `codexctl images rm --image <name>` removes the whole image family, including the stable tag and all timestamp tags.
+- `agentctl images prune` removes only old timestamp tags. It deliberately keeps the stable image tag.
+- `agentctl images rm --image <name>` removes the whole image family, including the stable tag and all timestamp tags.
 
 ### Network configuration
 
@@ -459,7 +504,9 @@ container rm "codex-`basename $PWD`"
 
 #### Store auth.json in macOS Keychain
 
-After you complete the OpenAI device-auth login flow, you may want to keep a copy of the device authorization tokens in your macOS Keychain. This is only relevant when `auth.json` exists (device-auth creates it). The file lives at `/home/coder/.codex/auth.json` inside the container and contains sensitive tokens. Use `codex-auth-keychain.sh` to move it into the Keychain:
+After you complete the OpenAI device-auth login flow, you may want to keep a copy of the device authorization tokens in your macOS Keychain. This is only relevant when `auth.json` exists (device-auth creates it). The runtime keeps that file in its own private state, but `agentctl run --openai` and `agentctl auth` now sync through `agent.sh auth read/write` rather than reading the runtime-private path directly from the host.
+
+If you want to move the current container file into the Keychain manually, `codex-auth-keychain.sh` still provides direct compatibility helpers:
 
 ```bash
 codex-auth-keychain.sh store-from-container "codex-`basename $PWD`"
@@ -475,9 +522,11 @@ Notes:
 
 - The container must be running for both commands.
 - The default path is `/home/coder/.codex/auth.json` unless you pass an explicit path.
-- `codexctl run --openai` and `codexctl auth` automatically sync the Keychain auth into running containers when it differs.
-- `codexctl run --openai` saves refreshed auth back to Keychain when the container reports a newer refresh time (and that field is present).
-- `codexctl run --profile <name>` sets the Codex profile used by the container.
+- `agentctl run --openai` and `agentctl auth` automatically sync the Keychain auth into running containers when it differs, using `agent.sh auth read/write`.
+- `agentctl run --openai` saves refreshed auth back to Keychain when the container reports a newer refresh time (and that field is present).
+- `agentctl` now chooses Keychain slots per runtime/auth-format pair. Codex still uses the legacy `codex-OpenAI-auth` entry so the current OpenAI workflow stays compatible.
+- Claude credentials are stored under a runtime-specific Keychain slot rather than the Codex legacy slot.
+- `agentctl run --profile <name>` sets the Codex profile used by the container.
   Profiles are defined in `config.toml` and control which model to use.
 
 # Qwen Profile

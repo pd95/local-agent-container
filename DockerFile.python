@@ -1,5 +1,5 @@
 # For Python environment
-FROM codex
+FROM agent-plain
 
 USER root
 
@@ -21,12 +21,14 @@ RUN printf '%s\n' \
 
 # Ensure venv is the default python/pip for all processes (including Codex runs)
 ENV PATH="$VIRTUAL_ENV/bin:$PATH" \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    IMAGE_NAME=agent-python
 
-RUN mkdir -p /etc/codexctl \
+RUN mkdir -p /etc/codexctl /etc/agentctl \
+ && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
-You are running inside the \`codex-python\` image.
+You are running inside the \`agent-python\` image.
 
 Environment:
 - containerized Alpine Linux (package manager \`apk\`)
@@ -35,11 +37,12 @@ Environment:
 - architecture: check with \`uname -m\` if needed
 
 Image metadata:
-- image: \`codex-python\`
+- image: \`agent-python\`
 - built_at_utc: \`${BUILD_TIME}\`
 
 Built-in CLI tools:
 - base tools: \`bash\`, \`zsh\`, \`git\`, \`curl\`, \`file\`, \`jq\`, \`rg\`, \`bwrap\`
+- control tools: \`agent.sh\`
 - programming tools: \`node\`, \`npm\`, \`python3\`, \`python\`, \`pip\`
 
 Programming environments:
@@ -49,6 +52,7 @@ Programming environments:
 
 Prefer the default \`/opt/venv\` environment for Python package installs and script execution unless the user asks for a project-local virtualenv.
 EOF
+RUN ln -sf /etc/codexctl/image.md /etc/agentctl/image.md
 RUN ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
 
 USER coder

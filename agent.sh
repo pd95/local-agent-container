@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly IMAGE_NAME="${IMAGE_NAME:-agent-plain}"
+readonly DEFAULT_RUNTIME_FILE="/etc/agentctl/preferred-runtime"
+readonly USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agentctl"
+readonly USER_RUNTIME_FILE="${USER_CONFIG_DIR}/preferred-runtime"
+readonly CODEX_HOME_DIR="${HOME}/.codex"
+readonly CODEX_AUTH_FILE="${CODEX_HOME_DIR}/auth.json"
+readonly DEFAULT_PROFILE="${AGENTCTL_DEFAULT_PROFILE:-gpt-oss}"
+readonly RUN_MODE="${AGENTCTL_RUN_MODE:-local-model}"
+readonly RUNTIME_REGISTRY_DIR="${AGENTCTL_RUNTIME_REGISTRY_DIR:-/etc/agentctl/runtimes.d}"
+readonly RUNTIME_ADAPTER_DIR="${AGENTCTL_RUNTIME_ADAPTER_DIR:-/usr/local/lib/agentctl/runtimes}"
+
+die() {
+  printf '%s\n' "$*" >&2
+  exit 1
+}
+
+runtime_default() {
+  if [ -f "$DEFAULT_RUNTIME_FILE" ]; then
+    tr -d '[:space:]' <"$DEFAULT_RUNTIME_FILE"
+    return
+  fi
+  printf '%s\n' codex
+}
+
+runtime_preferred() {
+  if [ -n "${AGENTCTL_PREFERRED_RUNTIME:-}" ]; then
+    printf '%s\n' "$AGENTCTL_PREFERRED_RUNTIME"
+    return
+  fi
+
+  if [ -f "$USER_RUNTIME_FILE" ]; then
+    tr -d '[:space:]' <"$USER_RUNTIME_FILE"
+    return
+  fi
+
+  runtime_default
+}
+
+has_explicit_profile() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --profile|--profile=*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+has_explicit_codex_cd() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --cd|--cd=*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+ensure_user_dirs() {
+  mkdir -p "$USER_CONFIG_DIR" "$CODEX_HOME_DIR"
+}
+
+runtime_manifest_path() {
+  local runtime="$1"
+  local path="${RUNTIME_REGISTRY_DIR}/${runtime}.json"
+
+  [ -f "$path" ] || return 1
+  printf '%s\n' "$path"
+}
+
+runtime_adapter_path() {
+  local runtime="$1"
+  local path="${RUNTIME_ADAPTER_DIR}/${runtime}.sh"
+
+  [ -f "$path" ] || return 1
+  printf '%s\n' "$path"
+}
+
+runtime_manifest_string() {
+  local runtime="$1" key="$2"
+  local manifest
+
+  manifest="$(runtime_manifest_path "$runtime")" || return 1
+  jq -er "$key // empty" "$manifest"
+}
+
+runtime_manifest_json() {
+  local runtime="$1" key="$2"
+  local manifest
+
+  manifest="$(runtime_manifest_path "$runtime")" || return 1
+  jq -c "$key // []" "$manifest"
+}
+
+runtime_known() {
+  runtime_manifest_path "$1" >/dev/null 2>&1
+}
+
+runtime_ids() {
+  local path
+
+  [ -d "$RUNTIME_REGISTRY_DIR" ] || return 0
+  for path in "$RUNTIME_REGISTRY_DIR"/*.json; do
+    [ -e "$path" ] || continue
+    basename "$path" .json
+  done | sort
+}
+
+runtime_ids_installed() {
+  local runtime
+
+  while IFS= read -r runtime; do
+    [ -n "$runtime" ] || continue
+    if runtime_command_exists "$runtime"; then
+      printf '%s\n' "$runtime"
+    fi
+  done < <(runtime_ids)
+}
+
+runtime_command_name() {
+  runtime_manifest_string "$1" '.command'
+}
+
+runtime_command_path() {
+  local runtime="$1"
+  local command_name=""
+  local candidate=""
+
+  command_name="$(runtime_command_name "$runtime")" || return 1
+  if command -v "$command_name" >/dev/null 2>&1; then
+    command -v "$command_name"
+    return 0
+  fi
+  for candidate in "$HOME/.local/bin/$command_name" "$HOME/bin/$command_name"; do
+    if [ -x "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+runtime_install_method() {
+  runtime_manifest_string "$1" '.install_method'
+}
+
+runtime_default_config_dir() {
+  runtime_manifest_string "$1" '.default_config_dir'
+}
+
+runtime_auth_formats_json() {
+  runtime_manifest_json "$1" '.auth_formats'
+}
+
+runtime_capabilities_json() {
+  runtime_manifest_json "$1" '.capabilities'
+}
+
+runtime_commands_json() {
+  runtime_manifest_json "$1" '.commands'
+}
+
+runtime_command_exists() {
+  runtime_command_path "$1" >/dev/null 2>&1
+}
+
+runtime_installed_json() {
+  local runtime="$1"
+  if runtime_command_exists "$runtime"; then
+    printf '%s\n' true
+  else
+    printf '%s\n' false
+  fi
+}
+
+ensure_runtime_known() {
+  local runtime="$1"
+  runtime_known "$runtime" || die "unsupported runtime: $runtime"
+}
+
+reset_runtime_hooks() {
+  unset -f \
+    agent_runtime_run \
+    agent_runtime_install \
+    agent_runtime_update \
+    agent_runtime_reset_config \
+    agent_runtime_auth_read \
+    agent_runtime_auth_write \
+    agent_runtime_auth_login \
+    >/dev/null 2>&1 || true
+}
+
+load_runtime_adapter() {
+  local runtime="$1"
+  local adapter
+
+  ensure_runtime_known "$runtime"
+  adapter="$(runtime_adapter_path "$runtime")" || die "missing runtime adapter: $runtime"
+  reset_runtime_hooks
+  # shellcheck source=/dev/null
+  . "$adapter"
+}
+
+ensure_runtime_installed() {
+  local runtime="$1"
+  ensure_runtime_known "$runtime"
+  runtime_command_exists "$runtime" && return 0
+  die "runtime not installed: $runtime (run: agent.sh runtime install $runtime)"
+}
+
+run_runtime() {
+  local runtime="$1"
+  shift
+
+  ensure_runtime_installed "$runtime"
+  load_runtime_adapter "$runtime"
+  agent_runtime_run "$runtime" "$@"
+}
+
+json_runtime_info() {
+  local runtime="$1"
+  local installed_json preferred_json commands_json capabilities_json
+
+  ensure_runtime_known "$runtime"
+  installed_json="$(runtime_installed_json "$runtime")"
+  commands_json="$(runtime_commands_json "$runtime")"
+  capabilities_json="$(runtime_capabilities_json "$runtime")"
+  if [ "$(runtime_preferred)" = "$runtime" ]; then
+    preferred_json=true
+  else
+    preferred_json=false
+  fi
+
+  jq -n \
+    --arg runtime "$runtime" \
+    --arg image "$IMAGE_NAME" \
+    --arg default_profile "$DEFAULT_PROFILE" \
+    --arg preferred "$(runtime_preferred)" \
+    --arg launcher "/usr/local/bin/agent.sh run" \
+    --arg command_name "$(runtime_command_name "$runtime")" \
+    --arg install_method "$(runtime_install_method "$runtime")" \
+    --arg config_dir "$(runtime_default_config_dir "$runtime")" \
+    --argjson auth_formats "$(runtime_auth_formats_json "$runtime")" \
+    --argjson capabilities "$capabilities_json" \
+    --argjson commands "$commands_json" \
+    --argjson installed "$installed_json" \
+    --argjson selected "$preferred_json" \
+    '{
+      runtime: $runtime,
+      image: $image,
+      installed: $installed,
+      preferred: $selected,
+      preferred_runtime: $preferred,
+      launcher: $launcher,
+      command: $command_name,
+      install_method: $install_method,
+      auth_formats: $auth_formats,
+      capabilities: $capabilities,
+      commands: $commands,
+      default_config_dir: $config_dir,
+      default_profile: $default_profile,
+      phase: 2
+    }'
+}
+
+json_runtime_capabilities() {
+  local runtime="$1"
+  local capabilities_json
+
+  ensure_runtime_known "$runtime"
+  capabilities_json="$(runtime_capabilities_json "$runtime")"
+  jq -n \
+    --arg runtime "$runtime" \
+    --argjson auth_formats "$(runtime_auth_formats_json "$runtime")" \
+    --argjson capabilities "$capabilities_json" \
+    --argjson commands "$(runtime_commands_json "$runtime")" \
+    '{
+      runtime: $runtime,
+      auth_formats: $auth_formats,
+      capabilities: $capabilities,
+      commands: $commands
+    }'
+}
+
+json_system_manifest() {
+  local package_manager packages_json
+
+  if command -v apk >/dev/null 2>&1; then
+    package_manager=apk
+    packages_json="$(apk info -q 2>/dev/null | sort -u | jq -R . | jq -s .)"
+  elif command -v dpkg-query >/dev/null 2>&1; then
+    package_manager=dpkg
+    packages_json="$(dpkg-query -W -f='${Package}\n' 2>/dev/null | sort -u | jq -R . | jq -s .)"
+  else
+    package_manager=unknown
+    packages_json='[]'
+  fi
+
+  jq -n \
+    --arg package_manager "$package_manager" \
+    --argjson packages "$packages_json" \
+    '{
+      package_manager: $package_manager,
+      packages: $packages
+    }'
+}
+
+auth_read() {
+  local runtime="$1" key="$2"
+  ensure_runtime_known "$runtime"
+  load_runtime_adapter "$runtime"
+  agent_runtime_auth_read "$runtime" "$key"
+}
+
+auth_write() {
+  local runtime="$1" key="$2" value="${3:-}"
+  ensure_runtime_known "$runtime"
+  load_runtime_adapter "$runtime"
+  agent_runtime_auth_write "$runtime" "$key" "$value"
+}
+
+auth_login() {
+  local runtime="$1"
+  ensure_runtime_installed "$runtime"
+  load_runtime_adapter "$runtime"
+  agent_runtime_auth_login "$runtime"
+}
+
+preferred_get() {
+  runtime_preferred
+}
+
+preferred_set() {
+  local runtime="${1:-}"
+  ensure_runtime_installed "$runtime"
+  ensure_user_dirs
+  printf '%s\n' "$runtime" >"$USER_RUNTIME_FILE"
+}
+
+runtime_list() {
+  runtime_ids_installed
+}
+
+runtime_install() {
+  local runtime="${1:-}"
+  ensure_runtime_known "$runtime"
+  load_runtime_adapter "$runtime"
+  agent_runtime_install "$runtime"
+}
+
+runtime_update() {
+  local runtime="${1:-}"
+  ensure_runtime_known "$runtime"
+  load_runtime_adapter "$runtime"
+  agent_runtime_update "$runtime"
+}
+
+runtime_reset_config() {
+  local runtime="${1:-}"
+  ensure_runtime_known "$runtime"
+  load_runtime_adapter "$runtime"
+  agent_runtime_reset_config "$runtime" "$(runtime_default_config_dir "$runtime")"
+}
+
+refresh_agent() {
+  ensure_user_dirs
+  jq -n \
+    --arg preferred "$(runtime_preferred)" \
+    --argjson runtimes "$(runtime_ids | jq -R . | jq -s .)" \
+    '{status: "ok", preferred_runtime: $preferred, runtimes: $runtimes}'
+}
+
+usage() {
+  cat <<'EOF'
+Usage:
+  agent.sh help
+  agent.sh run [codex args...]
+  agent.sh version
+  agent.sh refresh
+  agent.sh runtime list
+  agent.sh preferred get
+  agent.sh preferred set codex
+  agent.sh runtime info codex
+  agent.sh runtime capabilities codex
+  agent.sh runtime install codex
+  agent.sh runtime update codex
+  agent.sh runtime reset-config codex
+  agent.sh auth login codex
+  agent.sh auth read codex json_refresh_token
+  agent.sh auth write codex json_refresh_token [VALUE]
+  agent.sh system manifest
+EOF
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+
+  case "$command" in
+    help|-h|--help)
+      usage
+      ;;
+    run)
+      run_runtime "$(runtime_preferred)" "$@"
+      ;;
+    version)
+      printf '%s\n' "agent.sh phase2"
+      ;;
+    refresh)
+      refresh_agent
+      ;;
+    runtime)
+      case "${1:-}" in
+        list)
+          runtime_list
+          ;;
+        info)
+          json_runtime_info "${2:-}"
+          ;;
+        capabilities)
+          json_runtime_capabilities "${2:-}"
+          ;;
+        install)
+          runtime_install "${2:-}"
+          ;;
+        update)
+          runtime_update "${2:-}"
+          ;;
+        reset-config)
+          runtime_reset_config "${2:-}"
+          ;;
+        *)
+          die "unknown runtime command: ${1:-}"
+          ;;
+      esac
+      ;;
+    preferred)
+      case "${1:-}" in
+        get)
+          preferred_get
+          ;;
+        set)
+          preferred_set "${2:-}"
+          ;;
+        *)
+          die "unknown preferred command: ${1:-}"
+          ;;
+      esac
+      ;;
+    auth)
+      case "${1:-}" in
+        login)
+          auth_login "${2:-}"
+          ;;
+        read)
+          auth_read "${2:-}" "${3:-}"
+          ;;
+        write)
+          auth_write "${2:-}" "${3:-}" "${4:-}"
+          ;;
+        *)
+          die "unknown auth command: ${1:-}"
+          ;;
+      esac
+      ;;
+    system)
+      case "${1:-}" in
+        manifest)
+          json_system_manifest
+          ;;
+        *)
+          die "unknown system command: ${1:-}"
+          ;;
+      esac
+      ;;
+    *)
+      die "unknown command: $command"
+      ;;
+  esac
+}
+
+main "$@"

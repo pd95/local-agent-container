@@ -19,16 +19,30 @@ RUN addgroup -S coder \
  && chown -R coder:coder /home/coder /workdir
 
 # Make sure HOME is correct for subsequent RUNs when we switch user
-ENV HOME=/home/coder
+ENV HOME=/home/coder \
+    IMAGE_NAME=agent-plain
 
 # Copy Codex default configuration and local model metadata config
 COPY --chown=coder:coder config.toml local_models.json /home/coder/.codex/
+COPY claude-settings.json /etc/claudectl/settings.json
+COPY agentctl-path.sh /etc/profile.d/agentctl-path.sh
 
-RUN mkdir -p /etc/codexctl \
+# Install the generic runtime launcher and runtime registry
+COPY agent.sh /usr/local/bin/agent.sh
+COPY runtimes /usr/local/lib/agentctl/runtimes
+COPY runtimes.d /etc/agentctl/runtimes.d
+RUN chmod 0755 /usr/local/bin/agent.sh \
+ && chmod 0644 /etc/profile.d/agentctl-path.sh /etc/claudectl/settings.json \
+ && find /usr/local/lib/agentctl/runtimes -type f -name '*.sh' -exec chmod 0644 {} + \
+ && mkdir -p /etc/agentctl \
+ && printf '%s\n' codex > /etc/agentctl/preferred-runtime
+
+RUN mkdir -p /etc/codexctl /etc/agentctl \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
+ && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
-You are running inside the \`codex\` default image.
+You are running inside the \`agent-plain\` default image.
 
 Environment:
 - containerized Alpine Linux (package manager \`apk\`)
@@ -37,11 +51,12 @@ Environment:
 - architecture: check with \`uname -m\` if needed
 
 Image metadata:
-- image: \`codex\`
+- image: \`agent-plain\`
 - built_at_utc: \`${BUILD_TIME}\`
 
 Built-in CLI tools:
 - base tools: \`bash\`, \`zsh\`, \`git\`, \`curl\`, \`file\`, \`jq\`, \`rg\`, \`bwrap\`
+- control tools: \`agent.sh\`
 - programming tools: \`node\`, \`npm\`
 
 Programming environments:
@@ -49,6 +64,7 @@ Programming environments:
 
 Use this image for general shell work, Git operations, repository maintenance, and light scripting.
 EOF
+RUN ln -sf /etc/codexctl/image.md /etc/agentctl/image.md
 RUN ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
 
 # From here on, run as coder so swiftly writes user-owned files
@@ -63,4 +79,4 @@ RUN git config --global user.email "codex@localhost" \
 
 # Hardened entrypoint
 ENTRYPOINT ["setpriv","--inh-caps=-all","--ambient-caps=-all","--bounding-set=-all","--no-new-privs","--"]
-CMD ["codex","--profile","gpt-oss"]
+CMD ["/usr/local/bin/agent.sh","run"]

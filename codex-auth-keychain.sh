@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SERVICE_NAME="codex-OpenAI-auth"
-ACCOUNT_NAME="device-auth-openAI"
+SERVICE_NAME="${KEYCHAIN_SERVICE_NAME:-codex-OpenAI-auth}"
+ACCOUNT_NAME="${KEYCHAIN_ACCOUNT_NAME:-device-auth-openAI}"
 CONTAINER_CMD="${CONTAINER_CMD:-container}"
 
 usage() {
@@ -10,6 +10,7 @@ usage() {
   echo "  $0 store-from-container <container> [path_in_container]"
   echo "  $0 load-to-container    <container> [path_in_container]"
   echo "  $0 read"
+  echo "  $0 write"
   echo "  $0 verify"
   exit 1
 }
@@ -80,11 +81,28 @@ read_keychain() {
   exit 6
 }
 
+write_keychain() {
+  local data
+  data="$(cat)"
+  echo "Storing auth in Keychain ($SERVICE_NAME)" >&2
+  if security add-generic-password \
+    -a "$ACCOUNT_NAME" \
+    -s "$SERVICE_NAME" \
+    -w "$data" \
+    -U; then
+    echo "Stored auth blob in Keychain"
+  else
+    echo "Failed to store auth blob in Keychain" >&2
+    exit 5
+  fi
+}
+
 cmd="${1:-}"
 case "$cmd" in
   store-from-container) [[ $# -ge 2 && $# -le 3 ]] || usage; store_from_container "$2" "${3:-}" ;;
   load-to-container) [[ $# -ge 2 && $# -le 3 ]] || usage; load_to_container "$2" "${3:-}" ;;
   read) [[ $# -eq 1 ]] || usage; read_keychain ;;
+  write) [[ $# -eq 1 ]] || usage; write_keychain ;;
   verify)
     if security find-generic-password -a "$ACCOUNT_NAME" -s "$SERVICE_NAME" >/dev/null; then
       echo "Keychain item exists for $SERVICE_NAME"
