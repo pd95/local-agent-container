@@ -105,6 +105,9 @@ agentctl build --snapshot
 # Run the current directory (persistent by default)
 agentctl run
 
+# Create or reuse a container, install Codex if needed, set it preferred, and launch it
+agentctl run --runtime codex --install-runtime
+
 # Run Codex with the Gemma or qwen profile from config.toml
 agentctl run --profile gemma
 agentctl run --profile qwen
@@ -112,7 +115,7 @@ agentctl run --profile qwen
 # Run Codex for a specific directory
 agentctl run --workdir /path/to/project
 
-# Run with a specific base image
+# Run with a specific base image when you need a toolchain
 agentctl run --image agent-python
 
 # Run a specific historical build
@@ -166,6 +169,7 @@ agentctl run --cmd bash
 - Local-model runs use a Codex profile from `config.toml`. The default profile is `gpt-oss`; use `agentctl run --profile gemma` to launch the bundled Gemma profile after pulling `gemma4:26b-a4b-it-q4_K_M` into Ollama.
 - `--cmd` consumes the remaining arguments, cannot be combined with `--shell`, and should be placed last. If you pass one quoted string with spaces, it runs via `$CODEX_SHELL -lc`. The same behavior applies to `agentctl exec`.
 - `agentctl run --runtime <runtime>` selects the preferred runtime to launch in the target container before executing the default entrypoint. Add `--install-runtime` to install that runtime first when needed. A practical Claude bootstrap path is now just `agentctl run --runtime claude --install-runtime`.
+- For most new setups, prefer runtime-first flows such as `agentctl run --runtime codex --install-runtime` or `agentctl run --runtime claude --install-runtime` over choosing an image because it happens to bundle a specific agent/runtime.
 - When you use `agentctl run --runtime <runtime>`, agentctl now also performs best-effort pre-run auth replay from Keychain if that runtime exposes host-managed auth and a matching Keychain entry exists. This means a previously authenticated Claude runtime can come up already logged in on a fresh container without a separate manual auth write step.
 - Claude’s native installer can be OOM-killed on Linux if the container is too small. For fresh Claude bootstrap and temporary Claude auth containers, `agentctl` now defaults the create-time memory limit to `4G` unless you explicitly override it.
 - In local-model mode, the Ollama reachability preflight only runs for the default Codex startup path. `--cmd` and `--shell` skip that check so image inspection and ad hoc commands still work without a running Ollama listener.
@@ -190,7 +194,7 @@ agentctl run --cmd bash
 
 #### Image selection
 
-Use `--image` when you need a specific toolchain, or set `DEFAULT_IMAGE` in `agentctl` for a permanent default.
+Use `--image` when you need a specific toolchain, or set `DEFAULT_IMAGE` in `agentctl` for a permanent default. For agent/runtime choice, prefer `--runtime` plus `--install-runtime`.
 
 When to use which image:
 

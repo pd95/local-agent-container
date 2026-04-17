@@ -527,6 +527,8 @@ Options:
 
 Each successful build keeps the stable image name (for example `agent-plain`) and
 also adds an immutable UTC timestamp tag (for example `agent-plain:20260313-154500`).
+The primary built-in/base images are `agent-plain`, `agent-python`, and `agent-swift`.
+`agent-office` remains available only as a legacy compatibility image when explicitly requested.
 Local image names follow this convention:
   agent-plain   -> DockerFile
   agent-<name>  -> DockerFile.<name>

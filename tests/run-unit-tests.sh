@@ -86,6 +86,17 @@ test_run_help_reports_runtime_options() {
   assert_contains "--install-runtime  Install the selected runtime before launch"
 }
 
+test_build_help_reports_primary_base_images() {
+  begin_test "build help reports the primary base images"
+
+  run_capture "$AGENTCTL" build --help
+  assert_status 0
+  assert_contains "agent-plain"
+  assert_contains "agent-python"
+  assert_contains "agent-swift"
+  assert_contains "agent-office remains available only as a legacy compatibility image"
+}
+
 test_run_cmd_runtime_selection_prepares_runtime_before_launch() {
   begin_test "run_cmd can select and install a runtime before launch"
 
@@ -131,6 +142,22 @@ test_run_cmd_warns_for_legacy_office_image() {
   assert_status 0
   assert_contains "legacy compatibility image"
   assert_contains "agent-python"
+}
+
+test_build_cmd_warns_for_legacy_office_image() {
+  begin_test "build_cmd warns when building the legacy office image explicitly"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  image_exists() { return 0; }
+  stop_buildkit_container() { :; }
+  mock_container() { :; }
+  CONTAINER_CMD="mock_container"
+
+  run_capture build_cmd --image agent-office --snapshot
+  assert_status 0
+  assert_contains "legacy compatibility image"
 }
 
 test_run_cmd_rejects_non_codex_profile() {
