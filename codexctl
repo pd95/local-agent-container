@@ -1634,7 +1634,8 @@ fi
 ln -sf "$image_md" "$config_dir/AGENTS.md"
 chown -h coder:coder "$config_dir/AGENTS.md"
 if test -f "$defaults_dir/claude.json"; then
-  cp "$defaults_dir/claude.json" "$home_dir/.claude.json"
+  mkdir -p "$config_dir"
+  cp "$defaults_dir/claude.json" "$config_dir/settings.json"
 fi
 if test -f "$config_dir/config.toml"; then
   chown coder:coder "$config_dir/config.toml"
@@ -1642,8 +1643,8 @@ fi
 if test -f "$config_dir/local_models.json"; then
   chown coder:coder "$config_dir/local_models.json"
 fi
-if test -f "$home_dir/.claude.json"; then
-  chown coder:coder "$home_dir/.claude.json"
+if test -f "$config_dir/settings.json"; then
+  chown coder:coder "$config_dir/settings.json"
 fi
 SH
 }

@@ -1,5 +1,14 @@
 {
-  "hasCompletedOnboarding": true,
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "env": {
+    "USE_BUILTIN_RIPGREP": "0",
+    "DISABLE_AUTOUPDATER": "1",
+    "DISABLE_TELEMETRY": "1",
+    "DISABLE_ERROR_REPORTING": "1",
+    "DISABLE_FEEDBACK_COMMAND": "1",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "spinnerTipsEnabled": false,
   "projects": {
     "/workdir": {
       "allowedTools": [],
@@ -10,5 +19,27 @@
       "hasTrustDialogAccepted": true,
       "projectOnboardingSeenCount": 1
     }
-  }
+  },
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "allow": [
+    ],
+    "deny": [
+      "Bash(rm -rf /)",
+      "Read(/etc/shadow)"
+    ]
+  },
+  "allowedTools": [
+    "Task",
+    "Bash",           
+    "Glob",
+    "Grep",
+    "LS",
+    "Read",
+    "Edit",
+    "MultiEdit",
+    "Write",
+    "WebFetch",
+    "WebSearch"
+  ]
 }

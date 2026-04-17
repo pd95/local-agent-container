@@ -36,12 +36,15 @@ case "$cmd" in
     printf '%s\n' /home/coder/.claude/.credentials.json
     ;;
   update)
-    exec npm install -g @anthropic-ai/claude-code --omit=dev --no-fund --no-audit
+    exec claude update
     ;;
   supports)
     case "${1:-}" in
-      interactive-login|keychain-sync|local-model-mode|update)
+      update)
         printf '%s\n' 1
+        ;;
+      interactive-login|keychain-sync|local-model-mode)
+        printf '%s\n' 0
         ;;
       openai-mode)
         printf '%s\n' 0

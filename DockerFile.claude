@@ -4,21 +4,17 @@ FROM agent-codex
 USER root
 
 # --- Claude CLI ---
-RUN npm install -g @anthropic-ai/claude-code \
-    --omit=dev \
-    --no-fund \
-    --no-audit \
-    && npm cache clean --force
+RUN curl -fsSL https://claude.ai/install.sh | bash
 
 RUN mkdir -p /home/coder/.claude
 
 COPY --chown=root:root agent-claude.sh /usr/local/bin/agent.sh
 COPY --chown=root:root agent-claude.env /etc/agentctl/agent.env
-COPY --chown=coder:coder claude.json /home/coder/.claude.json
+COPY --chown=coder:coder claude.json /home/coder/.claude/settings.json
 
 RUN chmod 755 /usr/local/bin/agent.sh \
  && mkdir -p /etc/agentctl/defaults \
- && cp /home/coder/.claude.json /etc/agentctl/defaults/claude.json \
+ && cp /home/coder/.claude/settings.json /etc/agentctl/defaults/claude.json \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/agentctl/image.md <<EOF
 You are running inside the \`agent-claude\` image.
@@ -42,7 +38,7 @@ Programming environments:
 EOF
 
 RUN ln -sf /etc/agentctl/image.md /home/coder/.claude/AGENTS.md
-RUN chown -R coder:coder /home/coder/.claude /home/coder/.claude.json /etc/agentctl/defaults
+RUN chown -R coder:coder /home/coder/.claude /etc/agentctl/defaults
 
 USER coder
 WORKDIR /workdir

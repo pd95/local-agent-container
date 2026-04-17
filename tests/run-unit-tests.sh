@@ -388,15 +388,15 @@ test_matrix_dockerfiles_publish_runtime_metadata() {
 test_claude_images_publish_default_onboarding_state() {
   begin_test "Claude-capable images publish default claude.json state"
 
-  grep -Fq 'COPY --chown=coder:coder claude.json /home/coder/.claude.json' "$TEST_ROOT/DockerFile.claude" \
-    || fail "Expected DockerFile.claude to bake in /home/coder/.claude.json"
-  grep -Fq 'cp /home/coder/.claude.json /etc/agentctl/defaults/claude.json' "$TEST_ROOT/DockerFile.claude" \
+  grep -Fq 'COPY --chown=coder:coder claude.json /home/coder/.claude/settings.json' "$TEST_ROOT/DockerFile.claude" \
+    || fail "Expected DockerFile.claude to bake in /home/coder/.claude/settings.json"
+  grep -Fq 'cp /home/coder/.claude/settings.json /etc/agentctl/defaults/claude.json' "$TEST_ROOT/DockerFile.claude" \
     || fail "Expected DockerFile.claude to publish claude.json defaults"
 
   grep -Fq 'COPY --chown=root:root claude.json /tmp/claude.json' "$TEST_ROOT/DockerFile.swift" \
     || fail "Expected DockerFile.swift to stage claude.json for Claude runtime builds"
-  grep -Fq 'cp /tmp/claude.json /home/coder/.claude.json' "$TEST_ROOT/DockerFile.swift" \
-    || fail "Expected DockerFile.swift to install claude.json for Claude runtime builds"
+  grep -Fq 'cp /tmp/claude.json /home/coder/.claude/settings.json' "$TEST_ROOT/DockerFile.swift" \
+    || fail "Expected DockerFile.swift to install claude.json into /home/coder/.claude/settings.json for Claude runtime builds"
   grep -Fq 'cp /tmp/claude.json /etc/agentctl/defaults/claude.json' "$TEST_ROOT/DockerFile.swift" \
     || fail "Expected DockerFile.swift to publish claude.json defaults for Claude runtime builds"
 }

@@ -72,20 +72,31 @@ test_claude_runtime_contract_smoke() {
   assert_status 0
 
   run_capture "$CODEXCTL" run --name "$name" --image agent-claude --temp --workdir "$workdir" --cmd bash -lc '
-    command -v claude >/dev/null &&
-    [ "$(/usr/local/bin/agent.sh home-dir)" = "/home/coder" ] &&
-    [ "$(/usr/local/bin/agent.sh config-dir)" = "/home/coder/.claude" ] &&
-    [ "$(/usr/local/bin/agent.sh auth-path)" = "/home/coder/.claude/.credentials.json" ] &&
-    [ "$(/usr/local/bin/agent.sh supports openai-mode)" = "0" ] &&
-    grep -Fxq "AGENT_ID=claude" /etc/agentctl/agent.env &&
-    grep -Fxq "AGENT_HOME_DIR=/home/coder" /etc/agentctl/agent.env &&
-    grep -Fxq "AGENT_CONFIG_DIR=/home/coder/.claude" /etc/agentctl/agent.env &&
-    grep -Fxq "AGENT_AUTH_PATH=/home/coder/.claude/.credentials.json" /etc/agentctl/agent.env &&
-    grep -Fxq "AGENT_AUTH_FORMAT=opaque_blob" /etc/agentctl/agent.env &&
-    diff -q /etc/agentctl/defaults/claude.json /home/coder/.claude.json &&
-    grep -Fq "\"hasCompletedOnboarding\": true" /home/coder/.claude.json &&
-    test -L /home/coder/.claude/AGENTS.md &&
-    [ "$(readlink /home/coder/.claude/AGENTS.md)" = "/etc/agentctl/image.md" ] &&
+    check() {
+      "$@" || {
+        echo "claude-smoke-failed: $*" >&2
+        exit 1
+      }
+    }
+
+    check command -v claude
+    [ "$(/usr/local/bin/agent.sh home-dir)" = "/home/coder" ] || { echo "claude-smoke-failed: home-dir" >&2; exit 1; }
+    [ "$(/usr/local/bin/agent.sh config-dir)" = "/home/coder/.claude" ] || { echo "claude-smoke-failed: config-dir" >&2; exit 1; }
+    [ "$(/usr/local/bin/agent.sh auth-path)" = "/home/coder/.claude/.credentials.json" ] || { echo "claude-smoke-failed: auth-path" >&2; exit 1; }
+    [ "$(/usr/local/bin/agent.sh supports openai-mode)" = "0" ] || { echo "claude-smoke-failed: supports openai-mode" >&2; exit 1; }
+    [ "$(/usr/local/bin/agent.sh supports interactive-login)" = "0" ] || { echo "claude-smoke-failed: supports interactive-login" >&2; exit 1; }
+    [ "$(/usr/local/bin/agent.sh supports keychain-sync)" = "0" ] || { echo "claude-smoke-failed: supports keychain-sync" >&2; exit 1; }
+    check grep -Fxq "AGENT_ID=claude" /etc/agentctl/agent.env
+    check grep -Fxq "AGENT_HOME_DIR=/home/coder" /etc/agentctl/agent.env
+    check grep -Fxq "AGENT_CONFIG_DIR=/home/coder/.claude" /etc/agentctl/agent.env
+    check grep -Fxq "AGENT_AUTH_PATH=/home/coder/.claude/.credentials.json" /etc/agentctl/agent.env
+    check grep -Fxq "AGENT_AUTH_FORMAT=opaque_blob" /etc/agentctl/agent.env
+    check grep -Fxq "AGENT_SUPPORTS_INTERACTIVE_LOGIN=0" /etc/agentctl/agent.env
+    check grep -Fxq "AGENT_SUPPORTS_KEYCHAIN_SYNC=0" /etc/agentctl/agent.env
+    check diff -q /etc/agentctl/defaults/claude.json /home/coder/.claude/settings.json
+    check grep -Fq "\"hasCompletedOnboarding\": true" /home/coder/.claude/settings.json
+    check test -L /home/coder/.claude/AGENTS.md
+    [ "$(readlink /home/coder/.claude/AGENTS.md)" = "/etc/agentctl/image.md" ] || { echo "claude-smoke-failed: AGENTS target" >&2; exit 1; }
     echo claude-runtime-ok
   '
   assert_status 0
@@ -105,10 +116,10 @@ test_claude_reset_config_restores_image_defaults() {
   workdir="$(new_workdir)"
   register_container_cleanup "$name"
 
-  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.claude && printf "{\"custom\":true}\n" >/home/coder/.claude.json && rm -f /home/coder/.claude/AGENTS.md && printf "legacy-agents\n" >/home/coder/.claude/AGENTS.md'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.claude && printf "{\"custom\":true}\n" >/home/coder/.claude/settings.json && rm -f /home/coder/.claude/AGENTS.md && printf "legacy-agents\n" >/home/coder/.claude/AGENTS.md'
   assert_status 0
 
-  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --reset-config --cmd bash -lc 'if diff -q /etc/agentctl/defaults/claude.json /home/coder/.claude.json && test -L /home/coder/.claude/AGENTS.md && [ "$(readlink /home/coder/.claude/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo claude-reset-config-ok; else exit 1; fi'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --reset-config --cmd bash -lc 'if diff -q /etc/agentctl/defaults/claude.json /home/coder/.claude/settings.json && test -L /home/coder/.claude/AGENTS.md && [ "$(readlink /home/coder/.claude/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo claude-reset-config-ok; else exit 1; fi'
   assert_status 0
   assert_contains "claude-reset-config-ok"
 }
@@ -122,14 +133,14 @@ test_claude_upgrade_overwrite_config_restores_image_defaults() {
   workdir="$(new_workdir)"
   register_container_cleanup "$name"
 
-  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.claude && printf "{\"custom\":true}\n" >/home/coder/.claude.json && rm -f /home/coder/.claude/AGENTS.md && printf "legacy-agents\n" >/home/coder/.claude/AGENTS.md'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.claude && printf "{\"custom\":true}\n" >/home/coder/.claude/settings.json && rm -f /home/coder/.claude/AGENTS.md && printf "legacy-agents\n" >/home/coder/.claude/AGENTS.md'
   assert_status 0
 
   run_capture "$CODEXCTL" upgrade --name "$name" --overwrite-config --no-backup
   assert_status 0
   assert_contains "Upgrade complete: $name (backup skipped)"
 
-  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/agentctl/defaults/claude.json /home/coder/.claude.json && test -L /home/coder/.claude/AGENTS.md && [ "$(readlink /home/coder/.claude/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo claude-overwrite-config-ok; else exit 1; fi'
+  run_capture "$CODEXCTL" run --name "$name" --image agent-claude --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/agentctl/defaults/claude.json /home/coder/.claude/settings.json && test -L /home/coder/.claude/AGENTS.md && [ "$(readlink /home/coder/.claude/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo claude-overwrite-config-ok; else exit 1; fi'
   assert_status 0
   assert_contains "claude-overwrite-config-ok"
 }
