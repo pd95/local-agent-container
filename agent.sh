@@ -9,6 +9,8 @@ readonly CODEX_HOME_DIR="${HOME}/.codex"
 readonly CODEX_AUTH_FILE="${CODEX_HOME_DIR}/auth.json"
 readonly DEFAULT_PROFILE="${AGENTCTL_DEFAULT_PROFILE:-gpt-oss}"
 readonly RUN_MODE="${AGENTCTL_RUN_MODE:-local-model}"
+readonly RUNTIME_REGISTRY_DIR="${AGENTCTL_RUNTIME_REGISTRY_DIR:-/etc/agentctl/runtimes.d}"
+readonly RUNTIME_ADAPTER_DIR="${AGENTCTL_RUNTIME_ADAPTER_DIR:-/usr/local/lib/agentctl/runtimes}"
 
 die() {
   printf '%s\n' "$*" >&2
@@ -37,15 +39,6 @@ runtime_preferred() {
   runtime_default
 }
 
-require_codex_runtime() {
-  local runtime
-  runtime="$(runtime_preferred)"
-  case "$runtime" in
-    codex) return 0 ;;
-    *) die "unsupported runtime: $runtime" ;;
-  esac
-}
-
 has_explicit_profile() {
   local arg
   for arg in "$@"; do
@@ -56,60 +49,74 @@ has_explicit_profile() {
   return 1
 }
 
-run_codex() {
-  require_codex_runtime
-  case "$RUN_MODE" in
-    openai)
-      exec codex "$@"
-      ;;
-  esac
-  if has_explicit_profile "$@"; then
-    exec codex "$@"
-  fi
-  exec codex --profile "$DEFAULT_PROFILE" "$@"
-}
-
 ensure_user_dirs() {
   mkdir -p "$USER_CONFIG_DIR" "$CODEX_HOME_DIR"
 }
 
+runtime_manifest_path() {
+  local runtime="$1"
+  local path="${RUNTIME_REGISTRY_DIR}/${runtime}.json"
+
+  [ -f "$path" ] || return 1
+  printf '%s\n' "$path"
+}
+
+runtime_adapter_path() {
+  local runtime="$1"
+  local path="${RUNTIME_ADAPTER_DIR}/${runtime}.sh"
+
+  [ -f "$path" ] || return 1
+  printf '%s\n' "$path"
+}
+
+runtime_manifest_string() {
+  local runtime="$1" key="$2"
+  local manifest
+
+  manifest="$(runtime_manifest_path "$runtime")" || return 1
+  jq -er "$key // empty" "$manifest"
+}
+
+runtime_manifest_json() {
+  local runtime="$1" key="$2"
+  local manifest
+
+  manifest="$(runtime_manifest_path "$runtime")" || return 1
+  jq -c "$key // []" "$manifest"
+}
+
 runtime_known() {
-  case "$1" in
-    codex) return 0 ;;
-    *) return 1 ;;
-  esac
+  runtime_manifest_path "$1" >/dev/null 2>&1
 }
 
 runtime_ids() {
-  printf '%s\n' codex
+  local path
+
+  [ -d "$RUNTIME_REGISTRY_DIR" ] || return 0
+  for path in "$RUNTIME_REGISTRY_DIR"/*.json; do
+    [ -e "$path" ] || continue
+    basename "$path" .json
+  done | sort
 }
 
 runtime_command_name() {
-  case "$1" in
-    codex) printf '%s\n' codex ;;
-    *) return 1 ;;
-  esac
+  runtime_manifest_string "$1" '.command'
 }
 
 runtime_install_method() {
-  case "$1" in
-    codex) printf '%s\n' npm-global ;;
-    *) return 1 ;;
-  esac
+  runtime_manifest_string "$1" '.install_method'
 }
 
 runtime_default_config_dir() {
-  case "$1" in
-    codex) printf '%s\n' /etc/codexctl ;;
-    *) return 1 ;;
-  esac
+  runtime_manifest_string "$1" '.default_config_dir'
 }
 
 runtime_auth_formats_json() {
-  case "$1" in
-    codex) printf '%s\n' '["json_refresh_token"]' ;;
-    *) return 1 ;;
-  esac
+  runtime_manifest_json "$1" '.auth_formats'
+}
+
+runtime_commands_json() {
+  runtime_manifest_json "$1" '.commands'
 }
 
 runtime_command_exists() {
@@ -134,6 +141,29 @@ ensure_runtime_known() {
   runtime_known "$runtime" || die "unsupported runtime: $runtime"
 }
 
+reset_runtime_hooks() {
+  unset -f \
+    agent_runtime_run \
+    agent_runtime_install \
+    agent_runtime_update \
+    agent_runtime_reset_config \
+    agent_runtime_auth_read \
+    agent_runtime_auth_write \
+    agent_runtime_auth_login \
+    >/dev/null 2>&1 || true
+}
+
+load_runtime_adapter() {
+  local runtime="$1"
+  local adapter
+
+  ensure_runtime_known "$runtime"
+  adapter="$(runtime_adapter_path "$runtime")" || die "missing runtime adapter: $runtime"
+  reset_runtime_hooks
+  # shellcheck source=/dev/null
+  . "$adapter"
+}
+
 ensure_runtime_installed() {
   local runtime="$1"
   ensure_runtime_known "$runtime"
@@ -141,12 +171,22 @@ ensure_runtime_installed() {
   die "runtime not installed: $runtime (run: agent.sh runtime install $runtime)"
 }
 
+run_runtime() {
+  local runtime="$1"
+  shift
+
+  ensure_runtime_installed "$runtime"
+  load_runtime_adapter "$runtime"
+  agent_runtime_run "$runtime" "$@"
+}
+
 json_runtime_info() {
   local runtime="$1"
-  local installed_json preferred_json
+  local installed_json preferred_json commands_json
 
   ensure_runtime_known "$runtime"
   installed_json="$(runtime_installed_json "$runtime")"
+  commands_json="$(runtime_commands_json "$runtime")"
   if [ "$(runtime_preferred)" = "$runtime" ]; then
     preferred_json=true
   else
@@ -163,6 +203,7 @@ json_runtime_info() {
     --arg install_method "$(runtime_install_method "$runtime")" \
     --arg config_dir "$(runtime_default_config_dir "$runtime")" \
     --argjson auth_formats "$(runtime_auth_formats_json "$runtime")" \
+    --argjson commands "$commands_json" \
     --argjson installed "$installed_json" \
     --argjson selected "$preferred_json" \
     '{
@@ -175,6 +216,7 @@ json_runtime_info() {
       command: $command_name,
       install_method: $install_method,
       auth_formats: $auth_formats,
+      commands: $commands,
       default_config_dir: $config_dir,
       default_profile: $default_profile,
       phase: 2
@@ -187,26 +229,10 @@ json_runtime_capabilities() {
   ensure_runtime_known "$runtime"
   jq -n \
     --arg runtime "$runtime" \
+    --argjson commands "$(runtime_commands_json "$runtime")" \
     '{
       runtime: $runtime,
-      commands: [
-        "help",
-        "run",
-        "version",
-        "refresh",
-        "runtime list",
-        "preferred get",
-        "preferred set codex",
-        "runtime info codex",
-        "runtime capabilities codex",
-        "runtime install codex",
-        "runtime update codex",
-        "runtime reset-config codex",
-        "auth login codex",
-        "auth read codex json_refresh_token",
-        "auth write codex json_refresh_token",
-        "system manifest"
-      ]
+      commands: $commands
     }'
 }
 
@@ -236,26 +262,22 @@ json_system_manifest() {
 auth_read() {
   local runtime="$1" key="$2"
   ensure_runtime_known "$runtime"
-  [ "$key" = json_refresh_token ] || die "unsupported auth format: $key"
-  [ -f "$CODEX_AUTH_FILE" ] || exit 1
-  cat "$CODEX_AUTH_FILE"
+  load_runtime_adapter "$runtime"
+  agent_runtime_auth_read "$runtime" "$key"
 }
 
 auth_write() {
   local runtime="$1" key="$2" value="${3:-}"
   ensure_runtime_known "$runtime"
-  [ "$key" = json_refresh_token ] || die "unsupported auth format: $key"
-  ensure_user_dirs
-  if [ -z "$value" ] && [ ! -t 0 ]; then
-    value="$(cat)"
-  fi
-  printf '%s' "$value" >"$CODEX_AUTH_FILE"
+  load_runtime_adapter "$runtime"
+  agent_runtime_auth_write "$runtime" "$key" "$value"
 }
 
 auth_login() {
   local runtime="$1"
   ensure_runtime_installed "$runtime"
-  exec codex login --device-auth
+  load_runtime_adapter "$runtime"
+  agent_runtime_auth_login "$runtime"
 }
 
 preferred_get() {
@@ -276,36 +298,22 @@ runtime_list() {
 runtime_install() {
   local runtime="${1:-}"
   ensure_runtime_known "$runtime"
-
-  case "$runtime" in
-    codex)
-      npm install -g @openai/codex --omit=dev --no-fund --no-audit
-      preferred_set "$runtime"
-      ;;
-  esac
+  load_runtime_adapter "$runtime"
+  agent_runtime_install "$runtime"
 }
 
 runtime_update() {
   local runtime="${1:-}"
   ensure_runtime_known "$runtime"
-  exec npm install -g @openai/codex --omit=dev --no-fund --no-audit
+  load_runtime_adapter "$runtime"
+  agent_runtime_update "$runtime"
 }
 
 runtime_reset_config() {
   local runtime="${1:-}"
   ensure_runtime_known "$runtime"
-  local config_dir
-
-  config_dir="$(runtime_default_config_dir "$runtime")"
-  ensure_user_dirs
-  cp "$config_dir/config.toml" "$CODEX_HOME_DIR/config.toml"
-  if [ -f "$config_dir/local_models.json" ]; then
-    cp "$config_dir/local_models.json" "$CODEX_HOME_DIR/local_models.json"
-  else
-    rm -f "$CODEX_HOME_DIR/local_models.json"
-  fi
-  ln -sf "$config_dir/image.md" "$CODEX_HOME_DIR/AGENTS.md"
-  rm -f "$USER_RUNTIME_FILE"
+  load_runtime_adapter "$runtime"
+  agent_runtime_reset_config "$runtime" "$(runtime_default_config_dir "$runtime")"
 }
 
 refresh_agent() {
@@ -347,15 +355,7 @@ main() {
       usage
       ;;
     run)
-      ensure_runtime_installed "$(runtime_preferred)"
-      case "$(runtime_preferred)" in
-        codex)
-          run_codex "$@"
-          ;;
-        *)
-          die "unsupported runtime: $(runtime_preferred)"
-          ;;
-      esac
+      run_runtime "$(runtime_preferred)" "$@"
       ;;
     version)
       printf '%s\n' "agent.sh phase2"

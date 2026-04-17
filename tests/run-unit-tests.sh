@@ -20,6 +20,19 @@ load_codexctl_functions() {
   . "$harness"
 }
 
+run_agent_sh_capture() {
+  local temp_home="$1"
+  shift
+
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$PATH" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    "$TEST_ROOT/agent.sh" "$@"
+}
+
 test_run_profile_wires_selected_profile() {
   begin_test "run_cmd wires --profile into the launched agent.sh command"
 
@@ -102,7 +115,7 @@ test_agent_sh_runtime_info_reports_registry_metadata() {
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
 
-  run_capture env HOME="$temp_home/home" XDG_CONFIG_HOME="$temp_home/config" PATH="$PATH" "$TEST_ROOT/agent.sh" runtime info codex
+  run_agent_sh_capture "$temp_home" runtime info codex
   assert_status 0
   printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "npm-global" and .default_config_dir == "/etc/codexctl" and (.auth_formats | index("json_refresh_token") != null)' >/dev/null || fail "Expected runtime info JSON for codex, got: $RUN_OUTPUT"
 }
@@ -114,10 +127,10 @@ test_agent_sh_preferred_round_trip() {
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
 
-  run_capture env HOME="$temp_home/home" XDG_CONFIG_HOME="$temp_home/config" PATH="$PATH" "$TEST_ROOT/agent.sh" preferred set codex
+  run_agent_sh_capture "$temp_home" preferred set codex
   assert_status 0
 
-  run_capture env HOME="$temp_home/home" XDG_CONFIG_HOME="$temp_home/config" PATH="$PATH" "$TEST_ROOT/agent.sh" preferred get
+  run_agent_sh_capture "$temp_home" preferred get
   assert_status 0
   assert_contains "codex"
 }
@@ -350,6 +363,8 @@ test_refresh_updates_managed_files_without_recreate() {
   printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/config.toml" || fail "Expected refresh to update /etc/agentctl/config.toml"
   printf '%s\n' "$exec_log" | grep -Fq "/etc/codexctl/config.toml" || fail "Expected refresh to update /etc/codexctl/config.toml"
   printf '%s\n' "$exec_log" | grep -Fq "/usr/local/bin/agent.sh" || fail "Expected refresh to update agent.sh"
+  printf '%s\n' "$exec_log" | grep -Fq "/usr/local/lib/agentctl/runtimes" || fail "Expected refresh to update runtime adapters"
+  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/runtimes.d" || fail "Expected refresh to update runtime registry"
 }
 
 test_system_manifest_starts_stopped_container_and_restores_state() {

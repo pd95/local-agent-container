@@ -207,6 +207,28 @@ test_runtime_management_commands_work_for_existing_container() {
   assert_contains "codex"
 }
 
+test_refresh_pushes_runtime_registry_into_existing_container() {
+  begin_test "refresh updates the runtime registry in an existing container"
+  local name
+  local workdir
+
+  name="$(unique_name runtime-refresh)"
+  workdir="$(new_workdir)"
+  register_container_cleanup "$name"
+
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd true
+  assert_status 0
+
+  run_capture "$AGENTCTL" refresh --name "$name"
+  assert_status 0
+  assert_contains "Refresh complete: $name"
+
+  run_capture "$AGENTCTL" runtime --name "$name" info codex
+  assert_status 0
+  assert_contains '"runtime":"codex"'
+  assert_contains '"install_method":"npm-global"'
+}
+
 main() {
   require_host_prereqs
 
@@ -223,6 +245,7 @@ main() {
   test_run_reset_config_restores_image_defaults
   test_upgrade_overwrite_config_restores_image_defaults
   test_runtime_management_commands_work_for_existing_container
+  test_refresh_pushes_runtime_registry_into_existing_container
 
   log "PASS: all host integration tests completed"
 }

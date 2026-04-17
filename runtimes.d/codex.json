@@ -1,0 +1,27 @@
+{
+  "id": "codex",
+  "command": "codex",
+  "install_method": "npm-global",
+  "default_config_dir": "/etc/codexctl",
+  "auth_formats": [
+    "json_refresh_token"
+  ],
+  "commands": [
+    "help",
+    "run",
+    "version",
+    "refresh",
+    "runtime list",
+    "preferred get",
+    "preferred set codex",
+    "runtime info codex",
+    "runtime capabilities codex",
+    "runtime install codex",
+    "runtime update codex",
+    "runtime reset-config codex",
+    "auth login codex",
+    "auth read codex json_refresh_token",
+    "auth write codex json_refresh_token",
+    "system manifest"
+  ]
+}

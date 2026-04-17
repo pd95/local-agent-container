@@ -166,6 +166,7 @@ agentctl run --cmd bash
 - `CODEX_SHELL` overrides the shell used by `run --shell` and `exec` (default: `bash`). You can also set `DEFAULT_SHELL` in `agentctl` for a static default. All default images include both `bash` and `zsh`.
 - `agentctl run --update` upgrades `@openai/codex` inside the target container before starting. If the container does not exist yet, it is created first. With `--temp`, the update is ephemeral; `agentctl build --rebuild` remains the persistent way to refresh image content.
 - `agentctl runtime list`, `agentctl runtime info <runtime>`, and `agentctl runtime capabilities <runtime>` query the in-container `agent.sh` runtime contract. Phase 2 still ships only `codex`, but the command surface is now explicit.
+- Runtime metadata now lives under `/etc/agentctl/runtimes.d`, and runtime-specific handlers live under `/usr/local/lib/agentctl/runtimes`. `agentctl refresh` updates those directories in-place for existing containers.
 - `agentctl runtime install codex` installs or refreshes the Codex runtime inside an existing container and marks it as preferred for that container.
 - `agentctl use codex` updates the container-local preferred runtime without changing the default image selection used by `agentctl run`.
 - `--cpu` and `--mem` on `agentctl run` only apply when creating a new container. If the named container already exists, `agentctl run` fails fast and tells you to use `agentctl refresh` instead of silently ignoring the resource request.

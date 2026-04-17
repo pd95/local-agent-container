@@ -57,9 +57,12 @@ ENV HOME=/home/coder \
 # Copy Codex default configuration and local model metadata config
 COPY --chown=coder:coder config.toml local_models.json /home/coder/.codex/
 
-# Install the generic Phase 1 runtime launcher
+# Install the generic runtime launcher and runtime registry
 COPY agent.sh /usr/local/bin/agent.sh
+COPY runtimes /usr/local/lib/agentctl/runtimes
+COPY runtimes.d /etc/agentctl/runtimes.d
 RUN chmod 0755 /usr/local/bin/agent.sh \
+ && find /usr/local/lib/agentctl/runtimes -type f -name '*.sh' -exec chmod 0644 {} + \
  && mkdir -p /etc/agentctl \
  && printf '%s\n' codex > /etc/agentctl/preferred-runtime
 
