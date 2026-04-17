@@ -3,6 +3,16 @@
   "command": "codex",
   "install_method": "npm-global",
   "default_config_dir": "/etc/codexctl",
+  "capabilities": {
+    "install": true,
+    "update": true,
+    "reset_config": true,
+    "auth_login": true,
+    "auth_read": true,
+    "auth_write": true,
+    "local_model_mode": true,
+    "openai_mode": true
+  },
   "auth_formats": [
     "json_refresh_token"
   ],

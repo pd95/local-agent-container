@@ -606,8 +606,9 @@ usage_auth() {
 Usage: $CLI_NAME auth [options]
 
 Options:
-  --name NAME   Auth container name (default: agent-openai-auth-<dir>)
-  --image NAME  Image to use (default: agent-plain)
+  --name NAME      Auth container name (default: agent-openai-auth-<dir>)
+  --image NAME     Image to use (default: agent-plain)
+  --runtime NAME   Runtime to authenticate (default: codex)
 EOF
 }
 
@@ -1402,7 +1403,10 @@ build_cmd() {
 run_auth_flow() {
   local image="$1"
   local auth_name="$2"
+  local runtime="${3:-$OPENAI_RUNTIME_ID}"
   local created=0
+  local runtime_info=""
+  local auth_format=""
 
   cleanup_auth_container() {
     if [ "$created" -eq 1 ] && container_exists "$auth_name"; then
@@ -1425,8 +1429,13 @@ run_auth_flow() {
   created=1
 
   "$CONTAINER_CMD" start "$auth_name" >/dev/null
-  "$CONTAINER_CMD" exec -it "$auth_name" bash -lc "exec bash /usr/local/bin/agent.sh auth login $OPENAI_RUNTIME_ID"
-  "$CONTAINER_CMD" exec "$auth_name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh auth read "$OPENAI_RUNTIME_ID" "$OPENAI_AUTH_FORMAT" | "$KEYCHAIN_SCRIPT" write
+  runtime_info="$("$CONTAINER_CMD" exec "$auth_name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh runtime info "$runtime")" || die "Failed to inspect runtime auth contract: $runtime"
+  if ! printf '%s' "$runtime_info" | jq -e '.installed == true and (.capabilities.auth_login // false) and (.capabilities.auth_read // false)' >/dev/null; then
+    die "Runtime does not support host-managed auth flow yet: $runtime"
+  fi
+  auth_format="$(printf '%s' "$runtime_info" | jq -er '.auth_formats[0] // empty')" || die "Runtime does not expose a host-storable auth format: $runtime"
+  "$CONTAINER_CMD" exec -it "$auth_name" bash -lc "exec bash /usr/local/bin/agent.sh auth login $runtime"
+  "$CONTAINER_CMD" exec "$auth_name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh auth read "$runtime" "$auth_format" | "$KEYCHAIN_SCRIPT" write
   "$CONTAINER_CMD" stop "$auth_name" >/dev/null
   "$CONTAINER_CMD" rm "$auth_name" >/dev/null
   created=0
@@ -2360,11 +2369,13 @@ run_cmd() {
 auth_cmd() {
   local name=""
   local image="$DEFAULT_IMAGE"
+  local runtime="$OPENAI_RUNTIME_ID"
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
       --image) image="$2"; shift 2 ;;
+      --runtime) runtime="$2"; shift 2 ;;
       --help) usage_auth; return 0 ;;
       *) die "Unknown option for auth: $1" ;;
     esac
@@ -2375,7 +2386,7 @@ auth_cmd() {
     name="$(default_name "$AUTH_NAME_PREFIX")"
   fi
   image="$(image_ref_for_runtime "$image")"
-  run_auth_flow "$image" "$name"
+  run_auth_flow "$image" "$name" "$runtime"
   echo "Auth updated. Restart any running --openai containers to pick up the new token." >&2
 }
 

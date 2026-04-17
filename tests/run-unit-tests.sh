@@ -150,7 +150,7 @@ test_agent_sh_runtime_capabilities_reports_manifest_commands() {
 
   run_agent_sh_capture "$temp_home" runtime capabilities codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and (.commands | index("runtime install codex") != null) and (.commands | index("runtime capabilities codex") != null)' >/dev/null || fail "Expected runtime capabilities JSON for codex, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and (.commands | index("runtime install codex") != null) and (.commands | index("runtime capabilities codex") != null) and (.auth_formats | index("json_refresh_token") != null) and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.openai_mode == true' >/dev/null || fail "Expected runtime capabilities JSON for codex, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_claude_runtime_info_reports_skeleton_metadata() {
@@ -356,6 +356,9 @@ EOF
           shift 6
         fi
         printf '%s\n' "$*" >>"$exec_log_file"
+        if [ "$*" = "bash /usr/local/bin/agent.sh runtime info codex" ]; then
+          printf '{"runtime":"codex","installed":true,"auth_formats":["json_refresh_token"],"capabilities":{"auth_login":true,"auth_read":true,"auth_write":true}}'
+        fi
         if [ "$*" = "bash /usr/local/bin/agent.sh auth read codex json_refresh_token" ]; then
           printf '{"refresh_token":"auth-flow-token","last_refresh":"2026-04-17T01:02:03Z"}'
         fi
@@ -369,10 +372,80 @@ EOF
 
   run_capture run_auth_flow agent-plain unit-auth-container
   assert_status 0
+  grep -Fq 'bash /usr/local/bin/agent.sh runtime info codex' "$exec_log_file" || fail "Expected runtime info inspection before auth flow"
   grep -Fq 'bash -lc exec bash /usr/local/bin/agent.sh auth login codex' "$exec_log_file" || fail "Expected auth login via agent.sh"
   grep -Fq 'bash /usr/local/bin/agent.sh auth read codex json_refresh_token' "$exec_log_file" || fail "Expected auth read via agent.sh"
   [ -f "$stored_blob_file" ] || fail "Expected auth blob to be written to fake keychain"
   grep -Fq '"refresh_token":"auth-flow-token"' "$stored_blob_file" || fail "Expected auth blob from agent.sh auth read"
+}
+
+test_run_auth_flow_rejects_runtime_without_host_auth_support() {
+  begin_test "run_auth_flow rejects runtimes without host auth support"
+
+  local temp_dir
+  local unit_script
+  local fake_keychain
+  local exec_log_file
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-unsupported.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  unit_script="$temp_dir/check.sh"
+  fake_keychain="$temp_dir/fake-keychain.sh"
+  exec_log_file="$temp_dir/exec.log"
+
+  cat >"$fake_keychain" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+EOF
+  chmod +x "$fake_keychain"
+
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$CODEXCTL"
+KEYCHAIN_SCRIPT="$fake_keychain"
+container_exists() { return 1; }
+CONTAINER_CMD=container
+container() {
+  case "\$1" in
+    create|start|stop|rm)
+      return 0
+      ;;
+    exec)
+      shift
+      if [ "\$1" = "-it" ]; then
+        shift
+      fi
+      if [ "\$1" = "unit-auth-container" ]; then
+        shift
+      fi
+      if [ "\${1:-}" = "setpriv" ]; then
+        shift 6
+      fi
+      printf '%s\n' "\$*" >>"$exec_log_file"
+      if [ "\$*" = "bash /usr/local/bin/agent.sh runtime info claude" ]; then
+        printf '{"runtime":"claude","installed":false,"auth_formats":[],"capabilities":{"auth_login":false,"auth_read":false,"auth_write":false}}'
+      fi
+      return 0
+      ;;
+    *)
+      echo "Unexpected container invocation: \$*" >&2
+      exit 1
+      ;;
+  esac
+}
+run_auth_flow agent-plain unit-auth-container claude
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 1
+  assert_contains "Runtime does not support host-managed auth flow yet: claude"
+  grep -Fq 'bash /usr/local/bin/agent.sh runtime info claude' "$exec_log_file" || fail "Expected runtime info inspection for unsupported runtime"
+  if grep -Fq 'auth login claude' "$exec_log_file"; then
+    fail "Did not expect auth login attempt for unsupported runtime"
+  fi
 }
 
 test_rm_force_stops_running_container_before_remove() {
@@ -867,6 +940,7 @@ main() {
   test_container_auth_info_uses_agent_sh_auth_read
   test_write_auth_blob_to_container_uses_agent_sh_auth_write
   test_run_auth_flow_uses_agent_sh_auth_contract
+  test_run_auth_flow_rejects_runtime_without_host_auth_support
   test_rm_force_stops_running_container_before_remove
   test_image_ref_for_runtime_falls_back_to_legacy_when_present
   test_ls_filters_non_codex_containers

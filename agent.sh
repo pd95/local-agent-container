@@ -126,6 +126,10 @@ runtime_auth_formats_json() {
   runtime_manifest_json "$1" '.auth_formats'
 }
 
+runtime_capabilities_json() {
+  runtime_manifest_json "$1" '.capabilities'
+}
+
 runtime_commands_json() {
   runtime_manifest_json "$1" '.commands'
 }
@@ -193,11 +197,12 @@ run_runtime() {
 
 json_runtime_info() {
   local runtime="$1"
-  local installed_json preferred_json commands_json
+  local installed_json preferred_json commands_json capabilities_json
 
   ensure_runtime_known "$runtime"
   installed_json="$(runtime_installed_json "$runtime")"
   commands_json="$(runtime_commands_json "$runtime")"
+  capabilities_json="$(runtime_capabilities_json "$runtime")"
   if [ "$(runtime_preferred)" = "$runtime" ]; then
     preferred_json=true
   else
@@ -214,6 +219,7 @@ json_runtime_info() {
     --arg install_method "$(runtime_install_method "$runtime")" \
     --arg config_dir "$(runtime_default_config_dir "$runtime")" \
     --argjson auth_formats "$(runtime_auth_formats_json "$runtime")" \
+    --argjson capabilities "$capabilities_json" \
     --argjson commands "$commands_json" \
     --argjson installed "$installed_json" \
     --argjson selected "$preferred_json" \
@@ -227,6 +233,7 @@ json_runtime_info() {
       command: $command_name,
       install_method: $install_method,
       auth_formats: $auth_formats,
+      capabilities: $capabilities,
       commands: $commands,
       default_config_dir: $config_dir,
       default_profile: $default_profile,
@@ -236,13 +243,19 @@ json_runtime_info() {
 
 json_runtime_capabilities() {
   local runtime="$1"
+  local capabilities_json
 
   ensure_runtime_known "$runtime"
+  capabilities_json="$(runtime_capabilities_json "$runtime")"
   jq -n \
     --arg runtime "$runtime" \
+    --argjson auth_formats "$(runtime_auth_formats_json "$runtime")" \
+    --argjson capabilities "$capabilities_json" \
     --argjson commands "$(runtime_commands_json "$runtime")" \
     '{
       runtime: $runtime,
+      auth_formats: $auth_formats,
+      capabilities: $capabilities,
       commands: $commands
     }'
 }

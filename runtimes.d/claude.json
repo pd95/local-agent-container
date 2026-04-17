@@ -3,6 +3,16 @@
   "command": "claude",
   "install_method": "not-implemented",
   "default_config_dir": "/etc/claudectl",
+  "capabilities": {
+    "install": false,
+    "update": false,
+    "reset_config": false,
+    "auth_login": false,
+    "auth_read": false,
+    "auth_write": false,
+    "local_model_mode": false,
+    "openai_mode": false
+  },
   "auth_formats": [],
   "commands": [
     "help",
