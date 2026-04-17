@@ -1436,9 +1436,19 @@ run_auth_flow() {
   refresh_container_file "$auth_name" "$SCRIPT_DIR/local_models.json" "/etc/agentctl/local_models.json" "root:root" "644"
   refresh_container_file "$auth_name" "$SCRIPT_DIR/config.toml" "/etc/codexctl/config.toml" "root:root" "644"
   refresh_container_file "$auth_name" "$SCRIPT_DIR/local_models.json" "/etc/codexctl/local_models.json" "root:root" "644"
+  refresh_container_file "$auth_name" "$SCRIPT_DIR/claude-settings.json" "/etc/claudectl/settings.json" "root:root" "644"
+  refresh_container_file "$auth_name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
   refresh_container_tree "$auth_name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
   refresh_container_tree "$auth_name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
   runtime_info="$("$CONTAINER_CMD" exec "$auth_name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh runtime info "$runtime")" || die "Failed to inspect runtime auth contract: $runtime"
+  if ! printf '%s' "$runtime_info" | jq -e '.installed == true' >/dev/null; then
+    if printf '%s' "$runtime_info" | jq -e '(.capabilities.install // false) == true' >/dev/null; then
+      "$CONTAINER_CMD" exec "$auth_name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh runtime install "$runtime" >/dev/null || die "Failed to install runtime for auth flow: $runtime"
+      runtime_info="$("$CONTAINER_CMD" exec "$auth_name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh runtime info "$runtime")" || die "Failed to inspect installed runtime auth contract: $runtime"
+    else
+      die "Runtime is not installed in auth container and cannot be installed automatically: $runtime"
+    fi
+  fi
   if ! printf '%s' "$runtime_info" | jq -e '.installed == true and (.capabilities.auth_login // false) and (.capabilities.auth_read // false)' >/dev/null; then
     die "Runtime does not support host-managed auth flow yet: $runtime"
   fi
@@ -1582,7 +1592,19 @@ def extract_from_json(payload):
         tokens = payload.get("tokens", {})
         if isinstance(tokens, dict):
             token = tokens.get("refresh_token", "")
+    if not token:
+        claude = payload.get("claudeAiOauth", {})
+        if isinstance(claude, dict):
+            token = claude.get("refreshToken", "")
     last_refresh = payload.get("last_refresh", "")
+    if not last_refresh:
+        claude = payload.get("claudeAiOauth", {})
+        if isinstance(claude, dict):
+            expires_at = claude.get("expiresAt", "")
+            if isinstance(expires_at, int):
+                last_refresh = f"{expires_at:013d}"
+            elif isinstance(expires_at, str) and expires_at.isdigit():
+                last_refresh = expires_at.zfill(13)
     return token, last_refresh
 
 try:
@@ -1592,9 +1614,17 @@ try:
 except Exception:
     text = raw.decode("utf-8", "ignore")
     token_match = re.search(r'"refresh_token"\s*:\s*"([^"]+)"', text)
+    if not token_match:
+        token_match = re.search(r'"refreshToken"\s*:\s*"([^"]+)"', text)
     refresh_match = re.search(r'"last_refresh"\s*:\s*"([^"]+)"', text)
+    if not refresh_match:
+        refresh_match = re.search(r'"expiresAt"\s*:\s*([0-9]+)', text)
     token = token_match.group(1) if token_match else ""
-    last_refresh = refresh_match.group(1) if refresh_match else ""
+    if refresh_match:
+        raw_refresh = refresh_match.group(1)
+        last_refresh = raw_refresh.zfill(13) if raw_refresh.isdigit() else raw_refresh
+    else:
+        last_refresh = ""
     print(f"{token}\t{last_refresh}")
 PY
 )"
@@ -1805,6 +1835,8 @@ refresh_cmd() {
   refresh_container_file "$name" "$SCRIPT_DIR/local_models.json" "/etc/agentctl/local_models.json" "root:root" "644"
   refresh_container_file "$name" "$SCRIPT_DIR/config.toml" "/etc/codexctl/config.toml" "root:root" "644"
   refresh_container_file "$name" "$SCRIPT_DIR/local_models.json" "/etc/codexctl/local_models.json" "root:root" "644"
+  refresh_container_file "$name" "$SCRIPT_DIR/claude-settings.json" "/etc/claudectl/settings.json" "root:root" "644"
+  refresh_container_file "$name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
   if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -x /usr/local/bin/agent.sh; then

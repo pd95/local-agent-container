@@ -1,5 +1,7 @@
 CLAUDE_HOME_DIR="${HOME}/.claude"
 CLAUDE_SETTINGS_FILE="${CLAUDE_HOME_DIR}/settings.json"
+CLAUDE_CREDENTIALS_FILE="${CLAUDE_HOME_DIR}/.credentials.json"
+CLAUDE_HOME_STATE_FILE="${HOME}/.claude.json"
 
 claude_command_path() {
   runtime_command_path claude
@@ -8,6 +10,10 @@ claude_command_path() {
 claude_write_default_settings() {
   local target_file="$1"
 
+  if [ -f /etc/claudectl/settings.json ]; then
+    cp /etc/claudectl/settings.json "$target_file"
+    return 0
+  fi
   cat >"$target_file" <<'EOF'
 {
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
@@ -34,6 +40,16 @@ claude_verify_alpine_dependencies() {
   if [ "$missing" -ne 0 ]; then
     die "Install Claude prerequisites as root first: apk add libgcc libstdc++ ripgrep"
   fi
+}
+
+claude_auth_payload_valid() {
+  jq -e '
+    type == "object" and
+    (.claudeAiOauth | type == "object") and
+    ((.claudeAiOauth.accessToken // "") | type == "string" and length > 0) and
+    ((.claudeAiOauth.refreshToken // "") | type == "string" and length > 0) and
+    ((.claudeAiOauth.expiresAt // 0) | type == "number")
+  ' >/dev/null 2>&1
 }
 
 agent_runtime_run() {
@@ -78,21 +94,43 @@ agent_runtime_reset_config() {
 
 agent_runtime_auth_read() {
   local runtime="$1"
+  local key="$2"
 
   [ "$runtime" = "claude" ] || die "unsupported runtime adapter: $runtime"
-  die "auth read not implemented yet for claude"
+  [ "$key" = "claude_ai_oauth_json" ] || die "unsupported auth format: $key"
+  [ -f "$CLAUDE_CREDENTIALS_FILE" ] || exit 1
+  claude_auth_payload_valid <"$CLAUDE_CREDENTIALS_FILE" || die "invalid auth state: $CLAUDE_CREDENTIALS_FILE"
+  if [ -f "$CLAUDE_HOME_STATE_FILE" ] && jq -e 'type == "object"' "$CLAUDE_HOME_STATE_FILE" >/dev/null 2>&1; then
+    jq -c --slurpfile home_state "$CLAUDE_HOME_STATE_FILE" '. + {claudeCodeState: $home_state[0]}' "$CLAUDE_CREDENTIALS_FILE"
+    return 0
+  fi
+  cat "$CLAUDE_CREDENTIALS_FILE"
 }
 
 agent_runtime_auth_write() {
   local runtime="$1"
+  local key="$2"
+  local value="${3:-}"
 
   [ "$runtime" = "claude" ] || die "unsupported runtime adapter: $runtime"
-  die "auth write not implemented yet for claude"
+  [ "$key" = "claude_ai_oauth_json" ] || die "unsupported auth format: $key"
+  mkdir -p "$CLAUDE_HOME_DIR"
+  if [ -z "$value" ] && [ ! -t 0 ]; then
+    value="$(cat)"
+  fi
+  [ -n "$value" ] || die "empty auth payload for claude"
+  printf '%s' "$value" | claude_auth_payload_valid || die "invalid auth payload for claude"
+  printf '%s' "$value" | jq -c 'del(.claudeCodeState)' >"$CLAUDE_CREDENTIALS_FILE"
+  chmod 600 "$CLAUDE_CREDENTIALS_FILE"
+  if printf '%s' "$value" | jq -e '.claudeCodeState | type == "object"' >/dev/null 2>&1; then
+    printf '%s' "$value" | jq -c '.claudeCodeState' >"$CLAUDE_HOME_STATE_FILE"
+    chmod 600 "$CLAUDE_HOME_STATE_FILE"
+  fi
 }
 
 agent_runtime_auth_login() {
   local runtime="$1"
 
   [ "$runtime" = "claude" ] || die "unsupported runtime adapter: $runtime"
-  die "auth login not implemented yet for claude"
+  exec "$(claude_command_path)"
 }

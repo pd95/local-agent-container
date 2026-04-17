@@ -176,7 +176,7 @@ test_agent_sh_runtime_capabilities_reports_manifest_commands() {
 }
 
 test_agent_sh_claude_runtime_info_reports_skeleton_metadata() {
-  begin_test "agent.sh runtime info reports claude skeleton metadata"
+  begin_test "agent.sh runtime info reports claude runtime metadata"
 
   local temp_home
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
@@ -184,7 +184,7 @@ test_agent_sh_claude_runtime_info_reports_skeleton_metadata() {
 
   run_agent_sh_capture "$temp_home" runtime info claude
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "claude" and .installed == false and .install_method == "native-installer" and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and (.commands | index("runtime install claude") != null)' >/dev/null || fail "Expected runtime info JSON for claude runtime, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "claude" and .installed == false and .install_method == "native-installer" and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and (.auth_formats | index("claude_ai_oauth_json") != null) and (.commands | index("runtime install claude") != null) and (.commands | index("auth login claude") != null)' >/dev/null || fail "Expected runtime info JSON for claude runtime, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_claude_runtime_install_runs_native_installer() {
@@ -392,6 +392,74 @@ test_agent_sh_auth_write_rejects_invalid_codex_auth() {
   assert_contains "invalid auth payload for codex"
 }
 
+test_agent_sh_claude_auth_read_includes_optional_home_state() {
+  begin_test "agent.sh auth read returns claude credentials and optional home state"
+
+  local temp_home
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  mkdir -p "$temp_home/home/.claude"
+  printf '%s' '{"claudeAiOauth":{"accessToken":"access-token","refreshToken":"refresh-token","expiresAt":1776462236852}}' >"$temp_home/home/.claude/.credentials.json"
+  printf '%s' '{"installMethod":"native","userID":"abc123"}' >"$temp_home/home/.claude.json"
+
+  run_agent_sh_capture "$temp_home" auth read claude claude_ai_oauth_json
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.claudeAiOauth.refreshToken == "refresh-token" and .claudeCodeState.installMethod == "native" and .claudeCodeState.userID == "abc123"' >/dev/null || fail "Expected Claude auth payload with optional home state, got: $RUN_OUTPUT"
+}
+
+test_agent_sh_claude_auth_read_rejects_invalid_credentials() {
+  begin_test "agent.sh auth read rejects invalid claude auth data"
+
+  local temp_home
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  mkdir -p "$temp_home/home/.claude"
+  printf '%s' '{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":0}}' >"$temp_home/home/.claude/.credentials.json"
+
+  run_agent_sh_capture "$temp_home" auth read claude claude_ai_oauth_json
+  assert_status 1
+  assert_contains "invalid auth state:"
+}
+
+test_agent_sh_claude_auth_write_restores_credentials_and_home_state() {
+  begin_test "agent.sh auth write restores claude credentials and optional home state"
+
+  local temp_home
+  local payload
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  payload='{"claudeAiOauth":{"accessToken":"access-token","refreshToken":"refresh-token","expiresAt":1776462236852},"claudeCodeState":{"installMethod":"native","userID":"abc123"}}'
+
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$PATH" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    "$TEST_ROOT/agent.sh" auth write claude claude_ai_oauth_json "$payload"
+  assert_status 0
+  jq -er '(.claudeAiOauth.refreshToken == "refresh-token") and (has("claudeCodeState") | not)' "$temp_home/home/.claude/.credentials.json" >/dev/null || fail "Expected Claude credentials file to contain only auth payload"
+  jq -er '.installMethod == "native" and .userID == "abc123"' "$temp_home/home/.claude.json" >/dev/null || fail "Expected Claude home state file to be restored"
+}
+
+test_agent_sh_claude_auth_write_rejects_invalid_payload() {
+  begin_test "agent.sh auth write rejects invalid claude auth data"
+
+  local temp_home
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$PATH" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    "$TEST_ROOT/agent.sh" auth write claude claude_ai_oauth_json '{}'
+  assert_status 1
+  assert_contains "invalid auth payload for claude"
+}
+
 test_container_auth_info_uses_agent_sh_auth_read() {
   begin_test "container_auth_info reads auth via agent.sh auth read"
 
@@ -566,6 +634,24 @@ test_sync_runtime_auth_from_container_uses_runtime_parameters() {
   [ "$observed_format" = "json_refresh_token" ] || fail "Expected auth format json_refresh_token, got: $observed_format"
   [ -f "$written_blob_file" ] || fail "Expected container auth blob to be written back to keychain"
   jq -er '.last_refresh == "2026-04-17T02:00:00Z"' "$written_blob_file" >/dev/null || fail "Expected container auth blob to be written back to keychain"
+}
+
+test_auth_info_from_json_parses_claude_oauth_payload() {
+  begin_test "auth_info_from_json parses claude oauth payloads"
+
+  load_codexctl_functions
+  python_exec() {
+    jq -r '
+      . as $payload
+      | ($payload.claudeAiOauth.refreshToken // "") as $token
+      | ($payload.claudeAiOauth.expiresAt // "") as $expires_at
+      | "\($token)\t\($expires_at)"
+    '
+  }
+
+  RUN_OUTPUT="$(printf '%s' '{"claudeAiOauth":{"refreshToken":"claude-refresh","expiresAt":1776462236852}}' | auth_info_from_json)"
+  RUN_STATUS=0
+  [ "$RUN_OUTPUT" = $'claude-refresh\t1776462236852' ] || fail "Expected Claude auth info tuple, got: $RUN_OUTPUT"
 }
 
 test_run_auth_flow_uses_agent_sh_auth_contract() {
@@ -785,7 +871,7 @@ container() {
       fi
       printf '%s\n' "\$*" >>"$exec_log_file"
       if [ "\$*" = "bash /usr/local/bin/agent.sh runtime info claude" ]; then
-        printf '{"runtime":"claude","installed":false,"auth_formats":[],"capabilities":{"auth_login":false,"auth_read":false,"auth_write":false}}'
+        printf '{"runtime":"claude","installed":true,"auth_formats":[],"capabilities":{"install":false,"auth_login":false,"auth_read":false,"auth_write":false}}'
       fi
       return 0
       ;;
@@ -806,6 +892,106 @@ EOF
   if grep -Fq 'auth login claude' "$exec_log_file"; then
     fail "Did not expect auth login attempt for unsupported runtime"
   fi
+}
+
+test_run_auth_flow_installs_runtime_before_claude_auth() {
+  begin_test "run_auth_flow installs claude before interactive auth when needed"
+
+  local temp_dir
+  local unit_script
+  local fake_keychain
+  local stored_blob_file
+  local exec_log_file
+  local runtime_info_count_file
+  local auth_read_count_file
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-claude.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  unit_script="$temp_dir/check.sh"
+  fake_keychain="$temp_dir/fake-keychain.sh"
+  stored_blob_file="$temp_dir/stored-auth.json"
+  exec_log_file="$temp_dir/exec.log"
+  runtime_info_count_file="$temp_dir/runtime-info-count"
+  auth_read_count_file="$temp_dir/auth-read-count"
+  printf '0' >"$runtime_info_count_file"
+  printf '0' >"$auth_read_count_file"
+
+  cat >"$fake_keychain" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+case "\${1:-}" in
+  write)
+    cat >"$stored_blob_file"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$fake_keychain"
+
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$CODEXCTL"
+KEYCHAIN_SCRIPT="$fake_keychain"
+refresh_container_file() { :; }
+refresh_container_tree() { :; }
+container_exists() { return 1; }
+CONTAINER_CMD=container
+container() {
+  case "\$1" in
+    create|start|stop|rm)
+      return 0
+      ;;
+    exec)
+      shift
+      if [ "\$1" = "-it" ]; then
+        shift
+      fi
+      if [ "\$1" = "unit-auth-container" ]; then
+        shift
+      fi
+      if [ "\${1:-}" = "setpriv" ]; then
+        shift 6
+      fi
+      printf '%s\n' "\$*" >>"$exec_log_file"
+      if [ "\$*" = "bash /usr/local/bin/agent.sh runtime info claude" ]; then
+        runtime_info_calls="\$(cat "$runtime_info_count_file")"
+        runtime_info_calls=\$((runtime_info_calls + 1))
+        printf '%s' "\$runtime_info_calls" >"$runtime_info_count_file"
+        if [ "\$runtime_info_calls" -eq 1 ]; then
+          printf '{"runtime":"claude","installed":false,"auth_formats":["claude_ai_oauth_json"],"capabilities":{"install":true,"auth_login":true,"auth_read":true,"auth_write":true}}'
+        else
+          printf '{"runtime":"claude","installed":true,"auth_formats":["claude_ai_oauth_json"],"capabilities":{"install":true,"auth_login":true,"auth_read":true,"auth_write":true}}'
+        fi
+      fi
+      if [ "\$*" = "bash /usr/local/bin/agent.sh auth read claude claude_ai_oauth_json" ]; then
+        auth_read_calls="\$(cat "$auth_read_count_file")"
+        auth_read_calls=\$((auth_read_calls + 1))
+        printf '%s' "\$auth_read_calls" >"$auth_read_count_file"
+        if [ "\$auth_read_calls" -ge 2 ]; then
+          printf '{"claudeAiOauth":{"refreshToken":"claude-refresh","expiresAt":1776462236852}}'
+        fi
+      fi
+      return 0
+      ;;
+    *)
+      echo "Unexpected container invocation: \$*" >&2
+      exit 1
+      ;;
+  esac
+}
+run_auth_flow agent-plain unit-auth-container claude
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 0
+  grep -Fq 'bash /usr/local/bin/agent.sh runtime install claude' "$exec_log_file" || fail "Expected runtime install before Claude auth flow"
+  grep -Fq 'bash -lc exec bash /usr/local/bin/agent.sh auth login claude' "$exec_log_file" || fail "Expected Claude auth login via agent.sh"
+  [ -f "$stored_blob_file" ] || fail "Expected Claude auth blob to be written to fake keychain"
+  grep -Fq '"refreshToken":"claude-refresh"' "$stored_blob_file" || fail "Expected Claude auth blob in keychain write"
 }
 
 test_run_keychain_for_runtime_uses_legacy_codex_slot() {
@@ -1371,13 +1557,19 @@ main() {
   test_agent_sh_preferred_set_rejects_uninstalled_runtime
   test_agent_sh_auth_read_rejects_invalid_codex_auth
   test_agent_sh_auth_write_rejects_invalid_codex_auth
+  test_agent_sh_claude_auth_read_includes_optional_home_state
+  test_agent_sh_claude_auth_read_rejects_invalid_credentials
+  test_agent_sh_claude_auth_write_restores_credentials_and_home_state
+  test_agent_sh_claude_auth_write_rejects_invalid_payload
   test_container_auth_info_uses_agent_sh_auth_read
   test_write_auth_blob_to_container_uses_agent_sh_auth_write
   test_sync_runtime_auth_to_container_uses_runtime_parameters
   test_sync_runtime_auth_from_container_uses_runtime_parameters
+  test_auth_info_from_json_parses_claude_oauth_payload
   test_run_auth_flow_uses_agent_sh_auth_contract
   test_run_auth_flow_skips_keychain_write_when_auth_unchanged
   test_run_auth_flow_rejects_runtime_without_host_auth_support
+  test_run_auth_flow_installs_runtime_before_claude_auth
   test_run_keychain_for_runtime_uses_legacy_codex_slot
   test_run_keychain_for_runtime_uses_runtime_specific_slot
   test_rm_force_stops_running_container_before_remove

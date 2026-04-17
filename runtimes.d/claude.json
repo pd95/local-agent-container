@@ -7,13 +7,15 @@
     "install": true,
     "update": true,
     "reset_config": true,
-    "auth_login": false,
-    "auth_read": false,
-    "auth_write": false,
+    "auth_login": true,
+    "auth_read": true,
+    "auth_write": true,
     "local_model_mode": false,
     "openai_mode": false
   },
-  "auth_formats": [],
+  "auth_formats": [
+    "claude_ai_oauth_json"
+  ],
   "commands": [
     "help",
     "run",
@@ -27,6 +29,9 @@
     "runtime install claude",
     "runtime update claude",
     "runtime reset-config claude",
+    "auth login claude",
+    "auth read claude claude_ai_oauth_json",
+    "auth write claude claude_ai_oauth_json",
     "system manifest"
   ]
 }

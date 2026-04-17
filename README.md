@@ -165,12 +165,13 @@ agentctl run --cmd bash
 - In local-model mode, the Ollama reachability preflight only runs for the default Codex startup path. `--cmd` and `--shell` skip that check so image inspection and ad hoc commands still work without a running Ollama listener.
 - `CODEX_SHELL` overrides the shell used by `run --shell` and `exec` (default: `bash`). You can also set `DEFAULT_SHELL` in `agentctl` for a static default. All default images include both `bash` and `zsh`.
 - `agentctl run --update` upgrades `@openai/codex` inside the target container before starting. If the container does not exist yet, it is created first. With `--temp`, the update is ephemeral; `agentctl build --rebuild` remains the persistent way to refresh image content.
-- `agentctl runtime list` shows installed runtimes in the current container. `agentctl runtime info <runtime>` and `agentctl runtime capabilities <runtime>` query the in-container `agent.sh` runtime contract for a declared runtime, including explicit capability booleans and supported auth formats. The current branch fully wires `codex` and now also ships a real Claude install/update/reset-config adapter, while keeping Claude auth unsupported for now.
+- `agentctl runtime list` shows installed runtimes in the current container. `agentctl runtime info <runtime>` and `agentctl runtime capabilities <runtime>` query the in-container `agent.sh` runtime contract for a declared runtime, including explicit capability booleans and supported auth formats. The current branch fully wires `codex` and now also ships a real Claude install/update/reset-config/auth adapter.
 - Runtime metadata now lives under `/etc/agentctl/runtimes.d`, and runtime-specific handlers live under `/usr/local/lib/agentctl/runtimes`. `agentctl refresh` updates those directories in-place for existing containers.
 - `agentctl runtime install codex` installs or refreshes the Codex runtime inside an existing container and marks it as preferred for that container.
 - `agentctl runtime install claude` now runs the official native installer (`curl -fsSL https://claude.ai/install.sh | bash`) and, on Alpine, expects `libgcc`, `libstdc++`, and `ripgrep` to be present first.
 - `agentctl runtime update claude` now runs `claude update`.
 - `agentctl runtime reset-config claude` restores a default `~/.claude/settings.json` with `USE_BUILTIN_RIPGREP=0`.
+- refreshed and rebuilt containers now ship `/etc/profile.d/agentctl-path.sh`, so bash login shells prepend `~/.local/bin` to `PATH` and native Claude installs are available as `claude` without manual shell edits.
 - `agentctl use codex` updates the container-local preferred runtime without changing the default image selection used by `agentctl run`.
 - `--cpu` and `--mem` on `agentctl run` only apply when creating a new container. If the named container already exists, `agentctl run` fails fast and tells you to use `agentctl refresh` instead of silently ignoring the resource request.
 - `agentctl refresh` is the normal non-destructive update path for an existing named container. It updates `agent.sh`, the agentctl-managed default config files, runtime manifests, and runtime adapters in place, and preserves the container's running or stopped state.
@@ -223,6 +224,7 @@ If you want Gemma to become the default local model, either set `CODEX_PROFILE=g
 agentctl --help          # show command overview and available subcommands/options
 agentctl auth            # run codex device-auth and store it in Keychain
 agentctl auth --runtime codex  # explicit equivalent of the default auth flow
+agentctl auth --runtime claude  # install/login Claude in a temp auth container and store credentials in Keychain
 agentctl runtime list    # list installed runtimes in the current container
 agentctl runtime info codex  # inspect manifest-backed runtime metadata
 agentctl runtime info claude  # inspect Claude runtime metadata/capabilities
@@ -254,7 +256,8 @@ Notes:
 - Keychain auth is the source of truth for `--openai`; it is synced into running containers before each run.
 - After a run, if the container refresh time is newer (and present), the updated auth is saved back into Keychain.
 - After `agentctl auth`, exit any running `--openai` sessions and re-run `agentctl run --openai` to pick up the new token.
-- `agentctl auth --runtime <runtime>` only works for runtimes whose manifest declares `auth_login` and `auth_read` capability support plus at least one host-storable `auth_format`. In this branch, that means `codex`; `claude` still fails clearly as "not supported yet".
+- `agentctl auth --runtime <runtime>` only works for runtimes whose manifest declares `auth_login` and `auth_read` capability support plus at least one host-storable `auth_format`. In this branch, both `codex` and `claude` meet that contract.
+- Claude auth on Linux is synchronized through `~/.claude/.credentials.json`. When present, the legacy companion state file `~/.claude.json` is included in the host-storable blob and restored on write, but the credential boundary remains the `.credentials.json` file.
 - host-side Keychain storage is now keyed per runtime and auth format. Codex keeps the legacy `codex-OpenAI-auth` slot so existing setups continue to work unchanged.
 
 Security notes:
@@ -514,6 +517,7 @@ Notes:
 - `agentctl run --openai` and `agentctl auth` automatically sync the Keychain auth into running containers when it differs, using `agent.sh auth read/write`.
 - `agentctl run --openai` saves refreshed auth back to Keychain when the container reports a newer refresh time (and that field is present).
 - `agentctl` now chooses Keychain slots per runtime/auth-format pair. Codex still uses the legacy `codex-OpenAI-auth` entry so the current OpenAI workflow stays compatible.
+- Claude credentials are stored under a runtime-specific Keychain slot rather than the Codex legacy slot.
 - `agentctl run --profile <name>` sets the Codex profile used by the container.
   Profiles are defined in `config.toml` and control which model to use.
 
