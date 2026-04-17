@@ -33,6 +33,20 @@ run_agent_sh_capture() {
     "$TEST_ROOT/agent.sh" "$@"
 }
 
+make_fake_runtime_bin() {
+  local temp_home="$1"
+  local runtime="$2"
+  local fake_bin="$temp_home/bin"
+
+  mkdir -p "$fake_bin"
+  cat >"$fake_bin/$runtime" <<EOF
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/$runtime"
+  printf '%s\n' "$fake_bin"
+}
+
 test_run_profile_wires_selected_profile() {
   begin_test "run_cmd wires --profile into the launched agent.sh command"
 
@@ -132,10 +146,18 @@ test_agent_sh_runtime_list_reports_installed_runtimes_only() {
   begin_test "agent.sh runtime list reports installed runtimes only"
 
   local temp_home
+  local fake_bin
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
+  fake_bin="$(make_fake_runtime_bin "$temp_home" codex)"
 
-  run_agent_sh_capture "$temp_home" runtime list
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$fake_bin:$PATH" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    "$TEST_ROOT/agent.sh" runtime list
   assert_status 0
   assert_contains "codex"
   assert_not_contains "claude"
@@ -301,13 +323,27 @@ test_agent_sh_preferred_round_trip() {
   begin_test "agent.sh preferred set/get persists runtime selection"
 
   local temp_home
+  local fake_bin
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
+  fake_bin="$(make_fake_runtime_bin "$temp_home" codex)"
 
-  run_agent_sh_capture "$temp_home" preferred set codex
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$fake_bin:$PATH" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    "$TEST_ROOT/agent.sh" preferred set codex
   assert_status 0
 
-  run_agent_sh_capture "$temp_home" preferred get
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$fake_bin:$PATH" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    "$TEST_ROOT/agent.sh" preferred get
   assert_status 0
   assert_contains "codex"
 }
