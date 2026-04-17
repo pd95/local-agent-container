@@ -107,6 +107,7 @@ test_run_cmd_runtime_selection_prepares_runtime_before_launch() {
   [ "$captured_pre_exec" = "run_pre_exec" ] || fail "Expected run_pre_exec, got: $captured_pre_exec"
   [ "$RUN_SELECTED_RUNTIME" = "claude" ] || fail "Expected runtime claude, got: $RUN_SELECTED_RUNTIME"
   [ "$RUN_INSTALL_RUNTIME" -eq 1 ] || fail "Expected install-runtime to be enabled"
+  [ "$RUN_SYNC_SELECTED_RUNTIME_AUTH" -eq 1 ] || fail "Expected runtime auth sync to be enabled"
   [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 0 ] || fail "Did not expect local-model preflight for Claude shell launch"
 }
 
@@ -180,6 +181,50 @@ EOF
   run_capture bash "$unit_script"
   assert_status 1
   assert_contains "--openai currently requires --runtime codex"
+}
+
+test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
+  begin_test "run_pre_exec syncs selected runtime auth when available"
+
+  load_codexctl_functions
+
+  local call_log=""
+  RUN_SELECTED_RUNTIME="claude"
+  RUN_INSTALL_RUNTIME=1
+  RUN_SYNC_SELECTED_RUNTIME_AUTH=1
+  RUN_SYNC_OPENAI=0
+  RUN_LOCAL_MODEL_PREFLIGHT=0
+  RUN_UPDATE_CODEX=0
+
+  run_agent_sh_in_container() {
+    call_log="${call_log}$1:$2:$3"$'\n'
+  }
+  sync_runtime_auth_to_container_if_available() {
+    call_log="${call_log}sync:$1:$2"$'\n'
+  }
+
+  run_capture run_pre_exec unit-test-container
+  assert_status 0
+  printf '%s' "$call_log" | grep -Fq $'unit-test-container:runtime:install' || fail "Expected runtime install call, got: $call_log"
+  printf '%s' "$call_log" | grep -Fq $'unit-test-container:preferred:set' || fail "Expected preferred set call, got: $call_log"
+  printf '%s' "$call_log" | grep -Fq $'sync:unit-test-container:claude' || fail "Expected runtime auth sync call, got: $call_log"
+}
+
+test_sync_runtime_auth_to_container_if_available_skips_missing_keychain() {
+  begin_test "sync_runtime_auth_to_container_if_available skips runtimes without keychain auth"
+
+  load_codexctl_functions
+
+  local sync_called=0
+  runtime_info_in_container() {
+    printf '{"runtime":"claude","installed":true,"auth_formats":["claude_ai_oauth_json"],"capabilities":{"auth_read":true,"auth_write":true}}'
+  }
+  ensure_keychain() { return 1; }
+  sync_runtime_auth_to_container() { sync_called=1; }
+
+  run_capture sync_runtime_auth_to_container_if_available unit-test-container claude
+  assert_status 0
+  [ "$sync_called" -eq 0 ] || fail "Did not expect runtime auth sync without keychain auth"
 }
 
 test_run_help_reports_profile_default() {
@@ -1715,6 +1760,8 @@ main() {
   test_run_cmd_rejects_non_codex_profile
   test_run_cmd_rejects_install_runtime_without_runtime
   test_run_cmd_rejects_openai_for_non_codex_runtime
+  test_run_pre_exec_syncs_selected_runtime_auth_when_available
+  test_sync_runtime_auth_to_container_if_available_skips_missing_keychain
   test_agentctl_wrapper_usage_banner
   test_refresh_help_reports_new_command
   test_system_manifest_help_reports_new_command

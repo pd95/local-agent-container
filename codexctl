@@ -1764,6 +1764,38 @@ sync_runtime_auth_from_container() {
   container_auth_blob "$name" "$runtime" "$auth_format" | write_keychain_auth_blob "$runtime" "$auth_format"
 }
 
+runtime_info_in_container() {
+  local name="$1"
+  local runtime="$2"
+
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh runtime info "$runtime"
+}
+
+sync_runtime_auth_to_container_if_available() {
+  local name="$1"
+  local runtime="$2"
+  local runtime_info=""
+  local auth_format=""
+  local keychain_info=""
+  local keychain_token=""
+  local keychain_refresh=""
+
+  runtime_info="$(runtime_info_in_container "$name" "$runtime" 2>/dev/null || true)"
+  [ -n "$runtime_info" ] || return 0
+  if ! printf '%s' "$runtime_info" | jq -e '.installed == true and (.capabilities.auth_read // false) and (.capabilities.auth_write // false)' >/dev/null 2>&1; then
+    return 0
+  fi
+  auth_format="$(printf '%s' "$runtime_info" | jq -er '.auth_formats[0] // empty' 2>/dev/null || true)"
+  [ -n "$auth_format" ] || return 0
+  if ! ensure_keychain "$runtime" "$auth_format"; then
+    return 0
+  fi
+  keychain_info="$(keychain_auth_info "$runtime" "$auth_format" 2>/dev/null || true)"
+  IFS=$'\t' read -r keychain_token keychain_refresh <<<"$keychain_info"
+  [ -n "$keychain_token" ] || return 0
+  sync_runtime_auth_to_container "$name" "$runtime" "$auth_format" "Missing runtime auth in Keychain. Run: ${CLI_NAME} auth --runtime $runtime"
+}
+
 sync_openai_auth_to_container() {
   local name="$1"
   sync_runtime_auth_to_container "$name" "$OPENAI_RUNTIME_ID" "$OPENAI_AUTH_FORMAT" "Missing OpenAI auth in Keychain. Run: ${CLI_NAME} auth"
@@ -2150,6 +2182,7 @@ openai_post_exec() {
 RUN_SELECTED_RUNTIME=""
 RUN_INSTALL_RUNTIME=0
 RUN_SYNC_OPENAI=0
+RUN_SYNC_SELECTED_RUNTIME_AUTH=0
 RUN_LOCAL_MODEL_PREFLIGHT=0
 RUN_UPDATE_CODEX=0
 
@@ -2165,6 +2198,10 @@ run_pre_exec() {
       run_agent_sh_in_container "$name" runtime install "$RUN_SELECTED_RUNTIME"
     fi
     run_agent_sh_in_container "$name" preferred set "$RUN_SELECTED_RUNTIME"
+  fi
+
+  if [ "$RUN_SYNC_SELECTED_RUNTIME_AUTH" -eq 1 ] && [ -n "$RUN_SELECTED_RUNTIME" ]; then
+    sync_runtime_auth_to_container_if_available "$name" "$RUN_SELECTED_RUNTIME"
   fi
 
   if [ "$RUN_SYNC_OPENAI" -eq 1 ]; then
@@ -2531,10 +2568,13 @@ run_cmd() {
   RUN_SELECTED_RUNTIME="$runtime"
   RUN_INSTALL_RUNTIME="$install_runtime"
   RUN_SYNC_OPENAI=0
+  RUN_SYNC_SELECTED_RUNTIME_AUTH=0
   RUN_LOCAL_MODEL_PREFLIGHT=0
   RUN_UPDATE_CODEX=0
   if [ "$openai" -eq 1 ]; then
     RUN_SYNC_OPENAI=1
+  elif [ -n "$runtime" ]; then
+    RUN_SYNC_SELECTED_RUNTIME_AUTH=1
   elif [ "$shell" -eq 0 ] && [ "${#cmd_override[@]}" -eq 0 ] && { [ -z "$runtime" ] || [ "$runtime" = "codex" ]; }; then
     RUN_LOCAL_MODEL_PREFLIGHT=1
   fi
