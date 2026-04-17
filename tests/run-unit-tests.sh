@@ -318,6 +318,66 @@ test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
   printf '%s' "$call_log" | grep -Fq $'sync:unit-test-container:claude' || fail "Expected runtime auth sync call, got: $call_log"
 }
 
+test_run_pre_exec_skips_local_model_preflight_for_preferred_claude() {
+  begin_test "run_pre_exec skips local-model preflight for preferred claude"
+
+  load_codexctl_functions
+
+  local preflight_called=0
+
+  RUN_SELECTED_RUNTIME=""
+  RUN_INSTALL_RUNTIME=0
+  RUN_SYNC_SELECTED_RUNTIME_AUTH=0
+  RUN_SYNC_OPENAI=0
+  RUN_LOCAL_MODEL_PREFLIGHT=1
+  RUN_UPDATE_CODEX=0
+
+  run_agent_sh_in_container() {
+    if [ "$2" = "preferred" ] && [ "$3" = "get" ]; then
+      printf 'claude\n'
+      return 0
+    fi
+    return 0
+  }
+  local_model_preflight() {
+    preflight_called=1
+  }
+
+  run_capture run_pre_exec unit-test-container
+  assert_status 0
+  [ "$preflight_called" -eq 0 ] || fail "Did not expect local-model preflight for preferred claude"
+}
+
+test_run_pre_exec_runs_local_model_preflight_for_preferred_codex() {
+  begin_test "run_pre_exec runs local-model preflight for preferred codex"
+
+  load_codexctl_functions
+
+  local preflight_called=0
+
+  RUN_SELECTED_RUNTIME=""
+  RUN_INSTALL_RUNTIME=0
+  RUN_SYNC_SELECTED_RUNTIME_AUTH=0
+  RUN_SYNC_OPENAI=0
+  RUN_LOCAL_MODEL_PREFLIGHT=1
+  RUN_UPDATE_CODEX=0
+
+  run_agent_sh_in_container() {
+    if [ "$2" = "preferred" ] && [ "$3" = "get" ]; then
+      printf 'codex\n'
+      return 0
+    fi
+    return 0
+  }
+  local_model_preflight() {
+    preflight_called=1
+  }
+
+  run_capture run_pre_exec unit-test-container
+  assert_status 0
+  [ "$preflight_called" -eq 1 ] || fail "Expected local-model preflight for preferred codex"
+}
+
 test_sync_runtime_auth_to_container_if_available_skips_missing_keychain() {
   begin_test "sync_runtime_auth_to_container_if_available skips runtimes without keychain auth"
 

@@ -2589,6 +2589,7 @@ RUN_UPDATE_CODEX=0
 
 run_pre_exec() {
   local name="$1"
+  local effective_runtime=""
 
   if [ "$RUN_UPDATE_CODEX" -eq 1 ]; then
     update_codex_pre_exec "$name"
@@ -2610,7 +2611,13 @@ run_pre_exec() {
   fi
 
   if [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ]; then
-    local_model_preflight "$name" strict
+    effective_runtime="$RUN_SELECTED_RUNTIME"
+    if [ -z "$effective_runtime" ]; then
+      effective_runtime="$(run_agent_sh_in_container "$name" preferred get 2>/dev/null || true)"
+    fi
+    if [ -z "$effective_runtime" ] || [ "$effective_runtime" = "codex" ]; then
+      local_model_preflight "$name" strict
+    fi
   fi
 }
 
