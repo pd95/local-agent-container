@@ -1971,6 +1971,37 @@ run_agent_sh_in_container() {
   return "$status"
 }
 
+run_agent_sh_in_container_root() {
+  local name="$1"
+  shift
+  local was_running=0
+  local started_for_command=0
+  local status=0
+
+  if ! container_exists "$name"; then
+    die "Container not found: $name"
+  fi
+
+  if container_running "$name"; then
+    was_running=1
+  else
+    "$CONTAINER_CMD" start "$name" >/dev/null
+    started_for_command=1
+  fi
+
+  if "$CONTAINER_CMD" exec -u 0 "$name" bash /usr/local/bin/agent.sh "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  if [ "$started_for_command" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+    "$CONTAINER_CMD" stop "$name" >/dev/null
+  fi
+
+  return "$status"
+}
+
 runtime_cmd() {
   local name=""
   local subcommand=""
@@ -2046,9 +2077,13 @@ feature_cmd() {
     list)
       run_agent_sh_in_container "$name" feature list
       ;;
-    info|install|remove|update)
+    info)
       [ -n "$feature" ] || die "Missing feature for $subcommand"
       run_agent_sh_in_container "$name" feature "$subcommand" "$feature"
+      ;;
+    install|remove|update)
+      [ -n "$feature" ] || die "Missing feature for $subcommand"
+      run_agent_sh_in_container_root "$name" feature "$subcommand" "$feature"
       ;;
     "")
       usage_feature

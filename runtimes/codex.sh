@@ -3,19 +3,31 @@ agent_runtime_run() {
   shift
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
-  local -a codex_args=("$@")
+  local -a codex_args=()
 
-  if ! has_explicit_codex_cd "${codex_args[@]}"; then
+  if [ "$#" -gt 0 ]; then
+    codex_args=("$@")
+  fi
+
+  if [ "${#codex_args[@]}" -eq 0 ]; then
+    codex_args=(--cd /workdir)
+  elif ! has_explicit_codex_cd "${codex_args[@]}"; then
     codex_args=(--cd /workdir "${codex_args[@]}")
   fi
 
   case "$RUN_MODE" in
     openai)
+      if [ "${#codex_args[@]}" -eq 0 ]; then
+        exec codex
+      fi
       exec codex "${codex_args[@]}"
       ;;
   esac
-  if has_explicit_profile "${codex_args[@]}"; then
+  if [ "${#codex_args[@]}" -gt 0 ] && has_explicit_profile "${codex_args[@]}"; then
     exec codex "${codex_args[@]}"
+  fi
+  if [ "${#codex_args[@]}" -eq 0 ]; then
+    exec codex --profile "$DEFAULT_PROFILE"
   fi
   exec codex --profile "$DEFAULT_PROFILE" "${codex_args[@]}"
 }

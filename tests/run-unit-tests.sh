@@ -293,6 +293,27 @@ test_auth_cmd_warns_for_legacy_office_image() {
   assert_contains "agent-python"
 }
 
+test_feature_cmd_installs_via_root_helper() {
+  begin_test "feature_cmd install uses the root helper path"
+
+  load_codexctl_functions
+
+  local helper_log=""
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-feature-container\n'; }
+  run_agent_sh_in_container() {
+    helper_log="${helper_log}user:$1:$2:$3"$'\n'
+  }
+  run_agent_sh_in_container_root() {
+    helper_log="${helper_log}root:$1:$2:$3"$'\n'
+  }
+
+  run_capture feature_cmd --name unit-feature-container install office
+  assert_status 0
+  printf '%s' "$helper_log" | grep -Fq $'root:unit-feature-container:feature:install' || fail "Expected root feature helper call, got: $helper_log"
+}
+
 test_run_help_reports_profile_default() {
   begin_test "run help reports the actual default profile"
 
@@ -390,19 +411,91 @@ test_agent_sh_feature_info_reports_manifest_metadata() {
 
   run_agent_sh_capture "$temp_home" feature info office
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .display_name == "Office Compatibility Tooling" and .installed == false and .capabilities.install == false' >/dev/null || fail "Expected feature info JSON for office, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .display_name == "Office Compatibility Tooling" and .installed == false and .capabilities.install == true' >/dev/null || fail "Expected feature info JSON for office, got: $RUN_OUTPUT"
 }
 
-test_agent_sh_feature_install_rejects_unimplemented_feature() {
-  begin_test "agent.sh feature install rejects unsupported feature install"
+test_agent_sh_feature_install_office_creates_feature_state() {
+  begin_test "agent.sh feature install office creates feature state"
+
+  local temp_home
+  local fake_bin
+  local venv_dir
+  local profile_dir
+  local state_dir
+  local install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  venv_dir="$temp_home/venv"
+  profile_dir="$temp_home/profile.d"
+  state_dir="$temp_home/state"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin" "$venv_dir/bin" "$profile_dir" "$state_dir"
+
+  cat >"$fake_bin/apk" <<EOF
+#!/bin/sh
+printf 'apk %s\n' "\$*" >>"$install_log"
+exit 0
+EOF
+  cat >"$fake_bin/npm" <<EOF
+#!/bin/sh
+printf 'npm %s\n' "\$*" >>"$install_log"
+exit 0
+EOF
+  cat >"$fake_bin/chown" <<EOF
+#!/bin/sh
+printf 'chown %s\n' "\$*" >>"$install_log"
+exit 0
+EOF
+  cat >"$venv_dir/bin/pip" <<EOF
+#!/bin/sh
+printf 'pip %s\n' "\$*" >>"$install_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/apk" "$fake_bin/npm" "$fake_bin/chown" "$venv_dir/bin/pip"
+
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$fake_bin:$PATH" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    AGENTCTL_FEATURE_REGISTRY_DIR="$TEST_ROOT/features.d" \
+    AGENTCTL_FEATURE_ADAPTER_DIR="$TEST_ROOT/features" \
+    AGENTCTL_FEATURE_OFFICE_SKIP_ROOT_CHECK=1 \
+    AGENTCTL_FEATURE_OFFICE_VENV_DIR="$venv_dir" \
+    AGENTCTL_FEATURE_OFFICE_PROFILE_DIR="$profile_dir" \
+    AGENTCTL_FEATURE_STATE_DIR="$state_dir" \
+    "$TEST_ROOT/agent.sh" feature install office
+  assert_status 0
+  [ -f "$state_dir/office/install-complete" ] || fail "Expected office feature marker file"
+  [ -f "$profile_dir/node_path.sh" ] || fail "Expected office feature to write node_path profile"
+  grep -Fq "apk add --no-cache" "$install_log" || fail "Expected office feature to install apk packages"
+  grep -Fq "npm install -g pptxgenjs" "$install_log" || fail "Expected office feature to install pptxgenjs"
+  grep -Fq "pip install --no-cache-dir python-docx python-pptx xlrd pdfplumber" "$install_log" || fail "Expected office feature to install pip packages"
+}
+
+test_agent_sh_feature_info_reports_installed_after_office_install() {
+  begin_test "agent.sh feature info reports installed after office install"
 
   local temp_home
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
+  mkdir -p "$temp_home/state/office"
+  printf '%s\n' installed >"$temp_home/state/office/install-complete"
 
-  run_agent_sh_capture "$temp_home" feature install office
-  assert_status 1
-  assert_contains "feature does not support install: office"
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$PATH" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    AGENTCTL_FEATURE_REGISTRY_DIR="$TEST_ROOT/features.d" \
+    AGENTCTL_FEATURE_ADAPTER_DIR="$TEST_ROOT/features" \
+    AGENTCTL_FEATURE_STATE_DIR="$temp_home/state" \
+    "$TEST_ROOT/agent.sh" feature info office
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .installed == true and .capabilities.install == true' >/dev/null || fail "Expected installed feature info JSON for office, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_runtime_list_reports_installed_runtimes_only() {
@@ -1881,6 +1974,8 @@ main() {
   test_run_cmd_rejects_openai_for_non_codex_runtime
   test_run_pre_exec_syncs_selected_runtime_auth_when_available
   test_sync_runtime_auth_to_container_if_available_skips_missing_keychain
+  test_auth_cmd_warns_for_legacy_office_image
+  test_feature_cmd_installs_via_root_helper
   test_agentctl_wrapper_usage_banner
   test_refresh_help_reports_new_command
   test_system_manifest_help_reports_new_command
@@ -1891,7 +1986,8 @@ main() {
   test_agent_sh_runtime_info_reports_registry_metadata
   test_agent_sh_feature_list_reports_declared_features
   test_agent_sh_feature_info_reports_manifest_metadata
-  test_agent_sh_feature_install_rejects_unimplemented_feature
+  test_agent_sh_feature_install_office_creates_feature_state
+  test_agent_sh_feature_info_reports_installed_after_office_install
   test_agent_sh_runtime_list_reports_installed_runtimes_only
   test_agent_sh_runtime_capabilities_reports_manifest_commands
   test_agent_sh_claude_runtime_info_reports_skeleton_metadata

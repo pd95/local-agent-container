@@ -147,6 +147,7 @@ agentctl use codex
 # Inspect installable feature packs in an existing container
 agentctl feature list
 agentctl feature info office
+agentctl feature install office
 
 # Recreate a container from the latest image while preserving config
 agentctl refresh
@@ -186,7 +187,7 @@ agentctl run --cmd bash
 - `agentctl runtime install claude` now runs the official native installer (`curl -fsSL https://claude.ai/install.sh | bash`) and, on Alpine, expects `libgcc`, `libstdc++`, and `ripgrep` to be present first.
 - `agentctl runtime update claude` now runs `claude update`.
 - `agentctl runtime reset-config claude` restores a default `~/.claude/settings.json` with `USE_BUILTIN_RIPGREP=0`.
-- `agentctl feature list` and `agentctl feature info office` now expose the first feature-pack contract surface. The initial `office` feature is a manifest/adapter stub that documents the replacement path for `agent-office`; it is not yet a full installable feature pack.
+- `agentctl feature list`, `agentctl feature info office`, and `agentctl feature install office` now expose the first real feature-pack flow. The initial `office` feature targets `agent-python` and installs the core document/PDF/spreadsheet/OCR tooling that previously required `agent-office`.
 - refreshed and rebuilt containers now ship `/etc/profile.d/agentctl-path.sh`, so bash login shells prepend `~/.local/bin` to `PATH` and native Claude installs are available as `claude` without manual shell edits.
 - `agentctl use codex` updates the container-local preferred runtime without changing the default image selection used by `agentctl run`.
 - `agentctl run` is now runtime-neutral at the host layer. Codex still starts with its default `--cd /workdir` behavior, but that default now lives in the Codex runtime adapter instead of being forced on every runtime.

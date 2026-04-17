@@ -1,15 +1,16 @@
 {
   "id": "office",
   "display_name": "Office Compatibility Tooling",
-  "install_method": "planned-feature-pack",
-  "description": "Future replacement for the legacy agent-office image.",
+  "install_method": "apk+npm+pip",
+  "description": "Document, PDF, spreadsheet, OCR, and report-generation tooling layered onto agent-python.",
   "capabilities": {
-    "install": false,
+    "install": true,
     "remove": false,
     "update": false
   },
   "commands": [
     "feature list",
-    "feature info office"
+    "feature info office",
+    "feature install office"
   ]
 }
