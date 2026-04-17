@@ -578,6 +578,74 @@ EOF
   fi
 }
 
+test_run_keychain_for_runtime_uses_legacy_codex_slot() {
+  begin_test "run_keychain_for_runtime preserves the legacy codex keychain slot"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local fake_keychain
+  local env_log_file
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-keychain-codex.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  fake_keychain="$temp_dir/fake-keychain.sh"
+  env_log_file="$temp_dir/env.log"
+
+  cat >"$fake_keychain" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'service=%s\naccount=%s\ncmd=%s\n' "\${KEYCHAIN_SERVICE_NAME:-}" "\${KEYCHAIN_ACCOUNT_NAME:-}" "\${1:-}" >"$env_log_file"
+case "\${1:-}" in
+  verify) exit 0 ;;
+  read) printf '{"refresh_token":"token"}' ;;
+  write) cat >/dev/null ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$fake_keychain"
+
+  KEYCHAIN_SCRIPT="$fake_keychain"
+  run_capture run_keychain_for_runtime codex json_refresh_token verify
+  assert_status 0
+  grep -Fq 'service=codex-OpenAI-auth' "$env_log_file" || fail "Expected legacy codex keychain service name"
+  grep -Fq 'account=device-auth-openAI' "$env_log_file" || fail "Expected legacy codex keychain account name"
+}
+
+test_run_keychain_for_runtime_uses_runtime_specific_slot() {
+  begin_test "run_keychain_for_runtime uses runtime-specific keychain slots"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local fake_keychain
+  local env_log_file
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-keychain-runtime.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  fake_keychain="$temp_dir/fake-keychain.sh"
+  env_log_file="$temp_dir/env.log"
+
+  cat >"$fake_keychain" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'service=%s\naccount=%s\ncmd=%s\n' "\${KEYCHAIN_SERVICE_NAME:-}" "\${KEYCHAIN_ACCOUNT_NAME:-}" "\${1:-}" >"$env_log_file"
+case "\${1:-}" in
+  verify) exit 0 ;;
+  read) printf '{"refresh_token":"token"}' ;;
+  write) cat >/dev/null ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$fake_keychain"
+
+  KEYCHAIN_SCRIPT="$fake_keychain"
+  run_capture run_keychain_for_runtime claude opaque_blob verify
+  assert_status 0
+  grep -Fq 'service=agentctl-claude-opaque_blob-auth' "$env_log_file" || fail "Expected runtime-specific keychain service name"
+  grep -Fq 'account=runtime-claude-opaque_blob-auth' "$env_log_file" || fail "Expected runtime-specific keychain account name"
+}
+
 test_rm_force_stops_running_container_before_remove() {
   begin_test "rm --force stops a running container before remove"
 
@@ -1074,6 +1142,8 @@ main() {
   test_run_auth_flow_uses_agent_sh_auth_contract
   test_run_auth_flow_skips_keychain_write_when_auth_unchanged
   test_run_auth_flow_rejects_runtime_without_host_auth_support
+  test_run_keychain_for_runtime_uses_legacy_codex_slot
+  test_run_keychain_for_runtime_uses_runtime_specific_slot
   test_rm_force_stops_running_container_before_remove
   test_image_ref_for_runtime_falls_back_to_legacy_when_present
   test_ls_filters_non_codex_containers

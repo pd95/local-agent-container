@@ -253,6 +253,7 @@ Notes:
 - After a run, if the container refresh time is newer (and present), the updated auth is saved back into Keychain.
 - After `agentctl auth`, exit any running `--openai` sessions and re-run `agentctl run --openai` to pick up the new token.
 - `agentctl auth --runtime <runtime>` only works for runtimes whose manifest declares `auth_login` and `auth_read` capability support plus at least one host-storable `auth_format`. In this branch, that means `codex`; `claude` still fails clearly as "not supported yet".
+- host-side Keychain storage is now keyed per runtime and auth format. Codex keeps the legacy `codex-OpenAI-auth` slot so existing setups continue to work unchanged.
 
 Security notes:
 
@@ -510,6 +511,7 @@ Notes:
 - The default path is `/home/coder/.codex/auth.json` unless you pass an explicit path.
 - `agentctl run --openai` and `agentctl auth` automatically sync the Keychain auth into running containers when it differs, using `agent.sh auth read/write`.
 - `agentctl run --openai` saves refreshed auth back to Keychain when the container reports a newer refresh time (and that field is present).
+- `agentctl` now chooses Keychain slots per runtime/auth-format pair. Codex still uses the legacy `codex-OpenAI-auth` entry so the current OpenAI workflow stays compatible.
 - `agentctl run --profile <name>` sets the Codex profile used by the container.
   Profiles are defined in `config.toml` and control which model to use.
 
