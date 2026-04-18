@@ -4,6 +4,12 @@ This repository includes a small host-side integration test harness for `agentct
 Run these tests on the macOS host where Apple's `container` CLI is installed. Do not
 run them from inside a container.
 
+For user-facing setup and product docs, start with:
+- [README.md](README.md)
+- [docs/getting-started.md](docs/getting-started.md)
+- [docs/runtimes.md](docs/runtimes.md)
+- [docs/local-vs-online.md](docs/local-vs-online.md)
+
 ## Automated host tests
 
 The automated suite exercises the highest-risk container lifecycle flows without extra
