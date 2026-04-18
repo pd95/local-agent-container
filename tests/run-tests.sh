@@ -146,7 +146,7 @@ test_build_rebuild_stops_buildkit() {
 
   if ! "$CONTAINER_CMD" ls -a 2>/dev/null | grep -q -E '^buildkit[[:space:]]+.*[[:space:]]stopped([[:space:]]|$)'; then
     printf '%s\n' "$RUN_OUTPUT" >&2
-    fail "Expected buildkit to be stopped after codexctl build"
+    fail "Expected buildkit to be stopped after agentctl build"
   fi
 }
 
@@ -493,7 +493,7 @@ main() {
   require_host_prereqs
 
   log "Using agentctl at $AGENTCTL"
-  log "Using codexctl implementation at $CODEXCTL"
+  log "Using agentctl implementation at $AGENTCTL_IMPL"
   log "Using container runtime command $CONTAINER_CMD"
   log "Running host test tier: $TEST_TIER"
   if [ -n "$TEST_FILTER" ]; then

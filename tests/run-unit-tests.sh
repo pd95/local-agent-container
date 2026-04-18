@@ -451,6 +451,9 @@ test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
   run_agent_sh_in_container() {
     call_log="${call_log}$1:$2:$3"$'\n'
   }
+  run_agent_sh_in_container_root() {
+    call_log="${call_log}root:$1:$2:$3:$4"$'\n'
+  }
   runtime_info_in_container() {
     printf '{"runtime":"claude","installed":true,"auth_formats":["claude_ai_oauth_json"],"capabilities":{"auth_login":true,"auth_read":true,"auth_write":true}}'
   }
@@ -459,9 +462,62 @@ test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
 
   run_capture run_pre_exec unit-test-container
   assert_status 0
-  printf '%s' "$call_log" | grep -Fq $'unit-test-container:runtime:install' || fail "Expected runtime install call, got: $call_log"
+  printf '%s' "$call_log" | grep -Fq $'root:unit-test-container:runtime:install:claude' || fail "Expected root runtime install call, got: $call_log"
   printf '%s' "$call_log" | grep -Fq $'unit-test-container:preferred:set' || fail "Expected preferred set call, got: $call_log"
   printf '%s' "$call_log" | grep -Fq $'sync:unit-test-container:claude:claude_ai_oauth_json' || fail "Expected runtime auth sync call, got: $call_log"
+}
+
+test_run_pre_exec_updates_codex_via_runtime_helper() {
+  begin_test "run_pre_exec updates codex via the runtime root helper"
+
+  load_codexctl_functions
+
+  local helper_log=""
+  RUN_SELECTED_RUNTIME=""
+  RUN_INSTALL_RUNTIME=0
+  RUN_SYNC_RUNTIME_AUTH=0
+  RUN_SYNC_POST_RUNTIME_AUTH=0
+  RUN_FORCE_RUNTIME_AUTH=0
+  RUN_LOCAL_MODEL_PREFLIGHT=0
+  RUN_UPDATE_CODEX=1
+  RUN_REQUESTED_IMAGE="agent-plain"
+
+  run_agent_sh_in_container_root() {
+    helper_log="${helper_log}root:$1:$2:$3:$4"$'\n'
+  }
+
+  run_capture run_pre_exec unit-test-container
+  assert_status 0
+  printf '%s' "$helper_log" | grep -Fq $'root:unit-test-container:runtime:update:codex' || fail "Expected runtime update root helper call, got: $helper_log"
+}
+
+test_run_container_reset_config_uses_runtime_helper() {
+  begin_test "run_container reset-config uses the runtime reset helper"
+
+  load_codexctl_functions
+
+  local helper_log=""
+
+  require_container() { return 0; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  validate_mount_mode() { :; }
+  local CONTAINER_CMD=mock_reset_config_container
+  mock_reset_config_container() {
+    case "$1" in
+      start) : ;;
+      stop) : ;;
+      exec) : ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  reset_runtime_config_in_container() {
+    helper_log="${helper_log}$1:$2"$'\n'
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" 1 true
+  assert_status 0
+  printf '%s' "$helper_log" | grep -Fq $'unit-test-container:codex' || fail "Expected runtime reset-config helper call, got: $helper_log"
 }
 
 test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified() {
@@ -634,6 +690,48 @@ test_feature_cmd_installs_via_root_helper() {
   run_capture feature_cmd --name unit-feature-container install office
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'root:unit-feature-container:feature:install' || fail "Expected root feature helper call, got: $helper_log"
+}
+
+test_runtime_cmd_install_uses_root_helper() {
+  begin_test "runtime_cmd install uses the root helper path"
+
+  load_codexctl_functions
+
+  local helper_log=""
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-runtime-container\n'; }
+  run_agent_sh_in_container() {
+    helper_log="${helper_log}user:$1:$2:$3:$4"$'\n'
+  }
+  run_agent_sh_in_container_root() {
+    helper_log="${helper_log}root:$1:$2:$3:$4"$'\n'
+  }
+
+  run_capture runtime_cmd --name unit-runtime-container install codex
+  assert_status 0
+  printf '%s' "$helper_log" | grep -Fq $'root:unit-runtime-container:runtime:install:codex' || fail "Expected root runtime helper call, got: $helper_log"
+}
+
+test_runtime_cmd_update_uses_root_helper() {
+  begin_test "runtime_cmd update uses the root helper path"
+
+  load_codexctl_functions
+
+  local helper_log=""
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-runtime-container\n'; }
+  run_agent_sh_in_container() {
+    helper_log="${helper_log}user:$1:$2:$3:$4"$'\n'
+  }
+  run_agent_sh_in_container_root() {
+    helper_log="${helper_log}root:$1:$2:$3:$4"$'\n'
+  }
+
+  run_capture runtime_cmd --name unit-runtime-container update codex
+  assert_status 0
+  printf '%s' "$helper_log" | grep -Fq $'root:unit-runtime-container:runtime:update:codex' || fail "Expected root runtime helper call, got: $helper_log"
 }
 
 test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state() {
@@ -2017,8 +2115,8 @@ EOF
   grep -Fq '"refreshToken":"claude-refresh"' "$stored_blob_file" || fail "Expected Claude auth blob in keychain write"
 }
 
-test_run_keychain_for_runtime_uses_legacy_codex_slot() {
-  begin_test "run_keychain_for_runtime preserves the legacy codex keychain slot"
+test_run_keychain_for_runtime_uses_runtime_specific_codex_slot() {
+  begin_test "run_keychain_for_runtime uses the runtime-specific codex slot first"
 
   load_codexctl_functions
 
@@ -2047,8 +2145,87 @@ EOF
   KEYCHAIN_SCRIPT="$fake_keychain"
   run_capture run_keychain_for_runtime codex json_refresh_token verify
   assert_status 0
-  grep -Fq 'service=codex-OpenAI-auth' "$env_log_file" || fail "Expected legacy codex keychain service name"
-  grep -Fq 'account=device-auth-openAI' "$env_log_file" || fail "Expected legacy codex keychain account name"
+  grep -Fq 'service=agentctl-codex-json_refresh_token-auth' "$env_log_file" || fail "Expected runtime-specific codex keychain service name"
+  grep -Fq 'account=runtime-codex-json_refresh_token-auth' "$env_log_file" || fail "Expected runtime-specific codex keychain account name"
+}
+
+test_run_keychain_for_runtime_falls_back_to_legacy_codex_slot() {
+  begin_test "run_keychain_for_runtime falls back to the legacy codex slot"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local fake_keychain
+  local env_log_file
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-keychain-codex-legacy.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  fake_keychain="$temp_dir/fake-keychain.sh"
+  env_log_file="$temp_dir/env.log"
+
+  cat >"$fake_keychain" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'service=%s\naccount=%s\ncmd=%s\n' "\${KEYCHAIN_SERVICE_NAME:-}" "\${KEYCHAIN_ACCOUNT_NAME:-}" "\${1:-}" >>"$env_log_file"
+case "\${KEYCHAIN_SERVICE_NAME:-}" in
+  agentctl-codex-json_refresh_token-auth) exit 1 ;;
+  codex-OpenAI-auth)
+    case "\${1:-}" in
+      verify) exit 0 ;;
+      read) printf '{"refresh_token":"token"}' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$fake_keychain"
+
+  KEYCHAIN_SCRIPT="$fake_keychain"
+  run_capture run_keychain_for_runtime codex json_refresh_token verify
+  assert_status 0
+  grep -Fq 'service=agentctl-codex-json_refresh_token-auth' "$env_log_file" || fail "Expected primary codex keychain probe"
+  grep -Fq 'service=codex-OpenAI-auth' "$env_log_file" || fail "Expected legacy codex keychain fallback probe"
+}
+
+test_run_keychain_for_runtime_falls_back_to_agent_openai_slot() {
+  begin_test "run_keychain_for_runtime falls back to the older agent-openai slot"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local fake_keychain
+  local env_log_file
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-keychain-agent-openai.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  fake_keychain="$temp_dir/fake-keychain.sh"
+  env_log_file="$temp_dir/env.log"
+
+  cat >"$fake_keychain" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'service=%s\naccount=%s\ncmd=%s\n' "\${KEYCHAIN_SERVICE_NAME:-}" "\${KEYCHAIN_ACCOUNT_NAME:-}" "\${1:-}" >>"$env_log_file"
+case "\${KEYCHAIN_SERVICE_NAME:-}" in
+  agentctl-codex-json_refresh_token-auth|codex-OpenAI-auth) exit 1 ;;
+  agent-openai-auth)
+    case "\${1:-}" in
+      verify) exit 0 ;;
+      read) printf '{"refresh_token":"token"}' ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$fake_keychain"
+
+  KEYCHAIN_SCRIPT="$fake_keychain"
+  run_capture run_keychain_for_runtime codex json_refresh_token verify
+  assert_status 0
+  grep -Fq 'service=agentctl-codex-json_refresh_token-auth' "$env_log_file" || fail "Expected primary codex keychain probe"
+  grep -Fq 'service=codex-OpenAI-auth' "$env_log_file" || fail "Expected legacy codex keychain probe"
+  grep -Fq 'service=agent-openai-auth' "$env_log_file" || fail "Expected older agent-openai keychain fallback probe"
 }
 
 test_run_keychain_for_runtime_uses_runtime_specific_slot() {
@@ -2606,7 +2783,7 @@ test_cleanup_temp_dir_handles_read_only_trees() {
 
 main() {
   log "Using agentctl at $AGENTCTL"
-  log "Using codexctl implementation at $CODEXCTL"
+  log "Using agentctl implementation at $AGENTCTL_IMPL"
 
   test_run_profile_wires_selected_profile
   test_run_help_reports_profile_default
@@ -2625,6 +2802,8 @@ main() {
   test_run_cmd_rejects_install_runtime_without_runtime
   test_run_cmd_rejects_auth_without_online
   test_run_pre_exec_syncs_selected_runtime_auth_when_available
+  test_run_pre_exec_updates_codex_via_runtime_helper
+  test_run_container_reset_config_uses_runtime_helper
   test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified
   test_run_pre_exec_runs_local_model_preflight_for_preferred_claude
   test_run_pre_exec_runs_local_model_preflight_for_preferred_codex
@@ -2632,6 +2811,8 @@ main() {
   test_sync_runtime_auth_to_container_if_available_skips_missing_keychain
   test_auth_cmd_warns_for_legacy_office_image
   test_feature_cmd_installs_via_root_helper
+  test_runtime_cmd_install_uses_root_helper
+  test_runtime_cmd_update_uses_root_helper
   test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state
   test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container
   test_bootstrap_cmd_bootstraps_apt_container
@@ -2678,7 +2859,9 @@ main() {
   test_run_auth_flow_skips_keychain_write_when_auth_unchanged
   test_run_auth_flow_rejects_runtime_without_host_auth_support
   test_run_auth_flow_installs_runtime_before_claude_auth
-  test_run_keychain_for_runtime_uses_legacy_codex_slot
+  test_run_keychain_for_runtime_uses_runtime_specific_codex_slot
+  test_run_keychain_for_runtime_falls_back_to_legacy_codex_slot
+  test_run_keychain_for_runtime_falls_back_to_agent_openai_slot
   test_run_keychain_for_runtime_uses_runtime_specific_slot
   test_rm_force_stops_running_container_before_remove
   test_image_ref_for_runtime_falls_back_to_legacy_when_present

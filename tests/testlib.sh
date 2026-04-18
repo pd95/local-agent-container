@@ -3,7 +3,8 @@ set -euo pipefail
 
 TEST_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 AGENTCTL="${AGENTCTL:-$TEST_ROOT/agentctl}"
-CODEXCTL="${CODEXCTL:-$TEST_ROOT/codexctl}"
+AGENTCTL_IMPL="${AGENTCTL_IMPL:-$TEST_ROOT/agentctl}"
+CODEXCTL="${CODEXCTL:-$AGENTCTL_IMPL}"
 CONTAINER_CMD="${CONTAINER_CMD:-container}"
 TEST_FILTER="${TEST_FILTER:-}"
 TEST_START_FROM="${TEST_START_FROM:-}"
@@ -32,7 +33,7 @@ fail() {
 
 require_host_prereqs() {
   command -v "$AGENTCTL" >/dev/null 2>&1 || fail "Missing agentctl: $AGENTCTL"
-  command -v "$CODEXCTL" >/dev/null 2>&1 || fail "Missing codexctl: $CODEXCTL"
+  command -v "$AGENTCTL_IMPL" >/dev/null 2>&1 || fail "Missing agentctl implementation: $AGENTCTL_IMPL"
   command -v "$CONTAINER_CMD" >/dev/null 2>&1 || fail "Missing container runtime command: $CONTAINER_CMD"
   if [ "$(uname -s)" != "Darwin" ]; then
     fail "These host integration tests must run on macOS"
