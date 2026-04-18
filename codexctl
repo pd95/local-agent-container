@@ -601,7 +601,7 @@ EOF
 
 usage_runtime() {
   cat <<EOF
-Usage: $CLI_NAME runtime <list|info|capabilities|install|update|reset-config> [options] [runtime]
+Usage: $CLI_NAME runtime <list|info|capabilities|install|update|reset-config|use> [options] [runtime]
 
 Options:
   --name NAME  Container name (default: agent-<dir>)
@@ -610,6 +610,7 @@ Examples:
   $CLI_NAME runtime list
   $CLI_NAME runtime info codex
   $CLI_NAME runtime install codex
+  $CLI_NAME runtime use codex
 EOF
 }
 
@@ -2351,6 +2352,10 @@ runtime_cmd() {
       [ -n "$runtime" ] || die "Missing runtime for $subcommand"
       run_agent_sh_in_container "$name" runtime "$subcommand" "$runtime"
       ;;
+    use)
+      [ -n "$runtime" ] || die "Missing runtime for $subcommand"
+      set_preferred_runtime_in_container "$name" "$runtime"
+      ;;
     "")
       usage_runtime
       ;;
@@ -2408,6 +2413,14 @@ feature_cmd() {
   esac
 }
 
+set_preferred_runtime_in_container() {
+  local name="$1"
+  local runtime="$2"
+
+  run_agent_sh_in_container "$name" preferred set "$runtime"
+  echo "Preferred runtime set to $runtime in $name" >&2
+}
+
 use_cmd() {
   local name=""
   local runtime=""
@@ -2433,8 +2446,7 @@ use_cmd() {
     name="$(default_name "$DEFAULT_NAME_PREFIX")"
   fi
 
-  run_agent_sh_in_container "$name" preferred set "$runtime"
-  echo "Preferred runtime set to $runtime in $name" >&2
+  set_preferred_runtime_in_container "$name" "$runtime"
 }
 
 system_manifest_cmd() {

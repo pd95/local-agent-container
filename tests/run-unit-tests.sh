@@ -834,7 +834,8 @@ test_runtime_help_reports_new_command() {
 
   run_capture "$AGENTCTL" runtime --help
   assert_status 0
-  assert_contains "Usage: agentctl runtime <list|info|capabilities|install|update|reset-config> [options] [runtime]"
+  assert_contains "Usage: agentctl runtime <list|info|capabilities|install|update|reset-config|use> [options] [runtime]"
+  assert_contains "runtime use codex"
 }
 
 test_feature_help_reports_new_command() {
@@ -2425,6 +2426,52 @@ test_use_cmd_sets_preferred_runtime_in_stopped_container() {
   printf '%s\n' "$exec_log" | grep -Fq '/usr/local/bin/agent.sh preferred set codex' || fail "Expected use to invoke agent.sh preferred set, got: $exec_log"
 }
 
+test_runtime_use_cmd_sets_preferred_runtime_in_stopped_container() {
+  begin_test "runtime use sets the preferred runtime inside a stopped container"
+
+  load_codexctl_functions
+
+  local start_calls=0
+  local stop_calls=0
+  local exec_log=""
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 1; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      start)
+        start_calls=$((start_calls + 1))
+        ;;
+      stop)
+        stop_calls=$((stop_calls + 1))
+        ;;
+      exec)
+        shift
+        if [ "$1" = "unit-test-container" ]; then
+          shift
+        fi
+        if [ "${1:-}" = "setpriv" ]; then
+          shift 5
+        fi
+        exec_log="${exec_log}$(printf '%s\n' "$*")"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture runtime_cmd --name unit-test-container use codex
+  assert_status 0
+  assert_contains "Preferred runtime set to codex in unit-test-container"
+  [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
+  [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
+  printf '%s\n' "$exec_log" | grep -Fq '/usr/local/bin/agent.sh preferred set codex' || fail "Expected runtime use to invoke agent.sh preferred set, got: $exec_log"
+}
+
 test_cleanup_temp_dir_handles_read_only_trees() {
   begin_test "cleanup_temp_dir removes read-only extracted trees"
 
@@ -2524,6 +2571,7 @@ main() {
   test_runtime_cmd_starts_stopped_container_and_restores_state
   test_runtime_cmd_propagates_exec_failures
   test_use_cmd_sets_preferred_runtime_in_stopped_container
+  test_runtime_use_cmd_sets_preferred_runtime_in_stopped_container
   test_cleanup_temp_dir_handles_read_only_trees
 
   log "PASS: all shell unit tests completed"
