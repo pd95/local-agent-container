@@ -9,6 +9,14 @@ Run the commands in this guide on the **macOS host**, not inside a container.
 
 If you just want local mode to work with the least amount of debugging:
 
+> [!WARNING]
+> **This is the easiest setup, not the safest setup.**
+>
+> Enabling **Expose Ollama to the network** makes Ollama reachable beyond
+> `localhost`. Only use this when your Mac is connected to a **private, trusted
+> network**. If you are on a public, shared, or otherwise untrusted network,
+> prefer one of the more controlled options below instead.
+
 1. In the Ollama app, enable **Expose Ollama to the network**.
 2. In a macOS host terminal, verify that the container-visible host address can
    reach Ollama:
