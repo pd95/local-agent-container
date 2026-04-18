@@ -114,6 +114,9 @@ Common first-run workflows:
 # Run Codex with a specific local profile
 agentctl run --profile gemma
 
+# Test a specific model directly
+agentctl run --model qwen3.5
+
 # Use the runtime's online/provider-backed mode
 agentctl run --online
 

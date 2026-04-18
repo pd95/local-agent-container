@@ -96,12 +96,32 @@ agentctl run
 Common alternatives:
 
 ```bash
-agentctl run --runtime codex --install-runtime
+# Run Codex with a specific local profile
+agentctl run --profile gemma
+
+# Test a specific model directly
+agentctl run --model qwen3.5
+
+# Install and launch Claude in the current container
 agentctl run --runtime claude --install-runtime
-agentctl run --image agent-python
-agentctl run --read-only
-agentctl run --temp
+
+# Use the runtime's online/provider-backed mode
+agentctl run --online
+
+# Start a shell instead of the runtime
 agentctl run --shell
+
+# Install Codex explicitly in the current container
+agentctl run --runtime codex --install-runtime
+
+# Start with a different curated image
+agentctl run --image agent-python
+
+# Keep the mounted workdir read-only
+agentctl run --read-only
+
+# Use a temporary container
+agentctl run --temp
 ```
 
 Useful follow-ups:
