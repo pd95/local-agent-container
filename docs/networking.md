@@ -3,12 +3,37 @@
 Local runtime launches need a path from the container network to the Ollama
 process running on the host.
 
-## Default assumption
+Run the commands in this guide on the **macOS host**, not inside a container.
 
-The default Codex config points at:
+## Recommended first-success setup
+
+If you just want local mode to work with the least amount of debugging:
+
+1. In the Ollama app, enable **Expose Ollama to the network**.
+2. In a macOS host terminal, verify that the container-visible host address can
+   reach Ollama:
+
+   ```bash
+   curl -fsS http://192.168.64.1:11434/api/version
+   ```
+
+3. If that prints a small JSON response, try:
+
+   ```bash
+   agentctl run
+   ```
+
+This is the easiest path to first success. The tradeoff is that exposing Ollama
+to the network is the broadest and least restrictive option. Safer alternatives
+are documented below.
+
+## What this means
+
+The agentctl-managed local runtime setup expects local model traffic to go to a
+host-visible Ollama listener, typically:
 
 ```text
-http://192.168.64.1:11434/v1
+http://192.168.64.1:11434
 ```
 
 On many Apple container setups, `192.168.64.1` is the host-visible address from
@@ -22,13 +47,14 @@ So the container often cannot reach it until you expose or proxy it.
 
 ## Quick verification
 
-If `192.168.64.1` is your container-visible host address, try:
+If `192.168.64.1` is your container-visible host address, run this on the
+macOS host:
 
 ```bash
 curl -fsS http://192.168.64.1:11434/api/version
 ```
 
-If that fails, fix networking first.
+If that fails, fix networking before expecting local runtime launches to work.
 
 ## What agentctl checks
 
@@ -47,7 +73,8 @@ default entrypoint:
 
 ### Option 1: expose Ollama on the network
 
-This is the broadest and least safe option.
+This is the easiest option and the one recommended above for first success. It
+is also the broadest and least safe option.
 
 Enable Ollama's "Expose to network" setting in the GUI if you are comfortable
 with that exposure.
@@ -57,6 +84,8 @@ with that exposure.
 ```bash
 OLLAMA_HOST=192.168.64.1 ollama serve
 ```
+
+Run that on the macOS host.
 
 This only works when the container-visible address exists, which usually means a
 container is already running.
