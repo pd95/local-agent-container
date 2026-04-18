@@ -16,9 +16,13 @@ The main entry point is `agentctl`, which manages:
 
 You need:
 - a Mac with Apple Silicon
-- at least 32 GB RAM
 - Ollama installed
 - Apple’s `container` CLI installed
+
+Recommended memory:
+- for local-model workflows, plan for at least 32 GB RAM
+- online-only workflows may work with less memory, but that is not yet verified
+  in the current docs/test matrix
 
 Official releases:
 - `container`: <https://github.com/apple/container/releases>
