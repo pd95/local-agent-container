@@ -6,32 +6,32 @@ you want to use Apple’s `container` CLI directly instead of `agentctl`.
 ## Run a throwaway container
 
 ```bash
-container run --rm -it --mount type=bind,src="$(pwd)",dst=/workdir codex
+container run --rm -it --mount type=bind,src="$(pwd)",dst=/workdir agent-plain
 ```
 
 ## Use a named persistent container
 
 ```bash
-container run -it --name "codex-$(basename "$PWD")" --mount type=bind,src="$(pwd)",dst=/workdir codex
+container run -it --name "agent-$(basename "$PWD")" --mount type=bind,src="$(pwd)",dst=/workdir agent-plain
 ```
 
 Equivalent create/start split:
 
 ```bash
-container create -t --name "codex-$(basename "$PWD")" --mount type=bind,src="$(pwd)",dst=/workdir codex
-container start -i "codex-$(basename "$PWD")"
+container create -t --name "agent-$(basename "$PWD")" --mount type=bind,src="$(pwd)",dst=/workdir agent-plain
+container start -i "agent-$(basename "$PWD")"
 ```
 
 Restart later:
 
 ```bash
-container start -i "codex-$(basename "$PWD")"
+container start -i "agent-$(basename "$PWD")"
 ```
 
 Remove later:
 
 ```bash
-container rm "codex-$(basename "$PWD")"
+container rm "agent-$(basename "$PWD")"
 ```
 
 List even stopped containers:
@@ -43,7 +43,7 @@ container ls -a
 ## Exec into a running container
 
 ```bash
-container exec -it "my-codex" bash
+container exec -it "my-agent" bash
 ```
 
 ## Resource overrides
@@ -51,7 +51,7 @@ container exec -it "my-codex" bash
 If you need a heavier direct container:
 
 ```bash
-container run -it -c 6 -m 8G --name "codex-$(basename "$PWD")" --mount type=bind,src="$(pwd)",dst=/workdir codex
+container run -it -c 6 -m 8G --name "agent-$(basename "$PWD")" --mount type=bind,src="$(pwd)",dst=/workdir agent-plain
 ```
 
 ## Manual provider-backed Codex flow
@@ -61,7 +61,7 @@ If you want a fully manual isolated Codex login flow:
 1. Start a named container:
 
    ```bash
-   container run -it --name "codex-$(basename "$PWD")" --mount type=bind,src="$(pwd)",dst=/workdir codex bash
+   container run -it --name "agent-$(basename "$PWD")" --mount type=bind,src="$(pwd)",dst=/workdir agent-plain bash
    ```
 
 2. Log in inside the container:
