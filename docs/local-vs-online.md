@@ -51,21 +51,32 @@ The runtime adapter maps that to `claude --model qwen3:14b`.
 
 ## Online mode
 
-Use:
+Before the first online run for a runtime, you need to log in once with
+`agentctl auth` so `agentctl` has host-stored credentials to replay:
+
+```bash
+agentctl auth --runtime codex
+agentctl auth --runtime claude
+```
+
+Online mode also assumes you have a valid account, subscription, API access, or
+other provider entitlement for the selected runtime. Logging in alone is not
+enough if that runtime's online service is not available to your account.
+
+After that, use:
 
 ```bash
 agentctl run --online
-```
-
-or, explicitly with a runtime:
-
-```bash
 agentctl run --runtime claude --online
 agentctl run --runtime codex --online
 ```
 
 In online mode:
 - the effective runtime decides the provider-backed behavior
+- the first online run requires a prior `agentctl auth --runtime ...` login for
+  that runtime
+- the selected runtime must also have whatever provider access or subscription
+  its online service requires
 - `agentctl` does best-effort Keychain auth replay before launch
 - refreshed auth can be written back to Keychain after the run
 
