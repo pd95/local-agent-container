@@ -28,7 +28,7 @@ resolve_script_path() {
 SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
 CLI_NAME="${AGENTCTL_NAME:-$(basename -- "$SCRIPT_PATH")}"
-KEYCHAIN_SCRIPT="$SCRIPT_DIR/codex-auth-keychain.sh"
+KEYCHAIN_SCRIPT="$SCRIPT_DIR/agentctl-keychain.sh"
 OPENAI_RUNTIME_ID="codex"
 OPENAI_AUTH_FORMAT="json_refresh_token"
 

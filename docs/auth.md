@@ -85,20 +85,9 @@ from `~/.claude.json`:
 
 That is enough to replay auth into a fresh Claude container in current testing.
 
-## Manual compatibility helpers
+## Keychain helper
 
-`codex-auth-keychain.sh` still provides direct compatibility helpers when needed.
-
-Examples:
-
-```bash
-codex-auth-keychain.sh store-from-container "codex-$(basename "$PWD")"
-codex-auth-keychain.sh load-to-container "codex-$(basename "$PWD")"
-```
-
-Notes:
-- the container must be running for these helpers
-- the default Codex auth path is `/home/coder/.codex/auth.json`
+`agentctl-keychain.sh` is the low-level macOS Keychain adapter used by `agentctl` for runtime auth state.
 
 ## Related docs
 
