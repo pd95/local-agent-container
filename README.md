@@ -111,14 +111,8 @@ agentctl run
 Common first-run workflows:
 
 ```bash
-# Install and launch Claude in the current container
-agentctl run --runtime claude --install-runtime
-
 # Run Codex with a specific local profile
 agentctl run --profile gemma
-
-# Override the launch model for the selected runtime
-agentctl run --runtime claude --model qwen3:14b
 
 # Use the runtime's online/provider-backed mode
 agentctl run --online
@@ -126,7 +120,13 @@ agentctl run --online
 # Start a shell instead of the runtime
 agentctl run --shell
 
-# Refresh an existing container in place after agentctl/runtime changes
+# Install and launch Claude in the current container
+agentctl run --runtime claude --install-runtime
+
+# Override the launch model for the selected runtime
+agentctl run --runtime claude --model qwen3:14b
+
+# Refresh an existing container in place after pulling a newer agentctl checkout
 agentctl refresh
 ```
 
