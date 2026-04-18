@@ -73,6 +73,7 @@ test_run_profile_wires_selected_profile() {
   [ "$captured_pre_exec" = "run_pre_exec" ] || fail "Expected run_pre_exec, got: $captured_pre_exec"
   printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_RUN_MODE=' || fail "Expected agent.sh launch wrapper, got: $captured_cmd"
   printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_DEFAULT_PROFILE=' || fail "Expected profile to be passed to agent.sh, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_MODEL_OVERRIDE=' || fail "Expected model override env slot to be present, got: $captured_cmd"
   printf '%s\n' "$captured_cmd" | grep -Fq '/usr/local/bin/agent.sh run' || fail "Expected agent.sh run launch path, got: $captured_cmd"
   if printf '%s\n' "$captured_cmd" | grep -Fq -- '--cd /workdir'; then
     fail "Did not expect codex-specific --cd flag in generic host launch path: $captured_cmd"
@@ -86,6 +87,31 @@ test_run_help_reports_runtime_options() {
   assert_status 0
   assert_contains "--runtime NAME  Preferred runtime to launch"
   assert_contains "--install-runtime  Install the selected runtime before launch"
+  assert_contains "--model NAME    Override the launch model for the selected runtime"
+  assert_contains "--online        Use the runtime's online/provider-backed mode"
+}
+
+test_run_model_wires_selected_model() {
+  begin_test "run_cmd wires --model into the launched agent.sh command"
+
+  load_codexctl_functions
+
+  local captured_cmd=""
+  local workdir
+
+  workdir="$(new_workdir)"
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  run_container() {
+    shift 11
+    captured_cmd="$(printf '%s\n' "$*")"
+  }
+
+  run_cmd --name unit-test-container --workdir "$workdir" --model qwen3:14b
+
+  printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_MODEL_OVERRIDE=' || fail "Expected model override to be passed to agent.sh, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fq 'qwen3:14b' || fail "Expected selected model in launch wrapper, got: $captured_cmd"
 }
 
 test_build_help_reports_primary_base_images() {
@@ -215,7 +241,7 @@ test_run_cmd_runtime_selection_prepares_runtime_before_launch() {
   [ "$captured_pre_exec" = "run_pre_exec" ] || fail "Expected run_pre_exec, got: $captured_pre_exec"
   [ "$RUN_SELECTED_RUNTIME" = "claude" ] || fail "Expected runtime claude, got: $RUN_SELECTED_RUNTIME"
   [ "$RUN_INSTALL_RUNTIME" -eq 1 ] || fail "Expected install-runtime to be enabled"
-  [ "$RUN_SYNC_SELECTED_RUNTIME_AUTH" -eq 1 ] || fail "Expected runtime auth sync to be enabled"
+  [ "$RUN_SYNC_RUNTIME_AUTH" -eq 0 ] || fail "Did not expect online auth sync for local Claude shell launch"
   [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 0 ] || fail "Did not expect local-model preflight for Claude shell launch"
   [ "$captured_mem" = "4G" ] || fail "Expected Claude bootstrap run to request 4G, got: $captured_mem"
 }
@@ -351,8 +377,8 @@ EOF
   assert_contains "--install-runtime requires --runtime"
 }
 
-test_run_cmd_rejects_openai_for_non_codex_runtime() {
-  begin_test "run_cmd rejects --openai for non-codex runtimes"
+test_run_cmd_rejects_auth_without_online() {
+  begin_test "run_cmd rejects --auth without --online"
 
   local temp_dir
   local unit_script
@@ -366,44 +392,48 @@ test_run_cmd_rejects_openai_for_non_codex_runtime() {
 set -euo pipefail
 source "$CODEXCTL"
 require_container() { return 0; }
-run_cmd --runtime claude --openai
+run_cmd --runtime claude --auth
 EOF
   chmod +x "$unit_script"
 
   run_capture bash "$unit_script"
   assert_status 1
-  assert_contains "--openai currently requires --runtime codex"
+  assert_contains "--auth requires --online"
 }
 
 test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
-  begin_test "run_pre_exec syncs selected runtime auth when available"
+  begin_test "run_pre_exec syncs selected runtime auth when online mode is enabled"
 
   load_codexctl_functions
 
   local call_log=""
   RUN_SELECTED_RUNTIME="claude"
   RUN_INSTALL_RUNTIME=1
-  RUN_SYNC_SELECTED_RUNTIME_AUTH=1
-  RUN_SYNC_OPENAI=0
+  RUN_SYNC_RUNTIME_AUTH=1
+  RUN_SYNC_POST_RUNTIME_AUTH=0
+  RUN_FORCE_RUNTIME_AUTH=0
   RUN_LOCAL_MODEL_PREFLIGHT=0
   RUN_UPDATE_CODEX=0
+  RUN_REQUESTED_IMAGE="agent-plain"
 
   run_agent_sh_in_container() {
     call_log="${call_log}$1:$2:$3"$'\n'
   }
-  sync_runtime_auth_to_container_if_available() {
-    call_log="${call_log}sync:$1:$2"$'\n'
+  runtime_info_in_container() {
+    printf '{"runtime":"claude","installed":true,"auth_formats":["claude_ai_oauth_json"],"capabilities":{"auth_login":true,"auth_read":true,"auth_write":true}}'
   }
+  keychain_auth_info() { printf 'refresh-token\t1776462236852\n'; }
+  sync_runtime_auth_to_container() { call_log="${call_log}sync:$1:$2:$3"$'\n'; }
 
   run_capture run_pre_exec unit-test-container
   assert_status 0
   printf '%s' "$call_log" | grep -Fq $'unit-test-container:runtime:install' || fail "Expected runtime install call, got: $call_log"
   printf '%s' "$call_log" | grep -Fq $'unit-test-container:preferred:set' || fail "Expected preferred set call, got: $call_log"
-  printf '%s' "$call_log" | grep -Fq $'sync:unit-test-container:claude' || fail "Expected runtime auth sync call, got: $call_log"
+  printf '%s' "$call_log" | grep -Fq $'sync:unit-test-container:claude:claude_ai_oauth_json' || fail "Expected runtime auth sync call, got: $call_log"
 }
 
 test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified() {
-  begin_test "run_pre_exec syncs auth for the preferred runtime when runtime is unspecified"
+  begin_test "run_pre_exec syncs auth for the preferred runtime when online mode is enabled"
 
   load_codexctl_functions
 
@@ -411,10 +441,12 @@ test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified() {
 
   RUN_SELECTED_RUNTIME=""
   RUN_INSTALL_RUNTIME=0
-  RUN_SYNC_SELECTED_RUNTIME_AUTH=1
-  RUN_SYNC_OPENAI=0
+  RUN_SYNC_RUNTIME_AUTH=1
+  RUN_SYNC_POST_RUNTIME_AUTH=0
+  RUN_FORCE_RUNTIME_AUTH=0
   RUN_LOCAL_MODEL_PREFLIGHT=0
   RUN_UPDATE_CODEX=0
+  RUN_REQUESTED_IMAGE="agent-plain"
 
   run_agent_sh_in_container() {
     if [ "$2" = "preferred" ] && [ "$3" = "get" ]; then
@@ -423,17 +455,19 @@ test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified() {
     fi
     call_log="${call_log}$1:$2:$3"$'\n'
   }
-  sync_runtime_auth_to_container_if_available() {
-    call_log="${call_log}sync:$1:$2"$'\n'
+  runtime_info_in_container() {
+    printf '{"runtime":"claude","installed":true,"auth_formats":["claude_ai_oauth_json"],"capabilities":{"auth_login":true,"auth_read":true,"auth_write":true}}'
   }
+  keychain_auth_info() { printf 'refresh-token\t1776462236852\n'; }
+  sync_runtime_auth_to_container() { call_log="${call_log}sync:$1:$2:$3"$'\n'; }
 
   run_capture run_pre_exec unit-test-container
   assert_status 0
-  printf '%s' "$call_log" | grep -Fq $'sync:unit-test-container:claude' || fail "Expected runtime auth sync for preferred claude, got: $call_log"
+  printf '%s' "$call_log" | grep -Fq $'sync:unit-test-container:claude:claude_ai_oauth_json' || fail "Expected runtime auth sync for preferred claude, got: $call_log"
 }
 
-test_run_pre_exec_skips_local_model_preflight_for_preferred_claude() {
-  begin_test "run_pre_exec skips local-model preflight for preferred claude"
+test_run_pre_exec_runs_local_model_preflight_for_preferred_claude() {
+  begin_test "run_pre_exec runs local-mode preflight for preferred claude"
 
   load_codexctl_functions
 
@@ -441,8 +475,9 @@ test_run_pre_exec_skips_local_model_preflight_for_preferred_claude() {
 
   RUN_SELECTED_RUNTIME=""
   RUN_INSTALL_RUNTIME=0
-  RUN_SYNC_SELECTED_RUNTIME_AUTH=0
-  RUN_SYNC_OPENAI=0
+  RUN_SYNC_RUNTIME_AUTH=0
+  RUN_SYNC_POST_RUNTIME_AUTH=0
+  RUN_FORCE_RUNTIME_AUTH=0
   RUN_LOCAL_MODEL_PREFLIGHT=1
   RUN_UPDATE_CODEX=0
 
@@ -453,17 +488,17 @@ test_run_pre_exec_skips_local_model_preflight_for_preferred_claude() {
     fi
     return 0
   }
-  local_model_preflight() {
+  local_runtime_preflight() {
     preflight_called=1
   }
 
   run_capture run_pre_exec unit-test-container
   assert_status 0
-  [ "$preflight_called" -eq 0 ] || fail "Did not expect local-model preflight for preferred claude"
+  [ "$preflight_called" -eq 1 ] || fail "Expected local-mode preflight for preferred claude"
 }
 
 test_run_pre_exec_runs_local_model_preflight_for_preferred_codex() {
-  begin_test "run_pre_exec runs local-model preflight for preferred codex"
+  begin_test "run_pre_exec runs local-mode preflight for preferred codex"
 
   load_codexctl_functions
 
@@ -471,8 +506,9 @@ test_run_pre_exec_runs_local_model_preflight_for_preferred_codex() {
 
   RUN_SELECTED_RUNTIME=""
   RUN_INSTALL_RUNTIME=0
-  RUN_SYNC_SELECTED_RUNTIME_AUTH=0
-  RUN_SYNC_OPENAI=0
+  RUN_SYNC_RUNTIME_AUTH=0
+  RUN_SYNC_POST_RUNTIME_AUTH=0
+  RUN_FORCE_RUNTIME_AUTH=0
   RUN_LOCAL_MODEL_PREFLIGHT=1
   RUN_UPDATE_CODEX=0
 
@@ -483,17 +519,17 @@ test_run_pre_exec_runs_local_model_preflight_for_preferred_codex() {
     fi
     return 0
   }
-  local_model_preflight() {
+  local_runtime_preflight() {
     preflight_called=1
   }
 
   run_capture run_pre_exec unit-test-container
   assert_status 0
-  [ "$preflight_called" -eq 1 ] || fail "Expected local-model preflight for preferred codex"
+  [ "$preflight_called" -eq 1 ] || fail "Expected local-mode preflight for preferred codex"
 }
 
-test_run_cmd_default_entrypoint_enables_preferred_runtime_auth_sync() {
-  begin_test "run_cmd enables preferred runtime auth sync for the default entrypoint"
+test_run_cmd_default_entrypoint_enables_local_runtime_preflight() {
+  begin_test "run_cmd enables local runtime preflight for the default entrypoint"
 
   load_codexctl_functions
 
@@ -511,7 +547,7 @@ test_run_cmd_default_entrypoint_enables_preferred_runtime_auth_sync() {
   run_cmd --name unit-test-container --workdir "$workdir"
 
   [ "$captured_pre_exec" = "run_pre_exec" ] || fail "Expected run_pre_exec, got: $captured_pre_exec"
-  [ "$RUN_SYNC_SELECTED_RUNTIME_AUTH" -eq 1 ] || fail "Expected preferred runtime auth sync to be enabled"
+  [ "$RUN_SYNC_RUNTIME_AUTH" -eq 0 ] || fail "Did not expect online auth sync for local default run"
   [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ] || fail "Expected local-model preflight to remain enabled"
 }
 
@@ -895,7 +931,7 @@ test_agent_sh_feature_info_reports_manifest_metadata() {
 
   run_agent_sh_capture "$temp_home" feature info office
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .display_name == "Office Compatibility Tooling" and .installed == false and .capabilities.install == true' >/dev/null || fail "Expected feature info JSON for office, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .display_name == "Office Compatibility Tooling" and .installed == false and .capabilities.install == true and .install_method == "apk+npm+pip"' >/dev/null || fail "Expected feature info JSON for office, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_feature_install_office_creates_feature_state() {
@@ -941,7 +977,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     AGENTCTL_FEATURE_REGISTRY_DIR="$TEST_ROOT/features.d" \
@@ -979,7 +1015,7 @@ test_agent_sh_feature_info_reports_installed_after_office_install() {
     AGENTCTL_FEATURE_STATE_DIR="$temp_home/state" \
     "$TEST_ROOT/agent.sh" feature info office
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .installed == true and .capabilities.install == true' >/dev/null || fail "Expected installed feature info JSON for office, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .installed == true and .capabilities.install == true and .install_method == "apk+npm+pip"' >/dev/null || fail "Expected installed feature info JSON for office, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_runtime_list_reports_installed_runtimes_only() {
@@ -994,7 +1030,7 @@ test_agent_sh_runtime_list_reports_installed_runtimes_only() {
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     "$TEST_ROOT/agent.sh" runtime list
@@ -1012,7 +1048,7 @@ test_agent_sh_runtime_capabilities_reports_manifest_commands() {
 
   run_agent_sh_capture "$temp_home" runtime capabilities codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and (.commands | index("runtime install codex") != null) and (.commands | index("runtime capabilities codex") != null) and (.auth_formats | index("json_refresh_token") != null) and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.openai_mode == true' >/dev/null || fail "Expected runtime capabilities JSON for codex, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and (.commands | index("runtime install codex") != null) and (.commands | index("runtime capabilities codex") != null) and (.auth_formats | index("json_refresh_token") != null) and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.local_mode == true and .capabilities.online_mode == true' >/dev/null || fail "Expected runtime capabilities JSON for codex, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_claude_runtime_info_reports_skeleton_metadata() {
@@ -1024,7 +1060,7 @@ test_agent_sh_claude_runtime_info_reports_skeleton_metadata() {
 
   run_agent_sh_capture "$temp_home" runtime info claude
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "claude" and .installed == false and .install_method == "native-installer" and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and (.auth_formats | index("claude_ai_oauth_json") != null) and (.commands | index("runtime install claude") != null) and (.commands | index("auth login claude") != null)' >/dev/null || fail "Expected runtime info JSON for claude runtime, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "claude" and .installed == false and .install_method == "native-installer" and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.local_mode == true and .capabilities.online_mode == true and (.auth_formats | index("claude_ai_oauth_json") != null) and (.commands | index("runtime install claude") != null) and (.commands | index("auth login claude") != null)' >/dev/null || fail "Expected runtime info JSON for claude runtime, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_claude_runtime_install_runs_native_installer() {
@@ -1074,7 +1110,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     /bin/bash "$TEST_ROOT/agent.sh" runtime install claude
@@ -1089,7 +1125,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     /bin/bash "$TEST_ROOT/agent.sh" preferred get
@@ -1119,7 +1155,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     /bin/bash "$TEST_ROOT/agent.sh" runtime update claude
@@ -1169,7 +1205,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     /bin/bash "$TEST_ROOT/agent.sh" run
@@ -1177,8 +1213,40 @@ EOF
   grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to include --cd /workdir"
 }
 
-test_agent_sh_claude_run_avoids_codex_specific_cd_flag() {
-  begin_test "agent.sh claude run does not inject Codex-specific cd flag"
+test_agent_sh_codex_run_uses_model_override() {
+  begin_test "agent.sh codex run maps the model override to -m"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/codex-run.log"
+  mkdir -p "$fake_bin"
+
+  cat >"$fake_bin/codex" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    /bin/bash "$TEST_ROOT/agent.sh" run
+  assert_status 0
+  grep -Fq -- '-m qwen3:14b' "$run_log" || fail "Expected codex run to include -m qwen3:14b"
+  grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to keep --cd /workdir"
+}
+
+test_agent_sh_claude_run_uses_local_ollama_defaults() {
+  begin_test "agent.sh claude run uses Anthropic-compatible Ollama defaults"
 
   local temp_home
   local fake_bin
@@ -1192,22 +1260,107 @@ test_agent_sh_claude_run_avoids_codex_specific_cd_flag() {
 
   cat >"$fake_bin/claude" <<EOF
 #!/bin/sh
-printf '%s\n' "\$*" >"$run_log"
+printf 'AUTH=%s\n' "\${ANTHROPIC_AUTH_TOKEN:-}" >"$run_log"
+printf 'API=%s\n' "\${ANTHROPIC_API_KEY:-}" >>"$run_log"
+printf 'BASE=%s\n' "\${ANTHROPIC_BASE_URL:-}" >>"$run_log"
+printf 'ARGS=%s\n' "\$*" >>"$run_log"
 exit 0
 EOF
   chmod +x "$fake_bin/claude"
 
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
     /bin/bash "$TEST_ROOT/agent.sh" run
   assert_status 0
-  if grep -Fq -- '--cd /workdir' "$run_log"; then
-    fail "Did not expect Claude run to receive --cd /workdir"
-  fi
+  grep -Fq 'AUTH=ollama' "$run_log" || fail "Expected Claude local run to set ANTHROPIC_AUTH_TOKEN=ollama"
+  grep -Fq 'API=' "$run_log" || fail "Expected Claude local run to clear ANTHROPIC_API_KEY"
+  grep -Fq 'BASE=http://192.168.0.1:11434' "$run_log" || fail "Expected Claude local run to set the host gateway base URL"
+  grep -Fq 'ARGS=--model gpt-oss:20b' "$run_log" || fail "Expected Claude local run to inject the default local model"
+}
+
+test_agent_sh_claude_run_respects_explicit_model() {
+  begin_test "agent.sh claude run keeps an explicit model argument"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/claude-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' claude >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/claude" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/claude"
+
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
+    /bin/bash "$TEST_ROOT/agent.sh" run --model llama3
+  assert_status 0
+  grep -Fq 'ARGS=--model llama3' "$run_log" || fail "Expected explicit Claude model to be preserved"
+}
+
+test_agent_sh_claude_run_uses_model_override() {
+  begin_test "agent.sh claude run uses the generic model override"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/claude-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' claude >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/claude" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/claude"
+
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_capture env \
+    HOME="$temp_home/home" \
+    XDG_CONFIG_HOME="$temp_home/config" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
+    /bin/bash "$TEST_ROOT/agent.sh" run
+  assert_status 0
+  grep -Fq 'ARGS=--model qwen3:14b' "$run_log" || fail "Expected Claude model override to replace the default local model"
 }
 
 test_agent_sh_rejects_unknown_runtime() {
@@ -1234,7 +1387,7 @@ test_agent_sh_preferred_round_trip() {
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     "$TEST_ROOT/agent.sh" preferred set codex
@@ -1243,7 +1396,7 @@ test_agent_sh_preferred_round_trip() {
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     "$TEST_ROOT/agent.sh" preferred get
@@ -2498,6 +2651,7 @@ main() {
   test_run_profile_wires_selected_profile
   test_run_help_reports_profile_default
   test_run_help_reports_runtime_options
+  test_run_model_wires_selected_model
   test_build_help_reports_primary_base_images
   test_build_cmd_passes_runtime_list_build_args
   test_build_cmd_uses_first_runtime_as_default_when_unspecified
@@ -2509,8 +2663,12 @@ main() {
   test_build_cmd_rejects_default_runtime_outside_runtime_list
   test_run_cmd_rejects_non_codex_profile
   test_run_cmd_rejects_install_runtime_without_runtime
-  test_run_cmd_rejects_openai_for_non_codex_runtime
+  test_run_cmd_rejects_auth_without_online
   test_run_pre_exec_syncs_selected_runtime_auth_when_available
+  test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified
+  test_run_pre_exec_runs_local_model_preflight_for_preferred_claude
+  test_run_pre_exec_runs_local_model_preflight_for_preferred_codex
+  test_run_cmd_default_entrypoint_enables_local_runtime_preflight
   test_sync_runtime_auth_to_container_if_available_skips_missing_keychain
   test_auth_cmd_warns_for_legacy_office_image
   test_feature_cmd_installs_via_root_helper
@@ -2538,7 +2696,10 @@ main() {
   test_agent_sh_claude_runtime_update_calls_claude_update
   test_agent_sh_claude_runtime_reset_config_restores_settings
   test_agent_sh_codex_run_defaults_to_workdir_cd
-  test_agent_sh_claude_run_avoids_codex_specific_cd_flag
+  test_agent_sh_codex_run_uses_model_override
+  test_agent_sh_claude_run_uses_local_ollama_defaults
+  test_agent_sh_claude_run_respects_explicit_model
+  test_agent_sh_claude_run_uses_model_override
   test_agent_sh_rejects_unknown_runtime
   test_agent_sh_preferred_round_trip
   test_agent_sh_preferred_set_rejects_uninstalled_runtime

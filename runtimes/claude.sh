@@ -2,6 +2,7 @@ CLAUDE_HOME_DIR="${HOME}/.claude"
 CLAUDE_SETTINGS_FILE="${CLAUDE_HOME_DIR}/settings.json"
 CLAUDE_CREDENTIALS_FILE="${CLAUDE_HOME_DIR}/.credentials.json"
 CLAUDE_HOME_STATE_FILE="${HOME}/.claude.json"
+CLAUDE_LOCAL_MODEL="${AGENTCTL_CLAUDE_LOCAL_MODEL:-gpt-oss:20b}"
 
 claude_command_path() {
   runtime_command_path claude
@@ -63,12 +64,69 @@ claude_export_home_state() {
   ' "$CLAUDE_HOME_STATE_FILE" 2>/dev/null
 }
 
+claude_detect_gateway() {
+  local route_file="${AGENTCTL_CLAUDE_ROUTE_FILE:-/proc/net/route}"
+  awk '
+    function hex2dec(hex,   i, c, n, v) {
+      n = 0
+      hex = toupper(hex)
+      for (i = 1; i <= length(hex); i++) {
+        c = substr(hex, i, 1)
+        v = index("0123456789ABCDEF", c) - 1
+        if (v < 0) {
+          exit 1
+        }
+        n = (n * 16) + v
+      }
+      return n
+    }
+    $2 == "00000000" && length($3) == 8 {
+      printf "%s.%s.%s.%s\n",
+        hex2dec(substr($3, 7, 2)),
+        hex2dec(substr($3, 5, 2)),
+        hex2dec(substr($3, 3, 2)),
+        hex2dec(substr($3, 1, 2))
+      exit
+    }
+  ' "$route_file" 2>/dev/null || true
+}
+
+claude_has_explicit_model() {
+  local arg=""
+  for arg in "$@"; do
+    case "$arg" in
+      --model|--model=*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 agent_runtime_run() {
   local runtime="$1"
   shift
 
   [ "$runtime" = "claude" ] || die "unsupported runtime adapter: $runtime"
-  exec "$(claude_command_path)" "$@"
+  local gateway=""
+
+  case "$RUN_MODE" in
+    online)
+      if [ -n "$MODEL_OVERRIDE" ] && ! claude_has_explicit_model "$@"; then
+        exec "$(claude_command_path)" --model "$MODEL_OVERRIDE" "$@"
+      fi
+      exec "$(claude_command_path)" "$@"
+      ;;
+  esac
+
+  gateway="$(claude_detect_gateway)"
+  [ -n "$gateway" ] || die "unable to detect host gateway for claude local mode"
+  export ANTHROPIC_AUTH_TOKEN=ollama
+  export ANTHROPIC_API_KEY=""
+  export ANTHROPIC_BASE_URL="http://${gateway}:11434"
+
+  if claude_has_explicit_model "$@"; then
+    exec "$(claude_command_path)" "$@"
+  fi
+  exec "$(claude_command_path)" --model "${MODEL_OVERRIDE:-$CLAUDE_LOCAL_MODEL}" "$@"
 }
 
 agent_runtime_install() {

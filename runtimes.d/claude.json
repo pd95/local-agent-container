@@ -10,8 +10,8 @@
     "auth_login": true,
     "auth_read": true,
     "auth_write": true,
-    "local_model_mode": false,
-    "openai_mode": false
+    "local_mode": true,
+    "online_mode": true
   },
   "auth_formats": [
     "claude_ai_oauth_json"

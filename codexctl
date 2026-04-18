@@ -4,7 +4,7 @@ set -euo pipefail
 CONTAINER_CMD="${CONTAINER_CMD:-container}"
 DEFAULT_IMAGE="agent-plain"
 DEFAULT_NAME_PREFIX="agent-"
-AUTH_NAME_PREFIX="agent-openai-auth-"
+AUTH_NAME_PREFIX="agent-auth-"
 DEFAULT_SHELL="${CODEX_SHELL:-bash}"
 DEFAULT_CODEX_PROFILE="${CODEX_PROFILE:-gpt-oss}"
 DEFAULT_CODEX_CMD=(codex)
@@ -555,8 +555,9 @@ Options:
   --runtime NAME  Preferred runtime to launch in the container (e.g. codex, claude)
   --install-runtime  Install the selected runtime before launch
   --profile NAME  Codex profile to use (default: gpt-oss)
-  --openai        Use OpenAI mode (device auth)
-  --auth          Force OpenAI login flow
+  --model NAME    Override the launch model for the selected runtime
+  --online        Use the runtime's online/provider-backed mode
+  --auth          Force an online login flow before launch
   --reset-config  Replace ~/.codex/config.toml and local_models.json from the image and recreate ~/.codex/AGENTS.md as a symlink
   --update        Update @openai/codex in the target container before launch
   --temp          Create a throwaway container (auto-removed after exit)
@@ -668,7 +669,7 @@ usage_auth() {
 Usage: $CLI_NAME auth [options]
 
 Options:
-  --name NAME      Auth container name (default: agent-openai-auth-<dir>)
+  --name NAME      Auth container name (default: agent-auth-<dir>)
   --image NAME     Image to use (default: agent-plain)
   --runtime NAME   Runtime to authenticate (default: codex)
 EOF
@@ -1934,14 +1935,42 @@ sync_runtime_auth_to_container_if_available() {
   sync_runtime_auth_to_container "$name" "$runtime" "$auth_format" "Missing runtime auth in Keychain. Run: ${CLI_NAME} auth --runtime $runtime"
 }
 
-sync_openai_auth_to_container() {
+sync_runtime_auth_from_container_if_available() {
   local name="$1"
-  sync_runtime_auth_to_container "$name" "$OPENAI_RUNTIME_ID" "$OPENAI_AUTH_FORMAT" "Missing OpenAI auth in Keychain. Run: ${CLI_NAME} auth"
+  local runtime="$2"
+  local runtime_info=""
+  local auth_format=""
+
+  runtime_info="$(runtime_info_in_container "$name" "$runtime" 2>/dev/null || true)"
+  [ -n "$runtime_info" ] || return 0
+  if ! printf '%s' "$runtime_info" | jq -e '.installed == true and (.capabilities.auth_read // false)' >/dev/null 2>&1; then
+    return 0
+  fi
+  auth_format="$(printf '%s' "$runtime_info" | jq -er '.auth_formats[0] // empty' 2>/dev/null || true)"
+  [ -n "$auth_format" ] || return 0
+  sync_runtime_auth_from_container "$name" "$runtime" "$auth_format"
 }
 
-sync_openai_auth_from_container() {
+container_image_name() {
   local name="$1"
-  sync_runtime_auth_from_container "$name" "$OPENAI_RUNTIME_ID" "$OPENAI_AUTH_FORMAT"
+  local inspect_info=""
+
+  inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
+  printf '%s\n' "${inspect_info%%$'\t'*}"
+}
+
+resolve_auth_image_for_container() {
+  local name="$1"
+  local fallback_image="$2"
+  local image=""
+
+  if container_exists "$name"; then
+    image="$(container_image_name "$name")"
+  fi
+  if [ -z "$image" ]; then
+    image="$fallback_image"
+  fi
+  printf '%s\n' "$image"
 }
 
 refresh_container_file() {
@@ -2594,7 +2623,7 @@ run_mode() {
   local image="$2"
   local temp="$3"
   local shell="$4"
-  local openai="$5"
+  local online="$5"
   local auth="$6"
   local update="$7"
   local cpu="$8"
@@ -2603,22 +2632,20 @@ run_mode() {
   local workdir="${11}"
   local reset_config="${12}"
   local profile="${13}"
-  shift 13
+  local model_override="${14}"
+  shift 14
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
-  local runtime_mode="local-model"
-  local cmd=("$DEFAULT_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_DEFAULT_PROFILE=\$2 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$profile")
+  local runtime_mode="local"
+  local cmd=("$DEFAULT_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_DEFAULT_PROFILE=\$2 AGENTCTL_MODEL_OVERRIDE=\$3 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$profile" "$model_override")
 
-  if [ "$openai" -eq 1 ]; then
-    runtime_mode="openai"
-    post_exec="openai_post_exec"
-    cmd=("$DEFAULT_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_DEFAULT_PROFILE=\$2 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$profile")
-    if [ "$auth" -eq 1 ] || ! ensure_keychain; then
-      run_auth_flow "$image" "$(default_name "$AUTH_NAME_PREFIX")"
-    fi
+  if [ "$online" -eq 1 ]; then
+    runtime_mode="online"
+    post_exec="run_post_exec"
+    cmd=("$DEFAULT_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_DEFAULT_PROFILE=\$2 AGENTCTL_MODEL_OVERRIDE=\$3 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$profile" "$model_override")
   fi
-  if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_OPENAI" -eq 1 ] || [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ]; then
+  if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ]; then
     pre_exec="run_pre_exec"
   fi
 
@@ -2630,26 +2657,42 @@ run_mode() {
   run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$pre_exec" "$post_exec" "$reset_config" "${cmd[@]}"
 }
 
-openai_pre_exec() {
-  local name="$1"
-  sync_openai_auth_to_container "$name"
-}
-
-openai_post_exec() {
-  local name="$1"
-  sync_openai_auth_from_container "$name"
-}
-
 RUN_SELECTED_RUNTIME=""
 RUN_INSTALL_RUNTIME=0
-RUN_SYNC_OPENAI=0
-RUN_SYNC_SELECTED_RUNTIME_AUTH=0
+RUN_SYNC_RUNTIME_AUTH=0
+RUN_SYNC_POST_RUNTIME_AUTH=0
+RUN_FORCE_RUNTIME_AUTH=0
 RUN_LOCAL_MODEL_PREFLIGHT=0
 RUN_UPDATE_CODEX=0
+RUN_EFFECTIVE_MODE="local"
+RUN_REQUESTED_IMAGE=""
+RUN_CODEX_PROFILE="${DEFAULT_CODEX_PROFILE}"
+
+run_post_exec() {
+  local name="$1"
+  local effective_runtime=""
+
+  if [ "$RUN_SYNC_POST_RUNTIME_AUTH" -eq 0 ]; then
+    return 0
+  fi
+
+  effective_runtime="$RUN_SELECTED_RUNTIME"
+  if [ -z "$effective_runtime" ]; then
+    effective_runtime="$(run_agent_sh_in_container "$name" preferred get 2>/dev/null || true)"
+  fi
+  [ -n "$effective_runtime" ] || return 0
+  sync_runtime_auth_from_container_if_available "$name" "$effective_runtime"
+}
 
 run_pre_exec() {
   local name="$1"
   local effective_runtime=""
+  local auth_image=""
+  local runtime_info=""
+  local auth_format=""
+  local keychain_info=""
+  local keychain_token=""
+  local keychain_refresh=""
 
   if [ "$RUN_UPDATE_CODEX" -eq 1 ]; then
     update_codex_pre_exec "$name"
@@ -2662,29 +2705,38 @@ run_pre_exec() {
     run_agent_sh_in_container "$name" preferred set "$RUN_SELECTED_RUNTIME"
   fi
 
-  if [ "$RUN_SYNC_SELECTED_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ]; then
+  if [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ] || [ "$RUN_SYNC_POST_RUNTIME_AUTH" -eq 1 ]; then
     effective_runtime="$RUN_SELECTED_RUNTIME"
     if [ -z "$effective_runtime" ]; then
       effective_runtime="$(run_agent_sh_in_container "$name" preferred get 2>/dev/null || true)"
     fi
   fi
 
-  if [ "$RUN_SYNC_SELECTED_RUNTIME_AUTH" -eq 1 ] && [ -n "$effective_runtime" ]; then
-    sync_runtime_auth_to_container_if_available "$name" "$effective_runtime"
-  fi
-
-  if [ "$RUN_SYNC_OPENAI" -eq 1 ]; then
-    sync_openai_auth_to_container "$name"
+  if [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] && [ -n "$effective_runtime" ]; then
+    runtime_info="$(runtime_info_in_container "$name" "$effective_runtime" 2>/dev/null || true)"
+    if [ -n "$runtime_info" ] && printf '%s' "$runtime_info" | jq -e '.installed == true and (.capabilities.auth_login // false) and (.capabilities.auth_read // false) and (.capabilities.auth_write // false)' >/dev/null 2>&1; then
+      auth_format="$(printf '%s' "$runtime_info" | jq -er '.auth_formats[0] // empty' 2>/dev/null || true)"
+      if [ -n "$auth_format" ]; then
+        keychain_info="$(keychain_auth_info "$effective_runtime" "$auth_format" 2>/dev/null || true)"
+        IFS=$'\t' read -r keychain_token keychain_refresh <<<"$keychain_info"
+        if [ "$RUN_FORCE_RUNTIME_AUTH" -eq 1 ] || [ -z "$keychain_token" ]; then
+          auth_image="$(resolve_auth_image_for_container "$name" "$RUN_REQUESTED_IMAGE")"
+          run_auth_flow "$auth_image" "$(default_name "$AUTH_NAME_PREFIX")" "$effective_runtime"
+        fi
+        sync_runtime_auth_to_container "$name" "$effective_runtime" "$auth_format" "Missing runtime auth in Keychain. Run: ${CLI_NAME} auth --runtime $effective_runtime"
+      fi
+    fi
   fi
 
   if [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ]; then
-    if [ -z "$effective_runtime" ] || [ "$effective_runtime" = "codex" ]; then
-      local_model_preflight "$name" strict
+    if [ -z "$effective_runtime" ]; then
+      effective_runtime="codex"
     fi
+    local_runtime_preflight "$name" "$effective_runtime" "$RUN_CODEX_PROFILE" strict
   fi
 }
 
-local_model_preflight_info() {
+codex_local_model_preflight_info() {
   local name="$1"
   local profile="$2"
 
@@ -2811,9 +2863,54 @@ printf 'gateway_ok=%s\n' "$gateway_ok"
 SH
 }
 
-local_model_preflight() {
+claude_local_model_preflight_info() {
   local name="$1"
-  local mode="$2"
+
+  "$CONTAINER_CMD" exec -i "$name" "${SETPRIV_ARGS[@]}" sh -s <<'SH'
+gateway=""
+gateway_api_url=""
+gateway_ok=0
+
+gateway="$(awk '
+  function hex2dec(hex,   i, c, n, v) {
+    n = 0
+    hex = toupper(hex)
+    for (i = 1; i <= length(hex); i++) {
+      c = substr(hex, i, 1)
+      v = index("0123456789ABCDEF", c) - 1
+      if (v < 0) {
+        return ""
+      }
+      n = (n * 16) + v
+    }
+    return n
+  }
+  $2 == "00000000" && length($3) == 8 {
+    printf "%s.%s.%s.%s\n",
+      hex2dec(substr($3, 7, 2)),
+      hex2dec(substr($3, 5, 2)),
+      hex2dec(substr($3, 3, 2)),
+      hex2dec(substr($3, 1, 2))
+    exit
+  }
+' /proc/net/route 2>/dev/null || true)"
+if [ -n "$gateway" ]; then
+  gateway_api_url="http://${gateway}:11434/api/version"
+  if curl -fsS --max-time 3 "$gateway_api_url" >/dev/null 2>&1; then
+    gateway_ok=1
+  fi
+fi
+
+printf 'gateway=%s\n' "$gateway"
+printf 'gateway_api_url=%s\n' "$gateway_api_url"
+printf 'gateway_ok=%s\n' "$gateway_ok"
+SH
+}
+
+codex_local_model_preflight() {
+  local name="$1"
+  local profile="$2"
+  local mode="$3"
   local output
   local config_file=""
   local base_url=""
@@ -2829,7 +2926,7 @@ local_model_preflight() {
   local remediation_host=""
   local remediation=""
 
-  if ! output="$(local_model_preflight_info "$name" "$profile")"; then
+  if ! output="$(codex_local_model_preflight_info "$name" "$profile")"; then
     message="Unable to run local-model preflight inside container: $name"
     case "$mode" in
       warn) warn "$message"; return 0 ;;
@@ -2922,9 +3019,85 @@ See README.md 'Local model connectivity'.${remediation}"
   esac
 }
 
-local_model_pre_exec() {
+claude_local_model_preflight() {
   local name="$1"
-  local_model_preflight "$name" strict
+  local mode="$2"
+  local output=""
+  local gateway=""
+  local gateway_api_url=""
+  local gateway_ok="0"
+  local line=""
+  local key=""
+  local value=""
+  local message=""
+  local remediation=""
+
+  if ! output="$(claude_local_model_preflight_info "$name")"; then
+    message="Unable to run local-mode preflight inside container: $name"
+    case "$mode" in
+      warn) warn "$message"; return 0 ;;
+      *) die "$message" ;;
+    esac
+  fi
+
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      gateway) gateway="$value" ;;
+      gateway_api_url) gateway_api_url="$value" ;;
+      gateway_ok) gateway_ok="$value" ;;
+    esac
+  done <<< "$output"
+
+  if [ "$gateway_ok" = "1" ]; then
+    return 0
+  fi
+
+  if [ -n "$gateway" ]; then
+    remediation="$(cat <<EOF
+
+Host-side fixes:
+- Start a second Ollama listener:
+  OLLAMA_HOST=${gateway} ollama serve
+
+- Proxy localhost with socat (needs \`brew install socat\`):
+  socat TCP-LISTEN:11434,fork,bind=${gateway} TCP:127.0.0.1:11434
+EOF
+)"
+  fi
+
+  if [ -n "$gateway_api_url" ]; then
+    message="Local Ollama is not reachable from $name for Claude local mode.
+
+Tried:
+- Detected host gateway: $gateway_api_url
+
+Expose or proxy Ollama onto the container network.
+See README.md 'Local model connectivity'.${remediation}"
+  else
+    message="Unable to determine a usable Ollama endpoint for Claude local mode in $name.
+
+See README.md 'Local model connectivity'.${remediation}"
+  fi
+
+  case "$mode" in
+    warn) warn "$message" ;;
+    *) die "$message" ;;
+  esac
+}
+
+local_runtime_preflight() {
+  local name="$1"
+  local runtime="$2"
+  local profile="$3"
+  local mode="$4"
+
+  case "$runtime" in
+    codex) codex_local_model_preflight "$name" "$profile" "$mode" ;;
+    claude) claude_local_model_preflight "$name" "$mode" ;;
+    *) return 0 ;;
+  esac
 }
 
 update_codex_pre_exec() {
@@ -2938,30 +3111,19 @@ update_codex_pre_exec() {
   "$CONTAINER_CMD" exec -it "$name" sh -lc "$cmd"
 }
 
-openai_update_pre_exec() {
-  local name="$1"
-  update_codex_pre_exec "$name"
-  openai_pre_exec "$name"
-}
-
-local_model_update_pre_exec() {
-  local name="$1"
-  update_codex_pre_exec "$name"
-  local_model_preflight "$name" strict
-}
-
 run_cmd() {
   local name=""
   local image=""
   local runtime=""
   local install_runtime=0
-  local openai=0
+  local online=0
   local auth=0
   local update=0
   local temp=0
   local shell=0
   local reset_config=0
   local profile="${DEFAULT_CODEX_PROFILE}"
+  local model_override=""
   local profile_set=0
   local read_only=0
   local cpu=""
@@ -2978,7 +3140,8 @@ run_cmd() {
       --workdir) workdir="$2"; shift 2 ;;
       --runtime) runtime="$2"; shift 2 ;;
       --install-runtime) install_runtime=1; shift ;;
-      --openai) openai=1; shift ;;
+      --model) model_override="$2"; shift 2 ;;
+      --online) online=1; shift ;;
       --auth) auth=1; shift ;;
       --reset-config) reset_config=1; shift ;;
       --update) update=1; shift ;;
@@ -3006,14 +3169,11 @@ run_cmd() {
       *[[:space:]]*) cmd_override=("$DEFAULT_SHELL" "-lc" "${cmd_override[0]}") ;;
     esac
   fi
-  if [ "$auth" -eq 1 ] && [ "$openai" -eq 0 ]; then
-    die "--auth requires --openai"
+  if [ "$auth" -eq 1 ] && [ "$online" -eq 0 ]; then
+    die "--auth requires --online"
   fi
   if [ "$install_runtime" -eq 1 ] && [ -z "$runtime" ]; then
     die "--install-runtime requires --runtime"
-  fi
-  if [ -n "$runtime" ] && [ "$openai" -eq 1 ] && [ "$runtime" != "$OPENAI_RUNTIME_ID" ]; then
-    die "--openai currently requires --runtime $OPENAI_RUNTIME_ID"
   fi
   if [ -n "$runtime" ] && [ "$runtime" != "codex" ] && [ "$profile_set" -eq 1 ]; then
     die "--profile only applies to the codex runtime"
@@ -3042,23 +3202,27 @@ run_cmd() {
 
   RUN_SELECTED_RUNTIME="$runtime"
   RUN_INSTALL_RUNTIME="$install_runtime"
-  RUN_SYNC_OPENAI=0
-  RUN_SYNC_SELECTED_RUNTIME_AUTH=0
+  RUN_SYNC_RUNTIME_AUTH=0
+  RUN_SYNC_POST_RUNTIME_AUTH=0
+  RUN_FORCE_RUNTIME_AUTH=0
   RUN_LOCAL_MODEL_PREFLIGHT=0
   RUN_UPDATE_CODEX=0
-  if [ "$openai" -eq 1 ]; then
-    RUN_SYNC_OPENAI=1
-  elif [ -n "$runtime" ]; then
-    RUN_SYNC_SELECTED_RUNTIME_AUTH=1
+  RUN_EFFECTIVE_MODE="local"
+  RUN_REQUESTED_IMAGE="$image"
+  RUN_CODEX_PROFILE="$profile"
+  if [ "$online" -eq 1 ]; then
+    RUN_EFFECTIVE_MODE="online"
+    RUN_SYNC_RUNTIME_AUTH=1
+    RUN_SYNC_POST_RUNTIME_AUTH=1
+    RUN_FORCE_RUNTIME_AUTH="$auth"
   elif [ "$shell" -eq 0 ] && [ "${#cmd_override[@]}" -eq 0 ]; then
-    RUN_SYNC_SELECTED_RUNTIME_AUTH=1
     RUN_LOCAL_MODEL_PREFLIGHT=1
   fi
   if [ "$update" -eq 1 ]; then
     RUN_UPDATE_CODEX=1
   fi
 
-  run_mode "$name" "$image" "$temp" "$shell" "$openai" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$reset_config" "$profile" ${cmd_override[@]+"${cmd_override[@]}"}
+  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$reset_config" "$profile" "$model_override" ${cmd_override[@]+"${cmd_override[@]}"}
 }
 
 auth_cmd() {
@@ -3084,7 +3248,7 @@ auth_cmd() {
   warn_legacy_compat_image_usage "$image"
   run_auth_flow "$image" "$name" "$runtime"
   if [ "$runtime" = "$OPENAI_RUNTIME_ID" ]; then
-    echo "Auth updated. Restart any running --openai containers to pick up the new token." >&2
+    echo "Auth updated. Restart any running --online codex containers to pick up the new token." >&2
   else
     echo "Auth updated for runtime: $runtime" >&2
   fi

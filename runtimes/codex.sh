@@ -15,8 +15,12 @@ agent_runtime_run() {
     codex_args=(--cd /workdir "${codex_args[@]}")
   fi
 
+  if [ -n "$MODEL_OVERRIDE" ] && ! has_explicit_runtime_model "${codex_args[@]}"; then
+    codex_args=(-m "$MODEL_OVERRIDE" "${codex_args[@]}")
+  fi
+
   case "$RUN_MODE" in
-    openai)
+    online)
       if [ "${#codex_args[@]}" -eq 0 ]; then
         exec codex
       fi

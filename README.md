@@ -129,8 +129,11 @@ agentctl run --read-only
 # Throwaway session (container is deleted when codex is quit)
 agentctl run --temp
 
-# OpenAI mode (auto-auth if needed)
-agentctl run --openai
+# Override the launch model for the selected runtime
+agentctl run --runtime claude --model qwen3:14b
+
+# Online mode (auto-auth if needed)
+agentctl run --online
 
 # Update codex package in the running container
 agentctl run --update
@@ -180,13 +183,14 @@ agentctl run --cmd bash
 
 - Builds create stable local image tags and also add immutable UTC snapshot tags such as `agent-plain:20260313-154500`. By default `agentctl build` discovers local `DockerFile*` definitions in the repo, resolves local `FROM agent...` dependencies, and builds them in dependency order. Use `agentctl build --snapshot` to add fresh timestamp tags to the current images without rebuilding them.
 - `agentctl build --runtimes <runtime[,runtime...]>` changes which runtimes are preinstalled in newly built images, and `--default-runtime <runtime>` chooses which one becomes preferred at startup. If you omit `--default-runtime`, the first runtime in the list becomes the default. For the single-runtime case, `agentctl build --default-runtime claude` still works and installs only Claude. Image builds now invoke the copied in-image `agent.sh runtime install ...` path, so the same runtime adapter logic is used during builds and later in-container installs.
-- Local-model runs use a Codex profile from `config.toml`. The default profile is `gpt-oss`; use `agentctl run --profile gemma` to launch the bundled Gemma profile after pulling `gemma4:26b-a4b-it-q4_K_M` into Ollama.
+- Local mode is now runtime-specific. Codex local runs use a profile from `config.toml`; the default profile is `gpt-oss`, and `agentctl run --profile gemma` launches the bundled Gemma profile after pulling `gemma4:26b-a4b-it-q4_K_M` into Ollama. Claude local runs now default to Ollama-backed `gpt-oss:20b` using the Anthropic-compatible endpoint exported by the runtime adapter.
+- `agentctl run --model <name>` passes a runtime-neutral model override into the launch path. Codex maps it to `-m <name>` and Claude maps it to `--model <name>`. In Claude local mode, that override replaces the default `gpt-oss:20b` model.
 - `--cmd` consumes the remaining arguments, cannot be combined with `--shell`, and should be placed last. If you pass one quoted string with spaces, it runs via `$CODEX_SHELL -lc`. The same behavior applies to `agentctl exec`.
 - `agentctl run --runtime <runtime>` selects the preferred runtime to launch in the target container before executing the default entrypoint. Add `--install-runtime` to install that runtime first when needed. A practical Claude bootstrap path is now just `agentctl run --runtime claude --install-runtime`.
 - For most new setups, prefer runtime-first flows such as `agentctl run --runtime codex --install-runtime` or `agentctl run --runtime claude --install-runtime` over choosing an image because it happens to bundle a specific agent/runtime.
 - `agentctl run` now performs best-effort pre-run auth replay from Keychain for the effective runtime it is about to launch, whether that runtime comes from `--runtime <runtime>` or from the image/container preferred runtime. This means a previously authenticated Claude runtime can come up already logged in on a fresh container without a separate manual auth write step.
 - Claude’s native installer can be OOM-killed on Linux if the container is too small. For fresh Claude bootstrap and temporary Claude auth containers, `agentctl` now defaults the create-time memory limit to `4G` unless you explicitly override it.
-- In local-model mode, the Ollama reachability preflight only runs when the effective runtime being launched is Codex. `--cmd` and `--shell` skip that check so image inspection and ad hoc commands still work without a running Ollama listener.
+- In local mode, the Ollama reachability preflight runs for the effective runtime that is about to launch. For Codex it validates the configured `base_url`; for Claude it validates the detected host-gateway Ollama endpoint. `--cmd` and `--shell` skip that check so image inspection and ad hoc commands still work without a running Ollama listener.
 - `CODEX_SHELL` overrides the shell used by `run --shell` and `exec` (default: `bash`). You can also set `DEFAULT_SHELL` in `agentctl` for a static default. All default images include both `bash` and `zsh`.
 - `agentctl run --update` upgrades `@openai/codex` inside the target container before starting. If the container does not exist yet, it is created first. With `--temp`, the update is ephemeral; `agentctl build --rebuild` remains the persistent way to refresh image content.
 - `agentctl runtime list` shows installed runtimes in the current container. `agentctl runtime info <runtime>` and `agentctl runtime capabilities <runtime>` query the in-container `agent.sh` runtime contract for a declared runtime, including explicit capability booleans and supported auth formats. The current branch fully wires `codex` and now also ships a real Claude install/update/reset-config/auth adapter.
@@ -207,7 +211,7 @@ agentctl run --cmd bash
 - If you want to reset image-owned defaults such as `config.toml`, `local_models.json`, or the `AGENTS.md` symlink, use `agentctl run --name <container> --reset-config` or `agentctl runtime reset-config codex`.
 - Use `agentctl images rm --image <name>` when you want to remove an image family entirely, including the stable tag. This is the cleanup path for temporary custom images such as `agent-custom`.
 - Use `--rebuild`, `--refresh-base`, and `--pull-base` only for occasional refreshes when you want newer Codex or base image content. See the build cache section below for details.
-- `agentctl` was authored by Codex itself, running inside an Apple `container` in `--openai` mode.
+- `agentctl` was authored by Codex itself, running inside an Apple `container` in online mode.
 
 #### Image selection
 
@@ -305,7 +309,7 @@ agentctl rm              # remove the default container for this directory
 
 Notes:
 
-- `--auth` only works together with `--openai`.
+- `--auth` only works together with `--online`.
 - `--temp` creates a disposable container that is removed after the command exits.
 - `--read-only` mounts the workdir as read-only; agentctl can use its home directory or `/tmp` for scratch data, but cannot modify the workdir.
 - `--cpu` and `--mem` on `agentctl run` are create-time settings. If you pass them for an existing named container, `agentctl run` exits with an error and points you to `agentctl refresh`.
@@ -313,10 +317,10 @@ Notes:
 - `agentctl ls` only shows managed containers whose image name starts with `agent`; it hides runtime support containers such as `buildkit`.
 - After a successful `agentctl build`, the temporary `buildkit` support container is stopped so it does not linger in the runtime list.
 - Backup-enabled `agentctl refresh` requires a container runtime that supports `container export --output <path>`.
-- `--openai --temp` still injects Keychain auth before running the command.
-- Keychain auth is the source of truth for `--openai`; it is synced into running containers before each run.
+- `--online --temp` still injects Keychain auth before running the command when the effective runtime supports host-managed auth.
+- Keychain auth is the source of truth for `--online`; it is synced into running containers before each online run.
 - After a run, if the container refresh time is newer (and present), the updated auth is saved back into Keychain.
-- After `agentctl auth`, exit any running `--openai` sessions and re-run `agentctl run --openai` to pick up the new token.
+- After `agentctl auth`, exit any running online sessions and re-run `agentctl run --online` to pick up the new token.
 - `agentctl auth --runtime <runtime>` only works for runtimes whose manifest declares `auth_login` and `auth_read` capability support plus at least one host-storable `auth_format`. In this branch, both `codex` and `claude` meet that contract.
 - Claude auth on Linux is synchronized through `~/.claude/.credentials.json`. The host-storable Claude blob now preserves the credential file plus the minimal proven replay state from `~/.claude.json`: `oauthAccount` and `hasCompletedOnboarding`. That is enough to replay auth into a fresh Claude container in current testing, while keeping the credential boundary at `.credentials.json`.
 - host-side Keychain storage is now keyed per runtime and auth format. Codex keeps the legacy `codex-OpenAI-auth` slot so existing setups continue to work unchanged.
@@ -325,7 +329,7 @@ Security notes:
 
 - Containers run as a non-root `coder` user with Linux capabilities dropped.
 - `config.toml` sets `sandbox_mode = "danger-full-access"` to maximize capabilities. Codex can read/write anything in the mounted directory tree and run tools inside the container. Use only with trusted workspaces or change it to `workspace-write` for tighter guardrails.
-- Containers have full outbound network access by default. `--openai` needs outbound access; if you want to constrain networking, use host firewall rules or a restricted container network.
+- Containers have full outbound network access by default. `--online` needs outbound access; if you want to constrain networking, use host firewall rules or a restricted container network.
 - If you need root for maintenance tasks, use `agentctl su-exec` (or `container exec -u 0 ...`).
 - Some scripts that assume root access to system paths may fail; run them via `su-exec` or update them.
 
@@ -421,7 +425,7 @@ Notes:
 
 ### Network configuration
 
-By default, Ollama is only listening on localhost connections, i.e. on <http://localhost:11434> or <http://127.0.0.1:11434>. Containers have outbound network access enabled (required for `--openai`), so be deliberate about exposing host services. To be able to connect from a container (through a virtual network) to the Ollama service running on localhost, we have three options:
+By default, Ollama is only listening on localhost connections, i.e. on <http://localhost:11434> or <http://127.0.0.1:11434>. Containers have outbound network access enabled (required for `--online`), so be deliberate about exposing host services. To be able to connect from a container (through a virtual network) to the Ollama service running on localhost, we have three options:
 
 ### Option 1: Expose Ollama service on network (**risky**) ⚠️
 
@@ -576,7 +580,7 @@ container rm "codex-`basename $PWD`"
 
 #### Store auth.json in macOS Keychain
 
-After you complete the OpenAI device-auth login flow, you may want to keep a copy of the device authorization tokens in your macOS Keychain. This is only relevant when `auth.json` exists (device-auth creates it). The runtime keeps that file in its own private state, but `agentctl run --openai` and `agentctl auth` now sync through `agent.sh auth read/write` rather than reading the runtime-private path directly from the host.
+After you complete the Codex device-auth login flow, you may want to keep a copy of the device authorization tokens in your macOS Keychain. This is only relevant when `auth.json` exists (device-auth creates it). The runtime keeps that file in its own private state, but `agentctl run --online` and `agentctl auth` now sync through `agent.sh auth read/write` rather than reading the runtime-private path directly from the host.
 
 If you want to move the current container file into the Keychain manually, `codex-auth-keychain.sh` still provides direct compatibility helpers:
 
@@ -594,8 +598,8 @@ Notes:
 
 - The container must be running for both commands.
 - The default path is `/home/coder/.codex/auth.json` unless you pass an explicit path.
-- `agentctl run --openai` and `agentctl auth` automatically sync the Keychain auth into running containers when it differs, using `agent.sh auth read/write`.
-- `agentctl run --openai` saves refreshed auth back to Keychain when the container reports a newer refresh time (and that field is present).
+- `agentctl run --online` and `agentctl auth` automatically sync the Keychain auth into running containers when it differs, using `agent.sh auth read/write`.
+- `agentctl run --online` saves refreshed auth back to Keychain when the container reports a newer refresh time (and that field is present).
 - `agentctl` now chooses Keychain slots per runtime/auth-format pair. Codex still uses the legacy `codex-OpenAI-auth` entry so the current OpenAI workflow stays compatible.
 - Claude credentials are stored under a runtime-specific Keychain slot rather than the Codex legacy slot.
 - `agentctl run --profile <name>` sets the Codex profile used by the container.

@@ -10,8 +10,8 @@
     "auth_login": true,
     "auth_read": true,
     "auth_write": true,
-    "local_model_mode": true,
-    "openai_mode": true
+    "local_mode": true,
+    "online_mode": true
   },
   "auth_formats": [
     "json_refresh_token"
