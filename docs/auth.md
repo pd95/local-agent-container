@@ -3,6 +3,25 @@
 `agentctl auth` uses the runtime contract behind `agent.sh` to log in and
 synchronize host-storable auth data.
 
+Use it when you want a runtime to talk to its online/provider-backed service
+instead of the default local Ollama-backed mode.
+
+In practice, `agentctl auth` is the command that:
+- opens the runtime's login flow in a temporary auth container
+- stores the resulting auth state in the macOS Keychain
+- lets later `agentctl run --online` sessions replay that auth into containers
+
+You do not need `agentctl auth` for normal local-model runs. It is only needed
+for online runs such as:
+
+```bash
+agentctl auth --runtime codex
+agentctl run --online
+
+agentctl auth --runtime claude
+agentctl run --runtime claude --online
+```
+
 ## Basic commands
 
 ```bash
