@@ -7,7 +7,7 @@ readonly USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agentctl"
 readonly USER_RUNTIME_FILE="${USER_CONFIG_DIR}/preferred-runtime"
 readonly CODEX_HOME_DIR="${HOME}/.codex"
 readonly CODEX_AUTH_FILE="${CODEX_HOME_DIR}/auth.json"
-readonly DEFAULT_PROFILE="${AGENTCTL_DEFAULT_PROFILE:-gpt-oss}"
+readonly RUNTIME_CONFIG_JSON="${AGENTCTL_RUNTIME_CONFIG_JSON:-{}}"
 readonly MODEL_OVERRIDE="${AGENTCTL_MODEL_OVERRIDE:-}"
 readonly RUN_MODE="${AGENTCTL_RUN_MODE:-local}"
 readonly RUNTIME_REGISTRY_DIR="${AGENTCTL_RUNTIME_REGISTRY_DIR:-/etc/agentctl/runtimes.d}"
@@ -40,26 +40,6 @@ runtime_preferred() {
   fi
 
   runtime_default
-}
-
-has_explicit_profile() {
-  local arg
-  for arg in "$@"; do
-    case "$arg" in
-      --profile|--profile=*) return 0 ;;
-    esac
-  done
-  return 1
-}
-
-has_explicit_codex_cd() {
-  local arg
-  for arg in "$@"; do
-    case "$arg" in
-      --cd|--cd=*) return 0 ;;
-    esac
-  done
-  return 1
 }
 
 has_explicit_runtime_model() {
@@ -222,6 +202,14 @@ runtime_commands_json() {
   runtime_manifest_json "$1" '.commands'
 }
 
+runtime_launch_configs_json() {
+  local runtime="$1"
+  local manifest
+
+  manifest="$(runtime_manifest_path "$runtime")" || return 1
+  jq -c '.launch_configs // {}' "$manifest"
+}
+
 feature_display_name() {
   feature_manifest_string "$1" '.display_name'
 }
@@ -336,14 +324,49 @@ run_runtime() {
   agent_runtime_run "$runtime" "$@"
 }
 
+runtime_config_json() {
+  printf '%s' "$RUNTIME_CONFIG_JSON" | jq -c '
+    if type == "object" then
+      with_entries(.value |= if . == null then "" else tostring end)
+    else
+      error("runtime config must be an object")
+    end
+  ' 2>/dev/null || die "invalid runtime launch config JSON"
+}
+
+runtime_config_value() {
+  local key="$1"
+  local default_value="${2:-}"
+  local value=""
+
+  value="$(runtime_config_json | jq -er --arg key "$key" '.[$key] // empty' 2>/dev/null || true)"
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+  printf '%s\n' "$default_value"
+}
+
+runtime_config_enabled() {
+  local key="$1"
+  local value=""
+
+  value="$(runtime_config_value "$key")"
+  case "$value" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 json_runtime_info() {
   local runtime="$1"
-  local installed_json preferred_json commands_json capabilities_json
+  local installed_json preferred_json commands_json capabilities_json launch_configs_json
 
   ensure_runtime_known "$runtime"
   installed_json="$(runtime_installed_json "$runtime")"
   commands_json="$(runtime_commands_json "$runtime")"
   capabilities_json="$(runtime_capabilities_json "$runtime")"
+  launch_configs_json="$(runtime_launch_configs_json "$runtime")"
   if [ "$(runtime_preferred)" = "$runtime" ]; then
     preferred_json=true
   else
@@ -353,7 +376,6 @@ json_runtime_info() {
   jq -n \
     --arg runtime "$runtime" \
     --arg image "$IMAGE_NAME" \
-    --arg default_profile "$DEFAULT_PROFILE" \
     --arg preferred "$(runtime_preferred)" \
     --arg launcher "/usr/local/bin/agent.sh run" \
     --arg command_name "$(runtime_command_name "$runtime")" \
@@ -362,6 +384,7 @@ json_runtime_info() {
     --argjson auth_formats "$(runtime_auth_formats_json "$runtime")" \
     --argjson capabilities "$capabilities_json" \
     --argjson commands "$commands_json" \
+    --argjson launch_configs "$launch_configs_json" \
     --argjson installed "$installed_json" \
     --argjson selected "$preferred_json" \
     '{
@@ -376,28 +399,31 @@ json_runtime_info() {
       auth_formats: $auth_formats,
       capabilities: $capabilities,
       commands: $commands,
+      launch_configs: $launch_configs,
       default_config_dir: $config_dir,
-      default_profile: $default_profile,
       phase: 2
     }'
 }
 
 json_runtime_capabilities() {
   local runtime="$1"
-  local capabilities_json
+  local capabilities_json launch_configs_json
 
   ensure_runtime_known "$runtime"
   capabilities_json="$(runtime_capabilities_json "$runtime")"
+  launch_configs_json="$(runtime_launch_configs_json "$runtime")"
   jq -n \
     --arg runtime "$runtime" \
     --argjson auth_formats "$(runtime_auth_formats_json "$runtime")" \
     --argjson capabilities "$capabilities_json" \
     --argjson commands "$(runtime_commands_json "$runtime")" \
+    --argjson launch_configs "$launch_configs_json" \
     '{
       runtime: $runtime,
       auth_formats: $auth_formats,
       capabilities: $capabilities,
-      commands: $commands
+      commands: $commands,
+      launch_configs: $launch_configs
     }'
 }
 

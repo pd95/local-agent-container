@@ -101,19 +101,44 @@ claude_has_explicit_model() {
   return 1
 }
 
+claude_has_explicit_flag() {
+  local flag="$1"
+  shift
+  local arg=""
+  for arg in "$@"; do
+    [ "$arg" = "$flag" ] && return 0
+  done
+  return 1
+}
+
 agent_runtime_run() {
   local runtime="$1"
   shift
 
   [ "$runtime" = "claude" ] || die "unsupported runtime adapter: $runtime"
   local gateway=""
+  local -a claude_args=("$@")
+
+  if runtime_config_enabled "dangerously-skip-permissions"; then
+    if [ "${#claude_args[@]}" -eq 0 ]; then
+      claude_args=(--dangerously-skip-permissions)
+    elif ! claude_has_explicit_flag "--dangerously-skip-permissions" "${claude_args[@]}"; then
+      claude_args=(--dangerously-skip-permissions "${claude_args[@]}")
+    fi
+  fi
 
   case "$RUN_MODE" in
     online)
-      if [ -n "$MODEL_OVERRIDE" ] && ! claude_has_explicit_model "$@"; then
-        exec "$(claude_command_path)" --model "$MODEL_OVERRIDE" "$@"
+      if [ "${#claude_args[@]}" -eq 0 ]; then
+        if [ -n "$MODEL_OVERRIDE" ]; then
+          exec "$(claude_command_path)" --model "$MODEL_OVERRIDE"
+        fi
+        exec "$(claude_command_path)"
       fi
-      exec "$(claude_command_path)" "$@"
+      if [ -n "$MODEL_OVERRIDE" ] && ! claude_has_explicit_model "${claude_args[@]}"; then
+        exec "$(claude_command_path)" --model "$MODEL_OVERRIDE" "${claude_args[@]}"
+      fi
+      exec "$(claude_command_path)" "${claude_args[@]}"
       ;;
   esac
 
@@ -123,10 +148,13 @@ agent_runtime_run() {
   export ANTHROPIC_API_KEY=""
   export ANTHROPIC_BASE_URL="http://${gateway}:11434"
 
-  if claude_has_explicit_model "$@"; then
-    exec "$(claude_command_path)" "$@"
+  if [ "${#claude_args[@]}" -eq 0 ]; then
+    exec "$(claude_command_path)" --model "${MODEL_OVERRIDE:-$CLAUDE_LOCAL_MODEL}"
   fi
-  exec "$(claude_command_path)" --model "${MODEL_OVERRIDE:-$CLAUDE_LOCAL_MODEL}" "$@"
+  if claude_has_explicit_model "${claude_args[@]}"; then
+    exec "$(claude_command_path)" "${claude_args[@]}"
+  fi
+  exec "$(claude_command_path)" --model "${MODEL_OVERRIDE:-$CLAUDE_LOCAL_MODEL}" "${claude_args[@]}"
 }
 
 agent_runtime_install() {

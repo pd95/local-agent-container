@@ -3,10 +3,10 @@ set -euo pipefail
 
 CONTAINER_CMD="${CONTAINER_CMD:-container}"
 DEFAULT_IMAGE="agent-plain"
+DEFAULT_RUNTIME="${AGENTCTL_DEFAULT_RUNTIME:-codex}"
 DEFAULT_NAME_PREFIX="agent-"
 AUTH_NAME_PREFIX="agent-auth-"
 DEFAULT_LOGIN_SHELL="${AGENTCTL_SHELL:-bash}"
-DEFAULT_RUNTIME_PROFILE="${AGENTCTL_PROFILE:-gpt-oss}"
 CLAUDE_MIN_INSTALL_MEM="4G"
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs --)
 
@@ -519,8 +519,8 @@ Usage: $CLI_NAME build [--image NAME] [--runtimes NAME[,NAME...]] [--default-run
 
 Options:
   --image NAME       Local image name to build (for example: agent-plain, agent-python, agent-swift, agent-my-team)
-  --runtimes LIST    Comma-separated runtimes to preinstall in the image (default: codex)
-  --default-runtime  Runtime to install as the image default (default: codex)
+  --runtimes LIST    Comma-separated runtimes to preinstall in the image (default: $DEFAULT_RUNTIME)
+  --default-runtime  Runtime to install as the image default (default: $DEFAULT_RUNTIME)
   --rebuild          Rebuild images even if they already exist (disables build cache only; does not refresh FROM tags)
   --snapshot         Add a fresh UTC timestamp tag for existing images without rebuilding
   --pull-base     Pull the base image before building (preferred way to refresh remote FROM tags)
@@ -551,7 +551,7 @@ Options:
   --workdir PATH  Host directory to mount at /workdir (default: cwd)
   --runtime NAME  Preferred runtime to launch in the container (e.g. codex, claude)
   --install-runtime  Install the selected runtime before launch
-  --profile NAME  Codex profile to use (default: gpt-oss)
+  -c, --config KEY=VALUE  Pass runtime-specific launch config (repeatable)
   --model NAME    Override the launch model for the selected runtime
   --online        Use the runtime's online/provider-backed mode
   --auth          Force an online login flow before launch
@@ -668,7 +668,7 @@ Usage: $CLI_NAME auth [options]
 Options:
   --name NAME      Auth container name (default: agent-auth-<dir>)
   --image NAME     Image to use (default: agent-plain)
-  --runtime NAME   Runtime to authenticate (default: codex)
+  --runtime NAME   Runtime to authenticate (default: $DEFAULT_RUNTIME)
 EOF
 }
 
@@ -1190,9 +1190,9 @@ images_cmd() {
 
 build_cmd() {
   local image=""
-  local runtimes_csv="codex"
+  local runtimes_csv="$DEFAULT_RUNTIME"
   local runtimes_overridden=0
-  local default_runtime="codex"
+  local default_runtime="$DEFAULT_RUNTIME"
   local default_runtime_overridden=0
   local rebuild=0
   local snapshot=0
@@ -1525,7 +1525,7 @@ build_cmd() {
 run_auth_flow() {
   local image="$1"
   local auth_name="$2"
-  local runtime="${3:-codex}"
+  local runtime="${3:-$DEFAULT_RUNTIME}"
   local created=0
   local runtime_info=""
   local auth_format=""
@@ -1648,13 +1648,13 @@ codex_agents_state() {
 
 reset_runtime_config_in_container() {
   local name="$1"
-  local runtime="${2:-codex}"
+  local runtime="${2:-$DEFAULT_RUNTIME}"
   run_agent_sh_in_container "$name" runtime reset-config "$runtime"
 }
 
 ensure_keychain() {
-  local runtime="${1:-codex}"
-  local auth_format="${2:-json_refresh_token}"
+  local runtime="${1:-$DEFAULT_RUNTIME}"
+  local auth_format="$2"
   [ -x "$KEYCHAIN_SCRIPT" ] || die "Missing $KEYCHAIN_SCRIPT"
   run_keychain_for_runtime "$runtime" "$auth_format" verify >/dev/null 2>&1
 }
@@ -1665,8 +1665,8 @@ sanitize_keychain_segment() {
 }
 
 runtime_keychain_service() {
-  local runtime="${1:-codex}"
-  local auth_format="${2:-json_refresh_token}"
+  local runtime="${1:-$DEFAULT_RUNTIME}"
+  local auth_format="$2"
 
   if [ -n "$auth_format" ]; then
     printf 'agentctl-%s-%s-auth\n' "$(sanitize_keychain_segment "$runtime")" "$(sanitize_keychain_segment "$auth_format")"
@@ -1676,26 +1676,14 @@ runtime_keychain_service() {
 }
 
 runtime_keychain_account() {
-  local runtime="${1:-codex}"
-  local auth_format="${2:-json_refresh_token}"
+  local runtime="${1:-$DEFAULT_RUNTIME}"
+  local auth_format="$2"
 
   if [ -n "$auth_format" ]; then
     printf 'runtime-%s-%s-auth\n' "$(sanitize_keychain_segment "$runtime")" "$(sanitize_keychain_segment "$auth_format")"
   else
     printf 'runtime-%s-auth\n' "$(sanitize_keychain_segment "$runtime")"
   fi
-}
-
-legacy_runtime_keychain_slots() {
-  local runtime="${1:-codex}"
-  local auth_format="${2:-json_refresh_token}"
-
-  case "$runtime:$auth_format" in
-    codex:json_refresh_token)
-      printf '%s\t%s\n' 'codex-OpenAI-auth' 'device-auth-openAI'
-      printf '%s\t%s\n' 'agent-openai-auth' 'device-auth-openAI'
-      ;;
-  esac
 }
 
 run_keychain_with_slot() {
@@ -1709,37 +1697,15 @@ run_keychain_with_slot() {
 }
 
 run_keychain_for_runtime() {
-  local runtime="${1:-codex}"
-  local auth_format="${2:-json_refresh_token}"
+  local runtime="${1:-$DEFAULT_RUNTIME}"
+  local auth_format="$2"
   local primary_service=""
   local primary_account=""
-  local legacy_service=""
-  local legacy_account=""
-  local output=""
   shift 2
 
   primary_service="$(runtime_keychain_service "$runtime" "$auth_format")"
   primary_account="$(runtime_keychain_account "$runtime" "$auth_format")"
-
-  case "${1:-}" in
-    read|verify)
-      if output="$(run_keychain_with_slot "$primary_service" "$primary_account" "$@" 2>/dev/null)"; then
-        [ -n "$output" ] && printf '%s' "$output"
-        return 0
-      fi
-      while IFS=$'\t' read -r legacy_service legacy_account; do
-        [ -n "$legacy_service" ] || continue
-        if output="$(run_keychain_with_slot "$legacy_service" "$legacy_account" "$@" 2>/dev/null)"; then
-          [ -n "$output" ] && printf '%s' "$output"
-          return 0
-        fi
-      done < <(legacy_runtime_keychain_slots "$runtime" "$auth_format")
-      run_keychain_with_slot "$primary_service" "$primary_account" "$@"
-      ;;
-    *)
-      run_keychain_with_slot "$primary_service" "$primary_account" "$@"
-      ;;
-  esac
+  run_keychain_with_slot "$primary_service" "$primary_account" "$@"
 }
 
 auth_info_from_json() {
@@ -1797,27 +1763,27 @@ PY
 }
 
 keychain_auth_info() {
-  local runtime="${1:-codex}"
-  local auth_format="${2:-json_refresh_token}"
+  local runtime="${1:-$DEFAULT_RUNTIME}"
+  local auth_format="$2"
   run_keychain_for_runtime "$runtime" "$auth_format" read | auth_info_from_json
 }
 
 keychain_auth_blob() {
-  local runtime="${1:-codex}"
-  local auth_format="${2:-json_refresh_token}"
+  local runtime="${1:-$DEFAULT_RUNTIME}"
+  local auth_format="$2"
   run_keychain_for_runtime "$runtime" "$auth_format" read
 }
 
 write_keychain_auth_blob() {
-  local runtime="${1:-codex}"
-  local auth_format="${2:-json_refresh_token}"
+  local runtime="${1:-$DEFAULT_RUNTIME}"
+  local auth_format="$2"
   run_keychain_for_runtime "$runtime" "$auth_format" write
 }
 
 container_auth_blob() {
   local name="$1"
-  local runtime="${2:-codex}"
-  local auth_format="${3:-json_refresh_token}"
+  local runtime="${2:-$DEFAULT_RUNTIME}"
+  local auth_format="$3"
   if ! run_agent_sh_in_container "$name" auth read "$runtime" "$auth_format"; then
     return 0
   fi
@@ -1826,8 +1792,8 @@ container_auth_blob() {
 write_auth_blob_to_container() {
   local name="$1"
   local payload="$2"
-  local runtime="${3:-codex}"
-  local auth_format="${4:-json_refresh_token}"
+  local runtime="${3:-$DEFAULT_RUNTIME}"
+  local auth_format="$4"
   local was_running=0
   local started_for_command=0
 
@@ -1851,8 +1817,8 @@ write_auth_blob_to_container() {
 
 container_auth_info() {
   local name="$1"
-  local runtime="${2:-codex}"
-  local auth_format="${3:-json_refresh_token}"
+  local runtime="${2:-$DEFAULT_RUNTIME}"
+  local auth_format="$3"
   local blob
   blob="$(container_auth_blob "$name" "$runtime" "$auth_format")"
   if [ -z "$blob" ]; then
@@ -1864,8 +1830,8 @@ container_auth_info() {
 
 sync_runtime_auth_to_container() {
   local name="$1"
-  local runtime="${2:-codex}"
-  local auth_format="${3:-json_refresh_token}"
+  local runtime="${2:-$DEFAULT_RUNTIME}"
+  local auth_format="$3"
   local missing_message="${4:-Missing runtime auth in Keychain. Run: ${CLI_NAME} auth --runtime $runtime}"
   if ! ensure_keychain "$runtime" "$auth_format"; then
     die "$missing_message"
@@ -1897,8 +1863,8 @@ sync_runtime_auth_to_container() {
 
 sync_runtime_auth_from_container() {
   local name="$1"
-  local runtime="${2:-codex}"
-  local auth_format="${3:-json_refresh_token}"
+  local runtime="${2:-$DEFAULT_RUNTIME}"
+  local auth_format="$3"
   local container_info
   local container_token
   local container_refresh
@@ -1973,6 +1939,43 @@ sync_runtime_auth_from_container_if_available() {
   auth_format="$(printf '%s' "$runtime_info" | jq -er '.auth_formats[0] // empty' 2>/dev/null || true)"
   [ -n "$auth_format" ] || return 0
   sync_runtime_auth_from_container "$name" "$runtime" "$auth_format"
+}
+
+runtime_config_json_from_entries() {
+  local config_json='{}'
+  local entry=""
+  local key=""
+  local value=""
+
+  for entry in "$@"; do
+    case "$entry" in
+      *=*)
+        key="${entry%%=*}"
+        value="${entry#*=}"
+        ;;
+      *)
+        die "Invalid runtime config: $entry (expected key=value)"
+        ;;
+    esac
+    [ -n "$key" ] || die "Invalid runtime config: $entry (expected non-empty key)"
+    config_json="$(printf '%s' "$config_json" | jq -c --arg key "$key" --arg value "$value" '. + {($key): $value}')" || die "Failed to encode runtime config: $entry"
+  done
+
+  printf '%s\n' "$config_json"
+}
+
+runtime_config_value_from_json() {
+  local config_json="${1:-{}}"
+  local key="$2"
+  local default_value="${3:-}"
+  local value=""
+
+  value="$(printf '%s' "$config_json" | jq -er --arg key "$key" '.[$key] // empty' 2>/dev/null || true)"
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+  printf '%s\n' "$default_value"
 }
 
 container_image_name() {
@@ -2659,19 +2662,19 @@ run_mode() {
   local read_only="${10}"
   local workdir="${11}"
   local reset_config="${12}"
-  local profile="${13}"
+  local runtime_config_json="${13}"
   local model_override="${14}"
   shift 14
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
   local runtime_mode="local"
-  local cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_DEFAULT_PROFILE=\$2 AGENTCTL_MODEL_OVERRIDE=\$3 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$profile" "$model_override")
+  local cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_RUNTIME_CONFIG_JSON=\$2 AGENTCTL_MODEL_OVERRIDE=\$3 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override")
 
   if [ "$online" -eq 1 ]; then
     runtime_mode="online"
     post_exec="run_post_exec"
-    cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_DEFAULT_PROFILE=\$2 AGENTCTL_MODEL_OVERRIDE=\$3 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$profile" "$model_override")
+    cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_RUNTIME_CONFIG_JSON=\$2 AGENTCTL_MODEL_OVERRIDE=\$3 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override")
   fi
   if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ]; then
     pre_exec="run_pre_exec"
@@ -2694,7 +2697,7 @@ RUN_LOCAL_MODEL_PREFLIGHT=0
 RUN_UPDATE_CODEX=0
 RUN_EFFECTIVE_MODE="local"
 RUN_REQUESTED_IMAGE=""
-RUN_PROFILE="${DEFAULT_RUNTIME_PROFILE}"
+RUN_RUNTIME_CONFIG_JSON='{}'
 
 run_post_exec() {
   local name="$1"
@@ -2758,9 +2761,9 @@ run_pre_exec() {
 
   if [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ]; then
     if [ -z "$effective_runtime" ]; then
-      effective_runtime="codex"
+      effective_runtime="$DEFAULT_RUNTIME"
     fi
-    local_runtime_preflight "$name" "$effective_runtime" "$RUN_PROFILE" strict
+    local_runtime_preflight "$name" "$effective_runtime" "$RUN_RUNTIME_CONFIG_JSON" strict
   fi
 }
 
@@ -2937,9 +2940,10 @@ SH
 
 codex_local_model_preflight() {
   local name="$1"
-  local profile="$2"
+  local runtime_config_json="${2:-{}}"
   local mode="$3"
   local output
+  local profile=""
   local config_file=""
   local base_url=""
   local configured_api_url=""
@@ -2954,6 +2958,7 @@ codex_local_model_preflight() {
   local remediation_host=""
   local remediation=""
 
+  profile="$(runtime_config_value_from_json "$runtime_config_json" profile "gpt-oss")"
   if ! output="$(codex_local_model_preflight_info "$name" "$profile")"; then
     message="Unable to run local-model preflight inside container: $name"
     case "$mode" in
@@ -3118,11 +3123,11 @@ See README.md 'Local model connectivity'.${remediation}"
 local_runtime_preflight() {
   local name="$1"
   local runtime="$2"
-  local profile="$3"
+  local runtime_config_json="${3:-{}}"
   local mode="$4"
 
   case "$runtime" in
-    codex) codex_local_model_preflight "$name" "$profile" "$mode" ;;
+    codex) codex_local_model_preflight "$name" "$runtime_config_json" "$mode" ;;
     claude) claude_local_model_preflight "$name" "$mode" ;;
     *) return 0 ;;
   esac
@@ -3144,13 +3149,13 @@ run_cmd() {
   local temp=0
   local shell=0
   local reset_config=0
-  local profile="${DEFAULT_RUNTIME_PROFILE}"
+  local runtime_config_json='{}'
   local model_override=""
-  local profile_set=0
   local read_only=0
   local cpu=""
   local mem=""
   local workdir=""
+  local -a runtime_config_entries=()
   local -a cmd_override=()
   local cmd_override_set=0
   local shell_set=0
@@ -3170,7 +3175,7 @@ run_cmd() {
       --temp) temp=1; shift ;;
       --read-only) read_only=1; shift ;;
       --shell) shell=1; shell_set=1; shift ;;
-      --profile) profile="$2"; profile_set=1; shift 2 ;;
+      -c|--config) runtime_config_entries+=("$2"); shift 2 ;;
       --cmd) shift; cmd_override_set=1; cmd_override=("$@"); break ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
@@ -3197,9 +3202,6 @@ run_cmd() {
   if [ "$install_runtime" -eq 1 ] && [ -z "$runtime" ]; then
     die "--install-runtime requires --runtime"
   fi
-  if [ -n "$runtime" ] && [ "$runtime" != "codex" ] && [ "$profile_set" -eq 1 ]; then
-    die "--profile only applies to the codex runtime"
-  fi
 
   if [ -z "$workdir" ]; then
     workdir="$PWD"
@@ -3221,6 +3223,11 @@ run_cmd() {
   if [ "$temp" -eq 0 ] && [ -n "$name" ] && container_exists "$name" && { [ -n "$cpu" ] || [ -n "$mem" ]; }; then
     die "--cpu and --mem only apply when creating a new container. Use ${CLI_NAME} upgrade --name $name${image:+ --image $image}${cpu:+ --cpu $cpu}${mem:+ --mem $mem} to recreate the container with updated resources"
   fi
+  if [ "${#runtime_config_entries[@]}" -gt 0 ]; then
+    runtime_config_json="$(runtime_config_json_from_entries "${runtime_config_entries[@]}")"
+  else
+    runtime_config_json='{}'
+  fi
 
   RUN_SELECTED_RUNTIME="$runtime"
   RUN_INSTALL_RUNTIME="$install_runtime"
@@ -3231,7 +3238,7 @@ run_cmd() {
   RUN_UPDATE_CODEX=0
   RUN_EFFECTIVE_MODE="local"
   RUN_REQUESTED_IMAGE="$image"
-  RUN_PROFILE="$profile"
+  RUN_RUNTIME_CONFIG_JSON="$runtime_config_json"
   if [ "$online" -eq 1 ]; then
     RUN_EFFECTIVE_MODE="online"
     RUN_SYNC_RUNTIME_AUTH=1
@@ -3244,13 +3251,13 @@ run_cmd() {
     RUN_UPDATE_CODEX=1
   fi
 
-  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$reset_config" "$profile" "$model_override" ${cmd_override[@]+"${cmd_override[@]}"}
+  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$reset_config" "$runtime_config_json" "$model_override" ${cmd_override[@]+"${cmd_override[@]}"}
 }
 
 auth_cmd() {
   local name=""
   local image="$DEFAULT_IMAGE"
-  local runtime="codex"
+  local runtime="$DEFAULT_RUNTIME"
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3269,8 +3276,8 @@ auth_cmd() {
   image="$(image_ref_for_runtime "$image")"
   warn_legacy_compat_image_usage "$image"
   run_auth_flow "$image" "$name" "$runtime"
-  if [ "$runtime" = "codex" ]; then
-    echo "Auth updated. Restart any running --online codex containers to pick up the new token." >&2
+  if [ "$runtime" = "$DEFAULT_RUNTIME" ]; then
+    echo "Auth updated. Restart any running --online $runtime containers to pick up the new token." >&2
   else
     echo "Auth updated for runtime: $runtime" >&2
   fi

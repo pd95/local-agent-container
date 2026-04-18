@@ -115,10 +115,13 @@ Common first-run workflows:
 
 ```bash
 # Run Codex with a specific local profile
-agentctl run --profile gemma
+agentctl run -c profile=gemma
 
 # Test a specific model directly
 agentctl run --model qwen3.5:9b-nvfp4
+
+# Pass a runtime-specific Claude launch flag
+agentctl run --runtime claude -c dangerously-skip-permissions=true
 
 # Use the runtime's online/provider-backed mode after logging in once
 agentctl auth --runtime codex

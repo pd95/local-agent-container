@@ -16,6 +16,12 @@
   "auth_formats": [
     "claude_ai_oauth_json"
   ],
+  "launch_configs": {
+    "dangerously-skip-permissions": {
+      "type": "boolean",
+      "description": "Pass --dangerously-skip-permissions to the Claude CLI"
+    }
+  },
   "commands": [
     "help",
     "run",
