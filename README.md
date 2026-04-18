@@ -30,7 +30,25 @@ Official releases:
 
 ## Preliminary setup
 
-After installing Ollama and `container`, open Terminal and run:
+After installing Ollama and `container`, clone this repository and open a
+Terminal in the repository root.
+
+Then make `agentctl` available on your `PATH`. The easiest option on macOS is
+usually a symlink into `/usr/local/bin`:
+
+```bash
+sudo ln -sf "$PWD/agentctl" /usr/local/bin/agentctl
+```
+
+If you prefer a user-local install instead:
+
+```bash
+mkdir -p "$HOME/bin"
+ln -sf "$PWD/agentctl" "$HOME/bin/agentctl"
+export PATH="$HOME/bin:$PATH"
+```
+
+After that, run:
 
 ```bash
 # Pull the default local model used by current Codex and Claude local flows

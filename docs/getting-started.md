@@ -20,7 +20,25 @@ Install sources:
 
 ## Initial setup
 
-Run:
+Open a Terminal in the repository root.
+
+Make `agentctl` available on your `PATH`.
+
+Recommended on macOS:
+
+```bash
+sudo ln -sf "$PWD/agentctl" /usr/local/bin/agentctl
+```
+
+User-local alternative:
+
+```bash
+mkdir -p "$HOME/bin"
+ln -sf "$PWD/agentctl" "$HOME/bin/agentctl"
+export PATH="$HOME/bin:$PATH"
+```
+
+Then run:
 
 ```bash
 ollama pull gpt-oss:20b
