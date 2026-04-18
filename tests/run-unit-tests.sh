@@ -931,7 +931,7 @@ test_agent_sh_feature_info_reports_manifest_metadata() {
 
   run_agent_sh_capture "$temp_home" feature info office
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .display_name == "Office Compatibility Tooling" and .installed == false and .capabilities.install == true' >/dev/null || fail "Expected feature info JSON for office, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .display_name == "Office Compatibility Tooling" and .installed == false and .capabilities.install == true and .install_method == "apk+npm+pip"' >/dev/null || fail "Expected feature info JSON for office, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_feature_install_office_creates_feature_state() {
@@ -977,7 +977,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     AGENTCTL_FEATURE_REGISTRY_DIR="$TEST_ROOT/features.d" \
@@ -1015,7 +1015,7 @@ test_agent_sh_feature_info_reports_installed_after_office_install() {
     AGENTCTL_FEATURE_STATE_DIR="$temp_home/state" \
     "$TEST_ROOT/agent.sh" feature info office
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .installed == true and .capabilities.install == true' >/dev/null || fail "Expected installed feature info JSON for office, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .image == "agent-python" and .installed == true and .capabilities.install == true and .install_method == "apk+npm+pip"' >/dev/null || fail "Expected installed feature info JSON for office, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_runtime_list_reports_installed_runtimes_only() {
@@ -1030,7 +1030,7 @@ test_agent_sh_runtime_list_reports_installed_runtimes_only() {
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     "$TEST_ROOT/agent.sh" runtime list
@@ -1060,7 +1060,7 @@ test_agent_sh_claude_runtime_info_reports_skeleton_metadata() {
 
   run_agent_sh_capture "$temp_home" runtime info claude
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "claude" and .installed == false and .install_method == "native-installer" and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and (.auth_formats | index("claude_ai_oauth_json") != null) and (.commands | index("runtime install claude") != null) and (.commands | index("auth login claude") != null)' >/dev/null || fail "Expected runtime info JSON for claude runtime, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "claude" and .installed == false and .install_method == "native-installer" and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.local_mode == true and .capabilities.online_mode == true and (.auth_formats | index("claude_ai_oauth_json") != null) and (.commands | index("runtime install claude") != null) and (.commands | index("auth login claude") != null)' >/dev/null || fail "Expected runtime info JSON for claude runtime, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_claude_runtime_install_runs_native_installer() {
@@ -1110,7 +1110,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     /bin/bash "$TEST_ROOT/agent.sh" runtime install claude
@@ -1125,7 +1125,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     /bin/bash "$TEST_ROOT/agent.sh" preferred get
@@ -1155,7 +1155,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     /bin/bash "$TEST_ROOT/agent.sh" runtime update claude
@@ -1205,7 +1205,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     /bin/bash "$TEST_ROOT/agent.sh" run
@@ -1235,7 +1235,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
@@ -1276,7 +1276,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
@@ -1316,7 +1316,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
@@ -1353,7 +1353,7 @@ EOF
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
@@ -1387,7 +1387,7 @@ test_agent_sh_preferred_round_trip() {
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     "$TEST_ROOT/agent.sh" preferred set codex
@@ -1396,7 +1396,7 @@ test_agent_sh_preferred_round_trip() {
   run_capture env \
     HOME="$temp_home/home" \
     XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$fake_bin:$PATH" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
     AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     "$TEST_ROOT/agent.sh" preferred get
