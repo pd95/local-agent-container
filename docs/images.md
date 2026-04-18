@@ -53,6 +53,30 @@ image. `agentctl run` then uses that effective preferred runtime for:
 - auth replay
 - local/online launch-mode decisions
 
+## Changing images for an existing container
+
+Use `refresh` when you want to recreate a container from the same image family
+after pulling or rebuilding a newer local `agentctl` checkout.
+
+Use `upgrade --image ...` when you want to move an existing container to a
+different curated image.
+
+Example: you started with `agent-plain`, but later need Python tooling in the
+same named container:
+
+```bash
+agentctl upgrade --name my-project --image agent-python
+```
+
+If you also want the new image's owned defaults restored into `~/.codex`, add:
+
+```bash
+agentctl upgrade --name my-project --image agent-python --overwrite-config
+```
+
+This keeps the preserved `/workdir` mount and recreated container identity
+while switching the base image family underneath it.
+
 ## Snapshots and rebuilds
 
 - `--snapshot`: add a new timestamp tag without rebuilding

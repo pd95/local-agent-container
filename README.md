@@ -181,6 +181,13 @@ Use these curated images for most workflows:
 `agent-office` remains only as a legacy compatibility image. For new work, use
 `agent-python` plus the `office` feature pack.
 
+If you started with one curated image and later need another one for the same
+container, recreate it with `agentctl upgrade --image ...`. For example:
+
+```bash
+agentctl upgrade --name <container> --image agent-python
+```
+
 If you already have a compatible base container and want to bring the managed
 control surface onto it, use `agentctl bootstrap` instead of starting from a
 curated image. More on that in [docs/bootstrap.md](docs/bootstrap.md).
