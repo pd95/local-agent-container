@@ -24,15 +24,47 @@ run_agent_sh_capture() {
   local temp_home="$1"
   shift
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$PATH" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    AGENTCTL_FEATURE_REGISTRY_DIR="$TEST_ROOT/features.d" \
-    AGENTCTL_FEATURE_ADAPTER_DIR="$TEST_ROOT/features" \
-    "$TEST_ROOT/agent.sh" "$@"
+  run_agent_sh_capture_env "$temp_home" -- "$@"
+}
+
+run_agent_sh_capture_env() {
+  local temp_home="$1"
+  shift
+  local env_args=()
+  local run_cmd_args=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --)
+        shift
+        break
+        ;;
+      *=*)
+        env_args+=("$1")
+        shift
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  run_cmd_args=(
+    env -i
+    "HOME=$temp_home/home"
+    "XDG_CONFIG_HOME=$temp_home/config"
+    "PATH=/usr/bin:/bin"
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d"
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes"
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d"
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features"
+  )
+  if [ "${#env_args[@]}" -gt 0 ]; then
+    run_cmd_args+=("${env_args[@]}")
+  fi
+  run_cmd_args+=(/bin/bash "$TEST_ROOT/agent.sh" "$@")
+
+  run_capture "${run_cmd_args[@]}"
 }
 
 make_fake_runtime_bin() {
@@ -974,19 +1006,13 @@ exit 0
 EOF
   chmod +x "$fake_bin/apk" "$fake_bin/npm" "$fake_bin/chown" "$venv_dir/bin/pip"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    AGENTCTL_FEATURE_REGISTRY_DIR="$TEST_ROOT/features.d" \
-    AGENTCTL_FEATURE_ADAPTER_DIR="$TEST_ROOT/features" \
     AGENTCTL_FEATURE_OFFICE_SKIP_ROOT_CHECK=1 \
     AGENTCTL_FEATURE_OFFICE_VENV_DIR="$venv_dir" \
     AGENTCTL_FEATURE_OFFICE_PROFILE_DIR="$profile_dir" \
     AGENTCTL_FEATURE_STATE_DIR="$state_dir" \
-    "$TEST_ROOT/agent.sh" feature install office
+    -- feature install office
   assert_status 0
   [ -f "$state_dir/office/install-complete" ] || fail "Expected office feature marker file"
   [ -f "$profile_dir/node_path.sh" ] || fail "Expected office feature to write node_path profile"
@@ -1004,16 +1030,10 @@ test_agent_sh_feature_info_reports_installed_after_office_install() {
   mkdir -p "$temp_home/state/office"
   printf '%s\n' installed >"$temp_home/state/office/install-complete"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$PATH" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    AGENTCTL_FEATURE_REGISTRY_DIR="$TEST_ROOT/features.d" \
-    AGENTCTL_FEATURE_ADAPTER_DIR="$TEST_ROOT/features" \
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="/usr/bin:/bin" \
     AGENTCTL_FEATURE_STATE_DIR="$temp_home/state" \
-    "$TEST_ROOT/agent.sh" feature info office
+    -- feature info office
   assert_status 0
   printf '%s' "$RUN_OUTPUT" | jq -er '.feature == "office" and .installed == true and .capabilities.install == true and .install_method == "apk+npm+pip"' >/dev/null || fail "Expected installed feature info JSON for office, got: $RUN_OUTPUT"
 }
@@ -1027,13 +1047,9 @@ test_agent_sh_runtime_list_reports_installed_runtimes_only() {
   register_dir_cleanup "$temp_home"
   fake_bin="$(make_fake_runtime_bin "$temp_home" codex)"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    "$TEST_ROOT/agent.sh" runtime list
+    -- runtime list
   assert_status 0
   assert_contains "codex"
   assert_not_contains "claude"
@@ -1107,13 +1123,9 @@ chmod +x "$fake_bin/claude"
 EOF
   chmod +x "$fake_bin/bash"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    /bin/bash "$TEST_ROOT/agent.sh" runtime install claude
+    -- runtime install claude
   assert_status 0
   [ -x "$fake_bin/claude" ] || fail "Expected fake claude launcher to be created by installer"
   grep -Fq 'info -e libgcc' "$install_log" || fail "Expected Alpine dependency verification for libgcc"
@@ -1122,13 +1134,9 @@ EOF
   grep -Fq 'installer-bash' "$install_log" || fail "Expected native installer script to be piped into bash"
   jq -er '.env.USE_BUILTIN_RIPGREP == "0"' "$temp_home/home/.claude/settings.json" >/dev/null || fail "Expected Claude settings.json to disable builtin ripgrep"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    /bin/bash "$TEST_ROOT/agent.sh" preferred get
+    -- preferred get
   assert_status 0
   assert_contains "claude"
 }
@@ -1152,13 +1160,9 @@ exit 0
 EOF
   chmod +x "$fake_bin/claude"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    /bin/bash "$TEST_ROOT/agent.sh" runtime update claude
+    -- runtime update claude
   assert_status 0
   grep -Fxq 'update' "$update_log" || fail "Expected claude update to be invoked"
 }
@@ -1172,13 +1176,9 @@ test_agent_sh_claude_runtime_reset_config_restores_settings() {
   mkdir -p "$temp_home/home/.claude"
   printf '%s' '{"env":{"USE_BUILTIN_RIPGREP":"1"}}' >"$temp_home/home/.claude/settings.json"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$PATH" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    /bin/bash "$TEST_ROOT/agent.sh" runtime reset-config claude
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="/usr/bin:/bin" \
+    -- runtime reset-config claude
   assert_status 0
   jq -er '.env.USE_BUILTIN_RIPGREP == "0"' "$temp_home/home/.claude/settings.json" >/dev/null || fail "Expected Claude settings reset to default ripgrep behavior"
 }
@@ -1202,13 +1202,9 @@ exit 0
 EOF
   chmod +x "$fake_bin/codex"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    /bin/bash "$TEST_ROOT/agent.sh" run
+    -- run
   assert_status 0
   grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to include --cd /workdir"
 }
@@ -1232,14 +1228,10 @@ exit 0
 EOF
   chmod +x "$fake_bin/codex"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    /bin/bash "$TEST_ROOT/agent.sh" run
+    -- run
   assert_status 0
   grep -Fq -- '-m qwen3:14b' "$run_log" || fail "Expected codex run to include -m qwen3:14b"
   grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to keep --cd /workdir"
@@ -1273,14 +1265,10 @@ Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window I
 eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
 EOF
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
-    /bin/bash "$TEST_ROOT/agent.sh" run
+    -- run
   assert_status 0
   grep -Fq 'AUTH=ollama' "$run_log" || fail "Expected Claude local run to set ANTHROPIC_AUTH_TOKEN=ollama"
   grep -Fq 'API=' "$run_log" || fail "Expected Claude local run to clear ANTHROPIC_API_KEY"
@@ -1313,14 +1301,10 @@ Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window I
 eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
 EOF
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
-    /bin/bash "$TEST_ROOT/agent.sh" run --model llama3
+    -- run --model llama3
   assert_status 0
   grep -Fq 'ARGS=--model llama3' "$run_log" || fail "Expected explicit Claude model to be preserved"
 }
@@ -1350,15 +1334,11 @@ Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window I
 eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
 EOF
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
     AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
-    /bin/bash "$TEST_ROOT/agent.sh" run
+    -- run
   assert_status 0
   grep -Fq 'ARGS=--model qwen3:14b' "$run_log" || fail "Expected Claude model override to replace the default local model"
 }
@@ -1384,22 +1364,14 @@ test_agent_sh_preferred_round_trip() {
   register_dir_cleanup "$temp_home"
   fake_bin="$(make_fake_runtime_bin "$temp_home" codex)"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    "$TEST_ROOT/agent.sh" preferred set codex
+    -- preferred set codex
   assert_status 0
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
+  run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    "$TEST_ROOT/agent.sh" preferred get
+    -- preferred get
   assert_status 0
   assert_contains "codex"
 }
@@ -1437,13 +1409,9 @@ test_agent_sh_auth_write_rejects_invalid_codex_auth() {
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$PATH" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    "$TEST_ROOT/agent.sh" auth write codex json_refresh_token '{}'
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="/usr/bin:/bin" \
+    -- auth write codex json_refresh_token '{}'
   assert_status 1
   assert_contains "invalid auth payload for codex"
 }
@@ -1486,13 +1454,9 @@ test_agent_sh_claude_auth_write_restores_credentials_and_home_state() {
   register_dir_cleanup "$temp_home"
   payload='{"claudeAiOauth":{"accessToken":"access-token","refreshToken":"refresh-token","expiresAt":1776462236852},"claudeCodeState":{"oauthAccount":{"emailAddress":"user@example.com"},"hasCompletedOnboarding":true}}'
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$PATH" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    "$TEST_ROOT/agent.sh" auth write claude claude_ai_oauth_json "$payload"
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="/usr/bin:/bin" \
+    -- auth write claude claude_ai_oauth_json "$payload"
   assert_status 0
   jq -er '(.claudeAiOauth.refreshToken == "refresh-token") and (has("claudeCodeState") | not)' "$temp_home/home/.claude/.credentials.json" >/dev/null || fail "Expected Claude credentials file to contain only auth payload"
   jq -er '.oauthAccount.emailAddress == "user@example.com" and .hasCompletedOnboarding == true and (has("installMethod") | not) and (has("userID") | not)' "$temp_home/home/.claude.json" >/dev/null || fail "Expected Claude home state file to be restored minimally"
@@ -1505,13 +1469,9 @@ test_agent_sh_claude_auth_write_rejects_invalid_payload() {
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
 
-  run_capture env \
-    HOME="$temp_home/home" \
-    XDG_CONFIG_HOME="$temp_home/config" \
-    PATH="$PATH" \
-    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
-    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
-    "$TEST_ROOT/agent.sh" auth write claude claude_ai_oauth_json '{}'
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="/usr/bin:/bin" \
+    -- auth write claude claude_ai_oauth_json '{}'
   assert_status 1
   assert_contains "invalid auth payload for claude"
 }
