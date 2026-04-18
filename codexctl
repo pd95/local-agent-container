@@ -518,25 +518,26 @@ EOF
 
 usage_build() {
   cat <<EOF
-Usage: $CLI_NAME build [--image NAME] [--default-runtime NAME] [--rebuild] [--snapshot] [--pull-base] [--refresh-base]
+Usage: $CLI_NAME build [--image NAME] [--runtimes NAME[,NAME...]] [--default-runtime NAME] [--rebuild] [--snapshot] [--pull-base] [--refresh-base]
 
 Options:
   --image NAME       Local image name to build (for example: agent-plain, agent-python, agent-swift, agent-my-team)
+  --runtimes LIST    Comma-separated runtimes to preinstall in the image (default: codex)
   --default-runtime  Runtime to install as the image default (default: codex)
   --rebuild          Rebuild images even if they already exist (disables build cache only; does not refresh FROM tags)
   --snapshot         Add a fresh UTC timestamp tag for existing images without rebuilding
   --pull-base     Pull the base image before building (preferred way to refresh remote FROM tags)
   --refresh-base  Remove the base image first so it is re-fetched
 
-Each successful build keeps the stable image name (for example `agent-plain`) and
-also adds an immutable UTC timestamp tag (for example `agent-plain:20260313-154500`).
-The primary built-in/base images are `agent-plain`, `agent-python`, and `agent-swift`.
-`agent-office` remains available only as a legacy compatibility image when explicitly requested.
+Each successful build keeps the stable image name (for example agent-plain) and
+also adds an immutable UTC timestamp tag (for example agent-plain:20260313-154500).
+The primary built-in/base images are agent-plain, agent-python, and agent-swift.
+agent-office remains available only as a legacy compatibility image when explicitly requested.
 Local image names follow this convention:
   agent-plain   -> DockerFile
   agent-<name>  -> DockerFile.<name>
 
-Legacy aliases `codex`, `codex-python`, and `codex-swift` are accepted as inputs.
+Legacy aliases codex, codex-python, and codex-swift are accepted as inputs.
 
 When a local Dockerfile uses FROM another local agent image, $CLI_NAME builds the
 dependency chain first.
@@ -1190,6 +1191,8 @@ images_cmd() {
 
 build_cmd() {
   local image=""
+  local runtimes_csv="codex"
+  local runtimes_overridden=0
   local default_runtime="codex"
   local default_runtime_overridden=0
   local rebuild=0
@@ -1198,9 +1201,11 @@ build_cmd() {
   local pull_base=0
   local no_cache=""
   local build_stamp
+  local first_runtime=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --image) image="$2"; shift 2 ;;
+      --runtimes) runtimes_csv="$2"; runtimes_overridden=1; shift 2 ;;
       --default-runtime) default_runtime="$2"; default_runtime_overridden=1; shift 2 ;;
       --rebuild) rebuild=1; shift ;;
       --snapshot) snapshot=1; shift ;;
@@ -1216,11 +1221,54 @@ build_cmd() {
     warn_legacy_compat_image_usage "$image"
   fi
 
+  normalize_build_runtime_csv() {
+    local raw="$1"
+    local entry=""
+    local normalized=""
+    local first=""
+    local duplicate_guard=$'\n'
+    local IFS=','
+    read -r -a build_runtimes <<<"$raw"
+
+    for entry in "${build_runtimes[@]}"; do
+      entry="${entry#"${entry%%[![:space:]]*}"}"
+      entry="${entry%"${entry##*[![:space:]]}"}"
+      [ -n "$entry" ] || continue
+      [ -f "$SCRIPT_DIR/runtimes.d/${entry}.json" ] || die "Unknown runtime for build: $entry"
+      if printf '%s' "$duplicate_guard" | grep -Fqx -- "$entry"; then
+        continue
+      fi
+      duplicate_guard="${duplicate_guard}${entry}"$'\n'
+      if [ -z "$first" ]; then
+        first="$entry"
+      fi
+      if [ -n "$normalized" ]; then
+        normalized="${normalized},${entry}"
+      else
+        normalized="$entry"
+      fi
+    done
+
+    [ -n "$normalized" ] || die "No valid runtimes provided for build"
+    printf '%s\t%s\n' "$normalized" "$first"
+  }
+
+  if [ "$runtimes_overridden" -eq 0 ] && [ "$default_runtime_overridden" -eq 1 ]; then
+    runtimes_csv="$default_runtime"
+  fi
+
+  IFS=$'\t' read -r runtimes_csv first_runtime <<<"$(normalize_build_runtime_csv "$runtimes_csv")"
+  if [ "$default_runtime_overridden" -eq 0 ]; then
+    default_runtime="$first_runtime"
+  fi
   if [ ! -f "$SCRIPT_DIR/runtimes.d/${default_runtime}.json" ]; then
     die "Unknown runtime for build: $default_runtime"
   fi
-  if [ "$default_runtime_overridden" -eq 1 ] && [ "$snapshot" -eq 1 ]; then
-    die "--default-runtime cannot be combined with --snapshot"
+  if ! printf ',%s,' "$runtimes_csv" | grep -Fq ",$default_runtime,"; then
+    die "--default-runtime must be included in --runtimes"
+  fi
+  if { [ "$default_runtime_overridden" -eq 1 ] || [ "$runtimes_overridden" -eq 1 ]; } && [ "$snapshot" -eq 1 ]; then
+    die "--runtimes and --default-runtime cannot be combined with --snapshot"
   fi
 
   require_container
@@ -1417,7 +1465,7 @@ build_cmd() {
     local base=""
     file="$(dockerfile_name_for_image "$name")"
     file_path="$SCRIPT_DIR/$file"
-    if [ "$rebuild" -eq 0 ] && [ "$default_runtime_overridden" -eq 0 ] && image_exists "$name"; then
+    if [ "$rebuild" -eq 0 ] && [ "$default_runtime_overridden" -eq 0 ] && [ "$runtimes_overridden" -eq 0 ] && image_exists "$name"; then
       if [ "$snapshot" -eq 1 ]; then
         echo "Snapshotting existing image tags: $name, $versioned_name"
         "$CONTAINER_CMD" image tag "$name" "$versioned_name"
@@ -1443,7 +1491,7 @@ build_cmd() {
       fi
     fi
     echo "Building image tags: $name, $versioned_name"
-    build_args=(build -t "$name" -f "$file_path" --build-arg "AGENT_DEFAULT_RUNTIME=$default_runtime")
+    build_args=(build -t "$name" -f "$file_path" --build-arg "AGENT_RUNTIMES=$runtimes_csv" --build-arg "AGENT_DEFAULT_RUNTIME=$default_runtime")
     if [ -n "$no_cache" ]; then
       build_args+=("$no_cache")
       build_args+=("$context")

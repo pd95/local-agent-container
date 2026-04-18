@@ -1,6 +1,7 @@
 # For Swift Development
 FROM swift:latest
 
+ARG AGENT_RUNTIMES=codex
 ARG AGENT_DEFAULT_RUNTIME=codex
 
 # --- Core dev tooling (keep lean, no recommends) ---
@@ -74,13 +75,14 @@ ENV PATH=/home/coder/.local/bin:$PATH
 RUN mkdir -p /home/coder/.local/bin /home/coder/.swiftly \
  && chown -R coder:coder /home/coder/.local /home/coder/.swiftly
 
-# --- Install the configured default runtime via agent.sh ---
+# --- Install the configured runtimes via agent.sh ---
 RUN HOME=/home/coder \
     XDG_CONFIG_HOME=/home/coder/.config \
     AGENTCTL_SKIP_PREFERRED_SET=1 \
-    bash /usr/local/bin/agent.sh runtime install "$AGENT_DEFAULT_RUNTIME" \
- && chown -R coder:coder /home/coder /workdir \
- && printf '%s\n' "$AGENT_DEFAULT_RUNTIME" > /etc/agentctl/preferred-runtime
+    AGENT_RUNTIMES="$AGENT_RUNTIMES" \
+    AGENT_DEFAULT_RUNTIME="$AGENT_DEFAULT_RUNTIME" \
+    bash -lc 'set -euo pipefail; IFS="," read -r -a runtimes <<<"$AGENT_RUNTIMES"; [ "${#runtimes[@]}" -gt 0 ] || { echo "No runtimes configured for image build" >&2; exit 1; }; for runtime in "${runtimes[@]}"; do bash /usr/local/bin/agent.sh runtime install "$runtime"; done; printf "%s\n" "$AGENT_DEFAULT_RUNTIME" > /etc/agentctl/preferred-runtime' \
+ && chown -R coder:coder /home/coder /workdir
 
 RUN mkdir -p /etc/codexctl /etc/agentctl \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \

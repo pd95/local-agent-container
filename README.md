@@ -95,8 +95,8 @@ run on the host, not inside a container. For broader manual coverage, see
 # Build images once
 agentctl build
 
-# Build images with Claude as the default installed runtime
-agentctl build --default-runtime claude
+# Build images with both Codex and Claude preinstalled, defaulting to Claude
+agentctl build --runtimes codex,claude --default-runtime claude
 
 # Snapshot current images without rebuilding
 agentctl build --snapshot
@@ -179,7 +179,7 @@ agentctl run --cmd bash
 #### Quick start notes
 
 - Builds create stable local image tags and also add immutable UTC snapshot tags such as `agent-plain:20260313-154500`. By default `agentctl build` discovers local `DockerFile*` definitions in the repo, resolves local `FROM agent...` dependencies, and builds them in dependency order. Use `agentctl build --snapshot` to add fresh timestamp tags to the current images without rebuilding them.
-- `agentctl build --default-runtime <runtime>` changes which runtime is installed and marked preferred in newly built images. Image builds now invoke the copied in-image `agent.sh runtime install ...` path, so the same runtime adapter logic is used during builds and later in-container installs.
+- `agentctl build --runtimes <runtime[,runtime...]>` changes which runtimes are preinstalled in newly built images, and `--default-runtime <runtime>` chooses which one becomes preferred at startup. If you omit `--default-runtime`, the first runtime in the list becomes the default. For the single-runtime case, `agentctl build --default-runtime claude` still works and installs only Claude. Image builds now invoke the copied in-image `agent.sh runtime install ...` path, so the same runtime adapter logic is used during builds and later in-container installs.
 - Local-model runs use a Codex profile from `config.toml`. The default profile is `gpt-oss`; use `agentctl run --profile gemma` to launch the bundled Gemma profile after pulling `gemma4:26b-a4b-it-q4_K_M` into Ollama.
 - `--cmd` consumes the remaining arguments, cannot be combined with `--shell`, and should be placed last. If you pass one quoted string with spaces, it runs via `$CODEX_SHELL -lc`. The same behavior applies to `agentctl exec`.
 - `agentctl run --runtime <runtime>` selects the preferred runtime to launch in the target container before executing the default entrypoint. Add `--install-runtime` to install that runtime first when needed. A practical Claude bootstrap path is now just `agentctl run --runtime claude --install-runtime`.
@@ -391,20 +391,21 @@ container image tag agent-swift "agent-swift:${STAMP}"
 
 This keeps the stable image names for normal use and also creates immutable timestamped tags for A/B testing and rollback. `agentctl build` automates that same dependency ordering for both the built-in images and any custom local `DockerFile.<name>` images that follow the naming convention above.
 
-To change the default installed runtime at build time:
+To change which runtimes are preinstalled at build time:
 
 ```bash
-agentctl build --default-runtime claude
+agentctl build --runtimes codex,claude --default-runtime claude
 
 # Direct container build equivalent for agent-plain
 container build \
   -t agent-plain \
   -f DockerFile \
+  --build-arg AGENT_RUNTIMES=codex,claude \
   --build-arg AGENT_DEFAULT_RUNTIME=claude \
   .
 ```
 
-When you set `--default-runtime`, `agentctl build` performs a real rebuild instead of reusing an existing stable image, because the selected runtime changes the image contents.
+When you set `--runtimes` or `--default-runtime`, `agentctl build` performs a real rebuild instead of reusing an existing stable image, because the selected runtime set changes the image contents.
 Notes:
 - The Swift image includes `format` and `lint` wrappers for `swift-format` and initializes `swiftly` for toolchain management.
 - `agent-office` is still buildable manually from `DockerFile.office` if you need the legacy compatibility image for an existing workflow.

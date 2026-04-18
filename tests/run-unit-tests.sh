@@ -93,6 +93,7 @@ test_build_help_reports_primary_base_images() {
 
   run_capture "$AGENTCTL" build --help
   assert_status 0
+  assert_contains "--runtimes"
   assert_contains "--default-runtime"
   assert_contains "agent-plain"
   assert_contains "agent-python"
@@ -100,8 +101,54 @@ test_build_help_reports_primary_base_images() {
   assert_contains "agent-office remains available only as a legacy compatibility image"
 }
 
-test_build_cmd_passes_default_runtime_build_arg() {
-  begin_test "build_cmd passes the configured default runtime into container builds"
+test_build_cmd_passes_runtime_list_build_args() {
+  begin_test "build_cmd passes the configured runtime list into container builds"
+
+  load_codexctl_functions
+
+  local build_call=""
+
+  require_container() { return 0; }
+  image_exists() { return 1; }
+  stop_buildkit_container() { :; }
+  mock_container() {
+    if [ "$1" = "build" ]; then
+      build_call="$(printf '%s\n' "$*")"
+    fi
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture build_cmd --image agent-plain --runtimes codex,claude --default-runtime claude
+  assert_status 0
+  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_RUNTIMES=codex,claude' || fail "Expected build arg for runtime list, got: $build_call"
+  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_DEFAULT_RUNTIME=claude' || fail "Expected build arg for default runtime, got: $build_call"
+}
+
+test_build_cmd_uses_first_runtime_as_default_when_unspecified() {
+  begin_test "build_cmd uses the first runtime as default when unspecified"
+
+  load_codexctl_functions
+
+  local build_call=""
+
+  require_container() { return 0; }
+  image_exists() { return 1; }
+  stop_buildkit_container() { :; }
+  mock_container() {
+    if [ "$1" = "build" ]; then
+      build_call="$(printf '%s\n' "$*")"
+    fi
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture build_cmd --image agent-plain --runtimes claude,codex
+  assert_status 0
+  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_RUNTIMES=claude,codex' || fail "Expected build arg for runtime list, got: $build_call"
+  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_DEFAULT_RUNTIME=claude' || fail "Expected first runtime to become default, got: $build_call"
+}
+
+test_build_cmd_default_runtime_alone_installs_only_that_runtime() {
+  begin_test "build_cmd preserves single-runtime default-runtime behavior"
 
   load_codexctl_functions
 
@@ -119,11 +166,12 @@ test_build_cmd_passes_default_runtime_build_arg() {
 
   run_capture build_cmd --image agent-plain --default-runtime claude
   assert_status 0
-  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_DEFAULT_RUNTIME=claude' || fail "Expected build arg for default runtime, got: $build_call"
+  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_RUNTIMES=claude' || fail "Expected single-runtime list to follow --default-runtime, got: $build_call"
+  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_DEFAULT_RUNTIME=claude' || fail "Expected default runtime build arg, got: $build_call"
 }
 
-test_build_cmd_rebuilds_existing_image_when_default_runtime_is_overridden() {
-  begin_test "build_cmd rebuilds when default runtime is overridden"
+test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden() {
+  begin_test "build_cmd rebuilds when runtime selection is overridden"
 
   load_codexctl_functions
 
@@ -139,9 +187,9 @@ test_build_cmd_rebuilds_existing_image_when_default_runtime_is_overridden() {
   }
   CONTAINER_CMD="mock_container"
 
-  run_capture build_cmd --image agent-plain --default-runtime claude
+  run_capture build_cmd --image agent-plain --runtimes codex,claude --default-runtime claude
   assert_status 0
-  [ "$build_calls" -eq 1 ] || fail "Expected one build call when overriding the default runtime, got: $build_calls"
+  [ "$build_calls" -eq 1 ] || fail "Expected one build call when overriding the runtime selection, got: $build_calls"
 }
 
 test_run_cmd_runtime_selection_prepares_runtime_before_launch() {
@@ -207,16 +255,52 @@ test_build_cmd_warns_for_legacy_office_image() {
   assert_contains "legacy compatibility image"
 }
 
-test_build_cmd_rejects_default_runtime_snapshot_combo() {
-  begin_test "build_cmd rejects combining default runtime overrides with snapshot"
+test_build_cmd_rejects_runtime_override_snapshot_combo() {
+  begin_test "build_cmd rejects combining runtime overrides with snapshot"
 
-  load_codexctl_functions
+  local temp_dir
+  local unit_script
 
-  require_container() { return 0; }
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-build-invalid.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  unit_script="$temp_dir/check.sh"
 
-  run_capture build_cmd --image agent-plain --default-runtime claude --snapshot
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$CODEXCTL"
+require_container() { return 0; }
+build_cmd --image agent-plain --runtimes codex,claude --default-runtime claude --snapshot
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
   assert_status 1
-  assert_contains "--default-runtime cannot be combined with --snapshot"
+  assert_contains "--runtimes and --default-runtime cannot be combined with --snapshot"
+}
+
+test_build_cmd_rejects_default_runtime_outside_runtime_list() {
+  begin_test "build_cmd rejects a default runtime outside the runtime list"
+
+  local temp_dir
+  local unit_script
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-build-invalid.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  unit_script="$temp_dir/check.sh"
+
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$CODEXCTL"
+require_container() { return 0; }
+build_cmd --image agent-plain --runtimes codex --default-runtime claude
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 1
+  assert_contains "--default-runtime must be included in --runtimes"
 }
 
 test_run_cmd_rejects_non_codex_profile() {
@@ -2367,7 +2451,15 @@ main() {
   test_run_profile_wires_selected_profile
   test_run_help_reports_profile_default
   test_run_help_reports_runtime_options
+  test_build_help_reports_primary_base_images
+  test_build_cmd_passes_runtime_list_build_args
+  test_build_cmd_uses_first_runtime_as_default_when_unspecified
+  test_build_cmd_default_runtime_alone_installs_only_that_runtime
+  test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden
   test_run_cmd_runtime_selection_prepares_runtime_before_launch
+  test_build_cmd_warns_for_legacy_office_image
+  test_build_cmd_rejects_runtime_override_snapshot_combo
+  test_build_cmd_rejects_default_runtime_outside_runtime_list
   test_run_cmd_rejects_non_codex_profile
   test_run_cmd_rejects_install_runtime_without_runtime
   test_run_cmd_rejects_openai_for_non_codex_runtime
