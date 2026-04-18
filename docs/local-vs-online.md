@@ -17,13 +17,14 @@ Examples:
 
 ```bash
 agentctl run
-agentctl run --profile gemma
-agentctl run --profile qwen
+agentctl run -c profile=gemma
+agentctl run -c profile=qwen
 agentctl run --model qwen3.5:9b-nvfp4
 ```
 
 Notes:
-- `--profile` is Codex-specific
+- `-c/--config` is the generic runtime launch-config mechanism
+- Codex currently uses `profile=<name>`
 - `--model` is runtime-neutral and maps to `codex -m <model>`
 
 ### Claude local mode
@@ -45,9 +46,10 @@ You can override that with:
 
 ```bash
 agentctl run --runtime claude --model qwen3:14b
+agentctl run --runtime claude -c dangerously-skip-permissions=true
 ```
 
-The runtime adapter maps that to `claude --model qwen3:14b`.
+The runtime adapter maps those to Claude CLI flags, including `--model` and `--dangerously-skip-permissions`.
 
 ## Online mode
 

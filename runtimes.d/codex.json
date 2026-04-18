@@ -16,6 +16,13 @@
   "auth_formats": [
     "json_refresh_token"
   ],
+  "launch_configs": {
+    "profile": {
+      "type": "string",
+      "default": "gpt-oss",
+      "description": "Codex profile name passed as --profile"
+    }
+  },
   "commands": [
     "help",
     "run",

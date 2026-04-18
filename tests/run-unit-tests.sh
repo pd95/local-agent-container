@@ -81,8 +81,8 @@ EOF
   printf '%s\n' "$fake_bin"
 }
 
-test_run_profile_wires_selected_profile() {
-  begin_test "run_cmd wires --profile into the launched agent.sh command"
+test_run_config_wires_runtime_config_json() {
+  begin_test "run_cmd wires repeated --config values into the launched agent.sh command"
 
   load_codexctl_functions
 
@@ -100,11 +100,13 @@ test_run_profile_wires_selected_profile() {
     captured_cmd="$(printf '%s\n' "$*")"
   }
 
-  run_cmd --name unit-test-container --workdir "$workdir" --profile gemma
+  run_cmd --name unit-test-container --workdir "$workdir" -c profile=gemma -c dangerously-skip-permissions=true
 
   [ "$captured_pre_exec" = "run_pre_exec" ] || fail "Expected run_pre_exec, got: $captured_pre_exec"
   printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_RUN_MODE=' || fail "Expected agent.sh launch wrapper, got: $captured_cmd"
-  printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_DEFAULT_PROFILE=' || fail "Expected profile to be passed to agent.sh, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_RUNTIME_CONFIG_JSON=' || fail "Expected runtime config JSON to be passed to agent.sh, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fq '"profile":"gemma"' || fail "Expected profile launch config in runtime config JSON, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fq '"dangerously-skip-permissions":"true"' || fail "Expected repeated runtime config entries in runtime config JSON, got: $captured_cmd"
   printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_MODEL_OVERRIDE=' || fail "Expected model override env slot to be present, got: $captured_cmd"
   printf '%s\n' "$captured_cmd" | grep -Fq '/usr/local/bin/agent.sh run' || fail "Expected agent.sh run launch path, got: $captured_cmd"
   if printf '%s\n' "$captured_cmd" | grep -Fq -- '--cd /workdir'; then
@@ -361,8 +363,8 @@ EOF
   assert_contains "--default-runtime must be included in --runtimes"
 }
 
-test_run_cmd_rejects_non_codex_profile() {
-  begin_test "run_cmd rejects --profile for non-codex runtimes"
+test_run_cmd_rejects_invalid_runtime_config() {
+  begin_test "run_cmd rejects malformed runtime config entries"
 
   local temp_dir
   local unit_script
@@ -376,13 +378,13 @@ test_run_cmd_rejects_non_codex_profile() {
 set -euo pipefail
 source "$CODEXCTL"
 require_container() { return 0; }
-run_cmd --runtime claude --profile gemma
+run_cmd --runtime claude --config profile
 EOF
   chmod +x "$unit_script"
 
   run_capture bash "$unit_script"
   assert_status 1
-  assert_contains "--profile only applies to the codex runtime"
+  assert_contains "Invalid runtime config: profile (expected key=value)"
 }
 
 test_run_cmd_rejects_install_runtime_without_runtime() {
@@ -953,12 +955,12 @@ test_bootstrap_cmd_rejects_unsupported_base() {
   assert_contains "Unsupported bootstrap container base for current bootstrap slice"
 }
 
-test_run_help_reports_profile_default() {
-  begin_test "run help reports the actual default profile"
+test_run_help_reports_generic_runtime_config() {
+  begin_test "run help reports the generic runtime config flag"
 
   run_capture "$AGENTCTL" run --help
   assert_status 0
-  assert_contains "--profile NAME  Codex profile to use (default: gpt-oss)"
+  assert_contains "-c, --config KEY=VALUE  Pass runtime-specific launch config (repeatable)"
 }
 
 test_agentctl_wrapper_usage_banner() {
@@ -1037,7 +1039,7 @@ test_agent_sh_runtime_info_reports_registry_metadata() {
 
   run_agent_sh_capture "$temp_home" runtime info codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "npm-global" and .default_config_dir == "/etc/codexctl" and (.auth_formats | index("json_refresh_token") != null)' >/dev/null || fail "Expected runtime info JSON for codex, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "npm-global" and .default_config_dir == "/etc/codexctl" and (.auth_formats | index("json_refresh_token") != null) and .launch_configs.profile.type == "string" and .launch_configs.profile.default == "gpt-oss"' >/dev/null || fail "Expected runtime info JSON for codex, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_feature_list_reports_declared_features() {
@@ -1162,7 +1164,7 @@ test_agent_sh_runtime_capabilities_reports_manifest_commands() {
 
   run_agent_sh_capture "$temp_home" runtime capabilities codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and (.commands | index("runtime install codex") != null) and (.commands | index("runtime capabilities codex") != null) and (.auth_formats | index("json_refresh_token") != null) and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.local_mode == true and .capabilities.online_mode == true' >/dev/null || fail "Expected runtime capabilities JSON for codex, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and (.commands | index("runtime install codex") != null) and (.commands | index("runtime capabilities codex") != null) and (.auth_formats | index("json_refresh_token") != null) and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.local_mode == true and .capabilities.online_mode == true and .launch_configs.profile.type == "string"' >/dev/null || fail "Expected runtime capabilities JSON for codex, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_claude_runtime_info_reports_skeleton_metadata() {
@@ -1307,6 +1309,34 @@ EOF
   grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to include --cd /workdir"
 }
 
+test_agent_sh_codex_run_uses_runtime_profile_config() {
+  begin_test "agent.sh codex run maps runtime config profile to --profile"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/codex-run.log"
+  mkdir -p "$fake_bin"
+
+  cat >"$fake_bin/codex" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_RUNTIME_CONFIG_JSON='{"profile":"gemma"}' \
+    -- run
+  assert_status 0
+  grep -Fq -- '--profile gemma' "$run_log" || fail "Expected codex run to include --profile gemma"
+  grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to include --cd /workdir"
+}
+
 test_agent_sh_codex_run_uses_model_override() {
   begin_test "agent.sh codex run maps the model override to -m"
 
@@ -1439,6 +1469,40 @@ EOF
     -- run
   assert_status 0
   grep -Fq 'ARGS=--model qwen3:14b' "$run_log" || fail "Expected Claude model override to replace the default local model"
+}
+
+test_agent_sh_claude_run_uses_runtime_flag_config() {
+  begin_test "agent.sh claude run maps runtime config booleans to CLI flags"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/claude-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' claude >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/claude" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/claude"
+
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_RUNTIME_CONFIG_JSON='{"dangerously-skip-permissions":"true"}' \
+    AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  grep -Fq 'ARGS=--model gpt-oss:20b --dangerously-skip-permissions' "$run_log" || fail "Expected Claude runtime config flag to be passed through"
 }
 
 test_agent_sh_rejects_unknown_runtime() {
@@ -1611,7 +1675,7 @@ test_container_auth_info_uses_agent_sh_auth_read() {
     esac
   }
 
-  run_capture container_auth_info unit-test-container
+  run_capture container_auth_info unit-test-container codex json_refresh_token
   assert_status 0
   assert_contains $'unit-token\t2026-04-17T00:00:00Z'
   grep -Fq '/usr/local/bin/agent.sh auth read codex json_refresh_token' "$exec_log_file" || fail "Expected auth read via agent.sh"
@@ -1658,7 +1722,7 @@ test_write_auth_blob_to_container_uses_agent_sh_auth_write() {
     esac
   }
 
-  run_capture write_auth_blob_to_container unit-test-container '{"refresh_token":"write-token"}'
+  run_capture write_auth_blob_to_container unit-test-container '{"refresh_token":"write-token"}' codex json_refresh_token
   assert_status 0
   grep -Fxq '{"refresh_token":"write-token"}' "$payload_file" || fail "Expected auth payload to be piped through agent.sh auth write"
   grep -Fq '/usr/local/bin/agent.sh auth write codex json_refresh_token' "$exec_log_file" || fail "Expected auth write via agent.sh"
@@ -2147,85 +2211,6 @@ EOF
   assert_status 0
   grep -Fq 'service=agentctl-codex-json_refresh_token-auth' "$env_log_file" || fail "Expected runtime-specific codex keychain service name"
   grep -Fq 'account=runtime-codex-json_refresh_token-auth' "$env_log_file" || fail "Expected runtime-specific codex keychain account name"
-}
-
-test_run_keychain_for_runtime_falls_back_to_legacy_codex_slot() {
-  begin_test "run_keychain_for_runtime falls back to the legacy codex slot"
-
-  load_codexctl_functions
-
-  local temp_dir
-  local fake_keychain
-  local env_log_file
-
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-keychain-codex-legacy.XXXXXX")"
-  register_dir_cleanup "$temp_dir"
-  fake_keychain="$temp_dir/fake-keychain.sh"
-  env_log_file="$temp_dir/env.log"
-
-  cat >"$fake_keychain" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'service=%s\naccount=%s\ncmd=%s\n' "\${KEYCHAIN_SERVICE_NAME:-}" "\${KEYCHAIN_ACCOUNT_NAME:-}" "\${1:-}" >>"$env_log_file"
-case "\${KEYCHAIN_SERVICE_NAME:-}" in
-  agentctl-codex-json_refresh_token-auth) exit 1 ;;
-  codex-OpenAI-auth)
-    case "\${1:-}" in
-      verify) exit 0 ;;
-      read) printf '{"refresh_token":"token"}' ;;
-      *) exit 1 ;;
-    esac
-    ;;
-  *) exit 1 ;;
-esac
-EOF
-  chmod +x "$fake_keychain"
-
-  KEYCHAIN_SCRIPT="$fake_keychain"
-  run_capture run_keychain_for_runtime codex json_refresh_token verify
-  assert_status 0
-  grep -Fq 'service=agentctl-codex-json_refresh_token-auth' "$env_log_file" || fail "Expected primary codex keychain probe"
-  grep -Fq 'service=codex-OpenAI-auth' "$env_log_file" || fail "Expected legacy codex keychain fallback probe"
-}
-
-test_run_keychain_for_runtime_falls_back_to_agent_openai_slot() {
-  begin_test "run_keychain_for_runtime falls back to the older agent-openai slot"
-
-  load_codexctl_functions
-
-  local temp_dir
-  local fake_keychain
-  local env_log_file
-
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-keychain-agent-openai.XXXXXX")"
-  register_dir_cleanup "$temp_dir"
-  fake_keychain="$temp_dir/fake-keychain.sh"
-  env_log_file="$temp_dir/env.log"
-
-  cat >"$fake_keychain" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-printf 'service=%s\naccount=%s\ncmd=%s\n' "\${KEYCHAIN_SERVICE_NAME:-}" "\${KEYCHAIN_ACCOUNT_NAME:-}" "\${1:-}" >>"$env_log_file"
-case "\${KEYCHAIN_SERVICE_NAME:-}" in
-  agentctl-codex-json_refresh_token-auth|codex-OpenAI-auth) exit 1 ;;
-  agent-openai-auth)
-    case "\${1:-}" in
-      verify) exit 0 ;;
-      read) printf '{"refresh_token":"token"}' ;;
-      *) exit 1 ;;
-    esac
-    ;;
-  *) exit 1 ;;
-esac
-EOF
-  chmod +x "$fake_keychain"
-
-  KEYCHAIN_SCRIPT="$fake_keychain"
-  run_capture run_keychain_for_runtime codex json_refresh_token verify
-  assert_status 0
-  grep -Fq 'service=agentctl-codex-json_refresh_token-auth' "$env_log_file" || fail "Expected primary codex keychain probe"
-  grep -Fq 'service=codex-OpenAI-auth' "$env_log_file" || fail "Expected legacy codex keychain probe"
-  grep -Fq 'service=agent-openai-auth' "$env_log_file" || fail "Expected older agent-openai keychain fallback probe"
 }
 
 test_run_keychain_for_runtime_uses_runtime_specific_slot() {
@@ -2785,8 +2770,8 @@ main() {
   log "Using agentctl at $AGENTCTL"
   log "Using agentctl implementation at $AGENTCTL_IMPL"
 
-  test_run_profile_wires_selected_profile
-  test_run_help_reports_profile_default
+  test_run_config_wires_runtime_config_json
+  test_run_help_reports_generic_runtime_config
   test_run_help_reports_runtime_options
   test_run_model_wires_selected_model
   test_build_help_reports_primary_base_images
@@ -2798,7 +2783,7 @@ main() {
   test_build_cmd_warns_for_legacy_office_image
   test_build_cmd_rejects_runtime_override_snapshot_combo
   test_build_cmd_rejects_default_runtime_outside_runtime_list
-  test_run_cmd_rejects_non_codex_profile
+  test_run_cmd_rejects_invalid_runtime_config
   test_run_cmd_rejects_install_runtime_without_runtime
   test_run_cmd_rejects_auth_without_online
   test_run_pre_exec_syncs_selected_runtime_auth_when_available
@@ -2837,10 +2822,12 @@ main() {
   test_agent_sh_claude_runtime_update_calls_claude_update
   test_agent_sh_claude_runtime_reset_config_restores_settings
   test_agent_sh_codex_run_defaults_to_workdir_cd
+  test_agent_sh_codex_run_uses_runtime_profile_config
   test_agent_sh_codex_run_uses_model_override
   test_agent_sh_claude_run_uses_local_ollama_defaults
   test_agent_sh_claude_run_respects_explicit_model
   test_agent_sh_claude_run_uses_model_override
+  test_agent_sh_claude_run_uses_runtime_flag_config
   test_agent_sh_rejects_unknown_runtime
   test_agent_sh_preferred_round_trip
   test_agent_sh_preferred_set_rejects_uninstalled_runtime
@@ -2860,8 +2847,6 @@ main() {
   test_run_auth_flow_rejects_runtime_without_host_auth_support
   test_run_auth_flow_installs_runtime_before_claude_auth
   test_run_keychain_for_runtime_uses_runtime_specific_codex_slot
-  test_run_keychain_for_runtime_falls_back_to_legacy_codex_slot
-  test_run_keychain_for_runtime_falls_back_to_agent_openai_slot
   test_run_keychain_for_runtime_uses_runtime_specific_slot
   test_rm_force_stops_running_container_before_remove
   test_image_ref_for_runtime_falls_back_to_legacy_when_present
