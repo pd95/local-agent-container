@@ -715,6 +715,90 @@ test_runtime_cmd_install_uses_root_helper() {
   printf '%s' "$helper_log" | grep -Fq $'root:unit-runtime-container:runtime:install:codex' || fail "Expected root runtime helper call, got: $helper_log"
 }
 
+test_runtime_cmd_install_claude_warns_on_undersized_container() {
+  begin_test "runtime_cmd install claude warns on an undersized existing container"
+
+  load_codexctl_functions
+
+  local helper_log=""
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-runtime-container\n'; }
+  mock_container() {
+    case "$1" in
+      inspect)
+        cat <<'JSON'
+[{"configuration":{"resources":{"memoryInBytes":1073741824}}}]
+JSON
+        ;;
+      *)
+        echo "Unexpected container invocation: $*" >&2
+        return 1
+        ;;
+    esac
+  }
+  CONTAINER_CMD="mock_container"
+  run_agent_sh_in_container_root() {
+    helper_log="${helper_log}root:$1:$2:$3:$4"$'\n'
+  }
+
+  run_capture runtime_cmd --name unit-runtime-container install claude
+  assert_status 0
+  assert_contains "Container unit-runtime-container is limited to 1G."
+  assert_contains "Claude install may be killed by memory pressure"
+  assert_contains "upgrade --name unit-runtime-container --mem 4G"
+  printf '%s' "$helper_log" | grep -Fq $'root:unit-runtime-container:runtime:install:claude' || fail "Expected root runtime helper call, got: $helper_log"
+}
+
+test_runtime_cmd_install_claude_reports_memory_guidance_on_failure() {
+  begin_test "runtime_cmd install claude reports memory guidance after an undersized failure"
+
+  local harness
+  local script
+
+  harness="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit.XXXXXX")"
+  register_dir_cleanup "$harness"
+  sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
+    -e '/^cmd="${1:-}"/,$d' \
+    "$CODEXCTL" >"$harness"
+
+  script="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit-script.XXXXXX")"
+  register_dir_cleanup "$script"
+  cat >"$script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+. "$harness"
+require_container() { return 0; }
+default_name() { printf 'unit-runtime-container\n'; }
+mock_container() {
+  case "\$1" in
+    inspect)
+      cat <<'JSON'
+[{"configuration":{"resources":{"memoryInBytes":1073741824}}}]
+JSON
+      ;;
+    *)
+      echo "Unexpected container invocation: \$*" >&2
+      return 1
+      ;;
+  esac
+}
+CONTAINER_CMD="mock_container"
+run_agent_sh_in_container_root() {
+  return 137
+}
+runtime_cmd --name unit-runtime-container install claude
+EOF
+  chmod +x "$script"
+
+  run_capture bash "$script"
+  assert_status 1
+  assert_contains "Container unit-runtime-container is limited to 1G."
+  assert_contains "Claude runtime install failed in unit-runtime-container."
+  assert_contains "installer can be killed by memory pressure"
+  assert_contains "upgrade --name unit-runtime-container --mem 4G"
+}
+
 test_runtime_cmd_update_uses_root_helper() {
   begin_test "runtime_cmd update uses the root helper path"
 
@@ -1211,10 +1295,12 @@ test_agent_sh_claude_runtime_install_runs_native_installer() {
   local temp_home
   local fake_bin
   local install_log
+  local expected_owner
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$temp_home/bin"
   install_log="$temp_home/install.log"
+  expected_owner="$(id -u):$(id -g)"
   mkdir -p "$fake_bin"
 
   cat >"$fake_bin/apk" <<EOF
@@ -1249,6 +1335,23 @@ chmod +x "$fake_bin/claude"
 EOF
   chmod +x "$fake_bin/bash"
 
+  cat >"$fake_bin/id" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-u" ]; then
+  printf '%s\n' 0
+  exit 0
+fi
+exec /usr/bin/id "$@"
+EOF
+  chmod +x "$fake_bin/id"
+
+  cat >"$fake_bin/chown" <<EOF
+#!/bin/sh
+printf 'chown %s\n' "\$*" >>"$install_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/chown"
+
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     -- runtime install claude
@@ -1258,6 +1361,7 @@ EOF
   grep -Fq 'info -e libstdc++' "$install_log" || fail "Expected Alpine dependency verification for libstdc++"
   grep -Fq 'info -e ripgrep' "$install_log" || fail "Expected Alpine dependency verification for ripgrep"
   grep -Fq 'installer-bash' "$install_log" || fail "Expected native installer script to be piped into bash"
+  grep -Fq "chown -R $expected_owner $temp_home/home/.claude" "$install_log" || fail "Expected Claude install to hand .claude ownership back to the container user"
   jq -er '.env.USE_BUILTIN_RIPGREP == "0"' "$temp_home/home/.claude/settings.json" >/dev/null || fail "Expected Claude settings.json to disable builtin ripgrep"
 
   run_agent_sh_capture_env "$temp_home" \
@@ -1297,15 +1401,42 @@ test_agent_sh_claude_runtime_reset_config_restores_settings() {
   begin_test "agent.sh claude runtime reset-config restores settings"
 
   local temp_home
+  local fake_bin
+  local install_log
+  local expected_owner
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  install_log="$temp_home/install.log"
+  expected_owner="$(id -u):$(id -g)"
+  mkdir -p "$fake_bin"
   mkdir -p "$temp_home/home/.claude"
   printf '%s' '{"env":{"USE_BUILTIN_RIPGREP":"1"}}' >"$temp_home/home/.claude/settings.json"
+  printf '%s' '{"hasCompletedOnboarding":true}' >"$temp_home/home/.claude.json"
+
+  cat >"$fake_bin/id" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-u" ]; then
+  printf '%s\n' 0
+  exit 0
+fi
+exec /usr/bin/id "$@"
+EOF
+  chmod +x "$fake_bin/id"
+
+  cat >"$fake_bin/chown" <<EOF
+#!/bin/sh
+printf 'chown %s\n' "\$*" >>"$install_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/chown"
 
   run_agent_sh_capture_env "$temp_home" \
-    PATH="/usr/bin:/bin" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     -- runtime reset-config claude
   assert_status 0
+  grep -Fq "chown -R $expected_owner $temp_home/home/.claude" "$install_log" || fail "Expected reset-config to hand .claude ownership back to the container user"
+  grep -Fq "chown $expected_owner $temp_home/home/.claude.json" "$install_log" || fail "Expected reset-config to hand .claude.json ownership back to the container user"
   jq -er '.env.USE_BUILTIN_RIPGREP == "0"' "$temp_home/home/.claude/settings.json" >/dev/null || fail "Expected Claude settings reset to default ripgrep behavior"
 }
 
@@ -1680,15 +1811,41 @@ test_agent_sh_claude_auth_write_restores_credentials_and_home_state() {
   begin_test "agent.sh auth write restores claude credentials and minimal home state"
 
   local temp_home
+  local fake_bin
+  local auth_log
+  local expected_owner
   local payload
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  auth_log="$temp_home/auth.log"
+  expected_owner="$(id -u):$(id -g)"
+  mkdir -p "$fake_bin"
   payload='{"claudeAiOauth":{"accessToken":"access-token","refreshToken":"refresh-token","expiresAt":1776462236852},"claudeCodeState":{"oauthAccount":{"emailAddress":"user@example.com"},"hasCompletedOnboarding":true}}'
 
+  cat >"$fake_bin/id" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-u" ]; then
+  printf '%s\n' 0
+  exit 0
+fi
+exec /usr/bin/id "$@"
+EOF
+  chmod +x "$fake_bin/id"
+
+  cat >"$fake_bin/chown" <<EOF
+#!/bin/sh
+printf 'chown %s\n' "\$*" >>"$auth_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/chown"
+
   run_agent_sh_capture_env "$temp_home" \
-    PATH="/usr/bin:/bin" \
+    PATH="$fake_bin:/usr/bin:/bin" \
     -- auth write claude claude_ai_oauth_json "$payload"
   assert_status 0
+  grep -Fq "chown -R $expected_owner $temp_home/home/.claude" "$auth_log" || fail "Expected auth write to hand .claude ownership back to the container user"
+  grep -Fq "chown $expected_owner $temp_home/home/.claude.json" "$auth_log" || fail "Expected auth write to hand .claude.json ownership back to the container user"
   jq -er '(.claudeAiOauth.refreshToken == "refresh-token") and (has("claudeCodeState") | not)' "$temp_home/home/.claude/.credentials.json" >/dev/null || fail "Expected Claude credentials file to contain only auth payload"
   jq -er '.oauthAccount.emailAddress == "user@example.com" and .hasCompletedOnboarding == true and (has("installMethod") | not) and (has("userID") | not)' "$temp_home/home/.claude.json" >/dev/null || fail "Expected Claude home state file to be restored minimally"
 }
@@ -4042,6 +4199,8 @@ main() {
   test_auth_cmd_warns_for_legacy_office_image
   test_feature_cmd_installs_via_root_helper
   test_runtime_cmd_install_uses_root_helper
+  test_runtime_cmd_install_claude_warns_on_undersized_container
+  test_runtime_cmd_install_claude_reports_memory_guidance_on_failure
   test_runtime_cmd_update_uses_root_helper
   test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state
   test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container

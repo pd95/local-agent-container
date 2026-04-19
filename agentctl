@@ -2604,6 +2604,112 @@ run_agent_sh_in_container_root() {
   return "$status"
 }
 
+display_memory_limit() {
+  local value="$1"
+  local unit=""
+  local divisor=1
+
+  if [ -z "$value" ] || [ "$value" = "0" ]; then
+    printf 'unlimited\n'
+    return 0
+  fi
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  if [ $((value % 1073741824)) -eq 0 ]; then
+    unit="G"
+    divisor=1073741824
+  elif [ $((value % 1048576)) -eq 0 ]; then
+    unit="M"
+    divisor=1048576
+  elif [ $((value % 1024)) -eq 0 ]; then
+    unit="K"
+    divisor=1024
+  fi
+
+  if [ -n "$unit" ]; then
+    printf '%s%s\n' "$((value / divisor))" "$unit"
+    return 0
+  fi
+  printf '%s\n' "$value"
+}
+
+size_to_bytes() {
+  local value="$1"
+  local number=""
+  local suffix=""
+
+  [ -n "$value" ] || return 1
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+  if [[ "$value" =~ ^([0-9]+)([KMGT])B?$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    suffix="${BASH_REMATCH[2]}"
+    case "$suffix" in
+      K) printf '%s\n' $((number * 1024)) ;;
+      M) printf '%s\n' $((number * 1048576)) ;;
+      G) printf '%s\n' $((number * 1073741824)) ;;
+      T) printf '%s\n' $((number * 1099511627776)) ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  return 1
+}
+
+runtime_install_memory_pressure_limit() {
+  local name="$1"
+  local runtime="$2"
+  local inspect_info=""
+  local current_mem=""
+  local current_bytes=""
+  local required_bytes=""
+  local current_display=""
+
+  [ "$runtime" = "claude" ] || return 0
+  inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
+  current_mem="${inspect_info##*$'\t'}"
+  [ -n "$current_mem" ] || return 1
+  [ "$current_mem" != "0" ] || return 1
+
+  current_bytes="$(size_to_bytes "$current_mem" 2>/dev/null || true)"
+  required_bytes="$(size_to_bytes "$CLAUDE_MIN_INSTALL_MEM" 2>/dev/null || true)"
+  [ -n "$current_bytes" ] || return 1
+  [ -n "$required_bytes" ] || return 1
+  if [ "$current_bytes" -lt "$required_bytes" ]; then
+    current_display="$(display_memory_limit "$current_mem")"
+    printf '%s\n' "$current_display"
+    return 0
+  fi
+  return 1
+}
+
+install_runtime_in_container() {
+  local name="$1"
+  local runtime="$2"
+  local low_mem_limit=""
+  local status=0
+
+  low_mem_limit="$(runtime_install_memory_pressure_limit "$name" "$runtime" 2>/dev/null || true)"
+  if [ -n "$low_mem_limit" ]; then
+    warn "Container $name is limited to $low_mem_limit. Claude install may be killed by memory pressure; if that happens, recreate it with: ${CLI_NAME} upgrade --name $name --mem $CLAUDE_MIN_INSTALL_MEM"
+  fi
+
+  if run_agent_sh_in_container_root "$name" runtime install "$runtime"; then
+    return 0
+  fi
+  status=$?
+
+  if [ -n "$low_mem_limit" ]; then
+    die "Claude runtime install failed in $name. The container is limited to $low_mem_limit, and the installer can be killed by memory pressure. Recreate it with: ${CLI_NAME} upgrade --name $name --mem $CLAUDE_MIN_INSTALL_MEM"
+  fi
+  return "$status"
+}
+
 runtime_cmd() {
   local name=""
   local subcommand=""
@@ -2641,6 +2747,10 @@ runtime_cmd() {
       ;;
     install|update)
       [ -n "$runtime" ] || die "Missing runtime for $subcommand"
+      if [ "$subcommand" = "install" ]; then
+        install_runtime_in_container "$name" "$runtime"
+        return 0
+      fi
       run_agent_sh_in_container_root "$name" runtime "$subcommand" "$runtime"
       ;;
     use)
@@ -3549,7 +3659,7 @@ run_pre_exec() {
 
   if [ -n "$RUN_SELECTED_RUNTIME" ]; then
     if [ "$RUN_INSTALL_RUNTIME" -eq 1 ]; then
-      run_agent_sh_in_container_root "$name" runtime install "$RUN_SELECTED_RUNTIME"
+      install_runtime_in_container "$name" "$RUN_SELECTED_RUNTIME"
     fi
     run_agent_sh_in_container "$name" preferred set "$RUN_SELECTED_RUNTIME"
   fi

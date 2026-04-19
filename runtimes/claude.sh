@@ -25,6 +25,23 @@ claude_write_default_settings() {
 EOF
 }
 
+claude_home_owner() {
+  stat -c '%u:%g' "$HOME" 2>/dev/null || printf '%s\n' "coder:coder"
+}
+
+claude_fix_state_ownership() {
+  local owner=""
+
+  [ "$(id -u)" -eq 0 ] || return 0
+  owner="$(claude_home_owner)"
+  if [ -e "$CLAUDE_HOME_DIR" ]; then
+    chown -R "$owner" "$CLAUDE_HOME_DIR"
+  fi
+  if [ -e "$CLAUDE_HOME_STATE_FILE" ]; then
+    chown "$owner" "$CLAUDE_HOME_STATE_FILE"
+  fi
+}
+
 claude_verify_alpine_dependencies() {
   if ! command -v apk >/dev/null 2>&1; then
     return 0
@@ -188,6 +205,7 @@ agent_runtime_reset_config() {
   else
     claude_write_default_settings "$CLAUDE_SETTINGS_FILE"
   fi
+  claude_fix_state_ownership
   rm -f "$USER_RUNTIME_FILE"
 }
 
@@ -242,6 +260,7 @@ agent_runtime_auth_write() {
     fi
     chmod 600 "$CLAUDE_HOME_STATE_FILE"
   fi
+  claude_fix_state_ownership
 }
 
 agent_runtime_auth_login() {
