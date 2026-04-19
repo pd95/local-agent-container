@@ -657,6 +657,7 @@ Usage: $CLI_NAME upgrade [options]
 Options:
   --name NAME         Container name (default: agent-<dir>)
   --new-name NAME     New container name after recreation (default: preserve existing name)
+  --copy              Create the target as a copy and keep the source container unchanged (requires --new-name)
   --image NAME        Image to use for recreation (default: existing container image)
   --workdir PATH      Host directory to mount at /workdir after recreation (default: preserve existing mount source)
   --cpu NUM           CPU cores for recreated container (default: preserve existing setting)
@@ -669,6 +670,9 @@ Options:
 Upgrade recreates the container from the target image. Before recreation, it
 warns about extra OS packages installed after the container's stored baseline
 snapshot when those packages are not present in the target image.
+
+With --copy, upgrade preserves the source container and creates a second
+container with the requested name and settings instead of replacing it.
 EOF
 }
 
@@ -3014,6 +3018,7 @@ print_upgrade_dry_run_summary() {
   local no_backup="${14}"
   local backup_image="${15}"
   local overwrite_config="${16}"
+  local copy_mode="${17:-0}"
   local state_label=""
   local mount_label=""
   local config_label=""
@@ -3051,7 +3056,9 @@ print_upgrade_dry_run_summary() {
       ;;
   esac
 
-  if [ "$no_backup" -eq 1 ]; then
+  if [ "$copy_mode" -eq 1 ]; then
+    backup_label="not needed (source preserved)"
+  elif [ "$no_backup" -eq 1 ]; then
     backup_label="skipped (--no-backup)"
   else
     backup_label="$backup_image"
@@ -3078,7 +3085,9 @@ print_upgrade_dry_run_summary() {
   echo "  Config backup: $config_label" >&2
   echo "  Backup image: $backup_label" >&2
   echo "  Overwrite config: $overwrite_label" >&2
-  if [ "$name" = "$target_name" ]; then
+  if [ "$copy_mode" -eq 1 ]; then
+    echo "  Actions: keep $name and create $target_name as a copy" >&2
+  elif [ "$name" = "$target_name" ]; then
     echo "  Actions: remove $name and recreate it in place" >&2
   else
     echo "  Actions: remove $name and recreate it as $target_name" >&2
@@ -3880,6 +3889,7 @@ auth_cmd() {
 upgrade_cmd() {
   local name=""
   local new_name=""
+  local copy_mode=0
   local target_name=""
   local image=""
   local workdir_override=""
@@ -3907,6 +3917,7 @@ upgrade_cmd() {
     case "$1" in
       --name) name="$2"; shift 2 ;;
       --new-name) new_name="$2"; shift 2 ;;
+      --copy) copy_mode=1; shift ;;
       --image) image="$2"; shift 2 ;;
       --workdir) workdir_override="$2"; shift 2 ;;
       --cpu) cpu="$2"; shift 2 ;;
@@ -3930,10 +3941,19 @@ upgrade_cmd() {
   else
     target_name="$name"
   fi
+  if [ "$copy_mode" -eq 1 ] && [ -z "$new_name" ]; then
+    die "Copy mode requires --new-name."
+  fi
+  if [ "$copy_mode" -eq 1 ] && [ "$target_name" = "$name" ]; then
+    die "Copy mode requires a target name different from the source container."
+  fi
   if [ "$no_backup" -eq 1 ] && [ -n "$backup_image" ]; then
     die "Cannot combine --no-backup with --backup-image"
   fi
-  if [ "$no_backup" -eq 0 ]; then
+  if [ "$copy_mode" -eq 1 ] && [ -n "$backup_image" ]; then
+    die "Cannot combine --copy with --backup-image."
+  fi
+  if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ]; then
     require_container_backup_support
   fi
   if ! container_exists "$name"; then
@@ -3989,17 +4009,17 @@ upgrade_cmd() {
       backup_mode="running"
     fi
   fi
-  if [ "$no_backup" -eq 1 ] && [ "${source_supports_state_contract:-}" = "0" ]; then
+  if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 1 ] && [ "${source_supports_state_contract:-}" = "0" ]; then
     die "Legacy source containers require a backup image for upgrade safety. Re-run without --no-backup."
   fi
-  if [ "$no_backup" -eq 0 ] && [ -z "$backup_image" ]; then
+  if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ] && [ -z "$backup_image" ]; then
     backup_image="$(sanitize_image_name "${target_name}-backup-$(date -u +%Y%m%d%H%M%S)")"
   fi
   if [ "$dry_run" -eq 1 ]; then
     print_upgrade_dry_run_summary \
       "$name" "$target_name" "$current_image" "$image" "$current_workdir" "$workdir" \
       "$mount_mode" "$current_cpu" "$cpu" "$current_mem" "$mem" "$was_running" \
-      "$backup_mode" "$no_backup" "$backup_image" "$overwrite_config"
+      "$backup_mode" "$no_backup" "$backup_image" "$overwrite_config" "$copy_mode"
     return 0
   fi
 
@@ -4026,7 +4046,7 @@ upgrade_cmd() {
     else
       source_supports_state_contract=0
     fi
-    if [ "$no_backup" -eq 1 ] && [ "$source_supports_state_contract" -eq 0 ]; then
+    if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 1 ] && [ "$source_supports_state_contract" -eq 0 ]; then
       die "Legacy source containers require a backup image for upgrade safety. Re-run without --no-backup."
     fi
     backup_codex_config_from_export "$export_file" "$state_backup_file" "$export_config_root"
@@ -4074,12 +4094,12 @@ upgrade_cmd() {
     backup_codex_config "$name" "$state_backup_file"
   fi
 
-  if [ "$was_running" -eq 1 ] || [ "$started_for_backup" -eq 1 ]; then
+  if { [ "$copy_mode" -eq 0 ] && [ "$was_running" -eq 1 ]; } || [ "$started_for_backup" -eq 1 ]; then
     echo "Stopping container: $name" >&2
     "$CONTAINER_CMD" stop "$name" >/dev/null
   fi
 
-  if [ "$no_backup" -eq 0 ]; then
+  if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ]; then
     if [ "$used_export_for_config_backup" -eq 0 ]; then
       echo "Exporting container state to image: $backup_image" >&2
       "$CONTAINER_CMD" export "$name" --output "$export_file"
@@ -4087,14 +4107,17 @@ upgrade_cmd() {
       echo "Reusing exported container state for backup image: $backup_image" >&2
     fi
     build_backup_image_from_export "$backup_image" "$name" "$export_file" "$backup_root" "$backup_dockerfile"
-  else
+  elif [ "$copy_mode" -eq 0 ]; then
     echo "Skipping backup image export for $name" >&2
   fi
 
-  echo "Removing container: $name" >&2
-  "$CONTAINER_CMD" rm "$name" >/dev/null
-
-  echo "Recreating container: $target_name" >&2
+  if [ "$copy_mode" -eq 0 ]; then
+    echo "Removing container: $name" >&2
+    "$CONTAINER_CMD" rm "$name" >/dev/null
+    echo "Recreating container: $target_name" >&2
+  else
+    echo "Creating copy: $target_name" >&2
+  fi
   local create_cmd=("$CONTAINER_CMD" create -t)
   if [ -n "$cpu" ]; then
     create_cmd+=(-c "$cpu")
@@ -4129,14 +4152,16 @@ upgrade_cmd() {
     "$CONTAINER_CMD" stop "$target_name" >/dev/null
   fi
 
-  if [ "$no_backup" -eq 0 ]; then
+  if [ "$copy_mode" -eq 1 ]; then
+    echo "Copy complete: $target_name (source preserved)" >&2
+  elif [ "$no_backup" -eq 0 ]; then
     echo "Upgrade complete: $target_name (backup image: $backup_image)" >&2
   else
     echo "Upgrade complete: $target_name (backup skipped)" >&2
   fi
   echo >&2
   echo "If no valid AGENTS.md configuration already exists, reset it with: ${CLI_NAME} run --name $target_name --reset-config" >&2
-  if [ "$no_backup" -eq 0 ]; then
+  if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ]; then
     echo "If everything works as expected, remove the backup image with: ${CLI_NAME} images prune --backup --image $backup_image --keep 0" >&2
   fi
 }

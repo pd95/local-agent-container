@@ -91,6 +91,13 @@ can rename it during the same upgrade:
 agentctl upgrade --name my-project --new-name my-project-renamed --workdir /new/path/to/project
 ```
 
+If you want to test the new image or mount settings without touching the source
+container, add `--copy` with `--new-name`:
+
+```bash
+agentctl upgrade --name my-project --new-name my-project-copy --copy --image agent-python
+```
+
 To preview the upgrade plan first without recreating anything, add `--dry-run`:
 
 ```bash

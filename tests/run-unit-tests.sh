@@ -2788,6 +2788,117 @@ test_upgrade_can_rename_container_during_recreation() {
   [ "$restored_name" = "renamed-container" ] || fail "Expected config restore on renamed container, got: $restored_name"
 }
 
+test_upgrade_copy_keeps_running_source_container() {
+  begin_test "upgrade copy keeps the source container and creates a new target"
+
+  load_codexctl_functions
+
+  local create_args=""
+  local start_log=""
+  local stop_log=""
+  local rm_log=""
+  local persisted_baseline_name=""
+  local restored_name=""
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  warn_upgrade_package_loss() { :; }
+  container_supports_state_contract() { return 0; }
+  container_exists() {
+    case "$1" in
+      unit-test-container) return 0 ;;
+      copied-container) return 1 ;;
+      *) return 1 ;;
+    esac
+  }
+  container_running() {
+    [ "$1" = "unit-test-container" ]
+  }
+  image_exists() { return 0; }
+  backup_codex_config() { :; }
+  restore_codex_config() { restored_name="$1"; }
+  persist_container_system_manifest_baseline_from_image() { persisted_baseline_name="$1"; }
+  sanitize_image_name() { printf '%s\n' "$1"; }
+  build_backup_image_from_export() { fail "copy mode should not build a backup image"; }
+  trap() { :; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect)
+        printf 'placeholder\n'
+        ;;
+      create)
+        shift
+        create_args="$(printf '%s\n' "$*")"
+        ;;
+      start)
+        start_log="${start_log}${2}"$'\n'
+        ;;
+      stop)
+        stop_log="${stop_log}${2}"$'\n'
+        ;;
+      rm)
+        rm_log="${rm_log}${2}"$'\n'
+        ;;
+      export)
+        fail "copy mode should not export a backup image"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  container_upgrade_info() {
+    printf 'codex\t%s\trw\t2\t4G\n' "$TEST_ROOT"
+  }
+
+  run_capture upgrade_cmd --name unit-test-container --new-name copied-container --copy
+  assert_status 0
+  assert_contains "Backing up user state from unit-test-container"
+  assert_contains "Creating copy: copied-container"
+  assert_contains "Starting container: copied-container"
+  assert_contains "Restoring user state into copied-container"
+  assert_contains "Copy complete: copied-container (source preserved)"
+  printf '%s\n' "$create_args" | grep -F -- "--name copied-container" >/dev/null || fail "Expected create args to include copied container, got: $create_args"
+  [ -z "$rm_log" ] || fail "Expected source container to remain present, got rm log: $rm_log"
+  if printf '%s\n' "$stop_log" | grep -Fx -- "unit-test-container" >/dev/null; then
+    fail "Expected running source container to remain running during copy"
+  fi
+  printf '%s\n' "$start_log" | grep -Fx -- "copied-container" >/dev/null || fail "Expected copied container to start, got: $start_log"
+  [ "$persisted_baseline_name" = "copied-container" ] || fail "Expected baseline persistence on copied container, got: $persisted_baseline_name"
+  [ "$restored_name" = "copied-container" ] || fail "Expected restore on copied container, got: $restored_name"
+}
+
+test_upgrade_copy_requires_new_name() {
+  begin_test "upgrade copy requires a new target name"
+
+  local harness
+  local script
+
+  harness="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit.XXXXXX")"
+  register_dir_cleanup "$harness"
+  sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
+    -e '/^cmd="${1:-}"/,$d' \
+    "$CODEXCTL" >"$harness"
+
+  script="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit-script.XXXXXX")"
+  register_dir_cleanup "$script"
+  cat >"$script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+. "$harness"
+require_container() { return 0; }
+default_name() { printf 'unit-test-container\n'; }
+upgrade_cmd --name unit-test-container --copy
+EOF
+  chmod +x "$script"
+
+  run_capture bash "$script"
+  assert_status 1
+  assert_contains "Copy mode requires --new-name."
+}
+
 test_upgrade_dry_run_reports_plan_without_recreating_container() {
   begin_test "upgrade dry-run reports the plan without recreating the container"
 
@@ -2862,6 +2973,76 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
   assert_contains "  Config backup: export existing container filesystem and recover user state from it"
   assert_contains "  Backup image: renamed-container-backup-20260406120000"
   assert_contains "  Actions: remove unit-test-container and recreate it as renamed-container"
+  assert_contains "Dry run complete: no container changes applied"
+  [ "$create_calls" -eq 0 ] || fail "Expected no create calls during dry-run, got: $create_calls"
+  [ "$export_calls" -eq 0 ] || fail "Expected no export calls during dry-run, got: $export_calls"
+  [ "$start_calls" -eq 0 ] || fail "Expected no start calls during dry-run, got: $start_calls"
+  [ "$stop_calls" -eq 0 ] || fail "Expected no stop calls during dry-run, got: $stop_calls"
+  [ "$rm_calls" -eq 0 ] || fail "Expected no rm calls during dry-run, got: $rm_calls"
+}
+
+test_upgrade_copy_dry_run_reports_copy_plan() {
+  begin_test "upgrade copy dry-run reports copy actions without recreating containers"
+
+  load_codexctl_functions
+
+  local create_calls=0
+  local export_calls=0
+  local start_calls=0
+  local stop_calls=0
+  local rm_calls=0
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  warn_upgrade_package_loss() { :; }
+  container_supports_state_contract() { return 0; }
+  container_exists() {
+    case "$1" in
+      unit-test-container) return 0 ;;
+      copied-container) return 1 ;;
+      *) return 1 ;;
+    esac
+  }
+  container_running() { [ "$1" = "unit-test-container" ]; }
+  image_exists() { return 0; }
+  sanitize_image_name() { printf '%s\n' "$1"; }
+  trap() { :; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect)
+        printf 'placeholder\n'
+        ;;
+      create)
+        create_calls=$((create_calls + 1))
+        ;;
+      export)
+        export_calls=$((export_calls + 1))
+        ;;
+      start)
+        start_calls=$((start_calls + 1))
+        ;;
+      stop)
+        stop_calls=$((stop_calls + 1))
+        ;;
+      rm)
+        rm_calls=$((rm_calls + 1))
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  container_upgrade_info() {
+    printf 'agent-python:latest\t%s\tro\t2\t4294967296\n' "$TEST_ROOT"
+  }
+
+  run_capture upgrade_cmd --name unit-test-container --new-name copied-container --copy --image agent-python --dry-run
+  assert_status 0
+  assert_contains "Dry run: upgrade plan for unit-test-container -> copied-container"
+  assert_contains "  Backup image: not needed (source preserved)"
+  assert_contains "  Actions: keep unit-test-container and create copied-container as a copy"
   assert_contains "Dry run complete: no container changes applied"
   [ "$create_calls" -eq 0 ] || fail "Expected no create calls during dry-run, got: $create_calls"
   [ "$export_calls" -eq 0 ] || fail "Expected no export calls during dry-run, got: $export_calls"
@@ -3679,7 +3860,10 @@ main() {
   test_upgrade_rejects_no_backup_for_legacy_source
   test_upgrade_uses_explicit_resource_overrides
   test_upgrade_can_rename_container_during_recreation
+  test_upgrade_copy_keeps_running_source_container
+  test_upgrade_copy_requires_new_name
   test_upgrade_dry_run_reports_plan_without_recreating_container
+  test_upgrade_copy_dry_run_reports_copy_plan
   test_upgrade_warns_about_added_packages_missing_from_target_image
   test_upgrade_uses_stored_baseline_when_current_image_is_missing
   test_upgrade_accepts_workdir_override_when_original_mount_is_missing
