@@ -642,6 +642,7 @@ Usage: $CLI_NAME upgrade [options]
 Options:
   --name NAME         Container name (default: agent-<dir>)
   --image NAME        Image to use for recreation (default: existing container image)
+  --workdir PATH      Host directory to mount at /workdir after recreation (default: preserve existing mount source)
   --cpu NUM           CPU cores for recreated container (default: preserve existing setting)
   --mem SIZE          Memory limit for recreated container (default: preserve existing setting)
   --backup-image NAME Backup image name for container export (default: <name>-backup-<timestamp>)
@@ -1621,6 +1622,23 @@ backup_codex_config() {
   "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc 'cd /home/coder && tar -cf - .codex' >"$backup_file"
 }
 
+backup_codex_config_from_export() {
+  local export_file="$1"
+  local backup_file="$2"
+  local extract_root="$3"
+  local codex_dir=""
+  local home_dir=""
+
+  mkdir -p "$extract_root"
+  tar -xf "$export_file" -C "$extract_root"
+  codex_dir="$(find "$extract_root" -type d -path '*/home/coder/.codex' | head -n 1)"
+  if [ -z "$codex_dir" ]; then
+    return 0
+  fi
+  home_dir="$(dirname "$codex_dir")"
+  tar -C "$home_dir" -cf "$backup_file" .codex
+}
+
 restore_codex_config() {
   local name="$1"
   local backup_file="$2"
@@ -1645,6 +1663,25 @@ codex_agents_state() {
     return 0
   fi
   if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -e /home/coder/.codex/AGENTS.md; then
+    echo "other"
+    return 0
+  fi
+  echo "missing"
+}
+
+codex_agents_state_from_export_root() {
+  local extract_root="$1"
+  local agents_path="$extract_root/home/coder/.codex/AGENTS.md"
+
+  if [ -L "$agents_path" ]; then
+    echo "symlink"
+    return 0
+  fi
+  if [ -f "$agents_path" ]; then
+    echo "file"
+    return 0
+  fi
+  if [ -e "$agents_path" ]; then
     echo "other"
     return 0
   fi
@@ -2633,12 +2670,32 @@ container_system_manifest_json() {
 
 container_baseline_manifest_json() {
   local name="$1"
+  local was_running=0
+  local started_for_manifest=0
   local manifest=""
 
+  if container_running "$name"; then
+    was_running=1
+  else
+    "$CONTAINER_CMD" start "$name" >/dev/null
+    started_for_manifest=1
+  fi
+
   if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -f "$SYSTEM_BASELINE_MANIFEST_FILE"; then
+    if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+      "$CONTAINER_CMD" stop "$name" >/dev/null 2>&1 || true
+    fi
     return 1
   fi
-  manifest="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" cat "$SYSTEM_BASELINE_MANIFEST_FILE")" || return 1
+  if ! manifest="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" cat "$SYSTEM_BASELINE_MANIFEST_FILE")"; then
+    if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+      "$CONTAINER_CMD" stop "$name" >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+  if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+    "$CONTAINER_CMD" stop "$name" >/dev/null
+  fi
   [ -n "$manifest" ] || return 1
   printf '%s\n' "$manifest"
 }
@@ -3546,12 +3603,14 @@ auth_cmd() {
 upgrade_cmd() {
   local name=""
   local image=""
+  local workdir_override=""
   local cpu=""
   local mem=""
   local backup_image=""
   local no_backup=0
   local overwrite_config=0
   local current_image=""
+  local current_workdir=""
   local workdir=""
   local mount_mode=""
   local current_cpu=""
@@ -3559,12 +3618,14 @@ upgrade_cmd() {
   local read_only=0
   local was_running=0
   local started_for_backup=0
+  local used_export_for_config_backup=0
   local inspect_info=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
       --image) image="$2"; shift 2 ;;
+      --workdir) workdir_override="$2"; shift 2 ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
       --backup-image) backup_image="$2"; shift 2 ;;
@@ -3591,9 +3652,9 @@ upgrade_cmd() {
   fi
 
   inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
-  IFS=$'\t' read -r current_image workdir mount_mode current_cpu current_mem <<<"$inspect_info"
+  IFS=$'\t' read -r current_image current_workdir mount_mode current_cpu current_mem <<<"$inspect_info"
   [ -n "$current_image" ] || die "Unable to determine image for $name"
-  [ -n "$workdir" ] || die "Unable to determine /workdir mount source for $name"
+  [ -n "$current_workdir" ] || die "Unable to determine /workdir mount source for $name"
 
   if [ "$mount_mode" = "ro" ]; then
     read_only=1
@@ -3604,12 +3665,27 @@ upgrade_cmd() {
   [ -n "$image" ] || image="$current_image"
   image="$(image_ref_for_runtime "$image")"
   warn_legacy_compat_image_usage "$image"
+  if [ -n "$workdir_override" ]; then
+    [ -d "$workdir_override" ] || die "Workdir not found: $workdir_override"
+    workdir="$(CDPATH= cd -- "$workdir_override" && pwd)"
+  else
+    workdir="$current_workdir"
+  fi
   [ -n "$cpu" ] || cpu="$current_cpu"
   [ -n "$mem" ] || mem="$current_mem"
   image_exists "$image" || die "Image not found: $image"
-  [ -e "$workdir" ] || die "Preserved /workdir source does not exist: $workdir"
-  [ -d "$workdir" ] || die "Preserved /workdir source is not a directory: $workdir"
-  warn_upgrade_package_loss "$name" "$current_image" "$image"
+  if [ -z "$workdir_override" ]; then
+    [ -e "$workdir" ] || die "Preserved /workdir source does not exist: $workdir"
+    [ -d "$workdir" ] || die "Preserved /workdir source is not a directory: $workdir"
+  fi
+  if container_running "$name"; then
+    was_running=1
+  fi
+  if [ "$was_running" -eq 0 ] && [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; then
+    warn "Skipping package-loss warning because original /workdir source does not exist and $name is stopped"
+  else
+    warn_upgrade_package_loss "$name" "$current_image" "$image"
+  fi
   if [ "$no_backup" -eq 0 ] && [ -z "$backup_image" ]; then
     backup_image="$(sanitize_image_name "${name}-backup-$(date -u +%Y%m%d%H%M%S)")"
   fi
@@ -3619,25 +3695,32 @@ upgrade_cmd() {
   local export_file
   local backup_root
   local backup_dockerfile
+  local export_config_root
   backup_dir="$(mktemp -d)"
   config_backup_file="$backup_dir/codex-config.tar"
   export_file="$backup_dir/codex-export.tar"
   backup_root="$backup_dir/rootfs"
   backup_dockerfile="$backup_dir/Dockerfile.backup"
+  export_config_root="$backup_dir/export-config"
   trap 'cleanup_temp_dir "$backup_dir"' RETURN
 
-  if container_running "$name"; then
-    was_running=1
-  fi
-
-  if [ "$was_running" -eq 0 ]; then
+  if [ "$was_running" -eq 0 ] && [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; then
+    echo "Exporting container state for config backup: $name" >&2
+    "$CONTAINER_CMD" export "$name" --output "$export_file"
+    backup_codex_config_from_export "$export_file" "$config_backup_file" "$export_config_root"
+    used_export_for_config_backup=1
+  elif [ "$was_running" -eq 0 ]; then
     echo "Starting container for config backup: $name" >&2
     "$CONTAINER_CMD" start "$name" >/dev/null
     started_for_backup=1
   fi
 
   local agents_state=""
-  agents_state="$(codex_agents_state "$name")"
+  if [ "$used_export_for_config_backup" -eq 1 ]; then
+    agents_state="$(codex_agents_state_from_export_root "$export_config_root")"
+  else
+    agents_state="$(codex_agents_state "$name")"
+  fi
   case "$agents_state" in
     symlink|missing) ;;
     file)
@@ -3662,8 +3745,12 @@ upgrade_cmd() {
       ;;
   esac
 
-  echo "Backing up /home/coder/.codex from $name" >&2
-  backup_codex_config "$name" "$config_backup_file"
+  if [ "$used_export_for_config_backup" -eq 1 ]; then
+    echo "Backing up /home/coder/.codex from exported state: $name" >&2
+  else
+    echo "Backing up /home/coder/.codex from $name" >&2
+    backup_codex_config "$name" "$config_backup_file"
+  fi
 
   if [ "$was_running" -eq 1 ] || [ "$started_for_backup" -eq 1 ]; then
     echo "Stopping container: $name" >&2
@@ -3671,8 +3758,12 @@ upgrade_cmd() {
   fi
 
   if [ "$no_backup" -eq 0 ]; then
-    echo "Exporting container state to image: $backup_image" >&2
-    "$CONTAINER_CMD" export "$name" --output "$export_file"
+    if [ "$used_export_for_config_backup" -eq 0 ]; then
+      echo "Exporting container state to image: $backup_image" >&2
+      "$CONTAINER_CMD" export "$name" --output "$export_file"
+    else
+      echo "Reusing exported container state for backup image: $backup_image" >&2
+    fi
     build_backup_image_from_export "$backup_image" "$name" "$export_file" "$backup_root" "$backup_dockerfile"
   else
     echo "Skipping backup image export for $name" >&2

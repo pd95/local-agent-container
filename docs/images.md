@@ -77,6 +77,13 @@ agentctl upgrade --name my-project --image agent-python --overwrite-config
 This keeps the preserved `/workdir` mount and recreated container identity
 while switching the base image family underneath it.
 
+If the project directory moved on the host, you can update the bind mount at
+the same time:
+
+```bash
+agentctl upgrade --name my-project --image agent-python --workdir /new/path/to/project
+```
+
 Before recreating the container, `upgrade` warns about extra OS packages that
 were added after the container's stored baseline snapshot and are not present
 in the target image, because those packages are not preserved automatically.

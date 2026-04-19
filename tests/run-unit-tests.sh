@@ -2655,6 +2655,133 @@ test_upgrade_uses_stored_baseline_when_current_image_is_missing() {
   [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
 }
 
+test_upgrade_accepts_workdir_override_when_original_mount_is_missing() {
+  begin_test "upgrade can replace a missing workdir mount source"
+
+  load_codexctl_functions
+
+  local create_args=""
+  local export_calls=0
+  local start_calls=0
+  local stop_calls=0
+  local rm_calls=0
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  require_container_backup_support() { return 0; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 1; }
+  image_exists() { return 0; }
+  backup_codex_config() { fail "backup_codex_config should not be used when the original workdir is missing"; }
+  backup_codex_config_from_export() {
+    local extract_root="$3"
+    mkdir -p "$extract_root/home/coder/.codex"
+    ln -sf /etc/codexctl/image.md "$extract_root/home/coder/.codex/AGENTS.md"
+  }
+  restore_codex_config() { :; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  sanitize_image_name() { printf '%s\n' "$1"; }
+  build_backup_image_from_export() { :; }
+  trap() { :; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect)
+        printf 'placeholder\n'
+        ;;
+      create)
+        shift
+        create_args="$(printf '%s\n' "$*")"
+        ;;
+      export)
+        export_calls=$((export_calls + 1))
+        ;;
+      start)
+        start_calls=$((start_calls + 1))
+        ;;
+      stop)
+        stop_calls=$((stop_calls + 1))
+        ;;
+      rm)
+        rm_calls=$((rm_calls + 1))
+        ;;
+      exec)
+        fail "upgrade should not exec into the stopped source container during export-backed recovery"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  container_upgrade_info() {
+    printf 'agent-plain\t/does/not/exist\trw\t2\t4G\n'
+  }
+
+  run_capture upgrade_cmd --name unit-test-container --workdir "$TEST_ROOT" --no-backup
+  assert_status 0
+  assert_contains "Warning: Skipping package-loss warning because original /workdir source does not exist and unit-test-container is stopped"
+  assert_contains "Exporting container state for config backup: unit-test-container"
+  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  printf '%s\n' "$create_args" | grep -F -- "src=$TEST_ROOT,dst=/workdir" >/dev/null || fail "Expected recreated mount to use override workdir, got: $create_args"
+  [ "$export_calls" -eq 1 ] || fail "Expected 1 export call, got: $export_calls"
+  [ "$start_calls" -eq 1 ] || fail "Expected 1 start call for recreated container, got: $start_calls"
+  [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call for recreated container, got: $stop_calls"
+  [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
+}
+
+test_container_baseline_manifest_starts_stopped_container_and_restores_state() {
+  begin_test "container_baseline_manifest_json starts a stopped container and restores stopped state"
+
+  load_codexctl_functions
+
+  local start_calls=0
+  local stop_calls=0
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      start)
+        start_calls=$((start_calls + 1))
+        ;;
+      stop)
+        stop_calls=$((stop_calls + 1))
+        ;;
+      exec)
+        shift
+        if [ "${1:-}" = "unit-test-container" ]; then
+          shift
+        fi
+        if [ "${1:-}" = "setpriv" ]; then
+          shift 6
+        fi
+        case "$*" in
+          "test -f /etc/agentctl/system-manifest.json")
+            return 0
+            ;;
+          "cat /etc/agentctl/system-manifest.json")
+            printf '{"package_manager":"apk","packages":["bash"]}\n'
+            ;;
+          *)
+            fail "Unexpected container exec invocation: $*"
+            ;;
+        esac
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 1; }
+
+  run_capture container_baseline_manifest_json unit-test-container
+  assert_status 0
+  assert_contains '"package_manager":"apk"'
+  [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
+  [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
+}
+
 test_refresh_updates_managed_files_without_recreate() {
   begin_test "refresh updates managed files and preserves stopped state"
 
@@ -3052,6 +3179,8 @@ main() {
   test_upgrade_uses_explicit_resource_overrides
   test_upgrade_warns_about_added_packages_missing_from_target_image
   test_upgrade_uses_stored_baseline_when_current_image_is_missing
+  test_upgrade_accepts_workdir_override_when_original_mount_is_missing
+  test_container_baseline_manifest_starts_stopped_container_and_restores_state
   test_refresh_updates_managed_files_without_recreate
   test_refresh_container_file_streams_source_via_stdin
   test_system_manifest_starts_stopped_container_and_restores_state
