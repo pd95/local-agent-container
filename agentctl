@@ -2780,7 +2780,7 @@ baseline_manifest_json() {
     --arg image_ref "$image_ref" \
     '
       . + {
-        schema_version: 1,
+        schema_version: 2,
         baseline_source: $baseline_source,
         image_ref: $image_ref
       }

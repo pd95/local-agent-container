@@ -1182,6 +1182,29 @@ test_agent_sh_claude_runtime_info_reports_skeleton_metadata() {
   printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "claude" and .installed == false and .install_method == "native-installer" and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.local_mode == true and .capabilities.online_mode == true and (.auth_formats | index("claude_ai_oauth_json") != null) and (.commands | index("runtime install claude") != null) and (.commands | index("auth login claude") != null)' >/dev/null || fail "Expected runtime info JSON for claude runtime, got: $RUN_OUTPUT"
 }
 
+test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state() {
+  begin_test "agent.sh system manifest includes installed runtimes, features, and preferred runtime state"
+
+  local temp_home
+  local fake_bin
+  local state_dir
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$(make_fake_runtime_bin "$temp_home" codex)"
+  make_fake_runtime_bin "$temp_home" claude >/dev/null
+  state_dir="$temp_home/state"
+  mkdir -p "$state_dir/office" "$temp_home/config/agentctl"
+  printf '%s\n' installed >"$state_dir/office/install-complete"
+  printf '%s\n' claude >"$temp_home/config/agentctl/preferred-runtime"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_FEATURE_STATE_DIR="$state_dir" \
+    -- system manifest
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.installed_runtimes == ["claude","codex"] and .installed_features == ["office"] and .default_runtime == "codex" and .preferred_runtime == "claude"' >/dev/null || fail "Expected richer system manifest JSON, got: $RUN_OUTPUT"
+}
+
 test_agent_sh_claude_runtime_install_runs_native_installer() {
   begin_test "agent.sh claude runtime install runs the native installer"
 
@@ -3174,7 +3197,7 @@ test_upgrade_uses_stored_baseline_when_current_image_is_missing() {
   restore_codex_config() { :; }
   persist_container_system_manifest_baseline_from_image() { :; }
   container_baseline_manifest_json() {
-    printf '{"schema_version":1,"baseline_source":"image","image_ref":"agent-plain","package_manager":"apk","packages":["bash","git"]}\n'
+    printf '{"schema_version":2,"baseline_source":"image","image_ref":"agent-plain","package_manager":"apk","packages":["bash","git"],"installed_runtimes":["codex"],"installed_features":[],"default_runtime":"codex","preferred_runtime":"codex"}\n'
   }
   sanitize_image_name() { printf '%s\n' "$1"; }
   build_backup_image_from_export() { :; }
@@ -3817,6 +3840,7 @@ main() {
   test_agent_sh_runtime_list_reports_installed_runtimes_only
   test_agent_sh_runtime_capabilities_reports_manifest_commands
   test_agent_sh_claude_runtime_info_reports_skeleton_metadata
+  test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state
   test_agent_sh_claude_runtime_install_runs_native_installer
   test_agent_sh_claude_runtime_update_calls_claude_update
   test_agent_sh_claude_runtime_reset_config_restores_settings

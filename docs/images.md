@@ -110,7 +110,9 @@ in the target image, because those packages are not preserved automatically.
 
 New containers and upgrades persist that baseline snapshot at
 `/etc/agentctl/system-manifest.json` so later upgrades can still compare
-against it even if the original image is no longer present locally.
+against it even if the original image is no longer present locally. That
+baseline now records the image package list, installed runtimes, installed
+features, and the image default/preferred runtime.
 
 Modern upgrades now preserve broader user state, not just `~/.codex`. The
 state transfer path includes:

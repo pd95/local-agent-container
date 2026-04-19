@@ -167,6 +167,17 @@ runtime_ids_installed() {
   done < <(runtime_ids)
 }
 
+feature_ids_installed() {
+  local feature
+
+  while IFS= read -r feature; do
+    [ -n "$feature" ] || continue
+    if [ "$(feature_installed_json "$feature")" = "true" ]; then
+      printf '%s\n' "$feature"
+    fi
+  done < <(feature_ids)
+}
+
 runtime_command_name() {
   runtime_manifest_string "$1" '.command'
 }
@@ -472,7 +483,7 @@ json_feature_info() {
 }
 
 json_system_manifest() {
-  local package_manager packages_json
+  local package_manager packages_json runtimes_json features_json default_runtime preferred_runtime
 
   if command -v apk >/dev/null 2>&1; then
     package_manager=apk
@@ -484,13 +495,25 @@ json_system_manifest() {
     package_manager=unknown
     packages_json='[]'
   fi
+  runtimes_json="$(runtime_ids_installed | jq -R . | jq -s .)"
+  features_json="$(feature_ids_installed | jq -R . | jq -s .)"
+  default_runtime="$(runtime_default)"
+  preferred_runtime="$(runtime_preferred)"
 
   jq -n \
     --arg package_manager "$package_manager" \
     --argjson packages "$packages_json" \
+    --argjson installed_runtimes "$runtimes_json" \
+    --argjson installed_features "$features_json" \
+    --arg default_runtime "$default_runtime" \
+    --arg preferred_runtime "$preferred_runtime" \
     '{
       package_manager: $package_manager,
-      packages: $packages
+      packages: $packages,
+      installed_runtimes: $installed_runtimes,
+      installed_features: $installed_features,
+      default_runtime: $default_runtime,
+      preferred_runtime: $preferred_runtime
     }'
 }
 
