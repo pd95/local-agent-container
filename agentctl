@@ -3202,7 +3202,7 @@ reinstall_added_runtimes_and_features() {
     [ -n "$runtime" ] || continue
     if target_runtime_installable "$name" "$runtime"; then
       echo "Reinstalling added runtime in $name: $runtime" >&2
-      run_agent_sh_in_container_root "$name" runtime install "$runtime" || die "Failed to reinstall runtime during upgrade: $runtime"
+      install_runtime_in_container "$name" "$runtime" || die "Failed to reinstall runtime during upgrade: $runtime"
     else
       warn "Target image cannot automatically reinstall added runtime: $runtime"
     fi
@@ -3435,35 +3435,7 @@ display_upgrade_image_ref() {
 }
 
 display_upgrade_memory_limit() {
-  local value="$1"
-  local unit=""
-  local divisor=1
-
-  if [ -z "$value" ] || [ "$value" = "0" ]; then
-    printf 'unlimited\n'
-    return 0
-  fi
-  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
-    printf '%s\n' "$value"
-    return 0
-  fi
-
-  if [ $((value % 1073741824)) -eq 0 ]; then
-    unit="G"
-    divisor=1073741824
-  elif [ $((value % 1048576)) -eq 0 ]; then
-    unit="M"
-    divisor=1048576
-  elif [ $((value % 1024)) -eq 0 ]; then
-    unit="K"
-    divisor=1024
-  fi
-
-  if [ -n "$unit" ]; then
-    printf '%s%s\n' "$((value / divisor))" "$unit"
-    return 0
-  fi
-  printf '%s\n' "$value"
+  display_memory_limit "$1"
 }
 
 run_container() {

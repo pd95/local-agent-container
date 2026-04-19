@@ -235,6 +235,79 @@ Expected output after the overwrite refresh should show:
 - matching hash line for `/tmp/image-config.toml` and `/tmp/container-config.toml`
 - no diff output from either `diff -q` command
 
+## Upgrade state persistence
+
+Use this manual smoke test when validating the runtime-owned state export/import path
+during `upgrade`. It covers both cases:
+
+- Claude is not installed, so stray Claude state should be dropped
+- Claude is installed, so Claude state should survive the upgrade
+
+Run from the repository root on the host:
+
+```bash
+tmp_root="$(mktemp -d)"
+workdir="$tmp_root/project"
+mkdir -p "$workdir"
+printf 'hook-test\n' > "$workdir/README.md"
+
+agentctl run --name state-hook-smoke --image agent-python --mem 4G --workdir "$workdir" --cmd true
+agentctl start --name state-hook-smoke
+agentctl refresh --name state-hook-smoke
+
+# Phase 1: Codex + generic agentctl state should survive, stray Claude state should not.
+agentctl exec --name state-hook-smoke sh -lc '
+mkdir -p /home/coder/.codex /home/coder/.claude /home/coder/.config/agentctl
+printf "{\"refresh_token\":\"codex-token\"}\n" >/home/coder/.codex/auth.json
+printf "{\"claudeAiOauth\":{\"accessToken\":\"a\",\"refreshToken\":\"should-not-survive\",\"expiresAt\":1}}\n" >/home/coder/.claude/.credentials.json
+printf "{\"hasCompletedOnboarding\":true}\n" >/home/coder/.claude.json
+printf "codex\n" >/home/coder/.config/agentctl/preferred-runtime
+'
+
+agentctl upgrade --name state-hook-smoke --image agent-python --no-backup
+agentctl exec --name state-hook-smoke sh -lc '
+cat /home/coder/.codex/auth.json
+cat /home/coder/.config/agentctl/preferred-runtime
+test ! -e /home/coder/.claude/.credentials.json && echo claude-dir-missing
+test ! -e /home/coder/.claude.json && echo claude-home-missing
+'
+
+# Phase 2: After Claude is installed, Claude state should survive too.
+agentctl refresh --name state-hook-smoke
+agentctl runtime install --name state-hook-smoke claude
+agentctl exec --name state-hook-smoke sh -lc '
+mkdir -p /home/coder/.codex /home/coder/.claude /home/coder/.config/agentctl
+printf "{\"refresh_token\":\"codex-token\"}\n" >/home/coder/.codex/auth.json
+printf "{\"claudeAiOauth\":{\"accessToken\":\"a\",\"refreshToken\":\"should-survive\",\"expiresAt\":1}}\n" >/home/coder/.claude/.credentials.json
+printf "{\"hasCompletedOnboarding\":true}\n" >/home/coder/.claude.json
+printf "codex\n" >/home/coder/.config/agentctl/preferred-runtime
+'
+
+agentctl upgrade --name state-hook-smoke --image agent-python --no-backup
+agentctl exec --name state-hook-smoke sh -lc '
+cat /home/coder/.codex/auth.json
+cat /home/coder/.config/agentctl/preferred-runtime
+jq -er ".claudeAiOauth.refreshToken == \"should-survive\"" /home/coder/.claude/.credentials.json >/dev/null && echo claude-dir-restored
+jq -er ".hasCompletedOnboarding == true" /home/coder/.claude.json >/dev/null && echo claude-home-restored
+'
+
+agentctl rm --force --name state-hook-smoke
+rm -rf "$tmp_root"
+```
+
+Expected output should include:
+
+- Phase 1:
+  - the Codex auth JSON payload
+  - `codex`
+  - `claude-dir-missing`
+  - `claude-home-missing`
+- Phase 2:
+  - the Codex auth JSON payload
+  - `codex`
+  - `claude-dir-restored`
+  - `claude-home-restored`
+
 ## Image management
 
 Verify image discovery and retention behavior using `agentctl images`.

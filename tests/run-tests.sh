@@ -161,7 +161,14 @@ test_upgrade_no_backup_preserves_state() {
   register_container_cleanup "$name"
   backup_base="$(printf '%s\n' "${name}-backup" | tr '[:upper:]' '[:lower:]')"
 
-  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && echo upgrade-ok >/home/coder/.codex/upgrade-smoke.txt'
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc '
+    mkdir -p /home/coder/.codex /home/coder/.claude /home/coder/.config/agentctl
+    echo upgrade-ok >/home/coder/.codex/upgrade-smoke.txt
+    printf "{\"refresh_token\":\"codex-token\"}\n" >/home/coder/.codex/auth.json
+    printf "codex\n" >/home/coder/.config/agentctl/preferred-runtime
+    printf "{\"claudeAiOauth\":{\"accessToken\":\"a\",\"refreshToken\":\"should-not-survive\",\"expiresAt\":1}}\n" >/home/coder/.claude/.credentials.json
+    printf "{\"hasCompletedOnboarding\":true}\n" >/home/coder/.claude.json
+  '
   assert_status 0
 
   run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
@@ -174,9 +181,17 @@ test_upgrade_no_backup_preserves_state() {
     fail "Backup images were created unexpectedly for $name"
   fi
 
-  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc 'cat /home/coder/.codex/upgrade-smoke.txt'
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc '
+    cat /home/coder/.codex/upgrade-smoke.txt
+    jq -er '"'"'.refresh_token == "codex-token"'"'"' /home/coder/.codex/auth.json >/dev/null
+    test "$(cat /home/coder/.config/agentctl/preferred-runtime)" = "codex"
+    test ! -e /home/coder/.claude/.credentials.json
+    test ! -e /home/coder/.claude.json
+    echo runtime-state-ok
+  '
   assert_status 0
   assert_contains "upgrade-ok"
+  assert_contains "runtime-state-ok"
 }
 
 test_upgrade_with_backup_creates_recovery_image() {

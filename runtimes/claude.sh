@@ -26,7 +26,9 @@ EOF
 }
 
 claude_home_owner() {
-  stat -c '%u:%g' "$HOME" 2>/dev/null || printf '%s\n' "coder:coder"
+  stat -c '%u:%g' "$HOME" 2>/dev/null \
+    || stat -f '%u:%g' "$HOME" 2>/dev/null \
+    || printf '%s\n' "coder:coder"
 }
 
 claude_fix_state_ownership() {
@@ -207,6 +209,14 @@ agent_runtime_reset_config() {
   fi
   claude_fix_state_ownership
   rm -f "$USER_RUNTIME_FILE"
+}
+
+agent_runtime_state_paths() {
+  local runtime="$1"
+
+  [ "$runtime" = "claude" ] || die "unsupported runtime adapter: $runtime"
+  [ -e "$CLAUDE_HOME_DIR" ] && printf '%s\n' ".claude"
+  [ -e "$CLAUDE_HOME_STATE_FILE" ] && printf '%s\n' ".claude.json"
 }
 
 agent_runtime_auth_read() {

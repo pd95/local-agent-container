@@ -268,6 +268,7 @@ reset_runtime_hooks() {
     agent_runtime_install \
     agent_runtime_update \
     agent_runtime_reset_config \
+    agent_runtime_state_paths \
     agent_runtime_auth_read \
     agent_runtime_auth_write \
     agent_runtime_auth_login \
@@ -507,21 +508,58 @@ json_system_manifest() {
     }'
 }
 
-state_export_paths() {
+state_unique_paths() {
+  awk 'NF && !seen[$0]++'
+}
+
+state_runtime_paths() {
+  local runtime="$1"
+
+  ensure_runtime_known "$runtime"
+  load_runtime_adapter "$runtime"
+  if declare -F agent_runtime_state_paths >/dev/null 2>&1; then
+    agent_runtime_state_paths "$runtime"
+  fi
+}
+
+state_legacy_paths() {
   local codex_home_dir="${HOME}/.codex"
   local claude_home_dir="${HOME}/.claude"
   local claude_home_state_file="${HOME}/.claude.json"
-  local -a paths=()
 
-  [ -e "$codex_home_dir" ] && paths+=(".codex")
-  [ -e "$USER_CONFIG_DIR" ] && paths+=(".config/agentctl")
-  [ -e "$claude_home_dir" ] && paths+=(".claude")
-  [ -e "$claude_home_state_file" ] && paths+=(".claude.json")
+  [ -e "$codex_home_dir" ] && printf '%s\n' ".codex"
+  [ -e "$claude_home_dir" ] && printf '%s\n' ".claude"
+  [ -e "$claude_home_state_file" ] && printf '%s\n' ".claude.json"
+}
 
-  if [ "${#paths[@]}" -eq 0 ]; then
-    return 0
+state_export_paths() {
+  local installed_runtimes=""
+
+  [ -e "$USER_CONFIG_DIR" ] && printf '%s\n' ".config/agentctl"
+  installed_runtimes="$(runtime_ids_installed)"
+  if [ -n "$installed_runtimes" ]; then
+    printf '%s\n' "$installed_runtimes" | while IFS= read -r runtime; do
+      [ -n "$runtime" ] || continue
+      state_runtime_paths "$runtime"
+    done
+  else
+    state_legacy_paths
   fi
-  printf '%s\n' "${paths[@]}"
+}
+
+state_import_paths() {
+  local installed_runtimes=""
+
+  printf '%s\n' ".config/agentctl"
+  installed_runtimes="$(runtime_ids_installed)"
+  if [ -n "$installed_runtimes" ]; then
+    printf '%s\n' "$installed_runtimes" | while IFS= read -r runtime; do
+      [ -n "$runtime" ] || continue
+      state_runtime_paths "$runtime"
+    done
+  else
+    printf '%s\n' ".codex" ".claude" ".claude.json"
+  fi
 }
 
 state_export() {
@@ -531,7 +569,7 @@ state_export() {
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     paths+=("$path")
-  done < <(state_export_paths)
+  done < <(state_export_paths | state_unique_paths)
 
   if [ "${#paths[@]}" -eq 0 ]; then
     return 0
@@ -541,10 +579,8 @@ state_export() {
 }
 
 state_import() {
-  local codex_home_dir="${HOME}/.codex"
-  local claude_home_dir="${HOME}/.claude"
-  local claude_home_state_file="${HOME}/.claude.json"
   local import_file=""
+  local path=""
 
   if [ -t 0 ]; then
     return 0
@@ -562,11 +598,10 @@ state_import() {
   fi
 
   mkdir -p "$HOME"
-  rm -rf \
-    "$codex_home_dir" \
-    "$USER_CONFIG_DIR" \
-    "$claude_home_dir" \
-    "$claude_home_state_file"
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    rm -rf "$HOME/$path"
+  done < <(state_import_paths | state_unique_paths)
   tar -C "$HOME" -xf "$import_file"
   rm -f "$import_file"
 }

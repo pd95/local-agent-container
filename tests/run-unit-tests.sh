@@ -1898,6 +1898,46 @@ test_agent_sh_state_export_includes_known_user_state() {
   tar -tf "$tar_file" | grep -Fx '.claude.json' >/dev/null || fail "Expected Claude home state in exported state"
 }
 
+test_agent_sh_state_export_uses_installed_runtime_hooks() {
+  begin_test "agent.sh state export uses installed runtime hooks instead of sweeping legacy runtime state"
+
+  local temp_home
+  local fake_bin
+  local tar_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  tar_file="$temp_home/state.tar"
+  fake_bin="$(make_fake_runtime_bin "$temp_home" codex)"
+
+  mkdir -p \
+    "$temp_home/home/.codex" \
+    "$temp_home/home/.claude" \
+    "$temp_home/home/.config/agentctl"
+  printf '%s' 'codex-auth' >"$temp_home/home/.codex/auth.json"
+  printf '%s' '{"claudeAiOauth":{"accessToken":"a","refreshToken":"b","expiresAt":1}}' >"$temp_home/home/.claude/.credentials.json"
+  printf '%s' '{"hasCompletedOnboarding":true}' >"$temp_home/home/.claude.json"
+  printf '%s' 'codex' >"$temp_home/home/.config/agentctl/preferred-runtime"
+
+  env -i \
+    "HOME=$temp_home/home" \
+    "XDG_CONFIG_HOME=$temp_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state export >"$tar_file"
+
+  tar -tf "$tar_file" | grep -Fx '.codex/auth.json' >/dev/null || fail "Expected installed Codex runtime state in exported state"
+  tar -tf "$tar_file" | grep -Fx '.config/agentctl/preferred-runtime' >/dev/null || fail "Expected generic agentctl state in exported state"
+  if tar -tf "$tar_file" | grep -Fqx '.claude/.credentials.json'; then
+    fail "Did not expect Claude legacy state to be exported when only Codex is installed"
+  fi
+  if tar -tf "$tar_file" | grep -Fqx '.claude.json'; then
+    fail "Did not expect Claude home state to be exported when only Codex is installed"
+  fi
+}
+
 test_agent_sh_state_import_restores_known_user_state() {
   begin_test "agent.sh state import restores codex, agentctl, and claude state"
 
@@ -1943,6 +1983,55 @@ test_agent_sh_state_import_restores_known_user_state() {
   [ "$(cat "$target_home/home/.config/agentctl/preferred-runtime")" = "claude" ] || fail "Expected preferred runtime to be restored"
   jq -er '.claudeAiOauth.refreshToken == "b"' "$target_home/home/.claude/.credentials.json" >/dev/null || fail "Expected Claude credentials to be restored"
   jq -er '.hasCompletedOnboarding == true' "$target_home/home/.claude.json" >/dev/null || fail "Expected Claude home state to be restored"
+}
+
+test_agent_sh_state_import_uses_installed_runtime_hooks() {
+  begin_test "agent.sh state import clears only installed runtime state plus generic agentctl state"
+
+  local source_home
+  local target_home
+  local fake_bin
+  local tar_file
+  source_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  target_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$source_home"
+  register_dir_cleanup "$target_home"
+  tar_file="$source_home/state.tar"
+  fake_bin="$(make_fake_runtime_bin "$target_home" codex)"
+
+  mkdir -p \
+    "$source_home/home/.codex" \
+    "$source_home/home/.config/agentctl"
+  printf '%s' 'codex-auth' >"$source_home/home/.codex/auth.json"
+  printf '%s' 'codex' >"$source_home/home/.config/agentctl/preferred-runtime"
+
+  env -i \
+    "HOME=$source_home/home" \
+    "XDG_CONFIG_HOME=$source_home/home/.config" \
+    "PATH=/usr/bin:/bin" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state export >"$tar_file"
+
+  mkdir -p "$target_home/home/.codex" "$target_home/home/.claude"
+  printf '%s' 'stale-codex' >"$target_home/home/.codex/auth.json"
+  printf '%s' '{"claudeAiOauth":{"accessToken":"stale","refreshToken":"keep","expiresAt":1}}' >"$target_home/home/.claude/.credentials.json"
+
+  env -i \
+    "HOME=$target_home/home" \
+    "XDG_CONFIG_HOME=$target_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state import <"$tar_file"
+
+  [ "$(cat "$target_home/home/.codex/auth.json")" = "codex-auth" ] || fail "Expected installed Codex runtime state to be restored"
+  [ "$(cat "$target_home/home/.config/agentctl/preferred-runtime")" = "codex" ] || fail "Expected generic agentctl state to be restored"
+  jq -er '.claudeAiOauth.refreshToken == "keep"' "$target_home/home/.claude/.credentials.json" >/dev/null || fail "Expected unrelated Claude legacy state to remain untouched when Claude is not installed"
 }
 
 test_agent_sh_state_import_with_empty_stdin_preserves_existing_state() {
@@ -4245,7 +4334,9 @@ main() {
   test_agent_sh_claude_auth_write_restores_credentials_and_home_state
   test_agent_sh_claude_auth_write_rejects_invalid_payload
   test_agent_sh_state_export_includes_known_user_state
+  test_agent_sh_state_export_uses_installed_runtime_hooks
   test_agent_sh_state_import_restores_known_user_state
+  test_agent_sh_state_import_uses_installed_runtime_hooks
   test_agent_sh_state_import_with_empty_stdin_preserves_existing_state
   test_container_auth_info_uses_agent_sh_auth_read
   test_write_auth_blob_to_container_uses_agent_sh_auth_write
