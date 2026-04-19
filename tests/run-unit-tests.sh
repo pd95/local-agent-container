@@ -1788,6 +1788,28 @@ test_agent_sh_state_import_restores_known_user_state() {
   jq -er '.hasCompletedOnboarding == true' "$target_home/home/.claude.json" >/dev/null || fail "Expected Claude home state to be restored"
 }
 
+test_agent_sh_state_import_with_empty_stdin_preserves_existing_state() {
+  begin_test "agent.sh state import with empty stdin preserves existing state"
+
+  local temp_home
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  mkdir -p "$temp_home/home/.codex"
+  printf '%s' 'keep-me' >"$temp_home/home/.codex/auth.json"
+
+  env -i \
+    "HOME=$temp_home/home" \
+    "XDG_CONFIG_HOME=$temp_home/home/.config" \
+    "PATH=/usr/bin:/bin" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state import </dev/null
+
+  [ "$(cat "$temp_home/home/.codex/auth.json")" = "keep-me" ] || fail "Expected existing state to survive empty state import"
+}
+
 test_container_auth_info_uses_agent_sh_auth_read() {
   begin_test "container_auth_info reads auth via agent.sh auth read"
 
@@ -1942,6 +1964,61 @@ test_write_auth_blob_to_container_falls_back_for_legacy_codex() {
   grep -Fq '/usr/local/bin/agent.sh auth write codex json_refresh_token' "$exec_log_file" || fail "Expected initial auth write attempt via agent.sh"
   grep -Fq 'mkdir -p /home/coder/.codex && cat > /home/coder/.codex/auth.json' "$exec_log_file" || fail "Expected legacy codex auth fallback write"
   grep -Fxq '{"refresh_token":"write-token"}' "$fallback_payload_file" || fail "Expected fallback payload to be written"
+}
+
+test_write_auth_blob_to_container_does_not_fallback_on_non_legacy_error() {
+  begin_test "write_auth_blob_to_container does not fall back on non-legacy auth write errors"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local exec_log_file
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-write.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  exec_log_file="$temp_dir/exec.log"
+
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      start|stop)
+        ;;
+      exec)
+        shift
+        if [ "$1" = "-i" ]; then
+          shift
+        fi
+        if [ "$1" = "-u" ]; then
+          shift 2
+        fi
+        if [ "$1" = "unit-test-container" ]; then
+          shift
+        fi
+        if [ "${1:-}" = "setpriv" ]; then
+          shift 6
+        fi
+        printf '%s\n' "$*" >>"$exec_log_file"
+        if [[ "$*" == "bash /usr/local/bin/agent.sh auth write codex json_refresh_token" ]]; then
+          printf '%s\n' "invalid auth payload for codex" >&2
+          cat >/dev/null
+          return 1
+        fi
+        if [[ "$*" == "sh -lc mkdir -p /home/coder/.codex && cat > /home/coder/.codex/auth.json && chown -R coder:coder /home/coder/.codex" ]]; then
+          fail "Legacy fallback should not run for non-legacy auth write errors"
+        fi
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture write_auth_blob_to_container unit-test-container '{"refresh_token":"write-token"}' codex json_refresh_token
+  assert_status 1
+  assert_contains "invalid auth payload for codex"
+  assert_not_contains "Using legacy Codex auth refresh fallback"
 }
 
 test_sync_runtime_auth_to_container_uses_runtime_parameters() {
@@ -4010,9 +4087,11 @@ main() {
   test_agent_sh_claude_auth_write_rejects_invalid_payload
   test_agent_sh_state_export_includes_known_user_state
   test_agent_sh_state_import_restores_known_user_state
+  test_agent_sh_state_import_with_empty_stdin_preserves_existing_state
   test_container_auth_info_uses_agent_sh_auth_read
   test_write_auth_blob_to_container_uses_agent_sh_auth_write
   test_write_auth_blob_to_container_falls_back_for_legacy_codex
+  test_write_auth_blob_to_container_does_not_fallback_on_non_legacy_error
   test_sync_runtime_auth_to_container_uses_runtime_parameters
   test_sync_runtime_auth_from_container_uses_runtime_parameters
   test_auth_info_from_json_parses_claude_oauth_payload

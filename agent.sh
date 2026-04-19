@@ -552,6 +552,22 @@ state_export() {
 state_import() {
   local claude_home_dir="${HOME}/.claude"
   local claude_home_state_file="${HOME}/.claude.json"
+  local import_file=""
+
+  if [ -t 0 ]; then
+    return 0
+  fi
+
+  import_file="$(mktemp)"
+  cat >"$import_file"
+  if [ ! -s "$import_file" ]; then
+    rm -f "$import_file"
+    return 0
+  fi
+  if ! tar -tf "$import_file" >/dev/null 2>&1; then
+    rm -f "$import_file"
+    die "invalid state import archive"
+  fi
 
   mkdir -p "$HOME"
   rm -rf \
@@ -559,10 +575,8 @@ state_import() {
     "$USER_CONFIG_DIR" \
     "$claude_home_dir" \
     "$claude_home_state_file"
-  if [ -t 0 ]; then
-    return 0
-  fi
-  tar -C "$HOME" -xf -
+  tar -C "$HOME" -xf "$import_file"
+  rm -f "$import_file"
 }
 
 auth_read() {

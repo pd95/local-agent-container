@@ -1971,7 +1971,7 @@ write_auth_blob_to_container() {
   stderr_file="$(mktemp)"
   if printf '%s' "$payload" | "$CONTAINER_CMD" exec -i "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh auth write "$runtime" "$auth_format" 2>"$stderr_file"; then
     status=0
-  elif legacy_write_auth_blob_to_container "$name" "$payload" "$runtime" "$auth_format"; then
+  elif stderr_indicates_legacy_auth_write_fallback "$stderr_file" "$runtime" "$auth_format" && legacy_write_auth_blob_to_container "$name" "$payload" "$runtime" "$auth_format"; then
     warn "Using legacy Codex auth refresh fallback for $name. Run: ${CLI_NAME} refresh --name $name"
     status=0
   else
@@ -1985,6 +1985,33 @@ write_auth_blob_to_container() {
   fi
 
   return "$status"
+}
+
+stderr_indicates_legacy_auth_write_fallback() {
+  local stderr_file="$1"
+  local runtime="${2:-$DEFAULT_RUNTIME}"
+  local auth_format="$3"
+
+  [ -f "$stderr_file" ] || return 1
+
+  case "$runtime:$auth_format" in
+    codex:json_refresh_token)
+      if grep -Fq "can't create directory '/home/coder/.config/agentctl': Permission denied" "$stderr_file"; then
+        return 0
+      fi
+      if grep -Fq 'unknown auth command:' "$stderr_file"; then
+        return 0
+      fi
+      if grep -Fq 'unknown command: auth' "$stderr_file"; then
+        return 0
+      fi
+      if grep -Fq '/usr/local/bin/agent.sh: No such file or directory' "$stderr_file"; then
+        return 0
+      fi
+      ;;
+  esac
+
+  return 1
 }
 
 legacy_write_auth_blob_to_container() {
