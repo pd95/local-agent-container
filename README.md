@@ -130,8 +130,8 @@ agentctl run --runtime codex --online
 # Start a shell instead of the runtime
 agentctl run --shell
 
-# Install and launch Claude in the current container
-agentctl run --runtime claude --install-runtime
+# Create a new container and auto-install Claude on first launch
+agentctl run --runtime claude
 
 # Override the launch model for the selected runtime
 agentctl run --runtime claude --model qwen3:14b

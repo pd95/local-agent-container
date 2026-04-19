@@ -24,7 +24,13 @@ agentctl runtime install codex
 agentctl runtime install claude
 ```
 
-You can also install and launch in one step:
+`agentctl run` auto-installs an explicitly selected runtime when it creates a new container:
+
+```bash
+agentctl run --runtime claude
+```
+
+For an existing container, use `--install-runtime` to install before launch:
 
 ```bash
 agentctl run --runtime claude --install-runtime

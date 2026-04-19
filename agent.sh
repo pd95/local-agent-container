@@ -52,6 +52,15 @@ has_explicit_runtime_model() {
 
 ensure_user_config_dir() {
   mkdir -p "$USER_CONFIG_DIR"
+  if [ "$(id -u)" -eq 0 ]; then
+    chown "$(home_owner)" "$USER_CONFIG_DIR"
+  fi
+}
+
+home_owner() {
+  stat -c '%u:%g' "$HOME" 2>/dev/null \
+    || stat -f '%u:%g' "$HOME" 2>/dev/null \
+    || printf '%s\n' "coder:coder"
 }
 
 runtime_manifest_path() {
@@ -673,6 +682,9 @@ preferred_set() {
   ensure_runtime_installed "$runtime"
   ensure_user_config_dir
   printf '%s\n' "$runtime" >"$USER_RUNTIME_FILE"
+  if [ "$(id -u)" -eq 0 ]; then
+    chown "$(home_owner)" "$USER_RUNTIME_FILE"
+  fi
 }
 
 runtime_list() {

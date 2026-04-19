@@ -252,8 +252,8 @@ test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden() {
   [ "$build_calls" -eq 1 ] || fail "Expected one build call when overriding the runtime selection, got: $build_calls"
 }
 
-test_run_cmd_runtime_selection_prepares_runtime_before_launch() {
-  begin_test "run_cmd can select and install a runtime before launch"
+test_run_cmd_runtime_selection_auto_installs_for_new_container() {
+  begin_test "run_cmd auto-installs a selected runtime for a new container"
 
   load_codexctl_functions
 
@@ -270,14 +270,43 @@ test_run_cmd_runtime_selection_prepares_runtime_before_launch() {
     captured_mem="$6"
   }
 
-  run_cmd --name unit-test-container --workdir "$workdir" --runtime claude --install-runtime --shell
+  container_exists() { return 1; }
+
+  run_cmd --name unit-test-container --workdir "$workdir" --runtime claude --shell
 
   [ "$captured_pre_exec" = "run_pre_exec" ] || fail "Expected run_pre_exec, got: $captured_pre_exec"
   [ "$RUN_SELECTED_RUNTIME" = "claude" ] || fail "Expected runtime claude, got: $RUN_SELECTED_RUNTIME"
-  [ "$RUN_INSTALL_RUNTIME" -eq 1 ] || fail "Expected install-runtime to be enabled"
+  [ "$RUN_INSTALL_RUNTIME" -eq 1 ] || fail "Expected runtime auto-install to be enabled"
   [ "$RUN_SYNC_RUNTIME_AUTH" -eq 0 ] || fail "Did not expect online auth sync for local Claude shell launch"
   [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 0 ] || fail "Did not expect local-model preflight for Claude shell launch"
   [ "$captured_mem" = "4G" ] || fail "Expected Claude bootstrap run to request 4G, got: $captured_mem"
+}
+
+test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container() {
+  begin_test "run_cmd does not auto-install a selected runtime for an existing container"
+
+  load_codexctl_functions
+
+  local captured_pre_exec=""
+  local captured_mem=""
+  local workdir
+
+  workdir="$(new_workdir)"
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  run_container() {
+    captured_pre_exec="$9"
+    captured_mem="$6"
+  }
+
+  run_cmd --name unit-test-container --workdir "$workdir" --runtime claude --shell
+
+  [ "$captured_pre_exec" = "run_pre_exec" ] || fail "Expected run_pre_exec, got: $captured_pre_exec"
+  [ "$RUN_SELECTED_RUNTIME" = "claude" ] || fail "Expected runtime claude, got: $RUN_SELECTED_RUNTIME"
+  [ "$RUN_INSTALL_RUNTIME" -eq 0 ] || fail "Did not expect runtime auto-install for an existing container"
+  [ -z "$captured_mem" ] || fail "Did not expect Claude auto-install memory override for an existing container, got: $captured_mem"
 }
 
 test_run_cmd_warns_for_legacy_office_image() {
@@ -1720,6 +1749,46 @@ test_agent_sh_preferred_round_trip() {
     -- preferred get
   assert_status 0
   assert_contains "codex"
+}
+
+test_agent_sh_preferred_set_as_root_repairs_ownership() {
+  begin_test "agent.sh preferred set as root hands config ownership back to the container user"
+
+  local temp_home
+  local fake_bin
+  local ownership_log
+  local expected_owner
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  ownership_log="$temp_home/ownership.log"
+  mkdir -p "$fake_bin" "$temp_home/home"
+  expected_owner="$(stat -c '%u:%g' "$temp_home/home" 2>/dev/null || stat -f '%u:%g' "$temp_home/home")"
+  make_fake_runtime_bin "$temp_home" codex >/dev/null
+
+  cat >"$fake_bin/id" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-u" ]; then
+  printf '%s\n' 0
+  exit 0
+fi
+exec /usr/bin/id "$@"
+EOF
+  chmod +x "$fake_bin/id"
+
+  cat >"$fake_bin/chown" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >>"$ownership_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/chown"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    -- preferred set codex
+  assert_status 0
+  grep -Fq "$expected_owner $temp_home/config/agentctl" "$ownership_log" || fail "Expected preferred set to repair config directory ownership"
+  grep -Fq "$expected_owner $temp_home/config/agentctl/preferred-runtime" "$ownership_log" || fail "Expected preferred set to repair preferred-runtime ownership"
 }
 
 test_agent_sh_preferred_set_rejects_uninstalled_runtime() {
@@ -4396,7 +4465,8 @@ main() {
   test_build_cmd_uses_first_runtime_as_default_when_unspecified
   test_build_cmd_default_runtime_alone_installs_only_that_runtime
   test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden
-  test_run_cmd_runtime_selection_prepares_runtime_before_launch
+  test_run_cmd_runtime_selection_auto_installs_for_new_container
+  test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container
   test_build_cmd_warns_for_legacy_office_image
   test_build_cmd_rejects_runtime_override_snapshot_combo
   test_build_cmd_rejects_default_runtime_outside_runtime_list
@@ -4451,6 +4521,7 @@ main() {
   test_agent_sh_claude_run_uses_runtime_flag_config
   test_agent_sh_rejects_unknown_runtime
   test_agent_sh_preferred_round_trip
+  test_agent_sh_preferred_set_as_root_repairs_ownership
   test_agent_sh_preferred_set_rejects_uninstalled_runtime
   test_agent_sh_auth_read_rejects_invalid_codex_auth
   test_agent_sh_auth_write_rejects_invalid_codex_auth

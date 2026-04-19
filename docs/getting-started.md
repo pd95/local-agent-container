@@ -115,10 +115,10 @@ agentctl run --runtime codex --online
 # Start a shell instead of the runtime
 agentctl run --shell
 
-# Install and launch Claude in the current container
-agentctl run --runtime claude --install-runtime
+# Create a new container and auto-install Claude on first launch
+agentctl run --runtime claude
 
-# Install Codex explicitly in the current container
+# Install Codex explicitly in an existing container
 agentctl run --runtime codex --install-runtime
 
 # Start with a different curated image

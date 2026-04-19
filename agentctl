@@ -566,7 +566,7 @@ Options:
   --image NAME    Image to use (default: agent-plain)
   --workdir PATH  Host directory to mount at /workdir (default: cwd)
   --runtime NAME  Preferred runtime to launch in the container (e.g. codex, claude)
-  --install-runtime  Install the selected runtime before launch
+  --install-runtime  Install the selected runtime before launch (default for new containers)
   -c, --config KEY=VALUE  Pass runtime-specific launch config (repeatable)
   --model NAME    Override the launch model for the selected runtime
   --online        Use the runtime's online/provider-backed mode
@@ -4104,6 +4104,7 @@ run_cmd() {
   local image=""
   local runtime=""
   local install_runtime=0
+  local auto_install_runtime=0
   local online=0
   local auth=0
   local update=0
@@ -4177,6 +4178,12 @@ run_cmd() {
   warn_legacy_compat_image_usage "$image"
   if [ -z "$name" ] && [ "$temp" -eq 0 ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
+  fi
+  if [ -n "$runtime" ] && { [ "$temp" -eq 1 ] || [ -z "$name" ] || ! container_exists "$name"; }; then
+    auto_install_runtime=1
+  fi
+  if [ "$auto_install_runtime" -eq 1 ]; then
+    install_runtime=1
   fi
   if [ "$install_runtime" -eq 1 ] && [ "$runtime" = "claude" ] && [ -z "$mem" ] && { [ "$temp" -eq 1 ] || [ -z "$name" ] || ! container_exists "$name"; }; then
     mem="$CLAUDE_MIN_INSTALL_MEM"
