@@ -5,8 +5,6 @@ readonly IMAGE_NAME="${IMAGE_NAME:-agent-plain}"
 readonly DEFAULT_RUNTIME_FILE="/etc/agentctl/preferred-runtime"
 readonly USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agentctl"
 readonly USER_RUNTIME_FILE="${USER_CONFIG_DIR}/preferred-runtime"
-readonly CODEX_HOME_DIR="${HOME}/.codex"
-readonly CODEX_AUTH_FILE="${CODEX_HOME_DIR}/auth.json"
 readonly RUNTIME_CONFIG_JSON="${AGENTCTL_RUNTIME_CONFIG_JSON-}"
 readonly MODEL_OVERRIDE="${AGENTCTL_MODEL_OVERRIDE:-}"
 readonly RUN_MODE="${AGENTCTL_RUN_MODE:-local}"
@@ -52,16 +50,8 @@ has_explicit_runtime_model() {
   return 1
 }
 
-ensure_user_dirs() {
-  mkdir -p "$USER_CONFIG_DIR" "$CODEX_HOME_DIR"
-}
-
 ensure_user_config_dir() {
   mkdir -p "$USER_CONFIG_DIR"
-}
-
-ensure_codex_home_dir() {
-  mkdir -p "$CODEX_HOME_DIR"
 }
 
 runtime_manifest_path() {
@@ -518,11 +508,12 @@ json_system_manifest() {
 }
 
 state_export_paths() {
+  local codex_home_dir="${HOME}/.codex"
   local claude_home_dir="${HOME}/.claude"
   local claude_home_state_file="${HOME}/.claude.json"
   local -a paths=()
 
-  [ -e "$CODEX_HOME_DIR" ] && paths+=(".codex")
+  [ -e "$codex_home_dir" ] && paths+=(".codex")
   [ -e "$USER_CONFIG_DIR" ] && paths+=(".config/agentctl")
   [ -e "$claude_home_dir" ] && paths+=(".claude")
   [ -e "$claude_home_state_file" ] && paths+=(".claude.json")
@@ -550,6 +541,7 @@ state_export() {
 }
 
 state_import() {
+  local codex_home_dir="${HOME}/.codex"
   local claude_home_dir="${HOME}/.claude"
   local claude_home_state_file="${HOME}/.claude.json"
   local import_file=""
@@ -571,7 +563,7 @@ state_import() {
 
   mkdir -p "$HOME"
   rm -rf \
-    "$CODEX_HOME_DIR" \
+    "$codex_home_dir" \
     "$USER_CONFIG_DIR" \
     "$claude_home_dir" \
     "$claude_home_state_file"
