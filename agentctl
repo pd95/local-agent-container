@@ -1633,27 +1633,46 @@ run_auth_flow() {
 backup_codex_config() {
   local name="$1"
   local backup_file="$2"
-  if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -d /home/coder/.codex; then
+  if container_supports_state_contract "$name"; then
+    "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh state export >"$backup_file"
     return 0
   fi
-  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc 'cd /home/coder && tar -cf - .codex' >"$backup_file"
+  backup_known_state_from_container "$name" "$backup_file"
+}
+
+extract_export_root() {
+  local export_file="$1"
+  local extract_root="$2"
+  local marker_file="$extract_root/.agentctl-export-extracted"
+
+  mkdir -p "$extract_root"
+  if [ -f "$marker_file" ]; then
+    return 0
+  fi
+  tar -xf "$export_file" -C "$extract_root"
+  : >"$marker_file"
 }
 
 backup_codex_config_from_export() {
   local export_file="$1"
   local backup_file="$2"
   local extract_root="$3"
-  local codex_dir=""
   local home_dir=""
+  local -a state_paths=()
+  local path=""
 
-  mkdir -p "$extract_root"
-  tar -xf "$export_file" -C "$extract_root"
-  codex_dir="$(find "$extract_root" -type d -path '*/home/coder/.codex' | head -n 1)"
-  if [ -z "$codex_dir" ]; then
-    return 0
-  fi
-  home_dir="$(dirname "$codex_dir")"
-  tar -C "$home_dir" -cf "$backup_file" .codex
+  extract_export_root "$export_file" "$extract_root"
+  home_dir="$extract_root/home/coder"
+  [ -d "$home_dir" ] || return 0
+
+  for path in .codex .config/agentctl .claude .claude.json; do
+    if [ -e "$home_dir/$path" ]; then
+      state_paths+=("$path")
+    fi
+  done
+  [ "${#state_paths[@]}" -gt 0 ] || return 0
+
+  tar -C "$home_dir" -cf "$backup_file" "${state_paths[@]}"
 }
 
 restore_codex_config() {
@@ -1661,12 +1680,88 @@ restore_codex_config() {
   local backup_file="$2"
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'mkdir -p /home/coder && chown coder:coder /home/coder'
   if [ ! -s "$backup_file" ]; then
-    "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'mkdir -p /home/coder/.codex && chown -R coder:coder /home/coder/.codex'
+    "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'mkdir -p /home/coder/.codex /home/coder/.config/agentctl && chown -R coder:coder /home/coder'
     return 0
   fi
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'rm -rf /home/coder/.codex && mkdir -p /home/coder'
-  "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc 'cd /home/coder && tar -xf -' <"$backup_file"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'chown -R coder:coder /home/coder/.codex'
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
+mkdir -p /home/coder
+rm -rf \
+  /home/coder/.codex \
+  /home/coder/.config/agentctl \
+  /home/coder/.claude \
+  /home/coder/.claude.json
+'
+  if target_supports_state_contract "$name"; then
+    "$CONTAINER_CMD" exec -i "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh state import <"$backup_file"
+  else
+    "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc 'cd /home/coder && tar -xf -' <"$backup_file"
+  fi
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'chown -R coder:coder /home/coder >/dev/null 2>&1 || true'
+}
+
+backup_known_state_from_container() {
+  local name="$1"
+  local backup_file="$2"
+  local path_list=""
+
+  path_list="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc '
+for path in .codex .config/agentctl .claude .claude.json; do
+  if [ -e "/home/coder/$path" ]; then
+    printf "%s\n" "$path"
+  fi
+done
+' 2>/dev/null || true)"
+  [ -n "$path_list" ] || return 0
+
+  "$CONTAINER_CMD" exec -i "$name" "${SETPRIV_ARGS[@]}" sh -lc '
+cd /home/coder || exit 1
+paths_file="$(mktemp)"
+cat >"$paths_file"
+if [ ! -s "$paths_file" ]; then
+  rm -f "$paths_file"
+  exit 0
+fi
+tar -cf - -T "$paths_file"
+rm -f "$paths_file"
+' >"$backup_file" <<<"$path_list"
+}
+
+container_supports_state_contract() {
+  local name="$1"
+  local was_running=0
+  local started_for_check=0
+
+  if container_running "$name"; then
+    was_running=1
+  else
+    "$CONTAINER_CMD" start "$name" >/dev/null || return 1
+    started_for_check=1
+  fi
+
+  if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh help 2>/dev/null | grep -Fq 'agent.sh state export'; then
+    if [ "$started_for_check" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+      "$CONTAINER_CMD" stop "$name" >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+  if [ "$started_for_check" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+    "$CONTAINER_CMD" stop "$name" >/dev/null 2>&1 || true
+  fi
+  return 1
+}
+
+export_root_supports_state_contract() {
+  local extract_root="$1"
+  local agent_script="$extract_root/usr/local/bin/agent.sh"
+
+  [ -f "$agent_script" ] || return 1
+  grep -Fq 'agent.sh state export' "$agent_script"
+}
+
+target_supports_state_contract() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh help 2>/dev/null | grep -Fq 'agent.sh state import'
 }
 
 codex_agents_state() {
@@ -1855,6 +1950,8 @@ write_auth_blob_to_container() {
   local auth_format="$4"
   local was_running=0
   local started_for_command=0
+  local status=0
+  local stderr_file=""
 
   if ! container_exists "$name"; then
     die "Container not found: $name"
@@ -1867,11 +1964,39 @@ write_auth_blob_to_container() {
     started_for_command=1
   fi
 
-  printf '%s' "$payload" | "$CONTAINER_CMD" exec -i "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh auth write "$runtime" "$auth_format"
+  stderr_file="$(mktemp)"
+  if printf '%s' "$payload" | "$CONTAINER_CMD" exec -i "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh auth write "$runtime" "$auth_format" 2>"$stderr_file"; then
+    status=0
+  elif legacy_write_auth_blob_to_container "$name" "$payload" "$runtime" "$auth_format"; then
+    warn "Using legacy Codex auth refresh fallback for $name. Run: ${CLI_NAME} refresh --name $name"
+    status=0
+  else
+    cat "$stderr_file" >&2
+    status=1
+  fi
+  rm -f "$stderr_file"
 
   if [ "$started_for_command" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     "$CONTAINER_CMD" stop "$name" >/dev/null
   fi
+
+  return "$status"
+}
+
+legacy_write_auth_blob_to_container() {
+  local name="$1"
+  local payload="$2"
+  local runtime="${3:-$DEFAULT_RUNTIME}"
+  local auth_format="$4"
+
+  case "$runtime:$auth_format" in
+    codex:json_refresh_token)
+      "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc 'mkdir -p /home/coder/.codex && cat > /home/coder/.codex/auth.json && chown -R coder:coder /home/coder/.codex' <<<"$payload"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 container_auth_info() {
@@ -2913,16 +3038,16 @@ print_upgrade_dry_run_summary() {
 
   case "$backup_mode" in
     export)
-      config_label="export existing container filesystem and recover /home/coder/.codex from it"
+      config_label="export existing container filesystem and recover user state from it"
       ;;
     start)
-      config_label="start the stopped source container, back up /home/coder/.codex, then stop it again"
+      config_label="start the stopped source container, back up user state, then stop it again"
       ;;
     running)
-      config_label="back up /home/coder/.codex from the running source container"
+      config_label="back up user state from the running source container"
       ;;
     *)
-      config_label="back up /home/coder/.codex"
+      config_label="back up user state"
       ;;
   esac
 
@@ -3775,6 +3900,7 @@ upgrade_cmd() {
   local started_for_backup=0
   local used_export_for_config_backup=0
   local backup_mode=""
+  local source_supports_state_contract=""
   local inspect_info=""
 
   while [ $# -gt 0 ]; do
@@ -3852,11 +3978,19 @@ upgrade_cmd() {
     backup_mode="export"
   else
     warn_upgrade_package_loss "$name" "$current_image" "$image"
+    if container_supports_state_contract "$name"; then
+      source_supports_state_contract=1
+    else
+      source_supports_state_contract=0
+    fi
     if [ "$was_running" -eq 0 ]; then
       backup_mode="start"
     else
       backup_mode="running"
     fi
+  fi
+  if [ "$no_backup" -eq 1 ] && [ "${source_supports_state_contract:-}" = "0" ]; then
+    die "Legacy source containers require a backup image for upgrade safety. Re-run without --no-backup."
   fi
   if [ "$no_backup" -eq 0 ] && [ -z "$backup_image" ]; then
     backup_image="$(sanitize_image_name "${target_name}-backup-$(date -u +%Y%m%d%H%M%S)")"
@@ -3870,13 +4004,13 @@ upgrade_cmd() {
   fi
 
   local backup_dir
-  local config_backup_file
+  local state_backup_file
   local export_file
   local backup_root
   local backup_dockerfile
   local export_config_root
   backup_dir="$(mktemp -d)"
-  config_backup_file="$backup_dir/codex-config.tar"
+  state_backup_file="$backup_dir/container-state.tar"
   export_file="$backup_dir/codex-export.tar"
   backup_root="$backup_dir/rootfs"
   backup_dockerfile="$backup_dir/Dockerfile.backup"
@@ -3884,12 +4018,21 @@ upgrade_cmd() {
   trap 'cleanup_temp_dir "$backup_dir"' RETURN
 
   if [ "$was_running" -eq 0 ] && [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; then
-    echo "Exporting container state for config backup: $name" >&2
+    echo "Exporting container filesystem for state backup: $name" >&2
     "$CONTAINER_CMD" export "$name" --output "$export_file"
-    backup_codex_config_from_export "$export_file" "$config_backup_file" "$export_config_root"
+    extract_export_root "$export_file" "$export_config_root"
+    if export_root_supports_state_contract "$export_config_root"; then
+      source_supports_state_contract=1
+    else
+      source_supports_state_contract=0
+    fi
+    if [ "$no_backup" -eq 1 ] && [ "$source_supports_state_contract" -eq 0 ]; then
+      die "Legacy source containers require a backup image for upgrade safety. Re-run without --no-backup."
+    fi
+    backup_codex_config_from_export "$export_file" "$state_backup_file" "$export_config_root"
     used_export_for_config_backup=1
   elif [ "$was_running" -eq 0 ]; then
-    echo "Starting container for config backup: $name" >&2
+    echo "Starting container for state backup: $name" >&2
     "$CONTAINER_CMD" start "$name" >/dev/null
     started_for_backup=1
   fi
@@ -3925,10 +4068,10 @@ upgrade_cmd() {
   esac
 
   if [ "$used_export_for_config_backup" -eq 1 ]; then
-    echo "Backing up /home/coder/.codex from exported state: $name" >&2
+    echo "Backing up user state from exported filesystem: $name" >&2
   else
-    echo "Backing up /home/coder/.codex from $name" >&2
-    backup_codex_config "$name" "$config_backup_file"
+    echo "Backing up user state from $name" >&2
+    backup_codex_config "$name" "$state_backup_file"
   fi
 
   if [ "$was_running" -eq 1 ] || [ "$started_for_backup" -eq 1 ]; then
@@ -3974,8 +4117,8 @@ upgrade_cmd() {
   "$CONTAINER_CMD" start "$target_name" >/dev/null
   persist_container_system_manifest_baseline_from_image "$target_name" "$image"
 
-  echo "Restoring /home/coder/.codex into $target_name" >&2
-  restore_codex_config "$target_name" "$config_backup_file"
+  echo "Restoring user state into $target_name" >&2
+  restore_codex_config "$target_name" "$state_backup_file"
   if [ "$overwrite_config" -eq 1 ]; then
     echo "Overwriting config.toml, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $target_name" >&2
     reset_runtime_config_in_container "$target_name" codex

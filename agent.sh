@@ -7,7 +7,7 @@ readonly USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agentctl"
 readonly USER_RUNTIME_FILE="${USER_CONFIG_DIR}/preferred-runtime"
 readonly CODEX_HOME_DIR="${HOME}/.codex"
 readonly CODEX_AUTH_FILE="${CODEX_HOME_DIR}/auth.json"
-readonly RUNTIME_CONFIG_JSON="${AGENTCTL_RUNTIME_CONFIG_JSON:-{}}"
+readonly RUNTIME_CONFIG_JSON="${AGENTCTL_RUNTIME_CONFIG_JSON-}"
 readonly MODEL_OVERRIDE="${AGENTCTL_MODEL_OVERRIDE:-}"
 readonly RUN_MODE="${AGENTCTL_RUN_MODE:-local}"
 readonly RUNTIME_REGISTRY_DIR="${AGENTCTL_RUNTIME_REGISTRY_DIR:-/etc/agentctl/runtimes.d}"
@@ -54,6 +54,14 @@ has_explicit_runtime_model() {
 
 ensure_user_dirs() {
   mkdir -p "$USER_CONFIG_DIR" "$CODEX_HOME_DIR"
+}
+
+ensure_user_config_dir() {
+  mkdir -p "$USER_CONFIG_DIR"
+}
+
+ensure_codex_home_dir() {
+  mkdir -p "$CODEX_HOME_DIR"
 }
 
 runtime_manifest_path() {
@@ -325,7 +333,13 @@ run_runtime() {
 }
 
 runtime_config_json() {
-  printf '%s' "$RUNTIME_CONFIG_JSON" | jq -c '
+  local config_json="$RUNTIME_CONFIG_JSON"
+
+  if [ -z "$config_json" ]; then
+    config_json='{}'
+  fi
+
+  printf '%s' "$config_json" | jq -c '
     if type == "object" then
       with_entries(.value |= if . == null then "" else tostring end)
     else
@@ -480,6 +494,54 @@ json_system_manifest() {
     }'
 }
 
+state_export_paths() {
+  local claude_home_dir="${HOME}/.claude"
+  local claude_home_state_file="${HOME}/.claude.json"
+  local -a paths=()
+
+  [ -e "$CODEX_HOME_DIR" ] && paths+=(".codex")
+  [ -e "$USER_CONFIG_DIR" ] && paths+=(".config/agentctl")
+  [ -e "$claude_home_dir" ] && paths+=(".claude")
+  [ -e "$claude_home_state_file" ] && paths+=(".claude.json")
+
+  if [ "${#paths[@]}" -eq 0 ]; then
+    return 0
+  fi
+  printf '%s\n' "${paths[@]}"
+}
+
+state_export() {
+  local -a paths=()
+  local path=""
+
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    paths+=("$path")
+  done < <(state_export_paths)
+
+  if [ "${#paths[@]}" -eq 0 ]; then
+    return 0
+  fi
+
+  tar -C "$HOME" -cf - "${paths[@]}"
+}
+
+state_import() {
+  local claude_home_dir="${HOME}/.claude"
+  local claude_home_state_file="${HOME}/.claude.json"
+
+  mkdir -p "$HOME"
+  rm -rf \
+    "$CODEX_HOME_DIR" \
+    "$USER_CONFIG_DIR" \
+    "$claude_home_dir" \
+    "$claude_home_state_file"
+  if [ -t 0 ]; then
+    return 0
+  fi
+  tar -C "$HOME" -xf -
+}
+
 auth_read() {
   local runtime="$1" key="$2"
   ensure_runtime_known "$runtime"
@@ -545,7 +607,7 @@ preferred_get() {
 preferred_set() {
   local runtime="${1:-}"
   ensure_runtime_installed "$runtime"
-  ensure_user_dirs
+  ensure_user_config_dir
   printf '%s\n' "$runtime" >"$USER_RUNTIME_FILE"
 }
 
@@ -575,7 +637,6 @@ runtime_reset_config() {
 }
 
 refresh_agent() {
-  ensure_user_dirs
   jq -n \
     --arg preferred "$(runtime_preferred)" \
     --argjson runtimes "$(runtime_ids | jq -R . | jq -s .)" \
@@ -604,6 +665,8 @@ Usage:
   agent.sh auth login codex
   agent.sh auth read codex json_refresh_token
   agent.sh auth write codex json_refresh_token [VALUE]
+  agent.sh state export
+  agent.sh state import
   agent.sh system manifest
 EOF
 }
@@ -698,6 +761,19 @@ main() {
           ;;
         *)
           die "unknown auth command: ${1:-}"
+          ;;
+      esac
+      ;;
+    state)
+      case "${1:-}" in
+        export)
+          state_export
+          ;;
+        import)
+          state_import
+          ;;
+        *)
+          die "unknown state command: ${1:-}"
           ;;
       esac
       ;;

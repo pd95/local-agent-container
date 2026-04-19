@@ -105,6 +105,18 @@ New containers and upgrades persist that baseline snapshot at
 `/etc/agentctl/system-manifest.json` so later upgrades can still compare
 against it even if the original image is no longer present locally.
 
+Modern upgrades now preserve broader user state, not just `~/.codex`. The
+state transfer path includes:
+
+- `~/.codex`
+- `~/.config/agentctl`
+- `~/.claude`
+- `~/.claude.json`
+
+For older source containers that do not support the modern `agent.sh state`
+contract, `upgrade --no-backup` is rejected. In that case keep the backup image
+enabled so the original container filesystem can be recovered if needed.
+
 ## Snapshots and rebuilds
 
 - `--snapshot`: add a new timestamp tag without rebuilding

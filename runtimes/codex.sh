@@ -121,7 +121,7 @@ agent_runtime_auth_write() {
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   [ "$key" = "json_refresh_token" ] || die "unsupported auth format: $key"
-  ensure_user_dirs
+  ensure_codex_home_dir
   if [ -z "$value" ] && [ ! -t 0 ]; then
     value="$(cat)"
   fi
