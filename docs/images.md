@@ -84,6 +84,13 @@ the same time:
 agentctl upgrade --name my-project --image agent-python --workdir /new/path/to/project
 ```
 
+If you also want the recreated container to follow the new project name, you
+can rename it during the same upgrade:
+
+```bash
+agentctl upgrade --name my-project --new-name my-project-renamed --workdir /new/path/to/project
+```
+
 Before recreating the container, `upgrade` warns about extra OS packages that
 were added after the container's stored baseline snapshot and are not present
 in the target image, because those packages are not preserved automatically.

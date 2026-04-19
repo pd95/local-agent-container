@@ -2463,6 +2463,89 @@ test_upgrade_uses_explicit_resource_overrides() {
   [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
 }
 
+test_upgrade_can_rename_container_during_recreation() {
+  begin_test "upgrade can recreate the container under a new name"
+
+  load_codexctl_functions
+
+  local create_args=""
+  local start_log=""
+  local stop_log=""
+  local rm_log=""
+  local persisted_baseline_name=""
+  local restored_name=""
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  require_container_backup_support() { return 0; }
+  warn_upgrade_package_loss() { :; }
+  container_exists() {
+    case "$1" in
+      unit-test-container) return 0 ;;
+      renamed-container) return 1 ;;
+      *) return 1 ;;
+    esac
+  }
+  container_running() { return 1; }
+  image_exists() { return 0; }
+  codex_agents_state() { printf 'missing\n'; }
+  backup_codex_config() { :; }
+  restore_codex_config() { restored_name="$1"; }
+  persist_container_system_manifest_baseline_from_image() { persisted_baseline_name="$1"; }
+  sanitize_image_name() { printf '%s\n' "$1"; }
+  build_backup_image_from_export() { :; }
+  date() { printf '20260406120000\n'; }
+  trap() { :; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect)
+        printf 'placeholder\n'
+        ;;
+      create)
+        shift
+        create_args="$(printf '%s\n' "$*")"
+        ;;
+      start)
+        start_log="${start_log}${2}"$'\n'
+        ;;
+      stop)
+        stop_log="${stop_log}${2}"$'\n'
+        ;;
+      rm)
+        rm_log="${rm_log}${2}"$'\n'
+        ;;
+      export)
+        fail "export should not be called for --no-backup"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  container_upgrade_info() {
+    printf 'codex\t%s\trw\t2\t4G\n' "$TEST_ROOT"
+  }
+
+  run_capture upgrade_cmd --name unit-test-container --new-name renamed-container --no-backup
+  assert_status 0
+  assert_contains "Removing container: unit-test-container"
+  assert_contains "Recreating container: renamed-container"
+  assert_contains "Starting container: renamed-container"
+  assert_contains "Restoring /home/coder/.codex into renamed-container"
+  assert_contains "Upgrade complete: renamed-container (backup skipped)"
+  assert_contains "run --name renamed-container --reset-config"
+  printf '%s\n' "$create_args" | grep -F -- "--name renamed-container" >/dev/null || fail "Expected create args to include renamed container, got: $create_args"
+  printf '%s\n' "$rm_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected removal of source container, got: $rm_log"
+  printf '%s\n' "$start_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected source container to start for backup, got: $start_log"
+  printf '%s\n' "$start_log" | grep -Fx -- "renamed-container" >/dev/null || fail "Expected renamed container to start after recreation, got: $start_log"
+  printf '%s\n' "$stop_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected source container to stop after backup, got: $stop_log"
+  printf '%s\n' "$stop_log" | grep -Fx -- "renamed-container" >/dev/null || fail "Expected renamed container to stop after recreation, got: $stop_log"
+  [ "$persisted_baseline_name" = "renamed-container" ] || fail "Expected baseline persistence on renamed container, got: $persisted_baseline_name"
+  [ "$restored_name" = "renamed-container" ] || fail "Expected config restore on renamed container, got: $restored_name"
+}
+
 test_upgrade_warns_about_added_packages_missing_from_target_image() {
   begin_test "upgrade warns only for extra packages absent from the target image"
 
@@ -3177,6 +3260,7 @@ main() {
   test_upgrade_backup_support_check
   test_run_rejects_resource_flags_for_existing_container
   test_upgrade_uses_explicit_resource_overrides
+  test_upgrade_can_rename_container_during_recreation
   test_upgrade_warns_about_added_packages_missing_from_target_image
   test_upgrade_uses_stored_baseline_when_current_image_is_missing
   test_upgrade_accepts_workdir_override_when_original_mount_is_missing

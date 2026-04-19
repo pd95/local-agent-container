@@ -641,11 +641,12 @@ Usage: $CLI_NAME upgrade [options]
 
 Options:
   --name NAME         Container name (default: agent-<dir>)
+  --new-name NAME     New container name after recreation (default: preserve existing name)
   --image NAME        Image to use for recreation (default: existing container image)
   --workdir PATH      Host directory to mount at /workdir after recreation (default: preserve existing mount source)
   --cpu NUM           CPU cores for recreated container (default: preserve existing setting)
   --mem SIZE          Memory limit for recreated container (default: preserve existing setting)
-  --backup-image NAME Backup image name for container export (default: <name>-backup-<timestamp>)
+  --backup-image NAME Backup image name for container export (default: <new-name-or-name>-backup-<timestamp>)
   --no-backup         Skip container export backup image creation
   --overwrite-config  Replace ~/.codex/config.toml and local_models.json from the upgraded image and recreate ~/.codex/AGENTS.md as a symlink
 
@@ -3602,6 +3603,8 @@ auth_cmd() {
 
 upgrade_cmd() {
   local name=""
+  local new_name=""
+  local target_name=""
   local image=""
   local workdir_override=""
   local cpu=""
@@ -3624,6 +3627,7 @@ upgrade_cmd() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
+      --new-name) new_name="$2"; shift 2 ;;
       --image) image="$2"; shift 2 ;;
       --workdir) workdir_override="$2"; shift 2 ;;
       --cpu) cpu="$2"; shift 2 ;;
@@ -3641,6 +3645,11 @@ upgrade_cmd() {
   if [ -z "$name" ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX")"
   fi
+  if [ -n "$new_name" ]; then
+    target_name="$new_name"
+  else
+    target_name="$name"
+  fi
   if [ "$no_backup" -eq 1 ] && [ -n "$backup_image" ]; then
     die "Cannot combine --no-backup with --backup-image"
   fi
@@ -3649,6 +3658,9 @@ upgrade_cmd() {
   fi
   if ! container_exists "$name"; then
     die "Container not found: $name"
+  fi
+  if [ "$target_name" != "$name" ] && container_exists "$target_name"; then
+    die "Target container name already exists: $target_name"
   fi
 
   inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
@@ -3687,7 +3699,7 @@ upgrade_cmd() {
     warn_upgrade_package_loss "$name" "$current_image" "$image"
   fi
   if [ "$no_backup" -eq 0 ] && [ -z "$backup_image" ]; then
-    backup_image="$(sanitize_image_name "${name}-backup-$(date -u +%Y%m%d%H%M%S)")"
+    backup_image="$(sanitize_image_name "${target_name}-backup-$(date -u +%Y%m%d%H%M%S)")"
   fi
 
   local backup_dir
@@ -3772,7 +3784,7 @@ upgrade_cmd() {
   echo "Removing container: $name" >&2
   "$CONTAINER_CMD" rm "$name" >/dev/null
 
-  echo "Recreating container: $name" >&2
+  echo "Recreating container: $target_name" >&2
   local create_cmd=("$CONTAINER_CMD" create -t)
   if [ -n "$cpu" ]; then
     create_cmd+=(-c "$cpu")
@@ -3785,35 +3797,35 @@ upgrade_cmd() {
     mount_opts="${mount_opts},readonly"
   fi
   create_cmd+=(
-    --name "$name"
+    --name "$target_name"
     --mount "$mount_opts"
     "$image" sh -c 'sleep infinity'
   )
   "${create_cmd[@]}"
 
-  echo "Starting container: $name" >&2
-  "$CONTAINER_CMD" start "$name" >/dev/null
-  persist_container_system_manifest_baseline_from_image "$name" "$image"
+  echo "Starting container: $target_name" >&2
+  "$CONTAINER_CMD" start "$target_name" >/dev/null
+  persist_container_system_manifest_baseline_from_image "$target_name" "$image"
 
-  echo "Restoring /home/coder/.codex into $name" >&2
-  restore_codex_config "$name" "$config_backup_file"
+  echo "Restoring /home/coder/.codex into $target_name" >&2
+  restore_codex_config "$target_name" "$config_backup_file"
   if [ "$overwrite_config" -eq 1 ]; then
-    echo "Overwriting config.toml, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $name" >&2
-    reset_runtime_config_in_container "$name" codex
+    echo "Overwriting config.toml, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $target_name" >&2
+    reset_runtime_config_in_container "$target_name" codex
   fi
 
   if [ "$was_running" -eq 0 ]; then
-    echo "Stopping container: $name" >&2
-    "$CONTAINER_CMD" stop "$name" >/dev/null
+    echo "Stopping container: $target_name" >&2
+    "$CONTAINER_CMD" stop "$target_name" >/dev/null
   fi
 
   if [ "$no_backup" -eq 0 ]; then
-    echo "Upgrade complete: $name (backup image: $backup_image)" >&2
+    echo "Upgrade complete: $target_name (backup image: $backup_image)" >&2
   else
-    echo "Upgrade complete: $name (backup skipped)" >&2
+    echo "Upgrade complete: $target_name (backup skipped)" >&2
   fi
   echo >&2
-  echo "If no valid AGENTS.md configuration already exists, reset it with: ${CLI_NAME} run --name $name --reset-config" >&2
+  echo "If no valid AGENTS.md configuration already exists, reset it with: ${CLI_NAME} run --name $target_name --reset-config" >&2
   if [ "$no_backup" -eq 0 ]; then
     echo "If everything works as expected, remove the backup image with: ${CLI_NAME} images prune --backup --image $backup_image --keep 0" >&2
   fi
