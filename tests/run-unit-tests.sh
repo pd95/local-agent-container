@@ -3256,6 +3256,66 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   printf '%s\n' "$stop_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected source container stop after backup, got: $stop_log"
 }
 
+test_upgrade_warns_and_clears_missing_preferred_runtime() {
+  begin_test "upgrade warns and clears a preferred runtime that is unavailable in the target"
+
+  load_codexctl_functions
+
+  local cleared_name=""
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  warn_upgrade_package_loss() { :; }
+  upgrade_added_runtimes_json() { printf '[]\n'; }
+  upgrade_added_features_json() { printf '[]\n'; }
+  container_preferred_runtime() { printf 'claude\n'; }
+  target_default_runtime_for_upgrade() { printf 'codex\n'; }
+  container_supports_state_contract() { return 0; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 1; }
+  image_exists() { return 0; }
+  codex_agents_state() { printf 'missing\n'; }
+  backup_codex_config() { :; }
+  restore_codex_config() { :; }
+  clear_preferred_runtime_override_in_container() { cleared_name="$1"; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  sanitize_image_name() { printf '%s\n' "$1"; }
+  build_backup_image_from_export() { :; }
+  run_agent_sh_in_container() {
+    if [ "$2" = "runtime" ] && [ "$3" = "info" ] && [ "$4" = "claude" ]; then
+      printf '{"runtime":"claude","installed":false,"capabilities":{"install":false}}\n'
+      return 0
+    fi
+    fail "Unexpected run_agent_sh_in_container call: $*"
+  }
+  trap() { :; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect)
+        printf 'placeholder\n'
+        ;;
+      create|start|stop|rm)
+        ;;
+      export)
+        fail "export should not be called for --no-backup"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  container_upgrade_info() {
+    printf 'agent-plain\t%s\trw\t2\t4G\n' "$TEST_ROOT"
+  }
+
+  run_capture upgrade_cmd --name unit-test-container --image agent-python --no-backup
+  assert_status 0
+  assert_contains "Warning: Preferred runtime claude is not available after upgrade; cleared the user override so unit-test-container will use codex"
+  [ "$cleared_name" = "unit-test-container" ] || fail "Expected preferred runtime override clear on target container, got: $cleared_name"
+}
+
 test_upgrade_uses_stored_baseline_when_current_image_is_missing() {
   begin_test "upgrade uses the stored baseline manifest when the current image is unavailable"
 
@@ -3976,6 +4036,7 @@ main() {
   test_upgrade_copy_dry_run_reports_copy_plan
   test_upgrade_warns_about_added_packages_missing_from_target_image
   test_upgrade_reinstalls_added_runtimes_and_features_in_target
+  test_upgrade_warns_and_clears_missing_preferred_runtime
   test_upgrade_uses_stored_baseline_when_current_image_is_missing
   test_upgrade_accepts_workdir_override_when_original_mount_is_missing
   test_upgrade_allows_no_backup_for_modern_export_source

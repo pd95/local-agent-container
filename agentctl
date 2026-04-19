@@ -3002,6 +3002,58 @@ target_feature_installable() {
   printf '%s' "$feature_info" | jq -e '(.capabilities.install // false) == true' >/dev/null 2>&1
 }
 
+container_preferred_runtime() {
+  local name="$1"
+  local manifest=""
+
+  manifest="$(container_system_manifest_json "$name")" || return 1
+  manifest_preferred_runtime "$manifest"
+}
+
+target_default_runtime_for_upgrade() {
+  local target_image="$1"
+  local target_manifest=""
+
+  target_manifest="$(image_system_manifest_json "$target_image" target-preferred)" || return 1
+  manifest_default_runtime "$target_manifest"
+}
+
+target_runtime_installed() {
+  local name="$1"
+  local runtime="$2"
+  local runtime_info=""
+
+  runtime_info="$(run_agent_sh_in_container "$name" runtime info "$runtime" 2>/dev/null)" || return 1
+  printf '%s' "$runtime_info" | jq -e '.installed == true' >/dev/null 2>&1
+}
+
+clear_preferred_runtime_override_in_container() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
+rm -f /home/coder/.config/agentctl/preferred-runtime
+chown -R coder:coder /home/coder/.config/agentctl >/dev/null 2>&1 || true
+'
+}
+
+warn_if_preferred_runtime_lost() {
+  local name="$1"
+  local preferred_runtime="$2"
+  local target_default_runtime="${3:-}"
+
+  [ -n "$preferred_runtime" ] || return 0
+  if target_runtime_installed "$name" "$preferred_runtime"; then
+    return 0
+  fi
+
+  clear_preferred_runtime_override_in_container "$name"
+  if [ -n "$target_default_runtime" ] && [ "$target_default_runtime" != "$preferred_runtime" ]; then
+    warn "Preferred runtime $preferred_runtime is not available after upgrade; cleared the user override so $name will use $target_default_runtime"
+  else
+    warn "Preferred runtime $preferred_runtime is not available after upgrade; cleared the user override so $name can fall back to its image default"
+  fi
+}
+
 reinstall_added_runtimes_and_features() {
   local name="$1"
   local added_runtimes_json="${2:-[]}"
@@ -4049,6 +4101,8 @@ upgrade_cmd() {
   local source_supports_state_contract=""
   local added_runtimes_json='[]'
   local added_features_json='[]'
+  local current_preferred_runtime=""
+  local target_default_runtime=""
   local inspect_info=""
 
   while [ $# -gt 0 ]; do
@@ -4138,6 +4192,8 @@ upgrade_cmd() {
     warn_upgrade_package_loss "$name" "$current_image" "$image"
     added_runtimes_json="$(upgrade_added_runtimes_json "$name" "$current_image" "$image" 2>/dev/null || printf '[]\n')"
     added_features_json="$(upgrade_added_features_json "$name" "$current_image" "$image" 2>/dev/null || printf '[]\n')"
+    current_preferred_runtime="$(container_preferred_runtime "$name" 2>/dev/null || true)"
+    target_default_runtime="$(target_default_runtime_for_upgrade "$image" 2>/dev/null || true)"
     if container_supports_state_contract "$name"; then
       source_supports_state_contract=1
     else
@@ -4284,6 +4340,7 @@ upgrade_cmd() {
 
   echo "Restoring user state into $target_name" >&2
   restore_codex_config "$target_name" "$state_backup_file"
+  warn_if_preferred_runtime_lost "$target_name" "$current_preferred_runtime" "$target_default_runtime"
   if [ "$overwrite_config" -eq 1 ]; then
     echo "Overwriting config.toml, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $target_name" >&2
     reset_runtime_config_in_container "$target_name" codex

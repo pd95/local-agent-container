@@ -130,6 +130,10 @@ When an upgrade detects runtimes or features that were added after the source
 image baseline and are still installable in the target image, it reinstalls
 them automatically before restoring user state.
 
+If the current preferred runtime is not available after the upgrade, `agentctl`
+warns and drops the stale user override so the recreated container falls back to
+the target image default runtime instead of keeping a broken preference.
+
 ## Snapshots and rebuilds
 
 - `--snapshot`: add a new timestamp tag without rebuilding
