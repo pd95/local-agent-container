@@ -383,6 +383,63 @@ runtime_config_enabled() {
   esac
 }
 
+ollama_detect_gateway() {
+  local route_file="${AGENTCTL_OLLAMA_ROUTE_FILE:-${AGENTCTL_CLAUDE_ROUTE_FILE:-/proc/net/route}}"
+
+  awk '
+    function hex2dec(hex,   i, c, n, v) {
+      n = 0
+      hex = toupper(hex)
+      for (i = 1; i <= length(hex); i++) {
+        c = substr(hex, i, 1)
+        v = index("0123456789ABCDEF", c) - 1
+        if (v < 0) {
+          exit 1
+        }
+        n = (n * 16) + v
+      }
+      return n
+    }
+    $2 == "00000000" && length($3) == 8 {
+      printf "%s.%s.%s.%s\n",
+        hex2dec(substr($3, 7, 2)),
+        hex2dec(substr($3, 5, 2)),
+        hex2dec(substr($3, 3, 2)),
+        hex2dec(substr($3, 1, 2))
+      exit
+    }
+  ' "$route_file" 2>/dev/null || true
+}
+
+ollama_resolve_base_url() {
+  local gateway=""
+  local api_url=""
+
+  command -v curl >/dev/null 2>&1 || die "Missing curl required for local Ollama connectivity checks"
+  gateway="$(ollama_detect_gateway)"
+  [ -n "$gateway" ] || die "Unable to determine the container host gateway for local Ollama"
+  api_url="http://${gateway}:11434/api/version"
+  if curl -fsS --max-time 3 "$api_url" >/dev/null 2>&1; then
+    printf 'http://%s:11434\n' "$gateway"
+    return 0
+  fi
+
+  die "Local Ollama is not reachable from the container.
+
+Tried:
+- Detected host gateway: $api_url
+
+Expose or proxy Ollama onto the container network.
+See README.md 'Local model connectivity'.
+
+Host-side fixes:
+- Start a second Ollama listener:
+  OLLAMA_HOST=${gateway} ollama serve
+
+- Proxy localhost with socat (needs \`brew install socat\`):
+  socat TCP-LISTEN:11434,fork,bind=${gateway} TCP:127.0.0.1:11434"
+}
+
 json_runtime_info() {
   local runtime="$1"
   local installed_json preferred_json commands_json capabilities_json launch_configs_json

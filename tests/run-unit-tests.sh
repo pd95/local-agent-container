@@ -1600,6 +1600,11 @@ printf 'ARGS=%s\n' "\$*" >>"$run_log"
 exit 0
 EOF
   chmod +x "$fake_bin/claude"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/curl"
 
   cat >"$temp_home/proc-net-route" <<'EOF'
 Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
@@ -1636,6 +1641,11 @@ printf 'ARGS=%s\n' "\$*" >"$run_log"
 exit 0
 EOF
   chmod +x "$fake_bin/claude"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/curl"
 
   cat >"$temp_home/proc-net-route" <<'EOF'
 Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
@@ -1669,6 +1679,11 @@ printf 'ARGS=%s\n' "\$*" >"$run_log"
 exit 0
 EOF
   chmod +x "$fake_bin/claude"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/curl"
 
   cat >"$temp_home/proc-net-route" <<'EOF'
 Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
@@ -1703,6 +1718,11 @@ printf 'ARGS=%s\n' "\$*" >"$run_log"
 exit 0
 EOF
   chmod +x "$fake_bin/claude"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/curl"
 
   cat >"$temp_home/proc-net-route" <<'EOF'
 Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
