@@ -1444,7 +1444,6 @@ test_agent_sh_claude_runtime_reset_config_restores_settings() {
   expected_owner="$(id -u):$(id -g)"
   mkdir -p "$fake_bin"
   mkdir -p "$temp_home/home/.claude"
-  printf '%s' '{"env":{"USE_BUILTIN_RIPGREP":"1"}}' >"$temp_home/home/.claude/settings.json"
   printf '%s' '{"hasCompletedOnboarding":true}' >"$temp_home/home/.claude.json"
 
   cat >"$fake_bin/id" <<'EOF'
@@ -1464,13 +1463,83 @@ exit 0
 EOF
   chmod +x "$fake_bin/chown"
 
+  cat >"$temp_home/home/.claude/settings.json" <<'EOF'
+{
+  "env": {
+    "USE_BUILTIN_RIPGREP": "1"
+  },
+  "mcpServers": {
+    "custom": {
+      "command": "custom-mcp"
+    }
+  }
+}
+EOF
+
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     -- runtime reset-config claude
   assert_status 0
+  assert_contains "Warning: resetting Claude configuration will replace ~/.claude/settings.json"
+  assert_contains "MCP servers"
+  assert_contains "Existing Claude MCP configuration that reset-config will replace:"
+  assert_contains '"command": "custom-mcp"'
   grep -Fq "chown -R $expected_owner $temp_home/home/.claude" "$install_log" || fail "Expected reset-config to hand .claude ownership back to the container user"
   grep -Fq "chown $expected_owner $temp_home/home/.claude.json" "$install_log" || fail "Expected reset-config to hand .claude.json ownership back to the container user"
   jq -er '.env.USE_BUILTIN_RIPGREP == "0"' "$temp_home/home/.claude/settings.json" >/dev/null || fail "Expected Claude settings reset to default ripgrep behavior"
+}
+
+test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration() {
+  begin_test "agent.sh codex runtime reset-config warns about lost configuration"
+
+  local temp_home
+  local fake_bin
+  local registry_dir
+  local config_dir
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  registry_dir="$temp_home/runtimes.d"
+  config_dir="$temp_home/default-codex"
+  mkdir -p "$fake_bin" "$registry_dir" "$config_dir" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  jq --arg config_dir "$config_dir" '.default_config_dir = $config_dir' \
+    "$TEST_ROOT/runtimes.d/codex.json" >"$registry_dir/codex.json"
+
+  cat >"$config_dir/config.toml" <<'EOF'
+[profiles.gpt-oss]
+model = "gpt-oss:20b"
+EOF
+  printf '{"models":[]}\n' >"$config_dir/local_models.json"
+  printf '# image defaults\n' >"$config_dir/image.md"
+
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[mcp_servers.custom]
+command = "custom-mcp"
+EOF
+  printf '{"models":[{"slug":"custom"}]}\n' >"$temp_home/home/.codex/local_models.json"
+  printf '# custom agents\n' >"$temp_home/home/.codex/AGENTS.md"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$registry_dir" \
+    -- runtime reset-config codex
+  assert_status 0
+  assert_contains "Warning: resetting Codex configuration will replace ~/.codex/config.toml"
+  assert_contains "custom profiles, MCP servers, providers, local model metadata, and runtime preference"
+  assert_contains "Existing Codex MCP configuration that reset-config will replace:"
+  assert_contains "[mcp_servers.custom]"
+  assert_contains 'command = "custom-mcp"'
+  grep -Fq 'model = "gpt-oss:20b"' "$temp_home/home/.codex/config.toml" || fail "Expected Codex config.toml to reset to image defaults"
+  jq -er '.models == []' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected Codex local_models.json to reset to image defaults"
+  [ -L "$temp_home/home/.codex/AGENTS.md" ] || fail "Expected Codex AGENTS.md to reset to a symlink"
+  [ "$(readlink "$temp_home/home/.codex/AGENTS.md")" = "$config_dir/image.md" ] || fail "Expected Codex AGENTS.md to point at image defaults"
 }
 
 test_agent_sh_codex_run_defaults_to_workdir_cd() {
@@ -5277,6 +5346,7 @@ main() {
   test_agent_sh_claude_runtime_install_runs_native_installer
   test_agent_sh_claude_runtime_update_calls_claude_update
   test_agent_sh_claude_runtime_reset_config_restores_settings
+  test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration
   test_agent_sh_codex_run_defaults_to_workdir_cd
   test_agent_sh_codex_run_uses_runtime_profile_config
   test_agent_sh_accepts_explicit_empty_runtime_config_json

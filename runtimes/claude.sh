@@ -25,6 +25,16 @@ claude_write_default_settings() {
 EOF
 }
 
+claude_warn_mcp_config_reset() {
+  local mcp_config=""
+
+  [ -f "$CLAUDE_SETTINGS_FILE" ] || return 0
+  mcp_config="$(jq '.mcpServers? // empty' "$CLAUDE_SETTINGS_FILE" 2>/dev/null || true)"
+  if [ -n "$mcp_config" ]; then
+    printf 'Existing Claude MCP configuration that reset-config will replace:\n%s\n' "$mcp_config" >&2
+  fi
+}
+
 claude_home_owner() {
   stat -c '%u:%g' "$HOME" 2>/dev/null \
     || stat -f '%u:%g' "$HOME" 2>/dev/null \
@@ -174,6 +184,8 @@ agent_runtime_reset_config() {
 
   [ "$runtime" = "claude" ] || die "unsupported runtime adapter: $runtime"
   mkdir -p "$CLAUDE_HOME_DIR"
+  printf 'Warning: resetting Claude configuration will replace ~/.claude/settings.json and may remove MCP servers, permissions, hooks, env settings, and runtime preference.\n' >&2
+  claude_warn_mcp_config_reset
   if [ -n "$config_dir" ] && [ -f "$config_dir/settings.json" ]; then
     cp "$config_dir/settings.json" "$CLAUDE_SETTINGS_FILE"
   else

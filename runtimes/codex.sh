@@ -33,6 +33,32 @@ codex_ensure_config_file() {
   die "missing Codex config: $config_file"
 }
 
+codex_warn_mcp_config_reset() {
+  local config_file="$1"
+  local mcp_config=""
+
+  [ -f "$config_file" ] || return 0
+  mcp_config="$(awk '
+    function is_header(line) {
+      return line ~ /^\[[^]]+\][[:space:]]*$/
+    }
+    function is_mcp_header(line) {
+      return line ~ /^\[mcp_servers\.[^]]+\][[:space:]]*$/
+    }
+    {
+      if (is_header($0)) {
+        in_mcp = is_mcp_header($0)
+      }
+      if (in_mcp) {
+        print
+      }
+    }
+  ' "$config_file")"
+  if [ -n "$mcp_config" ]; then
+    printf 'Existing Codex MCP configuration that reset-config will replace:\n%s\n' "$mcp_config" >&2
+  fi
+}
+
 codex_has_explicit_profile() {
   local arg=""
   for arg in "$@"; do
@@ -523,6 +549,8 @@ agent_runtime_reset_config() {
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   codex_dir="$(codex_home_dir)"
   codex_ensure_home_dir
+  printf 'Warning: resetting Codex configuration will replace ~/.codex/config.toml, ~/.codex/local_models.json, ~/.codex/AGENTS.md, and may remove custom profiles, MCP servers, providers, local model metadata, and runtime preference.\n' >&2
+  codex_warn_mcp_config_reset "$codex_dir/config.toml"
   cp "$config_dir/config.toml" "$codex_dir/config.toml"
   if [ -f "$config_dir/local_models.json" ]; then
     cp "$config_dir/local_models.json" "$codex_dir/local_models.json"
