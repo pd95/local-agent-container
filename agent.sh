@@ -44,7 +44,7 @@ has_explicit_runtime_model() {
   local arg
   for arg in "$@"; do
     case "$arg" in
-      -m|--model|--model=*) return 0 ;;
+      -m|-m=*|--model|--model=*) return 0 ;;
     esac
   done
   return 1
@@ -414,13 +414,14 @@ ollama_detect_gateway() {
 ollama_resolve_base_url() {
   local gateway=""
   local api_url=""
+  local ollama_port="11434"
 
   command -v curl >/dev/null 2>&1 || die "Missing curl required for local Ollama connectivity checks"
   gateway="$(ollama_detect_gateway)"
   [ -n "$gateway" ] || die "Unable to determine the container host gateway for local Ollama"
-  api_url="http://${gateway}:11434/api/version"
+  api_url="http://${gateway}:${ollama_port}/api/version"
   if curl -fsS --max-time 3 "$api_url" >/dev/null 2>&1; then
-    printf 'http://%s:11434\n' "$gateway"
+    printf 'http://%s:%s\n' "$gateway" "$ollama_port"
     return 0
   fi
 
@@ -437,7 +438,7 @@ Host-side fixes:
   OLLAMA_HOST=${gateway} ollama serve
 
 - Proxy localhost with socat (needs \`brew install socat\`):
-  socat TCP-LISTEN:11434,fork,bind=${gateway} TCP:127.0.0.1:11434"
+  socat TCP-LISTEN:${ollama_port},fork,bind=${gateway} TCP:127.0.0.1:${ollama_port}"
 }
 
 json_runtime_info() {

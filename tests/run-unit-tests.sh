@@ -1259,6 +1259,10 @@ test_agent_sh_runtime_list_reports_installed_runtimes_only() {
 
   local temp_home
   local fake_bin
+  local config_mtime_before
+  local catalog_mtime_before
+  local config_mtime_after
+  local catalog_mtime_after
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$(make_fake_runtime_bin "$temp_home" codex)"
@@ -1582,6 +1586,40 @@ EOF
   grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to keep --cd /workdir"
 }
 
+test_agent_sh_codex_online_run_skips_catalog_update() {
+  begin_test "agent.sh codex online run skips local catalog update"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+base_url = "http://old-host:11434/v1"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_RUN_MODE=online \
+    -- run
+  assert_status 0
+  [ ! -e "$temp_home/home/.codex/local_models.json" ] || fail "Did not expect online run to create local model catalog"
+  grep -Fq 'base_url = "http://old-host:11434/v1"' "$temp_home/home/.codex/config.toml" || fail "Did not expect online run to update Codex local provider URL"
+}
+
 test_agent_sh_codex_local_run_updates_config_and_catalog() {
   begin_test "agent.sh codex local run updates Ollama config and model catalog"
 
@@ -1679,6 +1717,69 @@ EOF
   grep -Fq -- '--profile gpt-oss --cd /workdir' "$run_log" || fail "Expected codex run to launch after local metadata update"
 }
 
+test_agent_sh_codex_local_run_with_explicit_profile_updates_catalog() {
+  begin_test "agent.sh codex local run with explicit profile updates catalog"
+
+  local temp_home
+  local fake_bin
+  local request_log
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  request_log="$temp_home/request.json"
+  run_log="$temp_home/codex-run.log"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$fake_bin/curl" <<EOF
+#!/bin/sh
+case "\$*" in
+  *'/api/version'*) printf '{"version":"0.0.0"}\n'; exit 0 ;;
+  *'/api/show'*)
+    cat >"$request_log"
+    cat <<'JSON'
+{"system":"","capabilities":[],"details":{"format":"safetensors"},"model_info":{"llama.context_length":4096},"parameters":""}
+JSON
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "default:model"
+
+[profiles.gemma]
+model_provider = "myollama"
+model = "gemma:model"
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run --profile gemma
+  assert_status 0
+  jq -er '.model == "gemma:model"' "$request_log" >/dev/null || fail "Expected explicit profile model to be queried"
+  jq -er '.models[0].slug == "gemma:model"' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected catalog to use explicit profile model"
+  grep -Fq -- '--profile gemma' "$run_log" || fail "Expected explicit profile to be preserved in Codex launch args"
+  grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected Codex launch args to keep --cd /workdir"
+}
+
 test_agent_sh_codex_local_run_updates_stale_catalog_entry() {
   begin_test "agent.sh codex local run updates stale catalog metadata"
 
@@ -1766,6 +1867,389 @@ EOF
     .models[0].input_modalities == ["text"] and
     .models[0].supports_reasoning_summaries == false
   ' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected stale catalog entry to be updated without dropping unknown fields"
+}
+
+test_agent_sh_codex_local_run_reports_unchanged_catalog_entry() {
+  begin_test "agent.sh codex local run reports unchanged catalog metadata"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/version'*) printf '{"version":"0.0.0"}\n'; exit 0 ;;
+  *'/api/show'*)
+    cat >/dev/null
+    cat <<'JSON'
+{"system":"","capabilities":[],"details":{"format":"safetensors"},"model_info":{"llama.context_length":4096},"parameters":""}
+JSON
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+base_url = "http://192.168.0.1:11434/v1"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+
+  jq -n '{
+    models: [
+      {
+        slug: "gpt-oss:20b",
+        display_name: "gpt-oss:20b",
+        context_window: 4096,
+        apply_patch_tool_type: "function",
+        shell_type: "default",
+        visibility: "list",
+        supported_in_api: true,
+        priority: 0,
+        truncation_policy: {mode: "bytes", limit: 10000},
+        input_modalities: ["text"],
+        base_instructions: "",
+        support_verbosity: true,
+        default_verbosity: "low",
+        supports_parallel_tool_calls: false,
+        supports_reasoning_summaries: false,
+        supported_reasoning_levels: [],
+        experimental_supported_tools: []
+      }
+    ]
+	  }' >"$temp_home/home/.codex/local_models.json"
+  config_mtime_before="$(stat -c %Y "$temp_home/home/.codex/config.toml")"
+  catalog_mtime_before="$(stat -c %Y "$temp_home/home/.codex/local_models.json")"
+  sleep 1
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  assert_contains "model metadata unchanged: gpt-oss:20b"
+  config_mtime_after="$(stat -c %Y "$temp_home/home/.codex/config.toml")"
+  catalog_mtime_after="$(stat -c %Y "$temp_home/home/.codex/local_models.json")"
+  [ "$config_mtime_after" = "$config_mtime_before" ] || fail "Expected unchanged Codex config timestamp to be preserved"
+  [ "$catalog_mtime_after" = "$catalog_mtime_before" ] || fail "Expected unchanged Codex model catalog timestamp to be preserved"
+}
+
+test_agent_sh_codex_local_run_uses_model_override_for_catalog() {
+  begin_test "agent.sh codex local run uses model override for catalog metadata"
+
+  local temp_home
+  local fake_bin
+  local request_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  request_log="$temp_home/request.json"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$fake_bin/curl" <<EOF
+#!/bin/sh
+case "\$*" in
+  *'/api/version'*) printf '{"version":"0.0.0"}\n'; exit 0 ;;
+  *'/api/show'*)
+    cat >"$request_log"
+    cat <<'JSON'
+{"system":"","capabilities":[],"details":{"format":"safetensors"},"model_info":{"llama.context_length":4096},"parameters":""}
+JSON
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "profile:model"
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    AGENTCTL_MODEL_OVERRIDE="override:model" \
+    -- run
+  assert_status 0
+  jq -er '.model == "override:model"' "$request_log" >/dev/null || fail "Expected /api/show to use model override"
+  jq -er '.models[0].slug == "override:model"' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected catalog slug to use model override"
+}
+
+test_agent_sh_codex_local_run_uses_explicit_model_arg_for_catalog() {
+  begin_test "agent.sh codex local run uses explicit model arg for catalog metadata"
+
+  local temp_home
+  local fake_bin
+  local request_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  request_log="$temp_home/request.json"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$fake_bin/curl" <<EOF
+#!/bin/sh
+case "\$*" in
+  *'/api/version'*) printf '{"version":"0.0.0"}\n'; exit 0 ;;
+  *'/api/show'*)
+    cat >"$request_log"
+    cat <<'JSON'
+{"system":"","capabilities":[],"details":{"format":"safetensors"},"model_info":{"llama.context_length":4096},"parameters":""}
+JSON
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "profile:model"
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    AGENTCTL_MODEL_OVERRIDE="override:model" \
+    -- run -m=explicit:model
+  assert_status 0
+  jq -er '.model == "explicit:model"' "$request_log" >/dev/null || fail "Expected /api/show to use explicit model argument"
+  jq -er '.models[0].slug == "explicit:model"' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected catalog slug to use explicit model argument"
+}
+
+test_agent_sh_codex_local_run_creates_missing_catalog() {
+  begin_test "agent.sh codex local run creates missing model catalog"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/version'*) printf '{"version":"0.0.0"}\n'; exit 0 ;;
+  *'/api/show'*)
+    cat >/dev/null
+    printf '{"system":"","capabilities":[],"details":{"format":"safetensors"},"model_info":{"llama.context_length":4096}}\n'
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  assert_contains "added model metadata: gpt-oss:20b"
+  jq -er '.models | length == 1 and .[0].slug == "gpt-oss:20b"' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected missing catalog to be created with model metadata"
+}
+
+test_agent_sh_codex_local_run_rejects_invalid_catalog_without_overwrite() {
+  begin_test "agent.sh codex local run rejects invalid catalog without overwrite"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/version'*) printf '{"version":"0.0.0"}\n'; exit 0 ;;
+  *'/api/show'*)
+    cat >/dev/null
+    printf '{"system":"","capabilities":[],"details":{"format":"safetensors"},"model_info":{"llama.context_length":4096}}\n'
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+  printf '{ invalid json\n' >"$temp_home/home/.codex/local_models.json"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 1
+  assert_contains "invalid Codex model catalog"
+  grep -Fxq '{ invalid json' "$temp_home/home/.codex/local_models.json" || fail "Expected invalid catalog to remain untouched"
+}
+
+test_agent_sh_codex_local_run_rejects_missing_myollama_provider() {
+  begin_test "agent.sh codex local run rejects missing myollama provider"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+printf '{"version":"0.0.0"}\n'
+exit 0
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 1
+  assert_contains "missing Codex model provider in config: myollama"
+  if grep -Fq '[model_providers.myollama]' "$temp_home/home/.codex/config.toml"; then
+    fail "Did not expect missing provider to be created"
+  fi
+}
+
+test_agent_sh_codex_local_run_api_show_failure_preserves_catalog() {
+  begin_test "agent.sh codex local run preserves catalog when api show fails"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/version'*) printf '{"version":"0.0.0"}\n'; exit 0 ;;
+  *'/api/show'*) cat >/dev/null; exit 22 ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+  printf '{"models":[{"slug":"keep"}]}\n' >"$temp_home/home/.codex/local_models.json"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 1
+  assert_contains "failed to query Ollama model metadata for: gpt-oss:20b"
+  jq -er '.models == [{"slug":"keep"}]' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected catalog to remain untouched after /api/show failure"
 }
 
 test_agent_sh_claude_run_uses_local_ollama_defaults() {
@@ -4725,8 +5209,17 @@ main() {
   test_agent_sh_codex_run_uses_runtime_profile_config
   test_agent_sh_accepts_explicit_empty_runtime_config_json
   test_agent_sh_codex_run_uses_model_override
+  test_agent_sh_codex_online_run_skips_catalog_update
   test_agent_sh_codex_local_run_updates_config_and_catalog
+  test_agent_sh_codex_local_run_with_explicit_profile_updates_catalog
   test_agent_sh_codex_local_run_updates_stale_catalog_entry
+  test_agent_sh_codex_local_run_reports_unchanged_catalog_entry
+  test_agent_sh_codex_local_run_uses_model_override_for_catalog
+  test_agent_sh_codex_local_run_uses_explicit_model_arg_for_catalog
+  test_agent_sh_codex_local_run_creates_missing_catalog
+  test_agent_sh_codex_local_run_rejects_invalid_catalog_without_overwrite
+  test_agent_sh_codex_local_run_rejects_missing_myollama_provider
+  test_agent_sh_codex_local_run_api_show_failure_preserves_catalog
   test_agent_sh_claude_run_uses_local_ollama_defaults
   test_agent_sh_claude_run_respects_explicit_model
   test_agent_sh_claude_run_uses_model_override

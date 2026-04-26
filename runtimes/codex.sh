@@ -1,5 +1,4 @@
 CODEX_DEFAULT_PROFILE="${AGENTCTL_CODEX_PROFILE:-gpt-oss}"
-CODEX_MODEL_PROVIDER="${AGENTCTL_CODEX_MODEL_PROVIDER:-myollama}"
 
 codex_home_dir() {
   printf '%s\n' "${HOME}/.codex"
@@ -67,6 +66,12 @@ codex_arg_value() {
       return 0
     fi
     case "$arg" in
+      "$flag_short"=*)
+        if [ -n "$flag_short" ]; then
+          printf '%s\n' "${arg#*=}"
+          return 0
+        fi
+        ;;
       "$flag_long"=*)
         printf '%s\n' "${arg#*=}"
         return 0
@@ -104,6 +109,41 @@ codex_profile_model() {
   ' "$config_file"
 }
 
+codex_profile_provider() {
+  local profile="$1"
+  local config_file=""
+
+  codex_ensure_config_file
+  config_file="$(codex_config_file)"
+  awk -v profile="$profile" '
+    /^\[profiles\.[^]]+\][[:space:]]*$/ {
+      current=$0
+      sub(/^\[profiles\./, "", current)
+      sub(/\][[:space:]]*$/, "", current)
+      in_profile=(current == profile)
+      next
+    }
+    /^\[[^]]+\][[:space:]]*$/ {
+      in_profile=0
+    }
+    in_profile && /^[[:space:]]*model_provider[[:space:]]*=/ {
+      line=$0
+      sub(/^[^"]*"/, "", line)
+      sub(/".*$/, "", line)
+      print line
+      exit
+    }
+  ' "$config_file"
+}
+
+codex_require_myollama_profile() {
+  local profile="$1"
+  local provider=""
+
+  provider="$(codex_profile_provider "$profile")"
+  [ "$provider" = "myollama" ] || die "Codex profile must use model_provider \"myollama\" for local Ollama mode: $profile"
+}
+
 codex_effective_model() {
   local profile="$1"
   shift
@@ -128,11 +168,10 @@ codex_update_ollama_base_url() {
   codex_ensure_config_file
   config_file="$(codex_config_file)"
   tmp_file="$(mktemp)"
-  awk -v provider="$CODEX_MODEL_PROVIDER" -v base_url="$openai_base_url" '
+  awk -v provider="myollama" -v base_url="$openai_base_url" '
     BEGIN {
       section_header = "[model_providers." provider "]"
       in_provider = 0
-      seen_provider = 0
       wrote_base_url = 0
     }
     /^\[[^]]+\][[:space:]]*$/ {
@@ -141,9 +180,6 @@ codex_update_ollama_base_url() {
         wrote_base_url = 1
       }
       in_provider = ($0 == section_header)
-      if (in_provider) {
-        seen_provider = 1
-      }
       print
       next
     }
@@ -158,16 +194,25 @@ codex_update_ollama_base_url() {
     END {
       if (in_provider && !wrote_base_url) {
         print "base_url = \"" base_url "\""
-      } else if (!seen_provider) {
-        print ""
-        print section_header
-        print "name = \"Ollama\""
-        print "base_url = \"" base_url "\""
-        print "wire_api = \"responses\""
       }
     }
   ' "$config_file" >"$tmp_file"
-  mv "$tmp_file" "$config_file"
+  if ! awk -v provider="myollama" '
+    BEGIN { section_header = "[model_providers." provider "]" }
+    $0 == section_header { found = 1 }
+    END { exit found ? 0 : 1 }
+  ' "$tmp_file"; then
+    rm -f "$tmp_file"
+    die "missing Codex model provider in config: myollama"
+  fi
+  if cmp -s "$tmp_file" "$config_file"; then
+    rm -f "$tmp_file"
+    return 0
+  fi
+  mv "$tmp_file" "$config_file" || {
+    rm -f "$tmp_file"
+    die "failed to update Codex config: $config_file"
+  }
 }
 
 codex_parse_positive_int() {
@@ -227,6 +272,9 @@ codex_build_model_entry() {
       context_window="$num_ctx"
     fi
   fi
+  if [ "$context_window" = "0" ]; then
+    printf 'Warning: Ollama model metadata did not include a context length for %s; using context_window=0\n' "$model" >&2
+  fi
 
   base_instructions="$(jq -r '.system // ""' "$show_file")"
   input_modalities="$(jq -c '
@@ -282,16 +330,23 @@ codex_build_model_entry() {
 codex_upsert_model_catalog() {
   local model="$1"
   local entry_file="$2"
+  local tmp_dir="${3:-}"
   local catalog_file=""
   local catalog_tmp=""
   local updated_file=""
+  local own_tmp_dir=0
   local changed_fields=""
   local status=""
 
   catalog_file="$(codex_model_catalog_file)"
   mkdir -p "$(dirname "$catalog_file")"
-  catalog_tmp="$(mktemp)"
-  updated_file="$(mktemp)"
+  if [ -z "$tmp_dir" ]; then
+    tmp_dir="$(mktemp -d)"
+    own_tmp_dir=1
+    trap 'rm -rf "$tmp_dir"' EXIT
+  fi
+  catalog_tmp="$tmp_dir/catalog.json"
+  updated_file="$tmp_dir/updated.json"
 
   if [ -f "$catalog_file" ]; then
     jq '
@@ -331,8 +386,15 @@ codex_upsert_model_catalog() {
       )
   ' "$catalog_tmp" >"$updated_file"
   jq -e 'type == "object" and (.models | type == "array")' "$updated_file" >/dev/null || die "failed to build Codex model catalog"
-  mv "$updated_file" "$catalog_file"
-  rm -f "$catalog_tmp"
+  if [ -f "$catalog_file" ] && cmp -s "$updated_file" "$catalog_file"; then
+    :
+  else
+    mv "$updated_file" "$catalog_file"
+  fi
+  if [ "$own_tmp_dir" -eq 1 ]; then
+    rm -rf "$tmp_dir"
+    trap - EXIT
+  fi
 
   if [ -z "$status" ]; then
     printf 'added model metadata: %s\n' "$model"
@@ -350,16 +412,21 @@ codex_prepare_local_ollama_model() {
   local model=""
   local show_file=""
   local entry_file=""
+  local tmp_dir=""
 
+  codex_require_myollama_profile "$profile"
   ollama_base_url="$(ollama_resolve_base_url)"
   codex_update_ollama_base_url "$ollama_base_url"
   model="$(codex_effective_model "$profile" "$@")"
-  show_file="$(mktemp)"
-  entry_file="$(mktemp)"
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  show_file="$tmp_dir/show.json"
+  entry_file="$tmp_dir/entry.json"
   codex_show_model "$ollama_base_url" "$model" "$show_file"
   codex_build_model_entry "$model" "$show_file" "$entry_file"
-  codex_upsert_model_catalog "$model" "$entry_file"
-  rm -f "$show_file" "$entry_file"
+  codex_upsert_model_catalog "$model" "$entry_file" "$tmp_dir"
+  rm -rf "$tmp_dir"
+  trap - EXIT
 }
 
 agent_runtime_run() {
