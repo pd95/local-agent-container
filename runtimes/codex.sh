@@ -250,6 +250,7 @@ codex_build_model_entry() {
   local input_modalities=""
   local reasoning_levels=""
   local supports_reasoning_summaries="false"
+  local reasoning_defaults=""
 
   context_window="$(jq -r '
     [ .model_info? // {} | to_entries[]
@@ -291,8 +292,14 @@ codex_build_model_entry() {
       {"effort":"medium","description":"Medium reasoning effort"},
       {"effort":"high","description":"High reasoning effort"}
     ]'
+    reasoning_defaults='{
+      "reasoning_summary_format": "none",
+      "default_reasoning_summary": "auto",
+      "default_reasoning_level": "medium"
+    }'
   else
     reasoning_levels='[]'
+    reasoning_defaults='{}'
   fi
 
   jq -n \
@@ -303,7 +310,8 @@ codex_build_model_entry() {
     --argjson input_modalities "$input_modalities" \
     --argjson supports_reasoning_summaries "$supports_reasoning_summaries" \
     --argjson supported_reasoning_levels "$reasoning_levels" \
-    '{
+    --argjson reasoning_defaults "$reasoning_defaults" \
+    '({
       slug: $slug,
       display_name: $display_name,
       context_window: $context_window,
@@ -324,7 +332,7 @@ codex_build_model_entry() {
       supports_reasoning_summaries: $supports_reasoning_summaries,
       supported_reasoning_levels: $supported_reasoning_levels,
       experimental_supported_tools: []
-    }' >"$entry_file"
+    } + $reasoning_defaults)' >"$entry_file"
 }
 
 codex_upsert_model_catalog() {
@@ -343,7 +351,7 @@ codex_upsert_model_catalog() {
   if [ -z "$tmp_dir" ]; then
     tmp_dir="$(mktemp -d)"
     own_tmp_dir=1
-    trap 'rm -rf "$tmp_dir"' EXIT
+    trap 'rm -rf "${tmp_dir:-}"' EXIT
   fi
   catalog_tmp="$tmp_dir/catalog.json"
   updated_file="$tmp_dir/updated.json"
@@ -419,7 +427,7 @@ codex_prepare_local_ollama_model() {
   codex_update_ollama_base_url "$ollama_base_url"
   model="$(codex_effective_model "$profile" "$@")"
   tmp_dir="$(mktemp -d)"
-  trap 'rm -rf "$tmp_dir"' EXIT
+  trap 'rm -rf "${tmp_dir:-}"' EXIT
   show_file="$tmp_dir/show.json"
   entry_file="$tmp_dir/entry.json"
   codex_show_model "$ollama_base_url" "$model" "$show_file"

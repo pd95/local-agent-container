@@ -1712,6 +1712,9 @@ EOF
       and .base_instructions == "local instructions"
       and .input_modalities == ["text", "image"]
       and .supports_reasoning_summaries == true
+      and .reasoning_summary_format == "none"
+      and .default_reasoning_summary == "auto"
+      and .default_reasoning_level == "medium"
       and (.supported_reasoning_levels | length) == 3)
   ' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected Codex model catalog metadata to be generated"
   grep -Fq -- '--profile gpt-oss --cd /workdir' "$run_log" || fail "Expected codex run to launch after local metadata update"
@@ -1928,7 +1931,10 @@ EOF
     .models[0].context_window == 16384 and
     .models[0].custom == "keep" and
     .models[0].input_modalities == ["text"] and
-    .models[0].supports_reasoning_summaries == false
+    .models[0].supports_reasoning_summaries == false and
+    (.models[0] | has("reasoning_summary_format") | not) and
+    (.models[0] | has("default_reasoning_summary") | not) and
+    (.models[0] | has("default_reasoning_level") | not)
   ' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected stale catalog entry to be updated without dropping unknown fields"
 }
 
