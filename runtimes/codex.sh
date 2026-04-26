@@ -1,7 +1,16 @@
 CODEX_DEFAULT_PROFILE="${AGENTCTL_CODEX_PROFILE:-gpt-oss}"
+CODEX_MODEL_PROVIDER="${AGENTCTL_CODEX_MODEL_PROVIDER:-myollama}"
 
 codex_home_dir() {
   printf '%s\n' "${HOME}/.codex"
+}
+
+codex_config_file() {
+  printf '%s\n' "$(codex_home_dir)/config.toml"
+}
+
+codex_model_catalog_file() {
+  printf '%s\n' "$(codex_home_dir)/local_models.json"
 }
 
 codex_auth_file() {
@@ -10,6 +19,19 @@ codex_auth_file() {
 
 codex_ensure_home_dir() {
   mkdir -p "$(codex_home_dir)"
+}
+
+codex_ensure_config_file() {
+  local config_file=""
+
+  codex_ensure_home_dir
+  config_file="$(codex_config_file)"
+  [ -f "$config_file" ] && return 0
+  if [ -f /etc/codexctl/config.toml ]; then
+    cp /etc/codexctl/config.toml "$config_file"
+    return 0
+  fi
+  die "missing Codex config: $config_file"
 }
 
 codex_has_explicit_profile() {
@@ -30,6 +52,314 @@ codex_has_explicit_cd() {
     esac
   done
   return 1
+}
+
+codex_arg_value() {
+  local flag_short="$1"
+  local flag_long="$2"
+  shift 2
+  local arg=""
+  local previous=""
+
+  for arg in "$@"; do
+    if { [ -n "$flag_short" ] && [ "$previous" = "$flag_short" ]; } || { [ -n "$flag_long" ] && [ "$previous" = "$flag_long" ]; }; then
+      printf '%s\n' "$arg"
+      return 0
+    fi
+    case "$arg" in
+      "$flag_long"=*)
+        printf '%s\n' "${arg#*=}"
+        return 0
+        ;;
+    esac
+    previous="$arg"
+  done
+  return 1
+}
+
+codex_profile_model() {
+  local profile="$1"
+  local config_file=""
+
+  codex_ensure_config_file
+  config_file="$(codex_config_file)"
+  awk -v profile="$profile" '
+    /^\[profiles\.[^]]+\][[:space:]]*$/ {
+      current=$0
+      sub(/^\[profiles\./, "", current)
+      sub(/\][[:space:]]*$/, "", current)
+      in_profile=(current == profile)
+      next
+    }
+    /^\[[^]]+\][[:space:]]*$/ {
+      in_profile=0
+    }
+    in_profile && /^[[:space:]]*model[[:space:]]*=/ {
+      line=$0
+      sub(/^[^"]*"/, "", line)
+      sub(/".*$/, "", line)
+      print line
+      exit
+    }
+  ' "$config_file"
+}
+
+codex_effective_model() {
+  local profile="$1"
+  shift
+  local model=""
+
+  model="$(codex_arg_value -m --model "$@" || true)"
+  if [ -n "$model" ]; then
+    printf '%s\n' "$model"
+    return 0
+  fi
+  model="$(codex_profile_model "$profile")"
+  [ -n "$model" ] || die "unable to determine Codex model for profile: $profile"
+  printf '%s\n' "$model"
+}
+
+codex_update_ollama_base_url() {
+  local ollama_base_url="$1"
+  local config_file=""
+  local tmp_file=""
+  local openai_base_url="${ollama_base_url%/}/v1"
+
+  codex_ensure_config_file
+  config_file="$(codex_config_file)"
+  tmp_file="$(mktemp)"
+  awk -v provider="$CODEX_MODEL_PROVIDER" -v base_url="$openai_base_url" '
+    BEGIN {
+      section_header = "[model_providers." provider "]"
+      in_provider = 0
+      seen_provider = 0
+      wrote_base_url = 0
+    }
+    /^\[[^]]+\][[:space:]]*$/ {
+      if (in_provider && !wrote_base_url) {
+        print "base_url = \"" base_url "\""
+        wrote_base_url = 1
+      }
+      in_provider = ($0 == section_header)
+      if (in_provider) {
+        seen_provider = 1
+      }
+      print
+      next
+    }
+    in_provider && /^[[:space:]]*base_url[[:space:]]*=/ {
+      print "base_url = \"" base_url "\""
+      wrote_base_url = 1
+      next
+    }
+    {
+      print
+    }
+    END {
+      if (in_provider && !wrote_base_url) {
+        print "base_url = \"" base_url "\""
+      } else if (!seen_provider) {
+        print ""
+        print section_header
+        print "name = \"Ollama\""
+        print "base_url = \"" base_url "\""
+        print "wire_api = \"responses\""
+      }
+    }
+  ' "$config_file" >"$tmp_file"
+  mv "$tmp_file" "$config_file"
+}
+
+codex_parse_positive_int() {
+  local value="$1"
+  case "$value" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$value" -gt 0 ] || return 1
+  printf '%s\n' "$value"
+}
+
+codex_show_model() {
+  local ollama_base_url="$1"
+  local model="$2"
+  local show_file="$3"
+
+  command -v jq >/dev/null 2>&1 || die "Missing jq required for Codex model metadata"
+  command -v curl >/dev/null 2>&1 || die "Missing curl required for Codex model metadata"
+  if ! jq -n --arg model "$model" '{model: $model}' \
+    | curl -fsS --max-time 10 \
+      -H 'Content-Type: application/json' \
+      -d @- \
+      "${ollama_base_url%/}/api/show" >"$show_file"; then
+    die "failed to query Ollama model metadata for: $model"
+  fi
+  jq -e 'type == "object"' "$show_file" >/dev/null || die "invalid Ollama /api/show response for: $model"
+}
+
+codex_build_model_entry() {
+  local model="$1"
+  local show_file="$2"
+  local entry_file="$3"
+  local context_window=""
+  local base_instructions=""
+  local input_modalities=""
+  local reasoning_levels=""
+  local supports_reasoning_summaries="false"
+
+  context_window="$(jq -r '
+    [ .model_info? // {} | to_entries[]
+      | select(.key | test("\\.context_length$"))
+      | .value
+      | numbers
+    ] | max // 0
+  ' "$show_file")"
+  if [ "$(jq -r '.details.format // ""' "$show_file")" != "safetensors" ]; then
+    local num_ctx=""
+    num_ctx="$(jq -r '
+      (.parameters // "")
+      | split("\n")[]
+      | capture("^[[:space:]]*num_ctx[[:space:]]+(?<value>[0-9]+(?:\\.[0-9]+)?)")?
+      | .value
+      | tonumber
+      | floor
+    ' "$show_file" 2>/dev/null | tail -n 1 || true)"
+    if [ -n "$num_ctx" ] && codex_parse_positive_int "$num_ctx" >/dev/null; then
+      context_window="$num_ctx"
+    fi
+  fi
+
+  base_instructions="$(jq -r '.system // ""' "$show_file")"
+  input_modalities="$(jq -c '
+    if ((.capabilities // []) | index("vision")) then
+      ["text", "image"]
+    else
+      ["text"]
+    end
+  ' "$show_file")"
+  if jq -e '(.capabilities // []) | index("thinking")' "$show_file" >/dev/null; then
+    supports_reasoning_summaries="true"
+    reasoning_levels='[
+      {"effort":"low","description":"Low reasoning effort"},
+      {"effort":"medium","description":"Medium reasoning effort"},
+      {"effort":"high","description":"High reasoning effort"}
+    ]'
+  else
+    reasoning_levels='[]'
+  fi
+
+  jq -n \
+    --arg slug "$model" \
+    --arg display_name "$model" \
+    --arg base_instructions "$base_instructions" \
+    --argjson context_window "$context_window" \
+    --argjson input_modalities "$input_modalities" \
+    --argjson supports_reasoning_summaries "$supports_reasoning_summaries" \
+    --argjson supported_reasoning_levels "$reasoning_levels" \
+    '{
+      slug: $slug,
+      display_name: $display_name,
+      context_window: $context_window,
+      apply_patch_tool_type: "function",
+      shell_type: "default",
+      visibility: "list",
+      supported_in_api: true,
+      priority: 0,
+      truncation_policy: {
+        mode: "bytes",
+        limit: 10000
+      },
+      input_modalities: $input_modalities,
+      base_instructions: $base_instructions,
+      support_verbosity: true,
+      default_verbosity: "low",
+      supports_parallel_tool_calls: false,
+      supports_reasoning_summaries: $supports_reasoning_summaries,
+      supported_reasoning_levels: $supported_reasoning_levels,
+      experimental_supported_tools: []
+    }' >"$entry_file"
+}
+
+codex_upsert_model_catalog() {
+  local model="$1"
+  local entry_file="$2"
+  local catalog_file=""
+  local catalog_tmp=""
+  local updated_file=""
+  local changed_fields=""
+  local status=""
+
+  catalog_file="$(codex_model_catalog_file)"
+  mkdir -p "$(dirname "$catalog_file")"
+  catalog_tmp="$(mktemp)"
+  updated_file="$(mktemp)"
+
+  if [ -f "$catalog_file" ]; then
+    jq '
+      if type != "object" then
+        error("catalog must be a JSON object")
+      elif has("models") and (.models | type != "array") then
+        error("catalog .models must be an array")
+      elif has("models") then
+        .
+      else
+        . + {models: []}
+      end
+    ' "$catalog_file" >"$catalog_tmp" || die "invalid Codex model catalog: $catalog_file"
+  else
+    printf '{ "models": [] }\n' >"$catalog_tmp"
+  fi
+
+  changed_fields="$(jq -r --slurpfile entry "$entry_file" --arg slug "$model" '
+    ($entry[0]) as $new
+    | (.models[]? | select(.slug == $slug)) as $old
+    | if $old == null then
+        ""
+      else
+        [ $new | keys_unsorted[]
+          | select(($old[.] // null) != ($new[.] // null))
+        ] | join(",")
+      end
+  ' "$catalog_tmp")"
+
+  status="$(jq -r --arg slug "$model" '.models[]? | select(.slug == $slug) | .slug' "$catalog_tmp" | head -n 1)"
+  jq --slurpfile entry "$entry_file" '
+    ($entry[0]) as $new
+    | (.models | any(.slug == $new.slug)) as $exists
+    | .models = (
+        (.models | map(if .slug == $new.slug then . + $new else . end))
+        + (if $exists then [] else [$new] end)
+      )
+  ' "$catalog_tmp" >"$updated_file"
+  jq -e 'type == "object" and (.models | type == "array")' "$updated_file" >/dev/null || die "failed to build Codex model catalog"
+  mv "$updated_file" "$catalog_file"
+  rm -f "$catalog_tmp"
+
+  if [ -z "$status" ]; then
+    printf 'added model metadata: %s\n' "$model"
+  elif [ -n "$changed_fields" ]; then
+    printf 'updated model metadata: %s fields=%s\n' "$model" "$changed_fields"
+  else
+    printf 'model metadata unchanged: %s\n' "$model"
+  fi
+}
+
+codex_prepare_local_ollama_model() {
+  local profile="$1"
+  shift
+  local ollama_base_url=""
+  local model=""
+  local show_file=""
+  local entry_file=""
+
+  ollama_base_url="$(ollama_resolve_base_url)"
+  codex_update_ollama_base_url "$ollama_base_url"
+  model="$(codex_effective_model "$profile" "$@")"
+  show_file="$(mktemp)"
+  entry_file="$(mktemp)"
+  codex_show_model "$ollama_base_url" "$model" "$show_file"
+  codex_build_model_entry "$model" "$show_file" "$entry_file"
+  codex_upsert_model_catalog "$model" "$entry_file"
+  rm -f "$show_file" "$entry_file"
 }
 
 agent_runtime_run() {
@@ -64,9 +394,17 @@ agent_runtime_run() {
       ;;
   esac
   if [ "${#codex_args[@]}" -gt 0 ] && codex_has_explicit_profile "${codex_args[@]}"; then
+    if [ "$RUN_MODE" = "local" ]; then
+      profile="$(codex_arg_value "" --profile "${codex_args[@]}" || true)"
+      profile="${profile:-$CODEX_DEFAULT_PROFILE}"
+      codex_prepare_local_ollama_model "$profile" "${codex_args[@]}"
+    fi
     exec codex "${codex_args[@]}"
   fi
   profile="${profile:-$(runtime_config_value profile "$CODEX_DEFAULT_PROFILE")}"
+  if [ "$RUN_MODE" = "local" ]; then
+    codex_prepare_local_ollama_model "$profile" "${codex_args[@]}"
+  fi
   if [ "${#codex_args[@]}" -eq 0 ]; then
     exec codex --profile "$profile"
   fi

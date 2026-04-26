@@ -384,7 +384,7 @@ runtime_config_enabled() {
 }
 
 ollama_detect_gateway() {
-  local route_file="${AGENTCTL_OLLAMA_ROUTE_FILE:-${AGENTCTL_CLAUDE_ROUTE_FILE:-/proc/net/route}}"
+  local route_file="${AGENTCTL_OLLAMA_ROUTE_FILE:-/proc/net/route}"
 
   awk '
     function hex2dec(hex,   i, c, n, v) {

@@ -3637,7 +3637,7 @@ run_mode() {
     post_exec="run_post_exec"
     cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_RUNTIME_CONFIG_JSON=\$2 AGENTCTL_MODEL_OVERRIDE=\$3 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override")
   fi
-  if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ]; then
+  if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ]; then
     pre_exec="run_pre_exec"
   fi
 
@@ -3697,7 +3697,7 @@ run_pre_exec() {
     run_agent_sh_in_container "$name" preferred set "$RUN_SELECTED_RUNTIME"
   fi
 
-  if [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ] || [ "$RUN_SYNC_POST_RUNTIME_AUTH" -eq 1 ]; then
+  if [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_SYNC_POST_RUNTIME_AUTH" -eq 1 ]; then
     effective_runtime="$RUN_SELECTED_RUNTIME"
     if [ -z "$effective_runtime" ]; then
       effective_runtime="$(run_agent_sh_in_container "$name" preferred get 2>/dev/null || true)"
@@ -3720,12 +3720,6 @@ run_pre_exec() {
     fi
   fi
 
-  if [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ]; then
-    if [ -z "$effective_runtime" ]; then
-      effective_runtime="$DEFAULT_RUNTIME"
-    fi
-    local_runtime_preflight "$name" "$effective_runtime" "$RUN_RUNTIME_CONFIG_JSON" strict
-  fi
 }
 
 codex_local_model_preflight_info() {
@@ -4212,8 +4206,6 @@ run_cmd() {
     RUN_SYNC_RUNTIME_AUTH=1
     RUN_SYNC_POST_RUNTIME_AUTH=1
     RUN_FORCE_RUNTIME_AUTH="$auth"
-  elif [ "$shell" -eq 0 ] && [ "${#cmd_override[@]}" -eq 0 ]; then
-    RUN_LOCAL_MODEL_PREFLIGHT=1
   fi
   if [ "$update" -eq 1 ]; then
     RUN_UPDATE_CODEX=1

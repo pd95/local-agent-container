@@ -102,7 +102,7 @@ test_run_config_wires_runtime_config_json() {
 
   run_cmd --name unit-test-container --workdir "$workdir" -c profile=gemma -c dangerously-skip-permissions=true
 
-  [ "$captured_pre_exec" = "run_pre_exec" ] || fail "Expected run_pre_exec, got: $captured_pre_exec"
+  [ -z "$captured_pre_exec" ] || fail "Did not expect host-side pre_exec for local runtime config wiring, got: $captured_pre_exec"
   printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_RUN_MODE=' || fail "Expected agent.sh launch wrapper, got: $captured_cmd"
   printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_RUNTIME_CONFIG_JSON=' || fail "Expected runtime config JSON to be passed to agent.sh, got: $captured_cmd"
   printf '%s\n' "$captured_cmd" | grep -Fq '"profile":"gemma"' || fail "Expected profile launch config in runtime config JSON, got: $captured_cmd"
@@ -586,7 +586,7 @@ test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified() {
 }
 
 test_run_pre_exec_runs_local_model_preflight_for_preferred_claude() {
-  begin_test "run_pre_exec runs local-mode preflight for preferred claude"
+  begin_test "run_pre_exec leaves local-mode preflight to agent.sh for claude"
 
   load_codexctl_functions
 
@@ -613,11 +613,11 @@ test_run_pre_exec_runs_local_model_preflight_for_preferred_claude() {
 
   run_capture run_pre_exec unit-test-container
   assert_status 0
-  [ "$preflight_called" -eq 1 ] || fail "Expected local-mode preflight for preferred claude"
+  [ "$preflight_called" -eq 0 ] || fail "Expected agent.sh to own local-mode preflight for claude"
 }
 
 test_run_pre_exec_runs_local_model_preflight_for_preferred_codex() {
-  begin_test "run_pre_exec runs local-mode preflight for preferred codex"
+  begin_test "run_pre_exec leaves local-mode preflight to agent.sh for codex"
 
   load_codexctl_functions
 
@@ -644,11 +644,11 @@ test_run_pre_exec_runs_local_model_preflight_for_preferred_codex() {
 
   run_capture run_pre_exec unit-test-container
   assert_status 0
-  [ "$preflight_called" -eq 1 ] || fail "Expected local-mode preflight for preferred codex"
+  [ "$preflight_called" -eq 0 ] || fail "Expected agent.sh to own local-mode preflight for codex"
 }
 
 test_run_cmd_default_entrypoint_enables_local_runtime_preflight() {
-  begin_test "run_cmd enables local runtime preflight for the default entrypoint"
+  begin_test "run_cmd lets agent.sh handle local runtime preflight"
 
   load_codexctl_functions
 
@@ -665,9 +665,9 @@ test_run_cmd_default_entrypoint_enables_local_runtime_preflight() {
 
   run_cmd --name unit-test-container --workdir "$workdir"
 
-  [ "$captured_pre_exec" = "run_pre_exec" ] || fail "Expected run_pre_exec, got: $captured_pre_exec"
+  [ -z "$captured_pre_exec" ] || fail "Did not expect host-side run_pre_exec for local preflight, got: $captured_pre_exec"
   [ "$RUN_SYNC_RUNTIME_AUTH" -eq 0 ] || fail "Did not expect online auth sync for local default run"
-  [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 1 ] || fail "Expected local-model preflight to remain enabled"
+  [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 0 ] || fail "Expected local-model preflight to be handled by agent.sh"
 }
 
 test_sync_runtime_auth_to_container_if_available_skips_missing_keychain() {
@@ -1490,6 +1490,7 @@ EOF
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_RUN_MODE=online \
     -- run
   assert_status 0
   grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to include --cd /workdir"
@@ -1517,6 +1518,7 @@ EOF
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_CONFIG_JSON='{"profile":"gemma"}' \
+    AGENTCTL_RUN_MODE=online \
     -- run
   assert_status 0
   grep -Fq -- '--profile gemma' "$run_log" || fail "Expected codex run to include --profile gemma"
@@ -1545,6 +1547,7 @@ EOF
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_CONFIG_JSON='{}' \
+    AGENTCTL_RUN_MODE=online \
     -- run
   assert_status 0
   grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to include --cd /workdir"
@@ -1572,10 +1575,197 @@ EOF
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
+    AGENTCTL_RUN_MODE=online \
     -- run
   assert_status 0
   grep -Fq -- '-m qwen3:14b' "$run_log" || fail "Expected codex run to include -m qwen3:14b"
   grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to keep --cd /workdir"
+}
+
+test_agent_sh_codex_local_run_updates_config_and_catalog() {
+  begin_test "agent.sh codex local run updates Ollama config and model catalog"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/codex-run.log"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/version'*)
+    printf '{"version":"0.0.0"}\n'
+    exit 0
+    ;;
+  *'/api/show'*)
+    cat >/dev/null
+    cat <<'JSON'
+{
+  "system": "local instructions",
+  "capabilities": ["vision", "thinking"],
+  "details": {"format": "gguf"},
+  "model_info": {
+    "llama.context_length": 4096,
+    "qwen3.context_length": 8192
+  },
+  "parameters": "temperature 0.1\nnum_ctx 32768\n"
+}
+JSON
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+base_url = "http://old-host:11434/v1"
+wire_api = "responses"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+model_context_window = 131072
+EOF
+
+  cat >"$temp_home/home/.codex/local_models.json" <<'EOF'
+{
+  "models": [
+    {
+      "slug": "other:model",
+      "unknown": "preserved"
+    }
+  ]
+}
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  assert_contains "added model metadata: gpt-oss:20b"
+  grep -Fq 'base_url = "http://192.168.0.1:11434/v1"' "$temp_home/home/.codex/config.toml" || fail "Expected Codex myollama base_url to be updated"
+  grep -Fq 'wire_api = "responses"' "$temp_home/home/.codex/config.toml" || fail "Expected Codex config fields outside base_url to be preserved"
+  jq -er '
+    (.models | length) == 2 and
+    (.models[] | select(.slug == "other:model").unknown == "preserved") and
+    (.models[] | select(.slug == "gpt-oss:20b")
+      | .display_name == "gpt-oss:20b"
+      and .context_window == 32768
+      and .base_instructions == "local instructions"
+      and .input_modalities == ["text", "image"]
+      and .supports_reasoning_summaries == true
+      and (.supported_reasoning_levels | length) == 3)
+  ' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected Codex model catalog metadata to be generated"
+  grep -Fq -- '--profile gpt-oss --cd /workdir' "$run_log" || fail "Expected codex run to launch after local metadata update"
+}
+
+test_agent_sh_codex_local_run_updates_stale_catalog_entry() {
+  begin_test "agent.sh codex local run updates stale catalog metadata"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/version'*)
+    printf '{"version":"0.0.0"}\n'
+    exit 0
+    ;;
+  *'/api/show'*)
+    cat >/dev/null
+    cat <<'JSON'
+{
+  "system": "",
+  "capabilities": [],
+  "details": {"format": "safetensors"},
+  "model_info": {
+    "gemma3.context_length": 16384
+  },
+  "parameters": "num_ctx 32768\n"
+}
+JSON
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+
+  cat >"$temp_home/home/.codex/local_models.json" <<'EOF'
+{
+  "models": [
+    {
+      "slug": "gpt-oss:20b",
+      "display_name": "old name",
+      "context_window": 1,
+      "custom": "keep"
+    }
+  ]
+}
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  assert_contains "updated model metadata: gpt-oss:20b fields="
+  jq -er '
+    .models == [
+      (.models[0])
+    ] and
+    .models[0].slug == "gpt-oss:20b" and
+    .models[0].display_name == "gpt-oss:20b" and
+    .models[0].context_window == 16384 and
+    .models[0].custom == "keep" and
+    .models[0].input_modalities == ["text"] and
+    .models[0].supports_reasoning_summaries == false
+  ' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected stale catalog entry to be updated without dropping unknown fields"
 }
 
 test_agent_sh_claude_run_uses_local_ollama_defaults() {
@@ -1613,7 +1803,7 @@ EOF
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
     -- run
   assert_status 0
   grep -Fq 'AUTH=ollama' "$run_log" || fail "Expected Claude local run to set ANTHROPIC_AUTH_TOKEN=ollama"
@@ -1654,7 +1844,7 @@ EOF
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
-    AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
     -- run --model llama3
   assert_status 0
   grep -Fq 'ARGS=--model llama3' "$run_log" || fail "Expected explicit Claude model to be preserved"
@@ -1693,7 +1883,7 @@ EOF
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
-    AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
     -- run
   assert_status 0
   grep -Fq 'ARGS=--model qwen3:14b' "$run_log" || fail "Expected Claude model override to replace the default local model"
@@ -1732,7 +1922,7 @@ EOF
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_RUNTIME_CONFIG_JSON='{"dangerously-skip-permissions":"true"}' \
-    AGENTCTL_CLAUDE_ROUTE_FILE="$temp_home/proc-net-route" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
     -- run
   assert_status 0
   grep -Fq 'ARGS=--model gpt-oss:20b --dangerously-skip-permissions' "$run_log" || fail "Expected Claude runtime config flag to be passed through"
@@ -4535,6 +4725,8 @@ main() {
   test_agent_sh_codex_run_uses_runtime_profile_config
   test_agent_sh_accepts_explicit_empty_runtime_config_json
   test_agent_sh_codex_run_uses_model_override
+  test_agent_sh_codex_local_run_updates_config_and_catalog
+  test_agent_sh_codex_local_run_updates_stale_catalog_entry
   test_agent_sh_claude_run_uses_local_ollama_defaults
   test_agent_sh_claude_run_respects_explicit_model
   test_agent_sh_claude_run_uses_model_override
