@@ -397,11 +397,11 @@ codex_upsert_model_catalog() {
   fi
 
   if [ -z "$status" ]; then
-    printf 'added model metadata: %s\n' "$model"
+    printf 'added model metadata: %s\n' "$model" >&2
   elif [ -n "$changed_fields" ]; then
-    printf 'updated model metadata: %s fields=%s\n' "$model" "$changed_fields"
+    printf 'updated model metadata: %s fields=%s\n' "$model" "$changed_fields" >&2
   else
-    printf 'model metadata unchanged: %s\n' "$model"
+    printf 'model metadata unchanged: %s\n' "$model" >&2
   fi
 }
 

@@ -1717,6 +1717,69 @@ EOF
   grep -Fq -- '--profile gpt-oss --cd /workdir' "$run_log" || fail "Expected codex run to launch after local metadata update"
 }
 
+test_agent_sh_codex_local_metadata_status_uses_stderr() {
+  begin_test "agent.sh codex local metadata status uses stderr"
+
+  local temp_home
+  local fake_bin
+  local stdout_log
+  local stderr_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  stdout_log="$temp_home/stdout.log"
+  stderr_log="$temp_home/stderr.log"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+printf '{"type":"turn.completed"}\n'
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/version'*) printf '{"version":"0.0.0"}\n'; exit 0 ;;
+  *'/api/show'*)
+    cat >/dev/null
+    printf '{"system":"","capabilities":[],"details":{"format":"safetensors"},"model_info":{"llama.context_length":4096}}\n'
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+
+  env -i \
+    "HOME=$temp_home/home" \
+    "XDG_CONFIG_HOME=$temp_home/config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    "AGENTCTL_OLLAMA_ROUTE_FILE=$temp_home/proc-net-route" \
+    /bin/bash "$TEST_ROOT/agent.sh" run --json >"$stdout_log" 2>"$stderr_log"
+  jq -c . "$stdout_log" >/dev/null || fail "Expected stdout to remain valid JSONL"
+  if grep -Fq 'model metadata' "$stdout_log"; then
+    fail "Did not expect model metadata status on stdout"
+  fi
+  grep -Fq 'added model metadata: gpt-oss:20b' "$stderr_log" || fail "Expected model metadata status on stderr"
+}
+
 test_agent_sh_codex_local_run_with_explicit_profile_updates_catalog() {
   begin_test "agent.sh codex local run with explicit profile updates catalog"
 
@@ -5211,6 +5274,7 @@ main() {
   test_agent_sh_codex_run_uses_model_override
   test_agent_sh_codex_online_run_skips_catalog_update
   test_agent_sh_codex_local_run_updates_config_and_catalog
+  test_agent_sh_codex_local_metadata_status_uses_stderr
   test_agent_sh_codex_local_run_with_explicit_profile_updates_catalog
   test_agent_sh_codex_local_run_updates_stale_catalog_entry
   test_agent_sh_codex_local_run_reports_unchanged_catalog_entry
