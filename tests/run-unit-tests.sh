@@ -81,6 +81,13 @@ EOF
   printf '%s\n' "$fake_bin"
 }
 
+file_mtime() {
+  local path="$1"
+
+  stat -c %Y "$path" 2>/dev/null \
+    || stat -f %m "$path"
+}
+
 test_run_config_wires_runtime_config_json() {
   begin_test "run_cmd wires repeated --config values into the launched agent.sh command"
 
@@ -2077,8 +2084,8 @@ EOF
       }
     ]
 	  }' >"$temp_home/home/.codex/local_models.json"
-  config_mtime_before="$(stat -c %Y "$temp_home/home/.codex/config.toml")"
-  catalog_mtime_before="$(stat -c %Y "$temp_home/home/.codex/local_models.json")"
+  config_mtime_before="$(file_mtime "$temp_home/home/.codex/config.toml")"
+  catalog_mtime_before="$(file_mtime "$temp_home/home/.codex/local_models.json")"
   sleep 1
 
   run_agent_sh_capture_env "$temp_home" \
@@ -2087,8 +2094,8 @@ EOF
     -- run
   assert_status 0
   assert_contains "model metadata unchanged: gpt-oss:20b"
-  config_mtime_after="$(stat -c %Y "$temp_home/home/.codex/config.toml")"
-  catalog_mtime_after="$(stat -c %Y "$temp_home/home/.codex/local_models.json")"
+  config_mtime_after="$(file_mtime "$temp_home/home/.codex/config.toml")"
+  catalog_mtime_after="$(file_mtime "$temp_home/home/.codex/local_models.json")"
   [ "$config_mtime_after" = "$config_mtime_before" ] || fail "Expected unchanged Codex config timestamp to be preserved"
   [ "$catalog_mtime_after" = "$catalog_mtime_before" ] || fail "Expected unchanged Codex model catalog timestamp to be preserved"
 }
