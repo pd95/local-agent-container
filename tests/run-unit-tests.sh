@@ -322,6 +322,121 @@ test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden() {
   [ "$build_calls" -eq 1 ] || fail "Expected one build call when overriding the runtime selection, got: $build_calls"
 }
 
+test_build_cmd_rebuilds_and_snapshots_local_dependencies() {
+  begin_test "build_cmd rebuilds and snapshots local image dependencies"
+
+  load_codexctl_functions
+
+  local build_calls=""
+  local tag_calls=""
+
+  require_container() { return 0; }
+  image_exists() { return 0; }
+  stop_buildkit_container() { :; }
+  mock_container() {
+    case "$*" in
+      build\ -t\ agent-plain\ *)
+        build_calls="${build_calls}agent-plain"$'\n'
+        printf '%s\n' "$*" | grep -Fq -- '--no-cache' || fail "Expected agent-plain rebuild to use --no-cache, got: $*"
+        ;;
+      build\ -t\ agent-python\ *)
+        build_calls="${build_calls}agent-python"$'\n'
+        printf '%s\n' "$*" | grep -Fq -- '--no-cache' || fail "Expected agent-python rebuild to use --no-cache, got: $*"
+        ;;
+      image\ tag\ agent-plain\ agent-plain:*)
+        tag_calls="${tag_calls}agent-plain"$'\n'
+        ;;
+      image\ tag\ agent-python\ agent-python:*)
+        tag_calls="${tag_calls}agent-python"$'\n'
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture build_cmd --image agent-python --rebuild
+  assert_status 0
+  [ "$build_calls" = $'agent-plain\nagent-python\n' ] || fail "Expected agent-plain then agent-python rebuilds, got: $build_calls"
+  [ "$tag_calls" = $'agent-plain\nagent-python\n' ] || fail "Expected timestamp tags for both rebuilt images, got: $tag_calls"
+  CONTAINER_CMD=container
+}
+
+test_build_cmd_snapshots_existing_image_when_timestamp_missing() {
+  begin_test "build_cmd snapshots existing image when latest has no timestamp tag"
+
+  load_codexctl_functions
+
+  local tag_call=""
+
+  require_container() { return 0; }
+  image_exists() { return 0; }
+  stop_buildkit_container() { :; }
+  mock_container() {
+    case "$*" in
+      "image ls --format json")
+        cat <<'EOF'
+[
+  {"descriptor":{"digest":"sha256:plain-latest"},"reference":"agent-plain:latest"},
+  {"descriptor":{"digest":"sha256:older"},"reference":"docker.io/library/agent-plain:20260607-150156"}
+]
+EOF
+        ;;
+      image\ tag\ agent-plain\ agent-plain:*)
+        tag_call="$(printf '%s\n' "$*")"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture build_cmd --image agent-plain
+  assert_status 0
+  assert_contains "Snapshotting missing image tag: agent-plain, agent-plain:"
+  printf '%s\n' "$tag_call" | grep -Eq '^image tag agent-plain agent-plain:[0-9]{8}-[0-9]{6}$' || fail "Expected snapshot tag call, got: $tag_call"
+  CONTAINER_CMD=container
+}
+
+test_build_cmd_skips_existing_image_when_timestamp_matches() {
+  begin_test "build_cmd skips existing image when latest already has a timestamp tag"
+
+  load_codexctl_functions
+
+  local tag_calls=0
+
+  require_container() { return 0; }
+  image_exists() { return 0; }
+  stop_buildkit_container() { :; }
+  mock_container() {
+    case "$*" in
+      "image ls --format json")
+        cat <<'EOF'
+[
+  {"descriptor":{"digest":"sha256:plain-latest"},"reference":"agent-plain:latest"},
+  {"descriptor":{"digest":"sha256:plain-latest"},"reference":"docker.io/library/agent-plain:20260607-150156"}
+]
+EOF
+        ;;
+      image\ tag*)
+        tag_calls=$((tag_calls + 1))
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture build_cmd --image agent-plain
+  assert_status 0
+  assert_contains "Image already exists: agent-plain (use --rebuild to rebuild)"
+  [ "$tag_calls" -eq 0 ] || fail "Did not expect snapshot tag call, got $tag_calls"
+  CONTAINER_CMD=container
+}
+
 test_run_cmd_runtime_selection_auto_installs_for_new_container() {
   begin_test "run_cmd auto-installs a selected runtime for a new container"
 
@@ -4093,8 +4208,8 @@ test_image_ref_for_runtime_falls_back_to_legacy_when_present() {
   [ "$(image_ref_for_runtime codex)" = "codex" ] || fail "Expected fallback to legacy codex image"
 }
 
-test_ls_filters_non_codex_containers() {
-  begin_test "ls_cmd hides non-Codex runtime containers"
+test_ls_raw_filters_non_codex_containers() {
+  begin_test "ls --raw hides non-Codex runtime containers"
 
   load_codexctl_functions
 
@@ -4110,7 +4225,7 @@ codex-custom                     my-team/codex-custom:latest                    
 EOF
   }
 
-  run_capture ls_cmd
+  run_capture ls_cmd --raw
   assert_status 0
   assert_contains "ID                               IMAGE"
   assert_contains "codex-python                     codex-python:latest"
@@ -4118,6 +4233,127 @@ EOF
   assert_contains "codex-custom                     my-team/codex-custom:latest"
   assert_not_contains "buildkit"
   assert_not_contains "converter"
+}
+
+test_ls_reports_matching_snapshot_ref_by_default() {
+  begin_test "ls reports matching timestamp snapshot by image digest by default"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "ls -a")
+        cat <<'EOF'
+ID                               IMAGE                                                OS     ARCH   STATE    ADDR              CPUS  MEMORY   STARTED
+converter                        docker.io/library/debian:latest                      linux  amd64  stopped                    4     1024 MB
+agent-local-agent-container      agent-python:latest                                  linux  arm64  running  192.168.64.253/24  4     4096 MB  2026-06-07T15:03:00Z
+EOF
+        ;;
+      "image ls --format json")
+        cat <<'EOF'
+[
+  {"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"agent-python:latest"},
+  {"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"docker.io/library/agent-python:20260607-150156"},
+  {"descriptor":{"digest":"sha256:other"},"reference":"agent-python:20260607-144649"}
+]
+EOF
+        ;;
+      "inspect agent-local-agent-container")
+        cat <<'EOF'
+[{"configuration":{"mounts":[{"source":"/Users/philipp/Developer/local-agent-container","options":[],"destination":"/workdir","type":{"virtiofs":{}}}],"resources":{"memoryInBytes":4294967296,"cpus":4},"image":{"descriptor":{"annotations":{"org.opencontainers.image.created":"2026-06-07T15:02:18Z"},"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"agent-python:latest"}},"status":"running"}]
+EOF
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture ls_cmd
+  assert_status 0
+  assert_contains "NAME"
+  assert_contains "SNAPSHOT"
+  assert_contains "agent-local-agent-container"
+  assert_contains "agent-python:20260607-150156"
+  assert_contains "sha256:4924ec2b2c5a"
+  assert_contains "/Users/philipp/Developer/local-agent-container"
+  assert_contains "4G"
+  assert_not_contains "converter"
+}
+
+test_ls_reports_unknown_snapshot_when_timestamp_missing() {
+  begin_test "ls reports unknown snapshot when only latest matches digest"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "ls -a")
+        cat <<'EOF'
+ID                          IMAGE                OS     ARCH   STATE
+agent-local-agent-container agent-python:latest  linux  arm64  running
+EOF
+        ;;
+      "image ls --format json")
+        cat <<'EOF'
+[
+  {"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"agent-python:latest"}
+]
+EOF
+        ;;
+      "inspect agent-local-agent-container")
+        cat <<'EOF'
+[{"configuration":{"mounts":[],"resources":{},"image":{"descriptor":{"annotations":{},"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"agent-python:latest"}},"status":"running"}]
+EOF
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture ls_cmd
+  assert_status 0
+  assert_contains "agent-local-agent-container"
+  assert_matches '^agent-local-agent-container[[:space:]]+running[[:space:]]+agent-python:latest[[:space:]]+unknown[[:space:]]+sha256:4924ec2b2c5a'
+  assert_contains "unlimited"
+}
+
+test_ls_keeps_row_when_inspect_fails() {
+  begin_test "ls keeps a managed container row when inspect output is unavailable"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "ls -a")
+        cat <<'EOF'
+ID                          IMAGE                OS     ARCH   STATE
+agent-local-agent-container agent-python:latest  linux  arm64  running
+EOF
+        ;;
+      "image ls --format json")
+        printf '[]\n'
+        ;;
+      "inspect agent-local-agent-container")
+        printf 'not-json\n'
+        return 1
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture ls_cmd
+  assert_status 0
+  assert_matches '^agent-local-agent-container[[:space:]]+unknown[[:space:]]+unknown[[:space:]]+unknown[[:space:]]+unknown[[:space:]]+unknown[[:space:]]+unknown[[:space:]]+unlimited[[:space:]]+unlimited[[:space:]]+unknown$'
 }
 
 test_upgrade_backup_support_check() {
@@ -6235,6 +6471,9 @@ main() {
   run_selected_test test_build_cmd_uses_first_runtime_as_default_when_unspecified "test_build_cmd_uses_first_runtime_as_default_when_unspecified"
   run_selected_test test_build_cmd_default_runtime_alone_installs_only_that_runtime "test_build_cmd_default_runtime_alone_installs_only_that_runtime"
   run_selected_test test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden "test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden"
+  run_selected_test test_build_cmd_rebuilds_and_snapshots_local_dependencies "test_build_cmd_rebuilds_and_snapshots_local_dependencies"
+  run_selected_test test_build_cmd_snapshots_existing_image_when_timestamp_missing "test_build_cmd_snapshots_existing_image_when_timestamp_missing"
+  run_selected_test test_build_cmd_skips_existing_image_when_timestamp_matches "test_build_cmd_skips_existing_image_when_timestamp_matches"
   run_selected_test test_run_cmd_runtime_selection_auto_installs_for_new_container "test_run_cmd_runtime_selection_auto_installs_for_new_container"
   run_selected_test test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container "test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container"
   run_selected_test test_build_cmd_warns_for_legacy_office_image "test_build_cmd_warns_for_legacy_office_image"
@@ -6340,7 +6579,10 @@ main() {
   run_selected_test test_rescue_runs_command_in_temporary_backup_container "test_rescue_runs_command_in_temporary_backup_container"
   run_selected_test test_rescue_keep_leaves_container_running "test_rescue_keep_leaves_container_running"
   run_selected_test test_image_ref_for_runtime_falls_back_to_legacy_when_present "test_image_ref_for_runtime_falls_back_to_legacy_when_present"
-  run_selected_test test_ls_filters_non_codex_containers "test_ls_filters_non_codex_containers"
+  run_selected_test test_ls_raw_filters_non_codex_containers "test_ls_raw_filters_non_codex_containers"
+  run_selected_test test_ls_reports_matching_snapshot_ref_by_default "test_ls_reports_matching_snapshot_ref_by_default"
+  run_selected_test test_ls_reports_unknown_snapshot_when_timestamp_missing "test_ls_reports_unknown_snapshot_when_timestamp_missing"
+  run_selected_test test_ls_keeps_row_when_inspect_fails "test_ls_keeps_row_when_inspect_fails"
   run_selected_test test_upgrade_backup_support_check "test_upgrade_backup_support_check"
   run_selected_test test_run_rejects_resource_flags_for_existing_container "test_run_rejects_resource_flags_for_existing_container"
   run_selected_test test_upgrade_rejects_no_backup_for_legacy_source "test_upgrade_rejects_no_backup_for_legacy_source"
