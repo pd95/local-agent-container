@@ -63,6 +63,10 @@ python_exec() {
   "$python_cmd" -c "$script" "$@"
 }
 
+python_available() {
+  command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1
+}
+
 container_list_all() {
   "$CONTAINER_CMD" ls -a 2>/dev/null || true
 }
@@ -370,6 +374,72 @@ validate_mount_mode() {
 
 image_list() {
   "$CONTAINER_CMD" image ls 2>/dev/null || "$CONTAINER_CMD" images 2>/dev/null || true
+}
+
+image_list_json() {
+  "$CONTAINER_CMD" image ls --format json 2>/dev/null || printf '[]\n'
+}
+
+image_matching_timestamp_ref() {
+  local image="$1"
+  local images_json
+  local script
+
+  python_available || return 2
+  images_json="$(image_list_json)"
+  script="$(cat <<'PY'
+import json
+import re
+import sys
+
+target = sys.argv[1]
+if ":" not in target:
+    target_latest = f"{target}:latest"
+else:
+    target_latest = target
+target_family = target_latest.rsplit(":", 1)[0]
+
+def normalize_ref(ref):
+    if not isinstance(ref, str):
+        return ""
+    return re.sub(r"^docker\.io/library/", "", ref)
+
+try:
+    images = json.loads(sys.stdin.read())
+    if not isinstance(images, list):
+        images = []
+except Exception:
+    images = []
+
+target_digest = ""
+for entry in images:
+    if not isinstance(entry, dict):
+        continue
+    ref = normalize_ref(entry.get("reference") or "")
+    if ref in (target, target_latest):
+        target_digest = ((entry.get("descriptor") or {}).get("digest") or "")
+        break
+
+if not target_digest:
+    sys.exit(2)
+
+matches = []
+for entry in images:
+    if not isinstance(entry, dict):
+        continue
+    if ((entry.get("descriptor") or {}).get("digest") or "") != target_digest:
+        continue
+    ref = normalize_ref(entry.get("reference") or "")
+    if ref.rsplit(":", 1)[0] != target_family:
+        continue
+    if re.search(r":[0-9]{8}-[0-9]{6}$", ref):
+        matches.append(ref)
+
+if matches:
+    print(sorted(matches)[-1])
+PY
+)"
+  printf '%s' "$images_json" | python_exec "$script" "$image"
 }
 
 image_exists() {
@@ -1626,6 +1696,7 @@ build_cmd() {
     name="$(image_family_preferred "$name")"
     local versioned_name="${name}:${build_stamp}"
     local base=""
+    local existing_snapshot=""
     file="$(dockerfile_name_for_image "$name")"
     file_path="$SCRIPT_DIR/$file"
     if [ "$rebuild" -eq 0 ] && [ "$default_runtime_overridden" -eq 0 ] && [ "$runtimes_overridden" -eq 0 ] && image_exists "$name"; then
@@ -1633,6 +1704,14 @@ build_cmd() {
         echo "Snapshotting existing image tags: $name, $versioned_name"
         "$CONTAINER_CMD" image tag "$name" "$versioned_name"
         return 0
+      fi
+      if python_available; then
+        existing_snapshot="$(image_matching_timestamp_ref "$name" 2>/dev/null || true)"
+        if [ -z "$existing_snapshot" ]; then
+          echo "Snapshotting missing image tag: $name, $versioned_name"
+          "$CONTAINER_CMD" image tag "$name" "$versioned_name"
+          return 0
+        fi
       fi
       echo "Image already exists: $name (use --rebuild to rebuild)"
       return 0
@@ -4974,7 +5053,35 @@ simple_name_cmd() {
 }
 
 ls_cmd() {
+  local raw=0
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --details) shift ;;
+      --raw) raw=1; shift ;;
+      --help)
+        cat <<EOF
+Usage: $CLI_NAME ls [--details|--raw]
+
+Options:
+  --details  Show managed containers with image digest and matching timestamp snapshot (default)
+  --raw      Show the legacy filtered container list
+EOF
+        return 0
+        ;;
+      *) die "Unknown option for ls: $1" ;;
+    esac
+  done
+
   require_container
+  if [ "$raw" -eq 1 ]; then
+    ls_raw_cmd
+    return 0
+  fi
+  ls_details_cmd
+}
+
+ls_raw_cmd() {
   container_list_all | awk '
     NR == 1 { print; next }
     {
@@ -4986,6 +5093,225 @@ ls_cmd() {
       }
     }
   '
+}
+
+managed_container_names() {
+  container_list_all | awk '
+    NR == 1 { next }
+    {
+      image = $2
+      sub(/^.*\//, "", image)
+      sub(/[:@].*$/, "", image)
+      if (image ~ /^(agent|codex)([[:alnum:]_.-]*|$)/) {
+        print $1
+      }
+    }
+  '
+}
+
+ls_details_row() {
+  local name="$1"
+  local images_json_file="$2"
+  local inspect_json="${3:-}"
+  local script
+
+  script="$(cat <<'PY'
+import json
+import re
+import sys
+
+name = sys.argv[1]
+images_json_file = sys.argv[2]
+inspect_raw = sys.stdin.read()
+
+def normalize_ref(ref):
+    if not isinstance(ref, str):
+        return ""
+    return re.sub(r"^docker\.io/library/", "", ref)
+
+def family_for_ref(ref):
+    ref = normalize_ref(ref)
+    if ":" in ref:
+        return ref.rsplit(":", 1)[0]
+    return ref
+
+def value_or_unknown(value):
+    if value is None or value == "":
+        return "unknown"
+    return str(value)
+
+def resource_value(value):
+    if value in (None, "", 0, "0"):
+        return "unlimited"
+    if isinstance(value, (int, float)):
+        if int(value) <= 0:
+            return "unlimited"
+        return str(int(value))
+    return str(value)
+
+def memory_value(value):
+    if value in (None, "", 0, "0"):
+        return "unlimited"
+    try:
+        size = int(value)
+    except Exception:
+        return str(value)
+    if size <= 0:
+        return "unlimited"
+    units = [("T", 1024 ** 4), ("G", 1024 ** 3), ("M", 1024 ** 2), ("K", 1024)]
+    for suffix, factor in units:
+        if size % factor == 0 and size >= factor:
+            return f"{size // factor}{suffix}"
+    return str(size)
+
+def first_json_object(raw):
+    data = json.loads(raw)
+    if isinstance(data, list):
+        if data:
+            return data[0]
+        return {}
+    if isinstance(data, dict):
+        return data
+    return {}
+
+try:
+    with open(images_json_file, "r", encoding="utf-8") as handle:
+        images = json.load(handle)
+        if not isinstance(images, list):
+            images = []
+except Exception:
+    images = []
+
+try:
+    data = first_json_object(inspect_raw)
+except Exception:
+    data = {}
+
+if isinstance(data, dict):
+    config = data.get("configuration") or data
+else:
+    config = {}
+image = config.get("image") or {}
+descriptor = image.get("descriptor") or {}
+annotations = descriptor.get("annotations") or {}
+resources = config.get("resources") or {}
+mounts = config.get("mounts") or []
+
+ref = normalize_ref(image.get("reference") or "")
+digest = descriptor.get("digest") or ""
+created = annotations.get("org.opencontainers.image.created") or ""
+status = data.get("status") or "unknown"
+workdir = "unknown"
+mount_mode = "unknown"
+for mount in mounts:
+    if mount.get("destination") != "/workdir":
+        continue
+    workdir = mount.get("source") or "unknown"
+    options = mount.get("options") or []
+    if isinstance(options, str):
+        options = [options]
+    mount_mode = "ro" if "ro" in options else "rw"
+    break
+
+matching_refs = []
+timestamp_refs = []
+current_family = family_for_ref(ref)
+for entry in images:
+    if not isinstance(entry, dict):
+        continue
+    entry_digest = ((entry.get("descriptor") or {}).get("digest") or "")
+    if entry_digest != digest:
+        continue
+    entry_ref = normalize_ref(entry.get("reference") or "")
+    if not entry_ref:
+        continue
+    matching_refs.append(entry_ref)
+    if re.search(r":[0-9]{8}-[0-9]{6}$", entry_ref):
+        timestamp_refs.append(entry_ref)
+
+same_family_timestamps = [candidate for candidate in timestamp_refs if family_for_ref(candidate) == current_family]
+snapshot = "unknown"
+if same_family_timestamps:
+    snapshot = sorted(same_family_timestamps)[-1]
+elif timestamp_refs:
+    snapshot = sorted(timestamp_refs)[-1]
+
+digest_display = digest
+if digest_display.startswith("sha256:") and len(digest_display) > len("sha256:") + 12:
+    digest_display = digest_display[:len("sha256:") + 12]
+
+row = [
+    name,
+    value_or_unknown(status),
+    value_or_unknown(ref),
+    value_or_unknown(snapshot),
+    value_or_unknown(digest_display),
+    value_or_unknown(workdir),
+    value_or_unknown(mount_mode),
+    resource_value(resources.get("cpus")),
+    memory_value(resources.get("memoryInBytes")),
+    value_or_unknown(created),
+]
+print("\t".join(row))
+PY
+)"
+
+  python_exec "$script" "$name" "$images_json_file" <<<"$inspect_json"
+}
+
+format_tsv_table() {
+  local script
+
+  script="$(cat <<'PY'
+import sys
+
+rows = [line.rstrip("\n").split("\t") for line in sys.stdin if line.rstrip("\n")]
+if not rows:
+    sys.exit(0)
+
+widths = [0] * max(len(row) for row in rows)
+for row in rows:
+    for index, cell in enumerate(row):
+        widths[index] = max(widths[index], len(cell))
+
+for row in rows:
+    padded = []
+    for index, cell in enumerate(row):
+        if index == len(row) - 1:
+            padded.append(cell)
+        else:
+            padded.append(cell.ljust(widths[index]))
+    print("  ".join(padded).rstrip())
+PY
+)"
+  python_exec "$script"
+}
+
+ls_details_cmd() {
+  local images_json
+  local images_json_file
+  local name
+  local inspect_json
+  local rows
+
+  if ! python_available; then
+    warn "Python is required for detailed ls output; falling back to --raw"
+    ls_raw_cmd
+    return 0
+  fi
+
+  images_json="$(image_list_json)"
+  images_json_file="$(mktemp "${TMPDIR:-/tmp}/agentctl-images.XXXXXX")"
+  printf '%s\n' "$images_json" >"$images_json_file"
+  rows="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "NAME" "STATE" "IMAGE" "SNAPSHOT" "DIGEST" "WORKDIR" "MOUNT" "CPU" "MEMORY" "CREATED")"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    inspect_json="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null || true)"
+    rows="${rows}"$'\n'"$(ls_details_row "$name" "$images_json_file" "$inspect_json")"
+  done < <(managed_container_names)
+  printf '%s\n' "$rows" | format_tsv_table
+  rm -f "$images_json_file"
 }
 
 cmd="${1:-}"
