@@ -948,19 +948,19 @@ Commands:
   prune        Remove old timestamp-tagged agent images
   rm           Remove all refs for one agent image family or backup image
 
-Options for `images`:
+Options for images:
   --image NAME  Agent image family, custom agent-* image, legacy codex-* image, or a backup base/image
   --backup      Show only backup image refs
   --all         Include non-agent images
   --latest      Show only stable tags and newest timestamp tag per family
 
-Options for `images prune`:
+Options for images prune:
   --keep N      Keep the newest N timestamp tags per family (default: 1)
   --image NAME  Limit pruning to one image family, backup base, or exact backup image ref
   --backup      Prune only backup image refs
   --dry-run     Print images that would be deleted
 
-Options for `images rm`:
+Options for images rm:
   --image NAME  Remove one image family, custom codex-* image, or backup base/image
   --backup      Remove only backup image refs
   --dry-run     Print images that would be deleted
