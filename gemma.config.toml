@@ -1,0 +1,4 @@
+model_provider = "myollama"
+model = "gemma4:26b-nvfp4"
+model_context_window = 131072
+model_catalog_json = "~/.codex/local_models.json"

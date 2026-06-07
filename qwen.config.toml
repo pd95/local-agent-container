@@ -1,0 +1,4 @@
+model_provider = "myollama"
+model = "qwen3.5:35b-a3b-coding-nvfp4"
+model_context_window = 131072
+model_catalog_json = "~/.codex/local_models.json"

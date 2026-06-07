@@ -50,8 +50,8 @@ RUN groupadd coder \
 ENV HOME=/home/coder \
     IMAGE_NAME=agent-swift
 
-# Copy Codex default configuration and local model metadata config
-COPY --chown=coder:coder config.toml local_models.json /home/coder/.codex/
+# Copy Codex default configuration, profiles, and local model metadata config
+COPY --chown=coder:coder config.toml gpt-oss.config.toml gemma.config.toml qwen.config.toml local_models.json /home/coder/.codex/
 COPY claude-settings.json /etc/claudectl/settings.json
 COPY agentctl-path.sh /etc/profile.d/agentctl-path.sh
 
@@ -85,8 +85,8 @@ RUN HOME=/home/coder \
  && chown -R coder:coder /home/coder /workdir
 
 RUN mkdir -p /etc/codexctl /etc/agentctl \
- && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
- && cp /home/coder/.codex/config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
+ && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
+ && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
  && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
  && cat > /etc/codexctl/image.md <<EOF
 You are running inside the \`agent-swift\` image.
