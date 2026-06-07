@@ -1326,6 +1326,19 @@ test_use_help_reports_new_command() {
   assert_contains "Usage: agentctl use <runtime> [options]"
 }
 
+test_images_help_reports_subcommand_options() {
+  begin_test "images help reports subcommand option sections"
+
+  run_capture "$AGENTCTL" images --help
+  assert_status 0
+  assert_contains "Usage: agentctl images [options]"
+  assert_contains "Options for images:"
+  assert_contains "Options for images prune:"
+  assert_contains "Options for images rm:"
+  assert_not_contains "command not found"
+  assert_not_contains "Options for :"
+}
+
 test_rm_help_reports_force_option() {
   begin_test "rm help reports the force option"
 
@@ -6507,6 +6520,7 @@ main() {
   run_selected_test test_runtime_help_reports_new_command "test_runtime_help_reports_new_command"
   run_selected_test test_feature_help_reports_new_command "test_feature_help_reports_new_command"
   run_selected_test test_use_help_reports_new_command "test_use_help_reports_new_command"
+  run_selected_test test_images_help_reports_subcommand_options "test_images_help_reports_subcommand_options"
   run_selected_test test_rm_help_reports_force_option "test_rm_help_reports_force_option"
   run_selected_test test_agent_sh_runtime_info_reports_registry_metadata "test_agent_sh_runtime_info_reports_registry_metadata"
   run_selected_test test_agent_sh_feature_list_reports_declared_features "test_agent_sh_feature_list_reports_declared_features"
