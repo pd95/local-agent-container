@@ -1644,7 +1644,12 @@ EOF
     "$TEST_ROOT/runtimes.d/codex.json" >"$registry_dir/codex.json"
 
   cat >"$config_dir/config.toml" <<'EOF'
-[profiles.gpt-oss]
+[model_providers.myollama]
+name = "Ollama"
+base_url = "http://192.168.64.1:11434/v1"
+EOF
+  cat >"$config_dir/gpt-oss.config.toml" <<'EOF'
+model_provider = "myollama"
 model = "gpt-oss:20b"
 EOF
   printf '{"models":[]}\n' >"$config_dir/local_models.json"
@@ -1667,7 +1672,8 @@ EOF
   assert_contains "Existing Codex MCP configuration that reset-config will replace:"
   assert_contains "[mcp_servers.custom]"
   assert_contains 'command = "custom-mcp"'
-  grep -Fq 'model = "gpt-oss:20b"' "$temp_home/home/.codex/config.toml" || fail "Expected Codex config.toml to reset to image defaults"
+  grep -Fq '[model_providers.myollama]' "$temp_home/home/.codex/config.toml" || fail "Expected Codex config.toml to reset to image defaults"
+  grep -Fq 'model = "gpt-oss:20b"' "$temp_home/home/.codex/gpt-oss.config.toml" || fail "Expected Codex profile config to reset to image defaults"
   jq -er '.models == []' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected Codex local_models.json to reset to image defaults"
   [ -L "$temp_home/home/.codex/AGENTS.md" ] || fail "Expected Codex AGENTS.md to reset to a symlink"
   [ "$(readlink "$temp_home/home/.codex/AGENTS.md")" = "$config_dir/image.md" ] || fail "Expected Codex AGENTS.md to point at image defaults"
@@ -2025,12 +2031,8 @@ EOF
   cat >"$temp_home/home/.codex/config.toml" <<'EOF'
 [model_providers.myollama]
 name = "Ollama"
-
-[profiles.gpt-oss]
-model_provider = "myollama"
-model = "default:model"
-
-[profiles.gemma]
+EOF
+  cat >"$temp_home/home/.codex/gemma.config.toml" <<'EOF'
 model_provider = "myollama"
 model = "gemma:model"
 EOF
@@ -5531,7 +5533,9 @@ test_refresh_updates_managed_files_without_recreate() {
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
   printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/config.toml" || fail "Expected refresh to update /etc/agentctl/config.toml"
+  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/gpt-oss.config.toml" || fail "Expected refresh to update /etc/agentctl/gpt-oss.config.toml"
   printf '%s\n' "$exec_log" | grep -Fq "/etc/codexctl/config.toml" || fail "Expected refresh to update /etc/codexctl/config.toml"
+  printf '%s\n' "$exec_log" | grep -Fq "/etc/codexctl/gpt-oss.config.toml" || fail "Expected refresh to update /etc/codexctl/gpt-oss.config.toml"
   printf '%s\n' "$exec_log" | grep -Fq "/usr/local/bin/agent.sh" || fail "Expected refresh to update agent.sh"
   printf '%s\n' "$exec_log" | grep -Fq "/usr/local/lib/agentctl/runtimes" || fail "Expected refresh to update runtime adapters"
   printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/runtimes.d" || fail "Expected refresh to update runtime registry"
@@ -5708,7 +5712,14 @@ test_refresh_container_tree_suppresses_host_xattrs() {
   container() {
     case "$1" in
       exec)
-        cat >/dev/null || true
+        shift
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "-i" ]; then
+            cat >/dev/null || true
+            break
+          fi
+          shift
+        done
         ;;
       *)
         fail "Unexpected container invocation: $*"

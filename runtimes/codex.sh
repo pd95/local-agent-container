@@ -8,6 +8,24 @@ codex_config_file() {
   printf '%s\n' "$(codex_home_dir)/config.toml"
 }
 
+codex_profile_config_file() {
+  local profile="$1"
+
+  codex_profile_name_is_safe "$profile" || return 1
+  printf '%s\n' "$(codex_home_dir)/${profile}.config.toml"
+}
+
+codex_profile_name_is_safe() {
+  local profile="$1"
+
+  case "$profile" in
+    ''|*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-]*)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
 codex_model_catalog_file() {
   printf '%s\n' "$(codex_home_dir)/local_models.json"
 }
@@ -25,12 +43,29 @@ codex_ensure_config_file() {
 
   codex_ensure_home_dir
   config_file="$(codex_config_file)"
-  [ -f "$config_file" ] && return 0
+  if [ -f "$config_file" ]; then
+    codex_copy_missing_default_profile_configs
+    return 0
+  fi
   if [ -f /etc/codexctl/config.toml ]; then
     cp /etc/codexctl/config.toml "$config_file"
+    codex_copy_missing_default_profile_configs
     return 0
   fi
   die "missing Codex config: $config_file"
+}
+
+codex_copy_missing_default_profile_configs() {
+  local profile_config=""
+  local target=""
+
+  [ -d /etc/codexctl ] || return 0
+  for profile_config in /etc/codexctl/*.config.toml; do
+    [ -e "$profile_config" ] || continue
+    target="$(codex_home_dir)/$(basename "$profile_config")"
+    [ -f "$target" ] && continue
+    cp "$profile_config" "$target"
+  done
 }
 
 codex_warn_mcp_config_reset() {
@@ -110,22 +145,52 @@ codex_arg_value() {
 
 codex_profile_model() {
   local profile="$1"
-  local config_file=""
+  local model=""
 
   codex_ensure_config_file
-  config_file="$(codex_config_file)"
-  awk -v profile="$profile" '
-    /^\[profiles\.[^]]+\][[:space:]]*$/ {
-      current=$0
-      sub(/^\[profiles\./, "", current)
-      sub(/\][[:space:]]*$/, "", current)
-      in_profile=(current == profile)
+  model="$(codex_profile_value "$profile" model || true)"
+  [ -n "$model" ] && printf '%s\n' "$model"
+}
+
+codex_profile_provider() {
+  local profile="$1"
+  local provider=""
+
+  codex_ensure_config_file
+  provider="$(codex_profile_value "$profile" model_provider || true)"
+  [ -n "$provider" ] && printf '%s\n' "$provider"
+}
+
+codex_profile_value() {
+  local profile="$1"
+  local key="$2"
+  local profile_file=""
+  local value=""
+
+  profile_file="$(codex_profile_config_file "$profile" || true)"
+  if [ -n "$profile_file" ] && [ -f "$profile_file" ]; then
+    value="$(codex_top_level_config_value "$profile_file" "$key")"
+    if [ -n "$value" ]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+  fi
+  codex_legacy_profile_value "$profile" "$key"
+}
+
+codex_top_level_config_value() {
+  local config_file="$1"
+  local key="$2"
+
+  awk -v key="$key" '
+    /^\[[^]]+\][[:space:]]*$/ {
+      in_section=1
       next
     }
-    /^\[[^]]+\][[:space:]]*$/ {
-      in_profile=0
+    in_section {
+      next
     }
-    in_profile && /^[[:space:]]*model[[:space:]]*=/ {
+    $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
       line=$0
       sub(/^[^"]*"/, "", line)
       sub(/".*$/, "", line)
@@ -135,13 +200,13 @@ codex_profile_model() {
   ' "$config_file"
 }
 
-codex_profile_provider() {
+codex_legacy_profile_value() {
   local profile="$1"
+  local key="$2"
   local config_file=""
 
-  codex_ensure_config_file
   config_file="$(codex_config_file)"
-  awk -v profile="$profile" '
+  awk -v profile="$profile" -v key="$key" '
     /^\[profiles\.[^]]+\][[:space:]]*$/ {
       current=$0
       sub(/^\[profiles\./, "", current)
@@ -152,7 +217,7 @@ codex_profile_provider() {
     /^\[[^]]+\][[:space:]]*$/ {
       in_profile=0
     }
-    in_profile && /^[[:space:]]*model_provider[[:space:]]*=/ {
+    in_profile && $0 ~ "^[[:space:]]*" key "[[:space:]]*=" {
       line=$0
       sub(/^[^"]*"/, "", line)
       sub(/".*$/, "", line)
@@ -549,13 +614,18 @@ agent_runtime_reset_config() {
   local runtime="$1"
   local config_dir="$2"
   local codex_dir=""
+  local profile_config=""
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   codex_dir="$(codex_home_dir)"
   codex_ensure_home_dir
-  printf 'Warning: resetting Codex configuration will replace ~/.codex/config.toml, ~/.codex/local_models.json, ~/.codex/AGENTS.md, and may remove custom profiles, MCP servers, providers, local model metadata, and runtime preference.\n' >&2
+  printf 'Warning: resetting Codex configuration will replace ~/.codex/config.toml, default ~/.codex/*.config.toml profiles, ~/.codex/local_models.json, ~/.codex/AGENTS.md, and may remove custom profiles, MCP servers, providers, local model metadata, and runtime preference.\n' >&2
   codex_warn_mcp_config_reset "$codex_dir/config.toml"
   cp "$config_dir/config.toml" "$codex_dir/config.toml"
+  for profile_config in "$config_dir"/*.config.toml; do
+    [ -e "$profile_config" ] || continue
+    cp "$profile_config" "$codex_dir/"
+  done
   if [ -f "$config_dir/local_models.json" ]; then
     cp "$config_dir/local_models.json" "$codex_dir/local_models.json"
   else
