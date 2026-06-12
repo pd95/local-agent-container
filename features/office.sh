@@ -81,6 +81,7 @@ agent_feature_install() {
 
   office_apk add --no-cache \
     ca-certificates openssh-client \
+    npm \
     fd \
     build-base python3-dev musl-dev \
     fontconfig ttf-dejavu \

@@ -665,10 +665,7 @@ test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
   RUN_REQUESTED_IMAGE="agent-plain"
 
   run_agent_sh_in_container() {
-    call_log="${call_log}$1:$2:$3"$'\n'
-  }
-  run_agent_sh_in_container_root() {
-    call_log="${call_log}root:$1:$2:$3:$4"$'\n'
+    call_log="${call_log}user:$1:$2:${3:-}:${4:-}"$'\n'
   }
   runtime_info_in_container() {
     printf '{"runtime":"claude","installed":true,"auth_formats":["claude_ai_oauth_json"],"capabilities":{"auth_login":true,"auth_read":true,"auth_write":true}}'
@@ -678,13 +675,39 @@ test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
 
   run_capture run_pre_exec unit-test-container
   assert_status 0
-  printf '%s' "$call_log" | grep -Fq $'root:unit-test-container:runtime:install:claude' || fail "Expected root runtime install call, got: $call_log"
-  printf '%s' "$call_log" | grep -Fq $'unit-test-container:preferred:set' || fail "Expected preferred set call, got: $call_log"
+  printf '%s' "$call_log" | grep -Fq $'user:unit-test-container:runtime:install:claude' || fail "Expected user runtime install call, got: $call_log"
+  printf '%s' "$call_log" | grep -Fq $'user:unit-test-container:preferred:set' || fail "Expected preferred set call, got: $call_log"
   printf '%s' "$call_log" | grep -Fq $'sync:unit-test-container:claude:claude_ai_oauth_json' || fail "Expected runtime auth sync call, got: $call_log"
 }
 
 test_run_pre_exec_updates_codex_via_runtime_helper() {
-  begin_test "run_pre_exec updates codex via the runtime root helper"
+  begin_test "run_pre_exec updates codex via the runtime user helper"
+
+  load_codexctl_functions
+
+  local helper_log=""
+  local helper_log_file=""
+  local temp_dir=""
+  RUN_SELECTED_RUNTIME=""
+  RUN_INSTALL_RUNTIME=0
+  RUN_SYNC_RUNTIME_AUTH=0
+  RUN_SYNC_POST_RUNTIME_AUTH=0
+  RUN_FORCE_RUNTIME_AUTH=0
+  RUN_LOCAL_MODEL_PREFLIGHT=0
+  RUN_UPDATE_CODEX=1
+  RUN_REQUESTED_IMAGE="agent-plain"
+
+  run_agent_sh_in_container() {
+    helper_log="${helper_log}user:$1:$2:$3:$4"$'\n'
+  }
+
+  run_capture run_pre_exec unit-test-container
+  assert_status 0
+  printf '%s' "$helper_log" | grep -Fq $'user:unit-test-container:runtime:update:codex' || fail "Expected runtime update user helper call, got: $helper_log"
+}
+
+test_run_pre_exec_updates_legacy_npm_codex_via_root_helper() {
+  begin_test "run_pre_exec updates legacy npm-global codex via the runtime root helper"
 
   load_codexctl_functions
 
@@ -697,14 +720,30 @@ test_run_pre_exec_updates_codex_via_runtime_helper() {
   RUN_LOCAL_MODEL_PREFLIGHT=0
   RUN_UPDATE_CODEX=1
   RUN_REQUESTED_IMAGE="agent-plain"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-legacy-update.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  helper_log_file="$temp_dir/helper.log"
+  : >"$helper_log_file"
 
+  run_agent_sh_in_container() {
+    printf 'user:%s:%s:%s:%s\n' "$1" "$2" "$3" "${4:-}" >>"$helper_log_file"
+    if [ "$2" = "runtime" ] && [ "$3" = "info" ] && [ "${4:-}" = "codex" ]; then
+      printf '{"runtime":"codex","install_method":"npm-global"}\n'
+    fi
+  }
   run_agent_sh_in_container_root() {
-    helper_log="${helper_log}root:$1:$2:$3:$4"$'\n'
+    printf 'root:%s:%s:%s:%s\n' "$1" "$2" "$3" "$4" >>"$helper_log_file"
   }
 
   run_capture run_pre_exec unit-test-container
+  helper_log="$(cat "$helper_log_file")"
   assert_status 0
-  printf '%s' "$helper_log" | grep -Fq $'root:unit-test-container:runtime:update:codex' || fail "Expected runtime update root helper call, got: $helper_log"
+  assert_contains "Using root Codex update for legacy npm-global install in unit-test-container"
+  printf '%s' "$helper_log" | grep -Fq $'user:unit-test-container:runtime:info:codex' || fail "Expected runtime info probe, got: $helper_log"
+  printf '%s' "$helper_log" | grep -Fq $'root:unit-test-container:runtime:update:codex' || fail "Expected legacy runtime update root helper call, got: $helper_log"
+  if printf '%s' "$helper_log" | grep -Fq $'user:unit-test-container:runtime:update:codex'; then
+    fail "Did not expect user update for legacy npm-global codex, got: $helper_log"
+  fi
 }
 
 test_run_container_reset_config_uses_runtime_helper() {
@@ -908,8 +947,8 @@ test_feature_cmd_installs_via_root_helper() {
   printf '%s' "$helper_log" | grep -Fq $'root:unit-feature-container:feature:install' || fail "Expected root feature helper call, got: $helper_log"
 }
 
-test_runtime_cmd_install_uses_root_helper() {
-  begin_test "runtime_cmd install uses the root helper path"
+test_runtime_cmd_install_uses_user_helper() {
+  begin_test "runtime_cmd install uses the user helper path"
 
   load_codexctl_functions
 
@@ -926,7 +965,7 @@ test_runtime_cmd_install_uses_root_helper() {
 
   run_capture runtime_cmd --name unit-runtime-container install codex
   assert_status 0
-  printf '%s' "$helper_log" | grep -Fq $'root:unit-runtime-container:runtime:install:codex' || fail "Expected root runtime helper call, got: $helper_log"
+  printf '%s' "$helper_log" | grep -Fq $'user:unit-runtime-container:runtime:install:codex' || fail "Expected user runtime helper call, got: $helper_log"
 }
 
 test_runtime_cmd_install_claude_warns_on_undersized_container() {
@@ -952,8 +991,8 @@ JSON
     esac
   }
   CONTAINER_CMD="mock_container"
-  run_agent_sh_in_container_root() {
-    helper_log="${helper_log}root:$1:$2:$3:$4"$'\n'
+  run_agent_sh_in_container() {
+    helper_log="${helper_log}user:$1:$2:$3:$4"$'\n'
   }
 
   run_capture runtime_cmd --name unit-runtime-container install claude
@@ -961,7 +1000,7 @@ JSON
   assert_contains "Container unit-runtime-container is limited to 1G."
   assert_contains "Claude install may be killed by memory pressure"
   assert_contains "upgrade --name unit-runtime-container --mem 4G"
-  printf '%s' "$helper_log" | grep -Fq $'root:unit-runtime-container:runtime:install:claude' || fail "Expected root runtime helper call, got: $helper_log"
+  printf '%s' "$helper_log" | grep -Fq $'user:unit-runtime-container:runtime:install:claude' || fail "Expected user runtime helper call, got: $helper_log"
 }
 
 test_runtime_cmd_install_claude_reports_memory_guidance_on_failure() {
@@ -998,7 +1037,7 @@ JSON
   esac
 }
 CONTAINER_CMD="mock_container"
-run_agent_sh_in_container_root() {
+run_agent_sh_in_container() {
   return 137
 }
 runtime_cmd --name unit-runtime-container install claude
@@ -1013,8 +1052,8 @@ EOF
   assert_contains "upgrade --name unit-runtime-container --mem 4G"
 }
 
-test_runtime_cmd_update_uses_root_helper() {
-  begin_test "runtime_cmd update uses the root helper path"
+test_runtime_cmd_update_uses_user_helper() {
+  begin_test "runtime_cmd update uses the user helper path"
 
   load_codexctl_functions
 
@@ -1031,7 +1070,7 @@ test_runtime_cmd_update_uses_root_helper() {
 
   run_capture runtime_cmd --name unit-runtime-container update codex
   assert_status 0
-  printf '%s' "$helper_log" | grep -Fq $'root:unit-runtime-container:runtime:update:codex' || fail "Expected root runtime helper call, got: $helper_log"
+  printf '%s' "$helper_log" | grep -Fq $'user:unit-runtime-container:runtime:update:codex' || fail "Expected user runtime helper call, got: $helper_log"
 }
 
 test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state() {
@@ -1086,7 +1125,7 @@ test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state() {
   assert_contains "Bootstrap complete: unit-bootstrap-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "apk add --no-cache bash zsh npm file curl git ripgrep jq util-linux bubblewrap" || fail "Expected root bootstrap install commands"
+  printf '%s\n' "$exec_log" | grep -Fq "apk add --no-cache bash zsh file curl git ripgrep jq util-linux bubblewrap" || fail "Expected root bootstrap install commands"
   printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
   printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/runtimes.d" || fail "Expected bootstrap to install runtime manifests"
   printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/features.d" || fail "Expected bootstrap to install feature manifests"
@@ -1210,7 +1249,7 @@ test_bootstrap_cmd_bootstraps_apt_container() {
   assert_contains "Bootstrap complete: unit-bootstrap-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "apt-get install -y --no-install-recommends bash zsh npm file curl git ripgrep jq util-linux bubblewrap ca-certificates" || fail "Expected apt bootstrap install commands"
+  printf '%s\n' "$exec_log" | grep -Fq "apt-get install -y --no-install-recommends bash zsh file curl git ripgrep jq util-linux bubblewrap ca-certificates" || fail "Expected apt bootstrap install commands"
   printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
   printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/runtimes.d" || fail "Expected bootstrap to install runtime manifests"
   printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/features.d" || fail "Expected bootstrap to install feature manifests"
@@ -1356,7 +1395,7 @@ test_agent_sh_runtime_info_reports_registry_metadata() {
 
   run_agent_sh_capture "$temp_home" runtime info codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "npm-global" and .default_config_dir == "/etc/codexctl" and (.auth_formats | index("json_refresh_token") != null) and .launch_configs.profile.type == "string" and .launch_configs.profile.default == "gpt-oss"' >/dev/null || fail "Expected runtime info JSON for codex, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "standalone-installer" and .default_config_dir == "/etc/codexctl" and (.auth_formats | index("json_refresh_token") != null) and .launch_configs.profile.type == "string" and .launch_configs.profile.default == "gpt-oss"' >/dev/null || fail "Expected runtime info JSON for codex, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_feature_list_reports_declared_features() {
@@ -1434,6 +1473,7 @@ EOF
   [ -f "$state_dir/office/install-complete" ] || fail "Expected office feature marker file"
   [ -f "$profile_dir/node_path.sh" ] || fail "Expected office feature to write node_path profile"
   grep -Fq "apk add --no-cache" "$install_log" || fail "Expected office feature to install apk packages"
+  grep -Fq " npm " "$install_log" || fail "Expected office feature to install npm package"
   grep -Fq "npm install -g pptxgenjs" "$install_log" || fail "Expected office feature to install pptxgenjs"
   grep -Fq "pip install --no-cache-dir python-docx python-pptx xlrd pdfplumber" "$install_log" || fail "Expected office feature to install pip packages"
 }
@@ -1687,6 +1727,80 @@ EOF
     -- runtime update claude
   assert_status 0
   grep -Fxq 'update' "$update_log" || fail "Expected claude update to be invoked"
+}
+
+test_agent_sh_codex_runtime_install_runs_standalone_installer() {
+  begin_test "agent.sh codex runtime install runs the standalone installer"
+
+  local temp_home
+  local fake_bin
+  local install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin"
+
+  cat >"$fake_bin/curl" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >>"$install_log"
+cat <<'SCRIPT'
+#!/bin/sh
+exit 0
+SCRIPT
+EOF
+  chmod +x "$fake_bin/curl"
+
+  cat >"$fake_bin/sh" <<EOF
+#!/bin/sh
+cat >/dev/null
+printf 'sh CODEX_NON_INTERACTIVE=%s\n' "\${CODEX_NON_INTERACTIVE:-}" >>"$install_log"
+cat >"$fake_bin/codex" <<'SCRIPT'
+#!/bin/sh
+exit 0
+SCRIPT
+chmod +x "$fake_bin/codex"
+EOF
+  chmod +x "$fake_bin/sh"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    -- runtime install codex
+  assert_status 0
+  grep -Fq 'https://chatgpt.com/codex/install.sh' "$install_log" || fail "Expected Codex standalone installer URL"
+  grep -Fxq 'sh CODEX_NON_INTERACTIVE=1' "$install_log" || fail "Expected non-interactive Codex installer"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    -- preferred get
+  assert_status 0
+  assert_contains "codex"
+}
+
+test_agent_sh_codex_runtime_update_calls_codex_update() {
+  begin_test "agent.sh codex runtime update calls codex update"
+
+  local temp_home
+  local fake_bin
+  local update_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  update_log="$temp_home/update.log"
+  mkdir -p "$fake_bin"
+
+  cat >"$fake_bin/codex" <<EOF
+#!/bin/sh
+printf '%s\n' "\$*" >"$update_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    -- runtime update codex
+  assert_status 0
+  grep -Fxq 'update' "$update_log" || fail "Expected codex update to be invoked"
 }
 
 test_agent_sh_claude_runtime_reset_config_restores_settings() {
@@ -5154,6 +5268,32 @@ test_upgrade_reinstall_command_prefers_requested_apk_packages() {
   assert_not_contains "apk add --no-cache musl-dev"
 }
 
+test_upgrade_warns_about_image_packages_removed_from_target() {
+  begin_test "upgrade warns about image-provided packages removed from the target image"
+
+  load_codexctl_functions
+
+  CLI_NAME=agentctl
+
+  run_capture warn_upgrade_package_loss \
+    unit-test-container \
+    agent-python \
+    agent-python \
+    '{"package_manager":"apk","packages":["bash","git","nodejs","npm"],"requested_packages":["bash","git","npm"]}' \
+    '{"package_manager":"apk","packages":["bash","git","nodejs","npm"],"requested_packages":["bash","git","npm"]}' \
+    '{"package_manager":"apk","packages":["bash","git"],"requested_packages":["bash","git"]}' \
+    unit-test-container
+
+  assert_status 0
+  assert_contains "Upgrade will also remove 2 image-provided apk package(s) from agent-python that are no longer present in agent-python:"
+  assert_contains "  - nodejs"
+  assert_contains "  - npm"
+  assert_contains "If you still need them, reinstall top-level packages after upgrade:"
+  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache npm"
+  assert_not_contains "Upgrade will remove 2 extra apk package(s)"
+  assert_not_contains "apk add --no-cache nodejs"
+}
+
 test_upgrade_reinstall_command_prefers_requested_dpkg_packages() {
   begin_test "upgrade reinstall command prefers requested dpkg packages"
 
@@ -5188,6 +5328,7 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   local stop_log=""
   local rm_log=""
   local root_call_log=""
+  local user_call_log=""
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -5219,6 +5360,10 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
     fi
     if [ "$2" = "feature" ] && [ "$3" = "info" ] && [ "$4" = "office" ]; then
       printf '{"feature":"office","installed":false,"capabilities":{"install":true}}\n'
+      return 0
+    fi
+    if [ "$2" = "runtime" ] && [ "$3" = "install" ] && [ "$4" = "claude" ]; then
+      user_call_log="${user_call_log}$2 $3 $4"$'\n'
       return 0
     fi
     fail "Unexpected run_agent_sh_in_container call: $*"
@@ -5262,7 +5407,7 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   assert_status 0
   assert_contains "Reinstalling added runtime in unit-test-container: claude"
   assert_contains "Reinstalling added feature in unit-test-container: office"
-  printf '%s\n' "$root_call_log" | grep -Fx -- "runtime install claude" >/dev/null || fail "Expected runtime reinstall call, got: $root_call_log"
+  printf '%s\n' "$user_call_log" | grep -Fx -- "runtime install claude" >/dev/null || fail "Expected runtime reinstall call, got: $user_call_log"
   printf '%s\n' "$root_call_log" | grep -Fx -- "feature install office" >/dev/null || fail "Expected feature reinstall call, got: $root_call_log"
   assert_contains "Upgrade complete: unit-test-container (backup skipped)"
   printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
@@ -6497,6 +6642,7 @@ main() {
   run_selected_test test_run_cmd_rejects_auth_without_online "test_run_cmd_rejects_auth_without_online"
   run_selected_test test_run_pre_exec_syncs_selected_runtime_auth_when_available "test_run_pre_exec_syncs_selected_runtime_auth_when_available"
   run_selected_test test_run_pre_exec_updates_codex_via_runtime_helper "test_run_pre_exec_updates_codex_via_runtime_helper"
+  run_selected_test test_run_pre_exec_updates_legacy_npm_codex_via_root_helper "test_run_pre_exec_updates_legacy_npm_codex_via_root_helper"
   run_selected_test test_run_container_reset_config_uses_runtime_helper "test_run_container_reset_config_uses_runtime_helper"
   run_selected_test test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified "test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified"
   run_selected_test test_run_pre_exec_runs_local_model_preflight_for_preferred_claude "test_run_pre_exec_runs_local_model_preflight_for_preferred_claude"
@@ -6505,10 +6651,10 @@ main() {
   run_selected_test test_sync_runtime_auth_to_container_if_available_skips_missing_keychain "test_sync_runtime_auth_to_container_if_available_skips_missing_keychain"
   run_selected_test test_auth_cmd_warns_for_legacy_office_image "test_auth_cmd_warns_for_legacy_office_image"
   run_selected_test test_feature_cmd_installs_via_root_helper "test_feature_cmd_installs_via_root_helper"
-  run_selected_test test_runtime_cmd_install_uses_root_helper "test_runtime_cmd_install_uses_root_helper"
+  run_selected_test test_runtime_cmd_install_uses_user_helper "test_runtime_cmd_install_uses_user_helper"
   run_selected_test test_runtime_cmd_install_claude_warns_on_undersized_container "test_runtime_cmd_install_claude_warns_on_undersized_container"
   run_selected_test test_runtime_cmd_install_claude_reports_memory_guidance_on_failure "test_runtime_cmd_install_claude_reports_memory_guidance_on_failure"
-  run_selected_test test_runtime_cmd_update_uses_root_helper "test_runtime_cmd_update_uses_root_helper"
+  run_selected_test test_runtime_cmd_update_uses_user_helper "test_runtime_cmd_update_uses_user_helper"
   run_selected_test test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state "test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state"
   run_selected_test test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container "test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container"
   run_selected_test test_bootstrap_cmd_bootstraps_apt_container "test_bootstrap_cmd_bootstraps_apt_container"
@@ -6535,6 +6681,8 @@ main() {
   run_selected_test test_agent_sh_system_manifest_reports_dpkg_requested_packages "test_agent_sh_system_manifest_reports_dpkg_requested_packages"
   run_selected_test test_agent_sh_claude_runtime_install_runs_native_installer "test_agent_sh_claude_runtime_install_runs_native_installer"
   run_selected_test test_agent_sh_claude_runtime_update_calls_claude_update "test_agent_sh_claude_runtime_update_calls_claude_update"
+  run_selected_test test_agent_sh_codex_runtime_install_runs_standalone_installer "test_agent_sh_codex_runtime_install_runs_standalone_installer"
+  run_selected_test test_agent_sh_codex_runtime_update_calls_codex_update "test_agent_sh_codex_runtime_update_calls_codex_update"
   run_selected_test test_agent_sh_claude_runtime_reset_config_restores_settings "test_agent_sh_claude_runtime_reset_config_restores_settings"
   run_selected_test test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration "test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration"
   run_selected_test test_agent_sh_codex_run_defaults_to_workdir_cd "test_agent_sh_codex_run_defaults_to_workdir_cd"
@@ -6609,6 +6757,7 @@ main() {
   run_selected_test test_upgrade_copy_dry_run_reports_copy_plan "test_upgrade_copy_dry_run_reports_copy_plan"
   run_selected_test test_upgrade_warns_about_added_packages_missing_from_target_image "test_upgrade_warns_about_added_packages_missing_from_target_image"
   run_selected_test test_upgrade_reinstall_command_prefers_requested_apk_packages "test_upgrade_reinstall_command_prefers_requested_apk_packages"
+  run_selected_test test_upgrade_warns_about_image_packages_removed_from_target "test_upgrade_warns_about_image_packages_removed_from_target"
   run_selected_test test_upgrade_reinstall_command_prefers_requested_dpkg_packages "test_upgrade_reinstall_command_prefers_requested_dpkg_packages"
   run_selected_test test_upgrade_reinstalls_added_runtimes_and_features_in_target "test_upgrade_reinstalls_added_runtimes_and_features_in_target"
   run_selected_test test_upgrade_warns_and_clears_missing_preferred_runtime "test_upgrade_warns_and_clears_missing_preferred_runtime"

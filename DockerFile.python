@@ -43,10 +43,9 @@ Image metadata:
 Built-in CLI tools:
 - base tools: \`bash\`, \`zsh\`, \`git\`, \`curl\`, \`file\`, \`jq\`, \`rg\`, \`bwrap\`
 - control tools: \`agent.sh\`
-- programming tools: \`node\`, \`npm\`, \`python3\`, \`python\`, \`pip\`
+- programming tools: \`python3\`, \`python\`, \`pip\`
 
 Programming environments:
-- Node.js with npm
 - Python 3
 - default virtual environment at \`/opt/venv\`, already on \`PATH\`
 

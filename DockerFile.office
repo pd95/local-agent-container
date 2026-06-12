@@ -5,6 +5,7 @@ USER root
 # --- Office tooling and Python libs ---
 RUN apk add --no-cache \
     ca-certificates openssh-client \
+    npm \
     fd \
     build-base python3-dev musl-dev \
     fontconfig ttf-dejavu \
