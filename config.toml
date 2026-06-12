@@ -10,3 +10,7 @@ wire_api = "responses"
 
 [projects."/workdir"]
 trust_level = "trusted"
+
+[tui]
+status_line = ["model-with-reasoning", "current-dir", "git-branch", "branch-changes", "run-state", "context-used", "five-hour-limit", "weekly-limit", "context-window-size", "used-tokens", "task-progress"]
+status_line_use_colors = true

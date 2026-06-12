@@ -1,22 +1,24 @@
-# For pure JS environment
+# For the plain agent environment
 FROM alpine:latest
 
 ARG AGENT_RUNTIMES=codex
 ARG AGENT_DEFAULT_RUNTIME=codex
+ARG BUILD_TIME=""
 
 # --- Core tooling ---
 RUN apk add --no-cache \
-        bash zsh npm file curl git perl ripgrep jq util-linux bubblewrap libgcc libstdc++
+        bash zsh file curl git perl ripgrep jq util-linux bubblewrap nodejs npm libgcc libstdc++
 
 # --- Add user ---
 RUN addgroup -S coder \
  && adduser  -S -G coder -h /home/coder -s /bin/bash coder \
- && mkdir -p /home/coder/.codex /workdir \
+ && mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir \
  && chown -R coder:coder /home/coder /workdir
 
 # Make sure HOME is correct for subsequent RUNs when we switch user
 ENV HOME=/home/coder \
-    IMAGE_NAME=agent-plain
+    IMAGE_NAME=agent-plain \
+    PATH=/home/coder/.local/bin:$PATH
 
 # Copy Codex default configuration, profiles, and local model metadata config
 COPY --chown=coder:coder config.toml gpt-oss.config.toml gemma.config.toml qwen.config.toml local_models.json /home/coder/.codex/
@@ -35,19 +37,25 @@ RUN chmod 0755 /usr/local/bin/agent.sh \
  && find /usr/local/lib/agentctl/features -type f -name '*.sh' -exec chmod 0644 {} + \
  && mkdir -p /etc/agentctl
 
+USER coder
+
 # --- Install the configured runtimes via agent.sh ---
 RUN HOME=/home/coder \
     XDG_CONFIG_HOME=/home/coder/.config \
     AGENTCTL_SKIP_PREFERRED_SET=1 \
     AGENT_RUNTIMES="$AGENT_RUNTIMES" \
     AGENT_DEFAULT_RUNTIME="$AGENT_DEFAULT_RUNTIME" \
-    bash -lc 'set -euo pipefail; IFS="," read -r -a runtimes <<<"$AGENT_RUNTIMES"; [ "${#runtimes[@]}" -gt 0 ] || { echo "No runtimes configured for image build" >&2; exit 1; }; for runtime in "${runtimes[@]}"; do bash /usr/local/bin/agent.sh runtime install "$runtime"; done; printf "%s\n" "$AGENT_DEFAULT_RUNTIME" > /etc/agentctl/preferred-runtime' \
+    bash -lc 'set -euo pipefail; IFS="," read -r -a runtimes <<<"$AGENT_RUNTIMES"; [ "${#runtimes[@]}" -gt 0 ] || { echo "No runtimes configured for image build" >&2; exit 1; }; for runtime in "${runtimes[@]}"; do bash /usr/local/bin/agent.sh runtime install "$runtime"; done'
+
+USER root
+
+RUN printf "%s\n" "$AGENT_DEFAULT_RUNTIME" > /etc/agentctl/preferred-runtime \
  && chown -R coder:coder /home/coder /workdir
 
 RUN mkdir -p /etc/codexctl /etc/agentctl \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
- && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+ && BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
  && cat > /etc/codexctl/image.md <<EOF
 You are running inside the \`agent-plain\` default image.
 
@@ -66,15 +74,12 @@ Built-in CLI tools:
 - control tools: \`agent.sh\`
 - programming tools: \`node\`, \`npm\`
 
-Programming environments:
-- Node.js with npm
-
 Use this image for general shell work, Git operations, repository maintenance, and light scripting.
 EOF
 RUN ln -sf /etc/codexctl/image.md /etc/agentctl/image.md
 RUN ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
 
-# From here on, run as coder so swiftly writes user-owned files
+# From here on, run as coder.
 USER coder
 WORKDIR /workdir
 

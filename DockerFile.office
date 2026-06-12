@@ -1,16 +1,18 @@
 FROM agent-python
+ARG BUILD_TIME=""
 
 USER root
 
 # --- Office tooling and Python libs ---
 RUN apk add --no-cache \
     ca-certificates openssh-client \
+    npm \
     fd \
     build-base python3-dev musl-dev \
     fontconfig ttf-dejavu \
     freetype libpng jpeg zlib \
     py3-numpy py3-pandas py3-matplotlib py3-pytest \
-    py3-pypdf py3-pdfminer py3-mupdf \
+    py3-pypdf py3-pdfminer \
     py3-reportlab py3-pillow py3-openpyxl py3-xlsxwriter \
     poppler-utils tesseract-ocr qpdf ghostscript pandoc-cli
 
@@ -34,7 +36,7 @@ RUN "$VIRTUAL_ENV/bin/pip" install --no-cache-dir \
 
 RUN mkdir -p /etc/codexctl /etc/agentctl \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
- && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+ && BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
  && cat > /etc/codexctl/image.md <<EOF
 You are running inside the \`agent-office\` image.
 

@@ -81,12 +81,13 @@ agent_feature_install() {
 
   office_apk add --no-cache \
     ca-certificates openssh-client \
+    npm \
     fd \
     build-base python3-dev musl-dev \
     fontconfig ttf-dejavu \
     freetype libpng jpeg zlib \
     py3-numpy py3-pandas py3-matplotlib py3-pytest \
-    py3-pypdf py3-pdfminer py3-mupdf \
+    py3-pypdf py3-pdfminer \
     py3-reportlab py3-pillow py3-openpyxl py3-xlsxwriter \
     poppler-utils tesseract-ocr qpdf ghostscript pandoc-cli
 

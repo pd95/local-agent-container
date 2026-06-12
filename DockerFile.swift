@@ -3,12 +3,14 @@ FROM swift:latest
 
 ARG AGENT_RUNTIMES=codex
 ARG AGENT_DEFAULT_RUNTIME=codex
+ARG BUILD_TIME=""
 
 # --- Core dev tooling (keep lean, no recommends) ---
 RUN DEBIAN_FRONTEND=noninteractive \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        zsh npm file curl perl ripgrep jq util-linux bubblewrap \
+        zsh file curl perl ripgrep jq util-linux bubblewrap \
+        nodejs npm \
         make \
         python-is-python3 \
   && rm -rf /var/lib/apt/lists/*
@@ -48,7 +50,10 @@ RUN groupadd coder \
 
 # Make sure HOME is correct for subsequent RUNs when we switch user
 ENV HOME=/home/coder \
-    IMAGE_NAME=agent-swift
+    IMAGE_NAME=agent-swift \
+    SWIFTLY_HOME_DIR=/home/coder/.swiftly \
+    SWIFTLY_BIN_DIR=/home/coder/.local/bin \
+    PATH=/home/coder/.local/bin:$PATH
 
 # Copy Codex default configuration, profiles, and local model metadata config
 COPY --chown=coder:coder config.toml gpt-oss.config.toml gemma.config.toml qwen.config.toml local_models.json /home/coder/.codex/
@@ -67,13 +72,10 @@ RUN chmod 0755 /usr/local/bin/agent.sh \
  && find /usr/local/lib/agentctl/features -type f -name '*.sh' -exec chmod 0644 {} + \
  && mkdir -p /etc/agentctl
 
-# Swiftly paths (user-owned, so codex can install toolchains later if needed)
-ENV SWIFTLY_HOME_DIR=/home/coder/.swiftly
-ENV SWIFTLY_BIN_DIR=/home/coder/.local/bin
-ENV PATH=/home/coder/.local/bin:$PATH
-
 RUN mkdir -p /home/coder/.local/bin /home/coder/.swiftly \
  && chown -R coder:coder /home/coder/.local /home/coder/.swiftly
+
+USER coder
 
 # --- Install the configured runtimes via agent.sh ---
 RUN HOME=/home/coder \
@@ -81,13 +83,17 @@ RUN HOME=/home/coder \
     AGENTCTL_SKIP_PREFERRED_SET=1 \
     AGENT_RUNTIMES="$AGENT_RUNTIMES" \
     AGENT_DEFAULT_RUNTIME="$AGENT_DEFAULT_RUNTIME" \
-    bash -lc 'set -euo pipefail; IFS="," read -r -a runtimes <<<"$AGENT_RUNTIMES"; [ "${#runtimes[@]}" -gt 0 ] || { echo "No runtimes configured for image build" >&2; exit 1; }; for runtime in "${runtimes[@]}"; do bash /usr/local/bin/agent.sh runtime install "$runtime"; done; printf "%s\n" "$AGENT_DEFAULT_RUNTIME" > /etc/agentctl/preferred-runtime' \
+    bash -lc 'set -euo pipefail; IFS="," read -r -a runtimes <<<"$AGENT_RUNTIMES"; [ "${#runtimes[@]}" -gt 0 ] || { echo "No runtimes configured for image build" >&2; exit 1; }; for runtime in "${runtimes[@]}"; do bash /usr/local/bin/agent.sh runtime install "$runtime"; done'
+
+USER root
+
+RUN printf "%s\n" "$AGENT_DEFAULT_RUNTIME" > /etc/agentctl/preferred-runtime \
  && chown -R coder:coder /home/coder /workdir
 
 RUN mkdir -p /etc/codexctl /etc/agentctl \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
- && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+ && BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
  && cat > /etc/codexctl/image.md <<EOF
 You are running inside the \`agent-swift\` image.
 
@@ -107,8 +113,8 @@ Built-in CLI tools:
 - programming tools: \`node\`, \`npm\`, \`make\`, \`python\`, \`swift\`, \`swift-format\`, \`swiftly\`, plus the wrapper commands \`format\` and \`lint\`
 
 Programming environments:
-- Swift on Linux
 - Node.js with npm
+- Swift on Linux
 - Python
 
 Assume Linux Swift toolchains and Linux build behavior. Do not assume access to macOS, Xcode, iOS SDKs, or Apple simulator frameworks inside this container.

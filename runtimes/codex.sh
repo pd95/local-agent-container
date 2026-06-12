@@ -597,7 +597,8 @@ agent_runtime_install() {
   local runtime="$1"
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
-  npm install -g @openai/codex --omit=dev --no-fund --no-audit
+  curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh
+  runtime_command_path "$runtime" >/dev/null 2>&1 || die "codex installer finished but launcher was not found on PATH or in ~/.local/bin"
   if [ "${AGENTCTL_SKIP_PREFERRED_SET:-0}" != "1" ]; then
     preferred_set "$runtime"
   fi
@@ -607,7 +608,7 @@ agent_runtime_update() {
   local runtime="$1"
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
-  npm install -g @openai/codex --omit=dev --no-fund --no-audit
+  "$(runtime_command_path "$runtime")" update
 }
 
 agent_runtime_reset_config() {

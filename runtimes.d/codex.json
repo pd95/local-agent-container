@@ -1,7 +1,7 @@
 {
   "id": "codex",
   "command": "codex",
-  "install_method": "npm-global",
+  "install_method": "standalone-installer",
   "default_config_dir": "/etc/codexctl",
   "capabilities": {
     "install": true,
