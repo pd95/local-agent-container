@@ -5591,6 +5591,13 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
     fi
     fail "Unexpected run_agent_sh_in_container call: $*"
   }
+  run_agent_sh_in_container_env() {
+    if [ "$2" = "AGENTCTL_SKIP_PREFERRED_SET=1" ] && [ "$3" = "--" ] && [ "$4" = "runtime" ] && [ "$5" = "install" ] && [ "$6" = "claude" ]; then
+      user_call_log="${user_call_log}$4 $5 $6 skip-preferred"$'\n'
+      return 0
+    fi
+    fail "Unexpected run_agent_sh_in_container_env call: $*"
+  }
   run_agent_sh_in_container_root() {
     root_call_log="${root_call_log}$2 $3 $4"$'\n'
   }
@@ -5640,6 +5647,83 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   printf '%s\n' "$stop_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected source container stop after backup, got: $stop_log"
 }
 
+test_upgrade_reinstalls_missing_default_runtime_after_restore() {
+  begin_test "upgrade reinstalls missing default runtime after restore"
+
+  load_codexctl_functions
+
+  local create_log=""
+  local install_log=""
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  warn_upgrade_package_loss() { :; }
+  upgrade_added_runtimes_json() { printf '[]\n'; }
+  upgrade_added_features_json() { printf '[]\n'; }
+  container_preferred_runtime() { printf '\n'; }
+  target_default_runtime_for_upgrade() { printf 'codex\n'; }
+  container_supports_state_contract() { return 0; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 1; }
+  ensure_started_container_is_running() { return 0; }
+  image_exists() { return 0; }
+  codex_agents_state() { printf 'missing\n'; }
+  backup_codex_config() { :; }
+  restore_codex_config() { :; }
+  verify_restored_codex_state() { return 0; }
+  persist_container_system_manifest_baseline() { :; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  collect_upgrade_container_preflight() {
+    UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":[]}'
+    UPGRADE_PREFLIGHT_BASELINE_MANIFEST=''
+    UPGRADE_PREFLIGHT_SOURCE_SUPPORTS_STATE_CONTRACT=1
+  }
+  image_system_manifest_json() { return 1; }
+  sanitize_image_name() { printf '%s\n' "$1"; }
+  build_backup_image_from_export() { :; }
+  run_agent_sh_in_container() {
+    if [ "$2" = "runtime" ] && [ "$3" = "info" ] && [ "$4" = "codex" ]; then
+      printf '{"runtime":"codex","installed":false,"capabilities":{"install":true}}\n'
+      return 0
+    fi
+    fail "Unexpected run_agent_sh_in_container call: $*"
+  }
+  run_agent_sh_in_container_env() {
+    install_log="${install_log}$*"$'\n'
+    return 0
+  }
+  trap() { :; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect)
+        printf 'placeholder\n'
+        ;;
+      create)
+        create_log="${create_log}$(printf '%s\n' "$*")"$'\n'
+        ;;
+      start|stop|rm)
+        ;;
+      export)
+        fail "export should not be called for --no-backup"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  container_upgrade_info() {
+    printf 'agent-python\t%s\trw\t2\t4G\n' "$TEST_ROOT"
+  }
+
+  run_capture upgrade_cmd --name unit-test-container --image agent-python --no-backup
+  assert_status 0
+  assert_contains "Reinstalling target default runtime in unit-test-container: codex"
+  printf '%s\n' "$install_log" | grep -Fq -- "unit-test-container AGENTCTL_SKIP_PREFERRED_SET=1 -- runtime install codex" || fail "Expected default runtime reinstall without preferred-runtime side effect, got: $install_log"
+  printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
+}
+
 test_upgrade_warns_and_clears_missing_preferred_runtime() {
   begin_test "upgrade warns and clears a preferred runtime that is unavailable in the target"
 
@@ -5673,6 +5757,10 @@ test_upgrade_warns_and_clears_missing_preferred_runtime() {
   sanitize_image_name() { printf '%s\n' "$1"; }
   build_backup_image_from_export() { :; }
   run_agent_sh_in_container() {
+    if [ "$2" = "runtime" ] && [ "$3" = "info" ] && [ "$4" = "codex" ]; then
+      printf '{"runtime":"codex","installed":true,"capabilities":{"install":true}}\n'
+      return 0
+    fi
     if [ "$2" = "runtime" ] && [ "$3" = "info" ] && [ "$4" = "claude" ]; then
       printf '{"runtime":"claude","installed":false,"capabilities":{"install":false}}\n'
       return 0
@@ -6990,6 +7078,7 @@ main() {
   run_selected_test test_upgrade_warns_about_image_packages_removed_from_target "test_upgrade_warns_about_image_packages_removed_from_target"
   run_selected_test test_upgrade_reinstall_command_prefers_requested_dpkg_packages "test_upgrade_reinstall_command_prefers_requested_dpkg_packages"
   run_selected_test test_upgrade_reinstalls_added_runtimes_and_features_in_target "test_upgrade_reinstalls_added_runtimes_and_features_in_target"
+  run_selected_test test_upgrade_reinstalls_missing_default_runtime_after_restore "test_upgrade_reinstalls_missing_default_runtime_after_restore"
   run_selected_test test_upgrade_warns_and_clears_missing_preferred_runtime "test_upgrade_warns_and_clears_missing_preferred_runtime"
   run_selected_test test_upgrade_uses_stored_baseline_when_current_image_is_missing "test_upgrade_uses_stored_baseline_when_current_image_is_missing"
   run_selected_test test_upgrade_accepts_workdir_override_when_original_mount_is_missing "test_upgrade_accepts_workdir_override_when_original_mount_is_missing"

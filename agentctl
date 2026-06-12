@@ -3225,6 +3225,54 @@ run_agent_sh_in_container() {
   return "$status"
 }
 
+run_agent_sh_in_container_env() {
+  local name="$1"
+  shift
+  local was_running=0
+  local started_for_command=0
+  local status=0
+  local -a env_args=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --)
+        shift
+        break
+        ;;
+      *=*)
+        env_args+=("$1")
+        shift
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if ! container_exists "$name"; then
+    die "Container not found: $name"
+  fi
+
+  if container_running "$name"; then
+    was_running=1
+  else
+    "$CONTAINER_CMD" start "$name" >/dev/null
+    started_for_command=1
+  fi
+
+  if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" env "${env_args[@]}" bash /usr/local/bin/agent.sh "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  if [ "$started_for_command" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+    "$CONTAINER_CMD" stop "$name" >/dev/null
+  fi
+
+  return "$status"
+}
+
 run_agent_sh_in_container_root() {
   local name="$1"
   shift
@@ -3343,6 +3391,7 @@ runtime_install_memory_pressure_limit() {
 install_runtime_in_container() {
   local name="$1"
   local runtime="$2"
+  local skip_preferred="${3:-0}"
   local low_mem_limit=""
   local status=0
 
@@ -3351,7 +3400,11 @@ install_runtime_in_container() {
     warn "Container $name is limited to $low_mem_limit. Claude install may be killed by memory pressure; if that happens, recreate it with: ${CLI_NAME} upgrade --name $name --mem $CLAUDE_MIN_INSTALL_MEM"
   fi
 
-  if run_agent_sh_in_container "$name" runtime install "$runtime"; then
+  if [ "$skip_preferred" -eq 1 ]; then
+    if run_agent_sh_in_container_env "$name" AGENTCTL_SKIP_PREFERRED_SET=1 -- runtime install "$runtime"; then
+      return 0
+    fi
+  elif run_agent_sh_in_container "$name" runtime install "$runtime"; then
     return 0
   fi
   status=$?
@@ -3360,6 +3413,77 @@ install_runtime_in_container() {
     die "Claude runtime install failed in $name. The container is limited to $low_mem_limit, and the installer can be killed by memory pressure. Recreate it with: ${CLI_NAME} upgrade --name $name --mem $CLAUDE_MIN_INSTALL_MEM"
   fi
   return "$status"
+}
+
+ensure_target_default_runtime_installed() {
+  local name="$1"
+  local runtime="$2"
+  local reason="${3:-runtime}"
+  local required="${4:-0}"
+
+  [ -n "$runtime" ] || return 0
+  if target_runtime_installed "$name" "$runtime"; then
+    return 0
+  fi
+  if target_runtime_installable "$name" "$runtime"; then
+    echo "Reinstalling $reason in $name: $runtime" >&2
+    install_runtime_in_container "$name" "$runtime" 1 || die "Failed to install required runtime during upgrade: $runtime"
+    return 0
+  fi
+  if [ "$required" -eq 1 ]; then
+    die "Required runtime $runtime is not available after upgrade and cannot be installed automatically"
+  fi
+  warn "Runtime $runtime is not available after upgrade and cannot be reinstalled automatically"
+  return 1
+}
+
+target_feature_installed() {
+  local name="$1"
+  local feature="$2"
+  local feature_info=""
+
+  feature_info="$(run_agent_sh_in_container "$name" feature info "$feature" 2>/dev/null)" || return 1
+  printf '%s' "$feature_info" | jq -e '.installed == true' >/dev/null 2>&1
+}
+
+ensure_target_feature_installed() {
+  local name="$1"
+  local feature="$2"
+
+  [ -n "$feature" ] || return 0
+  if target_feature_installed "$name" "$feature"; then
+    return 0
+  fi
+  if target_feature_installable "$name" "$feature"; then
+    echo "Reinstalling added feature in $name after restore: $feature" >&2
+    run_agent_sh_in_container_root "$name" feature install "$feature" || die "Failed to reinstall feature after restore during upgrade: $feature"
+    return 0
+  fi
+  warn "Feature $feature is not available after upgrade and cannot be reinstalled automatically"
+  return 1
+}
+
+ensure_relevant_runtimes_and_features_after_restore() {
+  local name="$1"
+  local target_default_runtime="${2:-}"
+  local current_preferred_runtime="${3:-}"
+  local added_runtimes_json="${4:-[]}"
+  local added_features_json="${5:-[]}"
+  local runtime=""
+  local feature=""
+
+  ensure_target_default_runtime_installed "$name" "$target_default_runtime" "target default runtime" 1
+  ensure_target_default_runtime_installed "$name" "$current_preferred_runtime" "preferred runtime" 0 || true
+
+  while IFS= read -r runtime; do
+    [ -n "$runtime" ] || continue
+    ensure_target_default_runtime_installed "$name" "$runtime" "added runtime" 0 || true
+  done < <(printf '%s' "$added_runtimes_json" | jq -r '.[]' 2>/dev/null || true)
+
+  while IFS= read -r feature; do
+    [ -n "$feature" ] || continue
+    ensure_target_feature_installed "$name" "$feature" || true
+  done < <(printf '%s' "$added_features_json" | jq -r '.[]' 2>/dev/null || true)
 }
 
 runtime_cmd() {
@@ -5085,6 +5209,12 @@ upgrade_cmd() {
   restore_codex_config "$target_name" "$state_backup_file"
   verify_restored_codex_state "$target_name" "$state_backup_file" \
     || die "Restored Codex state verification failed for $target_name; inspect the backup image before continuing."
+  ensure_relevant_runtimes_and_features_after_restore \
+    "$target_name" \
+    "$target_default_runtime" \
+    "$current_preferred_runtime" \
+    "$added_runtimes_json" \
+    "$added_features_json"
   warn_if_preferred_runtime_lost "$target_name" "$current_preferred_runtime" "$target_default_runtime"
   if [ "$overwrite_config" -eq 1 ]; then
     echo "Overwriting config.toml, default profiles, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $target_name" >&2
