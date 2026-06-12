@@ -639,11 +639,18 @@ agent_runtime_reset_config() {
 agent_runtime_state_paths() {
   local runtime="$1"
   local codex_dir=""
+  local path=""
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   codex_dir="$(codex_home_dir)"
   [ -e "$codex_dir" ] || return 0
-  printf '%s\n' ".codex"
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    printf '%s\n' ".codex/$path"
+  done < <(
+    cd "$codex_dir" && \
+      find . -mindepth 1 -maxdepth 1 ! -name packages -exec basename {} \;
+  )
 }
 
 codex_auth_payload_valid() {
