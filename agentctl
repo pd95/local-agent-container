@@ -1942,8 +1942,13 @@ restore_codex_config() {
   fi
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
 mkdir -p /home/coder
+mkdir -p /home/coder/.codex
+for path in /home/coder/.codex/* /home/coder/.codex/.[!.]* /home/coder/.codex/..?*; do
+  [ -e "$path" ] || continue
+  [ "$(basename "$path")" = packages ] && continue
+  rm -rf "$path"
+done
 rm -rf \
-  /home/coder/.codex \
   /home/coder/.config/agentctl \
   /home/coder/.claude \
   /home/coder/.claude.json
@@ -1953,7 +1958,20 @@ chown -R coder:coder /home/coder
   if target_supports_state_contract "$name"; then
     "$CONTAINER_CMD" exec -i "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh state import <"$backup_file"
   else
-    "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc 'cd /home/coder && tar -xf -' <"$backup_file"
+    "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc '
+packages_backup="$(mktemp -d)"
+if [ -e /home/coder/.codex/packages ]; then
+  mkdir -p "$packages_backup/.codex"
+  mv /home/coder/.codex/packages "$packages_backup/.codex/packages"
+fi
+cd /home/coder && tar -xf -
+rm -rf /home/coder/.codex/packages
+if [ -e "$packages_backup/.codex/packages" ]; then
+  mkdir -p /home/coder/.codex
+  mv "$packages_backup/.codex/packages" /home/coder/.codex/packages
+fi
+rm -rf "$packages_backup"
+' <"$backup_file"
   fi
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'chown -R coder:coder /home/coder >/dev/null 2>&1 || true'
 }
@@ -2035,6 +2053,103 @@ verify_restored_codex_state() {
     warn "Restored Codex state verification failed for $name"
     return 1
   fi
+  echo "Restored Codex state in $name: history lines $actual_history/$expected_history, session files $actual_sessions/$expected_sessions, session index lines $actual_index/$expected_index" >&2
+}
+
+claude_state_summary_from_tar() {
+  local backup_file="$1"
+  local credentials_files=0
+  local settings_files=0
+  local home_state_files=0
+  local project_files=0
+
+  if tar -tf "$backup_file" 2>/dev/null | grep -Fqx '.claude/.credentials.json'; then
+    credentials_files=1
+  fi
+  if tar -tf "$backup_file" 2>/dev/null | grep -Fqx '.claude/settings.json'; then
+    settings_files=1
+  fi
+  if tar -tf "$backup_file" 2>/dev/null | grep -Fqx '.claude.json'; then
+    home_state_files=1
+  fi
+  project_files="$(tar -tf "$backup_file" 2>/dev/null \
+    | awk '/^\.claude\/projects\/.+[^\/]$/ { count++ } END { print count + 0 }' \
+    | tr -d '[:space:]')"
+  printf '%s\t%s\t%s\t%s\n' "$credentials_files" "$settings_files" "$home_state_files" "$project_files"
+}
+
+claude_state_summary_from_container() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
+credentials_files=0
+settings_files=0
+home_state_files=0
+project_files=0
+[ -f /home/coder/.claude/.credentials.json ] && credentials_files=1
+[ -f /home/coder/.claude/settings.json ] && settings_files=1
+[ -f /home/coder/.claude.json ] && home_state_files=1
+if [ -d /home/coder/.claude/projects ]; then
+  project_files="$(find /home/coder/.claude/projects -type f 2>/dev/null | wc -l | tr -d "[:space:]")"
+fi
+printf "%s\t%s\t%s\t%s\n" "$credentials_files" "$settings_files" "$home_state_files" "$project_files"
+'
+}
+
+verify_restored_claude_state() {
+  local name="$1"
+  local backup_file="$2"
+  local expected=""
+  local actual=""
+  local expected_credentials=0
+  local expected_settings=0
+  local expected_home_state=0
+  local expected_projects=0
+  local actual_credentials=0
+  local actual_settings=0
+  local actual_home_state=0
+  local actual_projects=0
+  local failed=0
+
+  [ -s "$backup_file" ] || return 0
+  expected="$(claude_state_summary_from_tar "$backup_file")"
+  IFS=$'\t' read -r expected_credentials expected_settings expected_home_state expected_projects <<<"$expected"
+  if [ "$expected_credentials" -eq 0 ] && [ "$expected_settings" -eq 0 ] && [ "$expected_home_state" -eq 0 ] && [ "$expected_projects" -eq 0 ]; then
+    return 0
+  fi
+
+  actual="$(claude_state_summary_from_container "$name")" || return 2
+  IFS=$'\t' read -r actual_credentials actual_settings actual_home_state actual_projects <<<"$actual"
+
+  if [ "$actual_credentials" -lt "$expected_credentials" ]; then
+    warn "Claude credentials restore verification failed in $name: expected credentials file, found none"
+    failed=1
+  fi
+  if [ "$actual_settings" -lt "$expected_settings" ]; then
+    warn "Claude settings restore verification failed in $name: expected settings file, found none"
+    failed=1
+  fi
+  if [ "$actual_home_state" -lt "$expected_home_state" ]; then
+    warn "Claude home state restore verification failed in $name: expected ~/.claude.json, found none"
+    failed=1
+  fi
+  if [ "$actual_projects" -lt "$expected_projects" ]; then
+    warn "Claude project restore verification failed in $name: expected at least $expected_projects project file(s), found $actual_projects"
+    failed=1
+  fi
+  if [ "$failed" -ne 0 ]; then
+    warn "Restored Claude state verification failed for $name"
+    return 1
+  fi
+  echo "Restored Claude state in $name: credentials files $actual_credentials/$expected_credentials, settings files $actual_settings/$expected_settings, home state files $actual_home_state/$expected_home_state, project files $actual_projects/$expected_projects" >&2
+}
+
+verify_restored_runtime_state() {
+  local name="$1"
+  local backup_file="$2"
+
+  verify_restored_codex_state "$name" "$backup_file" || return $?
+  verify_restored_claude_state "$name" "$backup_file" || return $?
 }
 
 backup_known_state_from_container() {
@@ -5207,8 +5322,8 @@ upgrade_cmd() {
 
   echo "Restoring user state into $target_name" >&2
   restore_codex_config "$target_name" "$state_backup_file"
-  verify_restored_codex_state "$target_name" "$state_backup_file" \
-    || die "Restored Codex state verification failed for $target_name; inspect the backup image before continuing."
+  verify_restored_runtime_state "$target_name" "$state_backup_file" \
+    || die "Restored runtime state verification failed for $target_name; inspect the backup image before continuing."
   ensure_relevant_runtimes_and_features_after_restore \
     "$target_name" \
     "$target_default_runtime" \

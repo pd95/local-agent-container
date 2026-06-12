@@ -700,6 +700,7 @@ state_export() {
 state_import() {
   local import_file=""
   local path=""
+  local packages_backup=""
 
   if [ -t 0 ]; then
     return 0
@@ -717,11 +718,22 @@ state_import() {
   fi
 
   mkdir -p "$HOME"
+  packages_backup="$(mktemp -d)"
+  if [ -e "$HOME/.codex/packages" ]; then
+    mkdir -p "$packages_backup/.codex"
+    mv "$HOME/.codex/packages" "$packages_backup/.codex/packages"
+  fi
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     rm -rf "$HOME/$path"
   done < <(state_import_paths | state_unique_paths)
   tar -C "$HOME" -xf "$import_file"
+  rm -rf "$HOME/.codex/packages"
+  if [ -e "$packages_backup/.codex/packages" ]; then
+    mkdir -p "$HOME/.codex"
+    mv "$packages_backup/.codex/packages" "$HOME/.codex/packages"
+  fi
+  rm -rf "$packages_backup"
   rm -f "$import_file"
 }
 

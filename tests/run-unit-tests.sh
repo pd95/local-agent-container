@@ -3443,6 +3443,42 @@ test_agent_sh_state_import_uses_installed_runtime_hooks() {
   jq -er '.claudeAiOauth.refreshToken == "keep"' "$target_home/home/.claude/.credentials.json" >/dev/null || fail "Expected unrelated Claude legacy state to remain untouched when Claude is not installed"
 }
 
+test_agent_sh_state_import_preserves_image_owned_codex_packages() {
+  begin_test "agent.sh state import preserves image-owned codex packages"
+
+  local source_home
+  local target_home
+  local fake_bin
+  local tar_file
+  source_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  target_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$source_home"
+  register_dir_cleanup "$target_home"
+  tar_file="$source_home/state.tar"
+  fake_bin="$(make_fake_runtime_bin "$target_home" codex)"
+
+  mkdir -p \
+    "$source_home/home/.codex/packages/standalone/current/bin" \
+    "$target_home/home/.codex/packages/standalone/current/bin"
+  printf '%s' 'restored-auth' >"$source_home/home/.codex/auth.json"
+  printf '%s' 'stale-codex-binary' >"$source_home/home/.codex/packages/standalone/current/bin/codex"
+  printf '%s' 'image-codex-binary' >"$target_home/home/.codex/packages/standalone/current/bin/codex"
+  tar -C "$source_home/home" -cf "$tar_file" .codex
+
+  env -i \
+    "HOME=$target_home/home" \
+    "XDG_CONFIG_HOME=$target_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state import <"$tar_file"
+
+  [ "$(cat "$target_home/home/.codex/auth.json")" = "restored-auth" ] || fail "Expected Codex auth state to be restored"
+  [ "$(cat "$target_home/home/.codex/packages/standalone/current/bin/codex")" = "image-codex-binary" ] || fail "Expected image-owned Codex packages to survive stale package state import"
+}
+
 test_agent_sh_state_import_with_empty_stdin_preserves_existing_state() {
   begin_test "agent.sh state import with empty stdin preserves existing state"
 
@@ -3489,6 +3525,7 @@ test_verify_restored_codex_state_passes_when_counts_match() {
 
   run_capture verify_restored_codex_state unit-test-container "$backup_file"
   assert_status 0
+  assert_contains "Restored Codex state in unit-test-container: history lines 2/2, session files 2/2, session index lines 1/1"
 }
 
 test_verify_restored_codex_state_fails_when_counts_drop() {
@@ -3516,6 +3553,64 @@ test_verify_restored_codex_state_fails_when_counts_drop() {
   assert_contains "Codex history restore verification failed"
   assert_contains "Codex session restore verification failed"
   assert_contains "Restored Codex state verification failed"
+}
+
+test_verify_restored_claude_state_passes_when_counts_match() {
+  begin_test "verify_restored_claude_state accepts restored Claude state"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local backup_file
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-state-verify.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  backup_file="$temp_dir/state.tar"
+
+  mkdir -p "$temp_dir/home/.claude/projects/project-a"
+  printf '{}\n' >"$temp_dir/home/.claude/.credentials.json"
+  printf '{}\n' >"$temp_dir/home/.claude/settings.json"
+  printf '{}\n' >"$temp_dir/home/.claude.json"
+  printf 'session\n' >"$temp_dir/home/.claude/projects/project-a/session.jsonl"
+  tar -C "$temp_dir/home" -cf "$backup_file" .claude .claude.json
+
+  claude_state_summary_from_container() {
+    printf '1\t1\t1\t1\n'
+  }
+
+  run_capture verify_restored_claude_state unit-test-container "$backup_file"
+  assert_status 0
+  assert_contains "Restored Claude state in unit-test-container: credentials files 1/1, settings files 1/1, home state files 1/1, project files 1/1"
+}
+
+test_verify_restored_claude_state_fails_when_counts_drop() {
+  begin_test "verify_restored_claude_state rejects missing restored Claude state"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local backup_file
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-state-verify.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  backup_file="$temp_dir/state.tar"
+
+  mkdir -p "$temp_dir/home/.claude/projects/project-a"
+  printf '{}\n' >"$temp_dir/home/.claude/.credentials.json"
+  printf '{}\n' >"$temp_dir/home/.claude/settings.json"
+  printf '{}\n' >"$temp_dir/home/.claude.json"
+  printf 'session\n' >"$temp_dir/home/.claude/projects/project-a/session.jsonl"
+  tar -C "$temp_dir/home" -cf "$backup_file" .claude .claude.json
+
+  claude_state_summary_from_container() {
+    printf '0\t0\t0\t0\n'
+  }
+
+  run_capture verify_restored_claude_state unit-test-container "$backup_file"
+  assert_status 1
+  assert_contains "Claude credentials restore verification failed"
+  assert_contains "Claude settings restore verification failed"
+  assert_contains "Claude home state restore verification failed"
+  assert_contains "Claude project restore verification failed"
+  assert_contains "Restored Claude state verification failed"
 }
 
 test_container_auth_info_uses_agent_sh_auth_read() {
@@ -7033,9 +7128,12 @@ main() {
   run_selected_test test_agent_sh_state_export_uses_installed_runtime_hooks "test_agent_sh_state_export_uses_installed_runtime_hooks"
   run_selected_test test_agent_sh_state_import_restores_known_user_state "test_agent_sh_state_import_restores_known_user_state"
   run_selected_test test_agent_sh_state_import_uses_installed_runtime_hooks "test_agent_sh_state_import_uses_installed_runtime_hooks"
+  run_selected_test test_agent_sh_state_import_preserves_image_owned_codex_packages "test_agent_sh_state_import_preserves_image_owned_codex_packages"
   run_selected_test test_agent_sh_state_import_with_empty_stdin_preserves_existing_state "test_agent_sh_state_import_with_empty_stdin_preserves_existing_state"
   run_selected_test test_verify_restored_codex_state_passes_when_counts_match "test_verify_restored_codex_state_passes_when_counts_match"
   run_selected_test test_verify_restored_codex_state_fails_when_counts_drop "test_verify_restored_codex_state_fails_when_counts_drop"
+  run_selected_test test_verify_restored_claude_state_passes_when_counts_match "test_verify_restored_claude_state_passes_when_counts_match"
+  run_selected_test test_verify_restored_claude_state_fails_when_counts_drop "test_verify_restored_claude_state_fails_when_counts_drop"
   run_selected_test test_container_auth_info_uses_agent_sh_auth_read "test_container_auth_info_uses_agent_sh_auth_read"
   run_selected_test test_write_auth_blob_to_container_uses_agent_sh_auth_write "test_write_auth_blob_to_container_uses_agent_sh_auth_write"
   run_selected_test test_write_auth_blob_to_container_falls_back_for_legacy_codex "test_write_auth_blob_to_container_falls_back_for_legacy_codex"
