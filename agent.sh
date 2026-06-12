@@ -543,8 +543,9 @@ json_feature_info() {
 }
 
 json_system_manifest() {
-  local package_manager packages_json requested_packages_json runtimes_json features_json default_runtime preferred_runtime
+  local package_manager packages_json requested_packages_json apk_repositories_json runtimes_json features_json default_runtime preferred_runtime
   local apk_world_file="${AGENTCTL_APK_WORLD_FILE:-/etc/apk/world}"
+  local apk_repositories_file="${AGENTCTL_APK_REPOSITORIES_FILE:-/etc/apk/repositories}"
 
   if command -v apk >/dev/null 2>&1; then
     package_manager=apk
@@ -554,6 +555,11 @@ json_system_manifest() {
     else
       requested_packages_json='[]'
     fi
+    if [ -f "$apk_repositories_file" ]; then
+      apk_repositories_json="$(sed '/^[[:space:]]*#/d;/^[[:space:]]*$/d' "$apk_repositories_file" 2>/dev/null | sort -u | jq -R . | jq -s .)"
+    else
+      apk_repositories_json='[]'
+    fi
   elif command -v dpkg-query >/dev/null 2>&1; then
     package_manager=dpkg
     packages_json="$(dpkg-query -W -f='${Package}\n' 2>/dev/null | sort -u | jq -R . | jq -s .)"
@@ -562,10 +568,12 @@ json_system_manifest() {
     else
       requested_packages_json='[]'
     fi
+    apk_repositories_json='[]'
   else
     package_manager=unknown
     packages_json='[]'
     requested_packages_json='[]'
+    apk_repositories_json='[]'
   fi
   runtimes_json="$(runtime_ids_installed | jq -R . | jq -s .)"
   features_json="$(feature_ids_installed | jq -R . | jq -s .)"
@@ -576,6 +584,7 @@ json_system_manifest() {
     --arg package_manager "$package_manager" \
     --argjson packages "$packages_json" \
     --argjson requested_packages "$requested_packages_json" \
+    --argjson apk_repositories "$apk_repositories_json" \
     --argjson installed_runtimes "$runtimes_json" \
     --argjson installed_features "$features_json" \
     --arg default_runtime "$default_runtime" \
@@ -584,6 +593,7 @@ json_system_manifest() {
       package_manager: $package_manager,
       packages: $packages,
       requested_packages: $requested_packages,
+      apk_repositories: $apk_repositories,
       installed_runtimes: $installed_runtimes,
       installed_features: $installed_features,
       default_runtime: $default_runtime,

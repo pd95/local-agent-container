@@ -3548,6 +3548,127 @@ manifest_requested_packages_json() {
   printf '%s' "$manifest" | jq -c '.requested_packages // []' 2>/dev/null || printf '[]\n'
 }
 
+manifest_apk_repositories_json() {
+  local manifest="${1:-}"
+
+  [ -n "$manifest" ] || manifest='{}'
+
+  printf '%s' "$manifest" | jq -c '.apk_repositories // []' 2>/dev/null || printf '[]\n'
+}
+
+manifest_with_apk_repositories_json() {
+  local manifest="${1:-}"
+  local repositories_json="${2:-[]}"
+
+  [ -n "$manifest" ] || manifest='{}'
+
+  printf '%s' "$manifest" | jq -c \
+    --argjson repositories "$repositories_json" \
+    'if (.package_manager // "unknown") == "apk" and ((.apk_repositories // []) | length) == 0 then
+       . + {apk_repositories: $repositories}
+     else
+       .
+     end'
+}
+
+apk_repositories_json_from_container() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -c '
+if [ -f /etc/apk/repositories ]; then
+  sed "/^[[:space:]]*#/d;/^[[:space:]]*$/d" /etc/apk/repositories | sort -u
+fi
+' 2>/dev/null | jq -R . | jq -s .
+}
+
+augment_manifest_with_container_apk_repositories() {
+  local name="$1"
+  local manifest="$2"
+  local repositories_json="[]"
+
+  [ "$(manifest_package_manager "$manifest")" = "apk" ] || {
+    printf '%s\n' "$manifest"
+    return 0
+  }
+  [ "$(printf '%s' "$(manifest_apk_repositories_json "$manifest")" | jq -r 'length' 2>/dev/null || printf '0\n')" -eq 0 ] || {
+    printf '%s\n' "$manifest"
+    return 0
+  }
+  repositories_json="$(apk_repositories_json_from_container "$name" 2>/dev/null || printf '[]\n')"
+  manifest_with_apk_repositories_json "$manifest" "$repositories_json"
+}
+
+apk_package_tags_json() {
+  local packages_json="${1:-[]}"
+
+  printf '%s' "$packages_json" | jq -c '
+    [
+      .[]?
+      | select(test("@"))
+      | split("@")[1]
+      | sub("[<>=~].*$"; "")
+      | select(length > 0)
+    ]
+    | unique
+    | sort
+  ' 2>/dev/null || printf '[]\n'
+}
+
+apk_repository_tags_json() {
+  local repositories_json="${1:-[]}"
+
+  printf '%s' "$repositories_json" | jq -c '
+    [
+      .[]?
+      | capture("^@(?<tag>[^[:space:]]+)[[:space:]]+.+")?
+      | .tag
+    ]
+    | unique
+    | sort
+  ' 2>/dev/null || printf '[]\n'
+}
+
+apk_repository_lines_for_tags_json() {
+  local repositories_json="${1:-[]}"
+  local tags_json="${2:-[]}"
+
+  jq -cn \
+    --argjson repositories "$repositories_json" \
+    --argjson tags "$tags_json" \
+    '
+      ($tags | map({key: ., value: true}) | from_entries) as $wanted
+      | [
+          $repositories[]?
+          | capture("^@(?<tag>[^[:space:]]+)[[:space:]]+(?<repository>.+)")?
+          | select($wanted[.tag] == true)
+          | "@" + .tag + " " + .repository
+        ]
+      | unique
+      | sort
+    '
+}
+
+apk_default_repository_lines_for_tags_json() {
+  local tags_json="${1:-[]}"
+
+  printf '%s' "$tags_json" | jq -c '
+    [
+      .[]?
+      | if . == "edgemain" then
+          "@edgemain https://dl-cdn.alpinelinux.org/alpine/edge/main"
+        elif . == "edgecommunity" then
+          "@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"
+        elif . == "edgetesting" then
+          "@edgetesting https://dl-cdn.alpinelinux.org/alpine/edge/testing"
+        else
+          empty
+        end
+    ]
+    | unique
+    | sort
+  ' 2>/dev/null || printf '[]\n'
+}
+
 manifest_installed_runtimes_json() {
   local manifest="${1:-}"
 
@@ -3652,6 +3773,7 @@ container_system_manifest_json() {
     fi
     return 1
   fi
+  manifest="$(augment_manifest_with_container_apk_repositories "$name" "$manifest")"
 
   if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     "$CONTAINER_CMD" stop "$name" >/dev/null
@@ -3729,6 +3851,7 @@ image_system_manifest_json() {
     fi
     return 1
   fi
+  manifest="$(augment_manifest_with_container_apk_repositories "$temp_name" "$manifest")"
 
   if [ "$started" -eq 1 ]; then
     "$CONTAINER_CMD" stop "$temp_name" >/dev/null 2>&1 || true
@@ -3959,6 +4082,8 @@ warn_upgrade_package_loss() {
   local current_requested_packages_json='[]'
   local source_requested_packages_json='[]'
   local target_requested_packages_json='[]'
+  local current_apk_repositories_json='[]'
+  local target_apk_repositories_json='[]'
   local added_packages_json='[]'
   local lost_packages_json='[]'
   local baseline_packages_in_current_json='[]'
@@ -3975,6 +4100,13 @@ warn_upgrade_package_loss() {
   local reinstall_label="To reinstall after upgrade:"
   local requested_package_count=0
   local requested_package_data_available=0
+  local missing_apk_repository_tags_json='[]'
+  local missing_apk_repository_lines_json='[]'
+  local missing_apk_repository_tag_count=0
+  local missing_apk_repository_line_count=0
+  local repository_line=""
+  local quoted_repository_line=""
+  local shell_repository_line=""
   local lost_count=""
 
   if [ -z "$current_manifest" ] && ! current_manifest="$(container_system_manifest_json "$name")"; then
@@ -3984,6 +4116,7 @@ warn_upgrade_package_loss() {
   current_package_manager="$(manifest_package_manager "$current_manifest")"
   current_packages_json="$(manifest_packages_json "$current_manifest")"
   current_requested_packages_json="$(manifest_requested_packages_json "$current_manifest")"
+  current_apk_repositories_json="$(manifest_apk_repositories_json "$current_manifest")"
   requested_package_count="$(printf '%s' "$current_requested_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
   if [ "$requested_package_count" -gt 0 ]; then
     requested_package_data_available=1
@@ -4000,6 +4133,7 @@ warn_upgrade_package_loss() {
   target_package_manager="$(manifest_package_manager "$target_manifest")"
   target_packages_json="$(manifest_packages_json "$target_manifest")"
   target_requested_packages_json="$(manifest_requested_packages_json "$target_manifest")"
+  target_apk_repositories_json="$(manifest_apk_repositories_json "$target_manifest")"
 
   if [ -z "$source_manifest" ]; then
     if stored_manifest="$(container_baseline_manifest_json "$name")"; then
@@ -4102,6 +4236,38 @@ warn_upgrade_package_loss() {
         reinstall_label="To reinstall top-level packages after upgrade:"
       fi
       printf '%s\n' "$reinstall_label" >&2
+      if [ "$reinstall_package_manager" = "apk" ]; then
+        missing_apk_repository_tags_json="$(
+          json_string_array_difference \
+            "$(apk_package_tags_json "$reinstall_packages_json")" \
+            "$(apk_repository_tags_json "$target_apk_repositories_json")"
+        )"
+        missing_apk_repository_tag_count="$(printf '%s' "$missing_apk_repository_tags_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
+        if [ "$missing_apk_repository_tag_count" -gt 0 ]; then
+          missing_apk_repository_lines_json="$(apk_repository_lines_for_tags_json "$current_apk_repositories_json" "$missing_apk_repository_tags_json")"
+          missing_apk_repository_line_count="$(printf '%s' "$missing_apk_repository_lines_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
+          if [ "$missing_apk_repository_line_count" -eq 0 ]; then
+            missing_apk_repository_lines_json="$(apk_default_repository_lines_for_tags_json "$missing_apk_repository_tags_json")"
+            missing_apk_repository_line_count="$(printf '%s' "$missing_apk_repository_lines_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
+          fi
+          if [ "$missing_apk_repository_line_count" -gt 0 ]; then
+            printf 'Restore APK repository tag(s) before reinstalling tagged packages:\n' >&2
+            while IFS= read -r repository_line; do
+              [ -n "$repository_line" ] || continue
+              quoted_repository_line="$(printf '%s' "$repository_line" | jq -Rr '@sh')"
+              shell_repository_line="$(printf 'grep -Fxq %s /etc/apk/repositories || printf "%%s\\\\n" %s >> /etc/apk/repositories' "$quoted_repository_line" "$quoted_repository_line" | jq -Rr '@sh')"
+              printf '  %s su-exec --name %s sh -lc %s\n' \
+                "$CLI_NAME" \
+                "$target_name" \
+                "$shell_repository_line" >&2
+            done < <(printf '%s' "$missing_apk_repository_lines_json" | jq -r '.[]' 2>/dev/null || true)
+            printf '  %s su-exec --name %s apk update\n' "$CLI_NAME" "$target_name" >&2
+          else
+            warn "Tagged APK package reinstall needs missing repository tag(s), but the original repository URL was not available:"
+            printf '%s' "$missing_apk_repository_tags_json" | jq -r '.[] | "  - @" + .' >&2
+          fi
+        fi
+      fi
       if [ "$reinstall_package_manager" = "apt-get" ]; then
         printf '  %s su-exec --name %s apt-get update\n' "$CLI_NAME" "$target_name" >&2
       fi

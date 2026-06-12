@@ -1597,10 +1597,12 @@ test_agent_sh_system_manifest_reports_apk_requested_packages() {
   local temp_home
   local fake_bin
   local apk_world_file
+  local apk_repositories_file
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$temp_home/bin"
   apk_world_file="$temp_home/world"
+  apk_repositories_file="$temp_home/repositories"
   mkdir -p "$fake_bin"
 
   cat >"$fake_bin/apk" <<'EOF'
@@ -1611,13 +1613,18 @@ fi
 EOF
   chmod +x "$fake_bin/apk"
   printf '%s\n' git bash >"$apk_world_file"
+  printf '%s\n' \
+    'https://dl-cdn.alpinelinux.org/alpine/v3.22/main' \
+    '@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community' \
+    >"$apk_repositories_file"
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_APK_WORLD_FILE="$apk_world_file" \
+    AGENTCTL_APK_REPOSITORIES_FILE="$apk_repositories_file" \
     -- system manifest
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.package_manager == "apk" and .packages == ["bash","git","libc-utils"] and .requested_packages == ["bash","git"]' >/dev/null || fail "Expected apk requested packages in system manifest, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.package_manager == "apk" and .packages == ["bash","git","libc-utils"] and .requested_packages == ["bash","git"] and (.apk_repositories | index("@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"))' >/dev/null || fail "Expected apk requested packages and repositories in system manifest, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_system_manifest_reports_dpkg_requested_packages() {
@@ -5435,6 +5442,55 @@ test_upgrade_reinstall_command_prefers_requested_apk_packages() {
   assert_not_contains "apk add --no-cache musl-dev"
 }
 
+test_upgrade_reinstall_command_restores_missing_apk_repository_tags() {
+  begin_test "upgrade reinstall command restores missing apk repository tags"
+
+  load_codexctl_functions
+
+  CLI_NAME=agentctl
+
+  run_capture warn_upgrade_package_loss \
+    unit-test-container \
+    agent-plain \
+    agent-python \
+    '{"package_manager":"apk","packages":["bash","go","golangci-lint","zstd"],"requested_packages":["bash","go@edgecommunity","golangci-lint@edgecommunity","zstd"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main","@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main"]}' \
+    unit-test-container
+
+  assert_status 0
+  assert_contains "Upgrade will remove 3 extra apk package(s) not present in agent-python:"
+  assert_contains "To reinstall top-level packages after upgrade:"
+  assert_contains "Restore APK repository tag(s) before reinstalling tagged packages:"
+  assert_contains "agentctl su-exec --name unit-test-container sh -lc 'grep -Fxq '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' /etc/apk/repositories || printf \"%s\\\\n\" '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' >> /etc/apk/repositories'"
+  assert_contains "agentctl su-exec --name unit-test-container apk update"
+  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache go@edgecommunity golangci-lint@edgecommunity zstd"
+}
+
+test_upgrade_reinstall_command_suggests_default_apk_edge_tags() {
+  begin_test "upgrade reinstall command suggests default apk edge tags"
+
+  load_codexctl_functions
+
+  CLI_NAME=agentctl
+
+  run_capture warn_upgrade_package_loss \
+    unit-test-container \
+    agent-plain \
+    agent-python \
+    '{"package_manager":"apk","packages":["bash","go","golangci-lint","zstd"],"requested_packages":["bash","go@edgecommunity","golangci-lint@edgecommunity","zstd"],"apk_repositories":[]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":[]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":[]}' \
+    unit-test-container
+
+  assert_status 0
+  assert_contains "Restore APK repository tag(s) before reinstalling tagged packages:"
+  assert_contains "agentctl su-exec --name unit-test-container sh -lc 'grep -Fxq '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' /etc/apk/repositories || printf \"%s\\\\n\" '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' >> /etc/apk/repositories'"
+  assert_contains "agentctl su-exec --name unit-test-container apk update"
+  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache go@edgecommunity golangci-lint@edgecommunity zstd"
+  assert_not_contains "original repository URL was not available"
+}
+
 test_upgrade_warns_about_image_packages_removed_from_target() {
   begin_test "upgrade warns about image-provided packages removed from the target image"
 
@@ -6929,6 +6985,8 @@ main() {
   run_selected_test test_upgrade_copy_dry_run_reports_copy_plan "test_upgrade_copy_dry_run_reports_copy_plan"
   run_selected_test test_upgrade_warns_about_added_packages_missing_from_target_image "test_upgrade_warns_about_added_packages_missing_from_target_image"
   run_selected_test test_upgrade_reinstall_command_prefers_requested_apk_packages "test_upgrade_reinstall_command_prefers_requested_apk_packages"
+  run_selected_test test_upgrade_reinstall_command_restores_missing_apk_repository_tags "test_upgrade_reinstall_command_restores_missing_apk_repository_tags"
+  run_selected_test test_upgrade_reinstall_command_suggests_default_apk_edge_tags "test_upgrade_reinstall_command_suggests_default_apk_edge_tags"
   run_selected_test test_upgrade_warns_about_image_packages_removed_from_target "test_upgrade_warns_about_image_packages_removed_from_target"
   run_selected_test test_upgrade_reinstall_command_prefers_requested_dpkg_packages "test_upgrade_reinstall_command_prefers_requested_dpkg_packages"
   run_selected_test test_upgrade_reinstalls_added_runtimes_and_features_in_target "test_upgrade_reinstalls_added_runtimes_and_features_in_target"
