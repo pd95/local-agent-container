@@ -6216,6 +6216,104 @@ test_container_baseline_manifest_starts_stopped_container_and_restores_state() {
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
 }
 
+test_image_system_manifest_removes_temp_container_after_success() {
+  begin_test "image_system_manifest_json removes temporary container after success"
+
+  load_codexctl_functions
+
+  local create_calls=0
+  local start_calls=0
+  local stop_calls=0
+  local rm_calls=0
+
+  temporary_system_manifest_container_name() { printf 'unit-manifest-temp\n'; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create)
+        create_calls=$((create_calls + 1))
+        [ "$4" = "unit-manifest-temp" ] || fail "Expected temp container name, got: $*"
+        ;;
+      start)
+        start_calls=$((start_calls + 1))
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp start, got: $*"
+        ;;
+      stop)
+        stop_calls=$((stop_calls + 1))
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp stop, got: $*"
+        ;;
+      rm)
+        rm_calls=$((rm_calls + 1))
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp rm, got: $*"
+        ;;
+      exec)
+        shift
+        [ "$1" = "unit-manifest-temp" ] || fail "Unexpected exec target: $*"
+        shift
+        if [ "${1:-}" = "setpriv" ]; then
+          shift 5
+        fi
+        [ "$*" = "bash /usr/local/bin/agent.sh system manifest" ] || fail "Unexpected exec command: $*"
+        printf '{"package_manager":"none"}\n'
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture image_system_manifest_json agent-plain target
+  assert_status 0
+  assert_contains '"package_manager":"none"'
+  [ "$create_calls" -eq 1 ] || fail "Expected 1 create call, got: $create_calls"
+  [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
+  [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
+  [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
+}
+
+test_image_system_manifest_removes_temp_container_after_exec_failure() {
+  begin_test "image_system_manifest_json removes temporary container after exec failure"
+
+  load_codexctl_functions
+
+  local stop_calls=0
+  local rm_calls=0
+
+  temporary_system_manifest_container_name() { printf 'unit-manifest-temp\n'; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create)
+        [ "$4" = "unit-manifest-temp" ] || fail "Expected temp container name, got: $*"
+        ;;
+      start)
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp start, got: $*"
+        ;;
+      stop)
+        stop_calls=$((stop_calls + 1))
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp stop, got: $*"
+        ;;
+      rm)
+        rm_calls=$((rm_calls + 1))
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp rm, got: $*"
+        ;;
+      exec)
+        return 1
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture image_system_manifest_json agent-plain target
+  assert_status 1
+  [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
+  [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
+}
+
 test_collect_upgrade_container_preflight_starts_stopped_container_once() {
   begin_test "collect_upgrade_container_preflight reuses one start for manifest, baseline, and capability checks"
 
@@ -7354,6 +7452,8 @@ main() {
   run_selected_test test_upgrade_accepts_workdir_override_when_original_mount_is_missing "test_upgrade_accepts_workdir_override_when_original_mount_is_missing"
   run_selected_test test_upgrade_allows_no_backup_for_modern_export_source "test_upgrade_allows_no_backup_for_modern_export_source"
   run_selected_test test_container_baseline_manifest_starts_stopped_container_and_restores_state "test_container_baseline_manifest_starts_stopped_container_and_restores_state"
+  run_selected_test test_image_system_manifest_removes_temp_container_after_success "test_image_system_manifest_removes_temp_container_after_success"
+  run_selected_test test_image_system_manifest_removes_temp_container_after_exec_failure "test_image_system_manifest_removes_temp_container_after_exec_failure"
   run_selected_test test_collect_upgrade_container_preflight_starts_stopped_container_once "test_collect_upgrade_container_preflight_starts_stopped_container_once"
   run_selected_test test_refresh_updates_managed_files_without_recreate "test_refresh_updates_managed_files_without_recreate"
   run_selected_test test_doctor_reports_state_permission_problems "test_doctor_reports_state_permission_problems"

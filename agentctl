@@ -4240,36 +4240,45 @@ image_system_manifest_json() {
   local manifest=""
 
   temp_name="$(temporary_system_manifest_container_name "$role")"
-  if ! "$CONTAINER_CMD" create -t --name "$temp_name" "$image" sh -c 'sleep infinity' >/dev/null; then
-    return 1
-  fi
-  created=1
-
-  if ! "$CONTAINER_CMD" start "$temp_name" >/dev/null; then
-    if [ "$created" -eq 1 ]; then
-      "$CONTAINER_CMD" rm "$temp_name" >/dev/null 2>&1 || true
-    fi
-    return 1
-  fi
-  started=1
-
-  if ! manifest="$("$CONTAINER_CMD" exec "$temp_name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh system manifest)"; then
+  cleanup_system_manifest_container() {
     if [ "$started" -eq 1 ]; then
       "$CONTAINER_CMD" stop "$temp_name" >/dev/null 2>&1 || true
     fi
     if [ "$created" -eq 1 ]; then
       "$CONTAINER_CMD" rm "$temp_name" >/dev/null 2>&1 || true
     fi
+  }
+  cleanup_system_manifest_container_on_signal() {
+    cleanup_system_manifest_container
+    trap - EXIT INT TERM HUP
+    exit 130
+  }
+
+  trap cleanup_system_manifest_container EXIT
+  trap cleanup_system_manifest_container_on_signal INT TERM HUP
+
+  if ! "$CONTAINER_CMD" create -t --name "$temp_name" "$image" sh -c 'sleep infinity' >/dev/null; then
+    trap - EXIT INT TERM HUP
+    return 1
+  fi
+  created=1
+
+  if ! "$CONTAINER_CMD" start "$temp_name" >/dev/null; then
+    cleanup_system_manifest_container
+    trap - EXIT INT TERM HUP
+    return 1
+  fi
+  started=1
+
+  if ! manifest="$("$CONTAINER_CMD" exec "$temp_name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh system manifest)"; then
+    cleanup_system_manifest_container
+    trap - EXIT INT TERM HUP
     return 1
   fi
   manifest="$(augment_manifest_with_container_apk_repositories "$temp_name" "$manifest")"
 
-  if [ "$started" -eq 1 ]; then
-    "$CONTAINER_CMD" stop "$temp_name" >/dev/null 2>&1 || true
-  fi
-  if [ "$created" -eq 1 ]; then
-    "$CONTAINER_CMD" rm "$temp_name" >/dev/null 2>&1 || true
-  fi
+  cleanup_system_manifest_container
+  trap - EXIT INT TERM HUP
 
   printf '%s\n' "$manifest"
 }
