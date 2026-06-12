@@ -3726,6 +3726,138 @@ test_sync_runtime_auth_to_container_uses_runtime_parameters() {
   printf '%s' "$written_payload" | jq -er '.refresh_token == "unit-token"' >/dev/null || fail "Expected runtime auth payload to be written"
 }
 
+test_sync_runtime_auth_to_container_skips_matching_auth() {
+  begin_test "sync_runtime_auth_to_container skips matching auth"
+
+  load_codexctl_functions
+
+  local writes=0
+
+  ensure_keychain() { return 0; }
+  keychain_auth_info() {
+    printf 'unit-token\t2026-04-17T00:00:00Z\n'
+  }
+  container_auth_info() {
+    printf 'unit-token\t2026-04-17T00:00:00Z\n'
+  }
+  write_auth_blob_to_container() {
+    writes=$((writes + 1))
+  }
+  write_keychain_auth_blob() {
+    writes=$((writes + 1))
+  }
+
+  run_capture sync_runtime_auth_to_container unit-test-container codex json_refresh_token "missing auth"
+  assert_status 0
+  [ "$writes" -eq 0 ] || fail "Did not expect matching auth to be written"
+}
+
+test_sync_runtime_auth_to_container_uses_newer_keychain_auth() {
+  begin_test "sync_runtime_auth_to_container refreshes container from newer Keychain auth"
+
+  load_codexctl_functions
+
+  local written_payload=""
+  local keychain_writes=0
+
+  ensure_keychain() { return 0; }
+  keychain_auth_info() {
+    printf 'keychain-token\t2026-04-17T02:00:00Z\n'
+  }
+  keychain_auth_blob() {
+    printf '{"refresh_token":"keychain-token","last_refresh":"2026-04-17T02:00:00Z"}'
+  }
+  container_auth_info() {
+    printf 'container-token\t2026-04-17T01:00:00Z\n'
+  }
+  write_auth_blob_to_container() {
+    local name="$1" payload="$2" runtime="$3" auth_format="$4"
+    [ "$name" = "unit-test-container" ] || fail "Unexpected container name: $name"
+    [ "$runtime" = "codex" ] || fail "Unexpected runtime: $runtime"
+    [ "$auth_format" = "json_refresh_token" ] || fail "Unexpected auth format: $auth_format"
+    written_payload="$payload"
+  }
+  write_keychain_auth_blob() {
+    keychain_writes=$((keychain_writes + 1))
+  }
+
+  run_capture sync_runtime_auth_to_container unit-test-container codex json_refresh_token "missing auth"
+  assert_status 0
+  printf '%s' "$written_payload" | jq -er '.refresh_token == "keychain-token"' >/dev/null || fail "Expected newer Keychain auth to be written to container"
+  [ "$keychain_writes" -eq 0 ] || fail "Did not expect Keychain to be written"
+}
+
+test_sync_runtime_auth_to_container_promotes_newer_container_auth() {
+  begin_test "sync_runtime_auth_to_container promotes newer container auth to Keychain"
+
+  load_codexctl_functions
+
+  local container_writes=0
+  local written_blob_file
+  local temp_dir
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-promote.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  written_blob_file="$temp_dir/written-auth.json"
+
+  ensure_keychain() { return 0; }
+  keychain_auth_info() {
+    printf 'keychain-token\t2026-04-17T01:00:00Z\n'
+  }
+  container_auth_info() {
+    printf 'container-token\t2026-04-17T02:00:00Z\n'
+  }
+  container_auth_blob() {
+    local name="$1" runtime="$2" auth_format="$3"
+    [ "$name" = "unit-test-container" ] || fail "Unexpected container name: $name"
+    [ "$runtime" = "codex" ] || fail "Unexpected runtime: $runtime"
+    [ "$auth_format" = "json_refresh_token" ] || fail "Unexpected auth format: $auth_format"
+    printf '{"refresh_token":"container-token","last_refresh":"2026-04-17T02:00:00Z"}'
+  }
+  write_auth_blob_to_container() {
+    container_writes=$((container_writes + 1))
+  }
+  write_keychain_auth_blob() {
+    local runtime="$1" auth_format="$2"
+    [ "$runtime" = "codex" ] || fail "Unexpected runtime: $runtime"
+    [ "$auth_format" = "json_refresh_token" ] || fail "Unexpected auth format: $auth_format"
+    cat >"$written_blob_file"
+  }
+
+  run_capture sync_runtime_auth_to_container unit-test-container codex json_refresh_token "missing auth"
+  assert_status 0
+  assert_contains "Updating Keychain auth from unit-test-container"
+  [ "$container_writes" -eq 0 ] || fail "Did not expect container auth to be overwritten"
+  jq -er '.refresh_token == "container-token"' "$written_blob_file" >/dev/null || fail "Expected newer container auth to be written to Keychain"
+}
+
+test_sync_runtime_auth_to_container_rejects_inconclusive_conflict() {
+  begin_test "sync_runtime_auth_to_container rejects conflicting auth without freshness"
+
+  load_codexctl_functions
+
+  ensure_keychain() { return 0; }
+  keychain_auth_info() {
+    printf 'keychain-token\t\n'
+  }
+  container_auth_info() {
+    printf 'container-token\t\n'
+  }
+  write_auth_blob_to_container() {
+    fail "Did not expect conflicting auth to be written to container"
+  }
+  write_keychain_auth_blob() {
+    fail "Did not expect conflicting auth to be written to Keychain"
+  }
+  run_conflicting_auth_sync() {
+    ( sync_runtime_auth_to_container unit-test-container codex json_refresh_token "missing auth" )
+  }
+
+  run_capture run_conflicting_auth_sync
+  assert_status 1
+  assert_contains "Refusing to overwrite conflicting codex auth for unit-test-container"
+}
+
 test_sync_runtime_auth_from_container_uses_runtime_parameters() {
   begin_test "sync_runtime_auth_from_container uses runtime-specific auth parameters"
 
@@ -6729,6 +6861,10 @@ main() {
   run_selected_test test_write_auth_blob_to_container_falls_back_for_legacy_codex "test_write_auth_blob_to_container_falls_back_for_legacy_codex"
   run_selected_test test_write_auth_blob_to_container_does_not_fallback_on_non_legacy_error "test_write_auth_blob_to_container_does_not_fallback_on_non_legacy_error"
   run_selected_test test_sync_runtime_auth_to_container_uses_runtime_parameters "test_sync_runtime_auth_to_container_uses_runtime_parameters"
+  run_selected_test test_sync_runtime_auth_to_container_skips_matching_auth "test_sync_runtime_auth_to_container_skips_matching_auth"
+  run_selected_test test_sync_runtime_auth_to_container_uses_newer_keychain_auth "test_sync_runtime_auth_to_container_uses_newer_keychain_auth"
+  run_selected_test test_sync_runtime_auth_to_container_promotes_newer_container_auth "test_sync_runtime_auth_to_container_promotes_newer_container_auth"
+  run_selected_test test_sync_runtime_auth_to_container_rejects_inconclusive_conflict "test_sync_runtime_auth_to_container_rejects_inconclusive_conflict"
   run_selected_test test_sync_runtime_auth_from_container_uses_runtime_parameters "test_sync_runtime_auth_from_container_uses_runtime_parameters"
   run_selected_test test_auth_info_from_json_parses_claude_oauth_payload "test_auth_info_from_json_parses_claude_oauth_payload"
   run_selected_test test_run_auth_flow_uses_agent_sh_auth_contract "test_run_auth_flow_uses_agent_sh_auth_contract"

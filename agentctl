@@ -2558,6 +2558,47 @@ container_auth_info() {
   printf '%s' "$blob" | auth_info_from_json
 }
 
+auth_refresh_values_comparable() {
+  local left="$1"
+  local right="$2"
+
+  [ -n "$left" ] && [ -n "$right" ] || return 1
+  case "$left:$right" in
+    *[!0-9]*:*[!0-9]*) return 0 ;;
+    *[!0-9]*:*|*:*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+compare_runtime_auth_info() {
+  local keychain_token="$1"
+  local keychain_refresh="$2"
+  local container_token="$3"
+  local container_refresh="$4"
+
+  if [ -z "$container_token" ]; then
+    printf '%s\n' missing_container
+    return 0
+  fi
+  if [ "$container_token" = "$keychain_token" ] && [ "$container_refresh" = "$keychain_refresh" ]; then
+    printf '%s\n' same
+    return 0
+  fi
+  if ! auth_refresh_values_comparable "$keychain_refresh" "$container_refresh"; then
+    printf '%s\n' inconclusive_conflict
+    return 0
+  fi
+  if [[ "$container_refresh" > "$keychain_refresh" ]]; then
+    printf '%s\n' container_newer
+    return 0
+  fi
+  if [[ "$keychain_refresh" > "$container_refresh" ]]; then
+    printf '%s\n' keychain_newer
+    return 0
+  fi
+  printf '%s\n' inconclusive_conflict
+}
+
 sync_runtime_auth_to_container() {
   local name="$1"
   local runtime="${2:-$DEFAULT_RUNTIME}"
@@ -2577,18 +2618,26 @@ sync_runtime_auth_to_container() {
   local container_info
   local container_token
   local container_refresh
+  local auth_status
   container_info="$(container_auth_info "$name" "$runtime" "$auth_format")"
   IFS=$'\t' read -r container_token container_refresh <<<"$container_info"
-  if [ -z "$container_token" ]; then
-    echo "Refreshing $runtime auth in $name" >&2
-    write_auth_blob_to_container "$name" "$(keychain_auth_blob "$runtime" "$auth_format")" "$runtime" "$auth_format"
-    return 0
-  fi
-  if [ "$container_token" = "$keychain_token" ] && [ "$container_refresh" = "$keychain_refresh" ]; then
-    return 0
-  fi
-  echo "Refreshing $runtime auth in $name" >&2
-  write_auth_blob_to_container "$name" "$(keychain_auth_blob "$runtime" "$auth_format")" "$runtime" "$auth_format"
+  auth_status="$(compare_runtime_auth_info "$keychain_token" "$keychain_refresh" "$container_token" "$container_refresh")"
+  case "$auth_status" in
+    same)
+      return 0
+      ;;
+    missing_container|keychain_newer)
+      echo "Refreshing $runtime auth in $name" >&2
+      write_auth_blob_to_container "$name" "$(keychain_auth_blob "$runtime" "$auth_format")" "$runtime" "$auth_format"
+      ;;
+    container_newer)
+      echo "Updating Keychain auth from $name" >&2
+      container_auth_blob "$name" "$runtime" "$auth_format" | write_keychain_auth_blob "$runtime" "$auth_format"
+      ;;
+    *)
+      die "Refusing to overwrite conflicting $runtime auth for $name because freshness could not be determined. Run ${CLI_NAME} auth --runtime $runtime, or stop the container after a successful online run so refreshed auth can sync back to Keychain."
+      ;;
+  esac
 }
 
 sync_runtime_auth_from_container() {
@@ -2610,17 +2659,18 @@ sync_runtime_auth_from_container() {
   local keychain_info
   local keychain_token
   local keychain_refresh
+  local auth_status
   keychain_info="$(keychain_auth_info "$runtime" "$auth_format")"
   IFS=$'\t' read -r keychain_token keychain_refresh <<<"$keychain_info"
   if [ -z "$keychain_token" ]; then
     echo "Keychain auth missing refresh_token; skipping post-run sync from $name" >&2
     return 0
   fi
-  if [ -z "$keychain_refresh" ] || [[ "$container_refresh" < "$keychain_refresh" ]] || [ "$container_refresh" = "$keychain_refresh" ]; then
-    return 0
+  auth_status="$(compare_runtime_auth_info "$keychain_token" "$keychain_refresh" "$container_token" "$container_refresh")"
+  if [ "$auth_status" = "container_newer" ]; then
+    echo "Updating Keychain auth from $name" >&2
+    container_auth_blob "$name" "$runtime" "$auth_format" | write_keychain_auth_blob "$runtime" "$auth_format"
   fi
-  echo "Updating Keychain auth from $name" >&2
-  container_auth_blob "$name" "$runtime" "$auth_format" | write_keychain_auth_blob "$runtime" "$auth_format"
 }
 
 runtime_info_in_container() {
