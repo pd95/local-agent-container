@@ -185,10 +185,12 @@ runtime_command_path() {
   local runtime="$1"
   local command_name=""
   local candidate=""
+  local command_path=""
 
   command_name="$(runtime_command_name "$runtime")" || return 1
-  if command -v "$command_name" >/dev/null 2>&1; then
-    command -v "$command_name"
+  command_path="$(command -v "$command_name" 2>/dev/null || true)"
+  if [ -n "$command_path" ] && [ -x "$command_path" ]; then
+    printf '%s\n' "$command_path"
     return 0
   fi
   for candidate in "$HOME/.local/bin/$command_name" "$HOME/bin/$command_name"; do

@@ -1525,6 +1525,25 @@ test_agent_sh_runtime_list_reports_installed_runtimes_only() {
   assert_not_contains "claude"
 }
 
+test_agent_sh_runtime_list_ignores_dangling_runtime_launcher() {
+  begin_test "agent.sh runtime list ignores a dangling runtime launcher"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin"
+  ln -s "$temp_home/missing/codex" "$fake_bin/codex"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    -- runtime list
+  assert_status 0
+  assert_not_contains "codex"
+  assert_not_contains "claude"
+}
+
 test_agent_sh_runtime_capabilities_reports_manifest_commands() {
   begin_test "agent.sh runtime capabilities reports manifest-backed commands"
 
@@ -3277,9 +3296,11 @@ test_agent_sh_state_export_uses_installed_runtime_hooks() {
 
   mkdir -p \
     "$temp_home/home/.codex" \
+    "$temp_home/home/.codex/packages/standalone/current/bin" \
     "$temp_home/home/.claude" \
     "$temp_home/home/.config/agentctl"
   printf '%s' 'codex-auth' >"$temp_home/home/.codex/auth.json"
+  printf '%s' 'codex-binary' >"$temp_home/home/.codex/packages/standalone/current/bin/codex"
   printf '%s' '{"claudeAiOauth":{"accessToken":"a","refreshToken":"b","expiresAt":1}}' >"$temp_home/home/.claude/.credentials.json"
   printf '%s' '{"hasCompletedOnboarding":true}' >"$temp_home/home/.claude.json"
   printf '%s' 'codex' >"$temp_home/home/.config/agentctl/preferred-runtime"
@@ -3296,6 +3317,9 @@ test_agent_sh_state_export_uses_installed_runtime_hooks() {
     /bin/bash "$TEST_ROOT/agent.sh" state export >"$tar_file"
 
   tar -tf "$tar_file" | grep -Fx '.codex/auth.json' >/dev/null || fail "Expected installed Codex runtime state in exported state"
+  if tar -tf "$tar_file" | grep -Fqx '.codex/packages/standalone/current/bin/codex'; then
+    fail "Did not expect Codex package artifacts in exported state"
+  fi
   tar -tf "$tar_file" | grep -Fx '.config/agentctl/preferred-runtime' >/dev/null || fail "Expected generic agentctl state in exported state"
   tar -tf "$tar_file" | grep -Fx '.profile' >/dev/null || fail "Expected shell state in exported state"
   if tar -tf "$tar_file" | grep -Fqx '.claude/.credentials.json'; then
@@ -3390,8 +3414,9 @@ test_agent_sh_state_import_uses_installed_runtime_hooks() {
     "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
     /bin/bash "$TEST_ROOT/agent.sh" state export >"$tar_file"
 
-  mkdir -p "$target_home/home/.codex" "$target_home/home/.claude"
+  mkdir -p "$target_home/home/.codex/packages/standalone/current/bin" "$target_home/home/.claude"
   printf '%s' 'stale-codex' >"$target_home/home/.codex/auth.json"
+  printf '%s' 'image-codex-binary' >"$target_home/home/.codex/packages/standalone/current/bin/codex"
   printf '%s' '{"claudeAiOauth":{"accessToken":"stale","refreshToken":"keep","expiresAt":1}}' >"$target_home/home/.claude/.credentials.json"
 
   env -i \
@@ -3405,6 +3430,7 @@ test_agent_sh_state_import_uses_installed_runtime_hooks() {
     /bin/bash "$TEST_ROOT/agent.sh" state import <"$tar_file"
 
   [ "$(cat "$target_home/home/.codex/auth.json")" = "codex-auth" ] || fail "Expected installed Codex runtime state to be restored"
+  [ "$(cat "$target_home/home/.codex/packages/standalone/current/bin/codex")" = "image-codex-binary" ] || fail "Expected image-owned Codex package artifacts to survive state import"
   [ "$(cat "$target_home/home/.config/agentctl/preferred-runtime")" = "codex" ] || fail "Expected generic agentctl state to be restored"
   grep -Fq 'go/bin' "$target_home/home/.profile" || fail "Expected shell state to be restored"
   jq -er '.claudeAiOauth.refreshToken == "keep"' "$target_home/home/.claude/.credentials.json" >/dev/null || fail "Expected unrelated Claude legacy state to remain untouched when Claude is not installed"
@@ -6815,6 +6841,7 @@ main() {
   run_selected_test test_agent_sh_feature_install_office_creates_feature_state "test_agent_sh_feature_install_office_creates_feature_state"
   run_selected_test test_agent_sh_feature_info_reports_installed_after_office_install "test_agent_sh_feature_info_reports_installed_after_office_install"
   run_selected_test test_agent_sh_runtime_list_reports_installed_runtimes_only "test_agent_sh_runtime_list_reports_installed_runtimes_only"
+  run_selected_test test_agent_sh_runtime_list_ignores_dangling_runtime_launcher "test_agent_sh_runtime_list_ignores_dangling_runtime_launcher"
   run_selected_test test_agent_sh_runtime_capabilities_reports_manifest_commands "test_agent_sh_runtime_capabilities_reports_manifest_commands"
   run_selected_test test_agent_sh_claude_runtime_info_reports_skeleton_metadata "test_agent_sh_claude_runtime_info_reports_skeleton_metadata"
   run_selected_test test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state "test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state"
