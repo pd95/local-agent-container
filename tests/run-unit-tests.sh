@@ -6360,6 +6360,8 @@ test_doctor_reports_state_permission_problems() {
     printf '%s\n' '.codex/config.toml' '.codex/history.jsonl'
     return 1
   }
+  doctor_runtime_health() { return 0; }
+  doctor_runtime_state_summary() { return 0; }
 
   CONTAINER_CMD=container
   container() {
@@ -6421,6 +6423,8 @@ test_doctor_fix_repairs_state_permission_problems() {
     printf '%s\n' '.codex/config.toml'
     return 1
   }
+  doctor_runtime_health() { return 0; }
+  doctor_runtime_state_summary() { return 0; }
 
   CONTAINER_CMD=container
   container() {
@@ -6431,6 +6435,174 @@ test_doctor_fix_repairs_state_permission_problems() {
   assert_status 0
   assert_contains "Doctor repaired user-state ownership/readability problems in unit-test-container:"
   assert_contains "  - .codex/config.toml"
+}
+
+test_doctor_reports_runtime_health_problems() {
+  begin_test "doctor reports runtime health problems"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  doctor_state_permissions() { return 0; }
+  doctor_runtime_state_summary() { return 0; }
+  doctor_runtime_health() {
+    [ "$1" = "unit-test-container" ] || fail "Unexpected doctor target: $1"
+    [ "$2" = "0" ] || fail "Did not expect fix mode: $2"
+    printf '%s\n' 'preferred runtime not installed: codex'
+    printf '%s\n' 'codex config missing model provider: myollama'
+    printf '%s\n' 'codex AGENTS.md missing'
+    return 1
+  }
+
+  CONTAINER_CMD=container
+  container() {
+    fail "Did not expect container lifecycle changes for a running container: $*"
+  }
+
+  run_capture doctor_cmd --name unit-test-container
+  assert_status 1
+  assert_contains "Doctor found no user-state ownership/readability problems in unit-test-container"
+  assert_contains "Doctor found runtime health problems in unit-test-container:"
+  assert_contains "  - preferred runtime not installed: codex"
+  assert_contains "  - codex config missing model provider: myollama"
+  assert_contains "  - codex AGENTS.md missing"
+  assert_contains "doctor --name unit-test-container --fix"
+}
+
+test_doctor_fix_repairs_runtime_health_problems() {
+  begin_test "doctor --fix repairs runtime health problems"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  doctor_state_permissions() { return 0; }
+  doctor_runtime_state_summary() { return 0; }
+  doctor_runtime_health() {
+    [ "$1" = "unit-test-container" ] || fail "Unexpected doctor target: $1"
+    [ "$2" = "1" ] || fail "Expected fix mode, got: $2"
+    printf '%s\n' 'codex config missing model provider: myollama'
+    printf '%s\n' 'codex AGENTS.md missing'
+    return 1
+  }
+
+  CONTAINER_CMD=container
+  container() {
+    fail "Did not expect container lifecycle changes for a running container: $*"
+  }
+
+  run_capture doctor_cmd --name unit-test-container --fix
+  assert_status 0
+  assert_contains "Doctor found no user-state ownership/readability problems in unit-test-container"
+  assert_contains "Doctor repaired runtime health problems in unit-test-container:"
+  assert_contains "  - codex config missing model provider: myollama"
+  assert_contains "  - codex AGENTS.md missing"
+}
+
+test_doctor_runtime_health_detects_codex_config_and_agents_problems() {
+  begin_test "doctor runtime health detects Codex config and AGENTS problems"
+
+  load_codexctl_functions
+
+  run_agent_sh_in_container() {
+    case "$2 $3" in
+      "runtime list") printf '%s\n' codex ;;
+      "preferred get") printf '%s\n' codex ;;
+      "runtime info")
+        [ "$4" = "codex" ] || fail "Unexpected runtime info target: $4"
+        printf '%s\n' '{"id":"codex","command":"codex","installed":true,"capabilities":{"install":true}}'
+        ;;
+      *) fail "Unexpected agent.sh invocation: $*" ;;
+    esac
+  }
+  doctor_runtime_command_available() { return 0; }
+  doctor_codex_config_has_myollama() { return 1; }
+  codex_agents_state() { printf '%s\n' missing; }
+
+  run_capture doctor_runtime_health unit-test-container 0
+  assert_status 1
+  assert_contains "codex config missing model provider: myollama"
+  assert_contains "codex AGENTS.md missing"
+}
+
+test_doctor_runtime_health_fix_reinstalls_runtime_and_restores_agents() {
+  begin_test "doctor runtime health --fix reinstalls missing runtime and restores AGENTS"
+
+  load_codexctl_functions
+
+  local installed_runtime=""
+  local reset_runtime=""
+  local fixed_agents=0
+
+  run_agent_sh_in_container() {
+    case "$2 $3" in
+      "runtime list") printf '%s\n' codex ;;
+      "preferred get") printf '%s\n' codex ;;
+      "runtime info")
+        [ "$4" = "codex" ] || fail "Unexpected runtime info target: $4"
+        printf '%s\n' '{"id":"codex","command":"codex","installed":false,"capabilities":{"install":true}}'
+        ;;
+      *) fail "Unexpected agent.sh invocation: $*" ;;
+    esac
+  }
+  doctor_runtime_command_available() { return 1; }
+  doctor_codex_config_has_myollama() { return 1; }
+  codex_agents_state() { printf '%s\n' missing; }
+  install_runtime_in_container() {
+    installed_runtime="$2:$3"
+    return 0
+  }
+  reset_runtime_config_in_container() {
+    reset_runtime="$2"
+    return 0
+  }
+  doctor_fix_missing_codex_agents() {
+    fixed_agents=1
+    return 0
+  }
+
+  run_capture doctor_runtime_health unit-test-container 1
+  assert_status 1
+  assert_contains "preferred runtime not installed: codex"
+  assert_contains "runtime command unavailable: codex (codex)"
+  assert_contains "codex config missing model provider: myollama"
+  assert_contains "codex AGENTS.md missing"
+  [ "$installed_runtime" = "codex:1" ] || fail "Expected Codex reinstall with skip preferred, got: $installed_runtime"
+  [ "$reset_runtime" = "codex" ] || fail "Expected Codex reset-config, got: $reset_runtime"
+  [ "$fixed_agents" -eq 1 ] || fail "Expected missing AGENTS.md to be restored"
+}
+
+test_doctor_reports_runtime_state_summary() {
+  begin_test "doctor reports runtime state summary"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  doctor_state_permissions() { return 0; }
+  doctor_runtime_health() { return 0; }
+  doctor_runtime_state_summary() {
+    printf '%s\n' 'Codex state: history lines 12, session files 3, session index lines 2'
+    printf '%s\n' 'Claude state: credentials files 1, settings files 1, home state files 1, project files 4'
+  }
+
+  CONTAINER_CMD=container
+  container() {
+    fail "Did not expect container lifecycle changes for a running container: $*"
+  }
+
+  run_capture doctor_cmd --name unit-test-container
+  assert_status 0
+  assert_contains "Doctor runtime state summary in unit-test-container:"
+  assert_contains "  - Codex state: history lines 12, session files 3, session index lines 2"
+  assert_contains "  - Claude state: credentials files 1, settings files 1, home state files 1, project files 4"
 }
 
 test_container_state_permission_script_repairs_unreadable_state() {
@@ -7187,6 +7359,11 @@ main() {
   run_selected_test test_doctor_reports_state_permission_problems "test_doctor_reports_state_permission_problems"
   run_selected_test test_doctor_reports_container_startup_problem "test_doctor_reports_container_startup_problem"
   run_selected_test test_doctor_fix_repairs_state_permission_problems "test_doctor_fix_repairs_state_permission_problems"
+  run_selected_test test_doctor_reports_runtime_health_problems "test_doctor_reports_runtime_health_problems"
+  run_selected_test test_doctor_fix_repairs_runtime_health_problems "test_doctor_fix_repairs_runtime_health_problems"
+  run_selected_test test_doctor_runtime_health_detects_codex_config_and_agents_problems "test_doctor_runtime_health_detects_codex_config_and_agents_problems"
+  run_selected_test test_doctor_runtime_health_fix_reinstalls_runtime_and_restores_agents "test_doctor_runtime_health_fix_reinstalls_runtime_and_restores_agents"
+  run_selected_test test_doctor_reports_runtime_state_summary "test_doctor_reports_runtime_state_summary"
   run_selected_test test_container_state_permission_script_repairs_unreadable_state "test_container_state_permission_script_repairs_unreadable_state"
   run_selected_test test_refresh_container_file_streams_source_via_stdin "test_refresh_container_file_streams_source_via_stdin"
   run_selected_test test_refresh_container_tree_suppresses_host_xattrs "test_refresh_container_tree_suppresses_host_xattrs"

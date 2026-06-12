@@ -794,10 +794,11 @@ Options:
   --name NAME  Container name (default: agent-<dir>)
   --fix        Repair detected user-state ownership and readability problems
 
-Doctor checks that the container can stay running for exec-based maintenance and
-checks known agentctl user-state paths in /home/coder. With --fix, it hands
-those paths back to coder:coder and restores owner read/write and directory
-traverse bits needed for state backup and upgrade.
+Doctor checks that the container can stay running for exec-based maintenance,
+checks known agentctl user-state paths in /home/coder, and verifies installed
+runtimes plus image-managed Codex local-mode config. With --fix, it repairs
+state permissions, reinstalls missing installable runtimes, restores missing
+Codex AGENTS.md, and resets broken Codex runtime config when needed.
 EOF
 }
 
@@ -2268,6 +2269,150 @@ doctor_state_permissions() {
   return 1
 }
 
+doctor_runtime_command_available() {
+  local name="$1"
+  local command="$2"
+
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc 'command -v "$1" >/dev/null 2>&1' sh "$command"
+}
+
+doctor_codex_config_has_myollama() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc '
+config=/home/coder/.codex/config.toml
+[ -f "$config" ] || exit 1
+awk "
+  BEGIN { found = 0 }
+  /^[[:space:]]*\\[model_providers\\.myollama\\][[:space:]]*$/ { found = 1 }
+  END { exit found ? 0 : 1 }
+" "$config"
+'
+}
+
+doctor_fix_missing_codex_agents() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
+mkdir -p /home/coder/.codex
+ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
+chown -h coder:coder /home/coder/.codex/AGENTS.md
+'
+}
+
+doctor_runtime_health() {
+  local name="$1"
+  local fix="${2:-0}"
+  local runtime_list=""
+  local preferred_runtime=""
+  local runtime=""
+  local runtime_info=""
+  local command=""
+  local installed=""
+  local installable=""
+  local issue_count=0
+  local codex_seen=0
+  local agents_state=""
+
+  runtime_list="$(run_agent_sh_in_container "$name" runtime list 2>/dev/null)" || {
+    printf '%s\n' 'agent.sh runtime list failed'
+    return 2
+  }
+  preferred_runtime="$(run_agent_sh_in_container "$name" preferred get 2>/dev/null || true)"
+
+  if [ -n "$preferred_runtime" ]; then
+    runtime_info="$(run_agent_sh_in_container "$name" runtime info "$preferred_runtime" 2>/dev/null || true)"
+    installed="$(printf '%s' "$runtime_info" | jq -r '.installed // false' 2>/dev/null || printf 'false')"
+    installable="$(printf '%s' "$runtime_info" | jq -r '.capabilities.install // false' 2>/dev/null || printf 'false')"
+    if [ "$installed" != "true" ]; then
+      printf 'preferred runtime not installed: %s\n' "$preferred_runtime"
+      issue_count=$((issue_count + 1))
+      if [ "$fix" -eq 1 ] && [ "$installable" = "true" ]; then
+        install_runtime_in_container "$name" "$preferred_runtime" 1 || return 2
+      fi
+    fi
+  fi
+
+  while IFS= read -r runtime; do
+    [ -n "$runtime" ] || continue
+    [ "$runtime" = "codex" ] && codex_seen=1
+    runtime_info="$(run_agent_sh_in_container "$name" runtime info "$runtime" 2>/dev/null || true)"
+    command="$(printf '%s' "$runtime_info" | jq -r '.command // empty' 2>/dev/null || true)"
+    [ -n "$command" ] || command="$runtime"
+    if ! doctor_runtime_command_available "$name" "$command"; then
+      printf 'runtime command unavailable: %s (%s)\n' "$runtime" "$command"
+      issue_count=$((issue_count + 1))
+      installable="$(printf '%s' "$runtime_info" | jq -r '.capabilities.install // false' 2>/dev/null || printf 'false')"
+      if [ "$fix" -eq 1 ] && [ "$installable" = "true" ]; then
+        install_runtime_in_container "$name" "$runtime" 1 || return 2
+      fi
+    fi
+  done <<EOF
+$runtime_list
+EOF
+
+  if [ "$preferred_runtime" = "codex" ]; then
+    codex_seen=1
+  fi
+  if [ "$codex_seen" -eq 1 ] && ! doctor_codex_config_has_myollama "$name"; then
+    printf '%s\n' 'codex config missing model provider: myollama'
+    issue_count=$((issue_count + 1))
+    if [ "$fix" -eq 1 ]; then
+      reset_runtime_config_in_container "$name" codex || return 2
+    fi
+  fi
+  if [ "$codex_seen" -eq 1 ]; then
+    agents_state="$(codex_agents_state "$name")"
+    case "$agents_state" in
+      symlink)
+        ;;
+      missing)
+        printf '%s\n' 'codex AGENTS.md missing'
+        issue_count=$((issue_count + 1))
+        if [ "$fix" -eq 1 ]; then
+          doctor_fix_missing_codex_agents "$name" || return 2
+        fi
+        ;;
+      file)
+        printf '%s\n' 'codex AGENTS.md is a regular file; leaving custom project instructions untouched'
+        issue_count=$((issue_count + 1))
+        ;;
+      *)
+        printf 'codex AGENTS.md is not a symlink: %s\n' "$agents_state"
+        issue_count=$((issue_count + 1))
+        ;;
+    esac
+  fi
+
+  [ "$issue_count" -eq 0 ] && return 0
+  return 1
+}
+
+doctor_runtime_state_summary() {
+  local name="$1"
+  local codex_summary=""
+  local claude_summary=""
+  local history_lines=0
+  local session_files=0
+  local session_index_lines=0
+  local credentials_files=0
+  local settings_files=0
+  local home_state_files=0
+  local project_files=0
+
+  codex_summary="$(codex_state_summary_from_container "$name" 2>/dev/null || true)"
+  if [ -n "$codex_summary" ]; then
+    IFS=$'\t' read -r history_lines session_files session_index_lines <<<"$codex_summary"
+    printf 'Codex state: history lines %s, session files %s, session index lines %s\n' "$history_lines" "$session_files" "$session_index_lines"
+  fi
+
+  claude_summary="$(claude_state_summary_from_container "$name" 2>/dev/null || true)"
+  if [ -n "$claude_summary" ]; then
+    IFS=$'\t' read -r credentials_files settings_files home_state_files project_files <<<"$claude_summary"
+    printf 'Claude state: credentials files %s, settings files %s, home state files %s, project files %s\n' "$credentials_files" "$settings_files" "$home_state_files" "$project_files"
+  fi
+}
+
 repair_state_permissions_for_upgrade() {
   local name="$1"
   local output=""
@@ -3250,6 +3395,8 @@ doctor_cmd() {
   local was_running=0
   local started_for_doctor=0
   local permission_output=""
+  local runtime_output=""
+  local state_summary_output=""
   local doctor_status=0
   local status=0
 
@@ -3300,6 +3447,31 @@ doctor_cmd() {
       echo "Re-run with: $CLI_NAME doctor --name $name --fix" >&2
       status=1
     fi
+  fi
+
+  if runtime_output="$(doctor_runtime_health "$name" "$fix")"; then
+    echo "Doctor found no runtime health problems in $name" >&2
+  else
+    doctor_status=$?
+    if [ "$doctor_status" -gt 1 ]; then
+      echo "Doctor could not inspect runtime health in $name:" >&2
+      [ -n "$runtime_output" ] && printf '%s\n' "$runtime_output" | sed 's/^/  - /' >&2
+      status="$doctor_status"
+    elif [ "$fix" -eq 1 ]; then
+      echo "Doctor repaired runtime health problems in $name:" >&2
+      printf '%s\n' "$runtime_output" | sed 's/^/  - /' >&2
+    else
+      echo "Doctor found runtime health problems in $name:" >&2
+      printf '%s\n' "$runtime_output" | sed 's/^/  - /' >&2
+      echo "Re-run with: $CLI_NAME doctor --name $name --fix" >&2
+      status=1
+    fi
+  fi
+
+  state_summary_output="$(doctor_runtime_state_summary "$name" 2>/dev/null || true)"
+  if [ -n "$state_summary_output" ]; then
+    echo "Doctor runtime state summary in $name:" >&2
+    printf '%s\n' "$state_summary_output" | sed 's/^/  - /' >&2
   fi
 
   if [ "$started_for_doctor" -eq 1 ] && [ "$was_running" -eq 0 ]; then
