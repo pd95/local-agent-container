@@ -1479,6 +1479,10 @@ EOF
   [ -f "$profile_dir/node_path.sh" ] || fail "Expected office feature to write node_path profile"
   grep -Fq "apk add --no-cache" "$install_log" || fail "Expected office feature to install apk packages"
   grep -Fq " npm " "$install_log" || fail "Expected office feature to install npm package"
+  grep -Fq " py3-pypdf py3-pdfminer " "$install_log" || fail "Expected office feature to install available PDF apk packages"
+  if grep -Fq "py3-mupdf" "$install_log"; then
+    fail "Did not expect unavailable py3-mupdf package in office feature install"
+  fi
   grep -Fq "npm install -g pptxgenjs" "$install_log" || fail "Expected office feature to install pptxgenjs"
   grep -Fq "pip install --no-cache-dir python-docx python-pptx xlrd pdfplumber" "$install_log" || fail "Expected office feature to install pip packages"
 }
