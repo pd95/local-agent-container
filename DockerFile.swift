@@ -9,6 +9,7 @@ RUN DEBIAN_FRONTEND=noninteractive \
     apt-get update && \
     apt-get install -y --no-install-recommends \
         zsh file curl perl ripgrep jq util-linux bubblewrap \
+        nodejs npm \
         make \
         python-is-python3 \
   && rm -rf /var/lib/apt/lists/*
@@ -108,9 +109,10 @@ Image metadata:
 Built-in CLI tools:
 - base tools: \`bash\`, \`zsh\`, \`curl\`, \`file\`, \`jq\`, \`rg\`, \`bwrap\`
 - control tools: \`agent.sh\`
-- programming tools: \`make\`, \`python\`, \`swift\`, \`swift-format\`, \`swiftly\`, plus the wrapper commands \`format\` and \`lint\`
+- programming tools: \`node\`, \`npm\`, \`make\`, \`python\`, \`swift\`, \`swift-format\`, \`swiftly\`, plus the wrapper commands \`format\` and \`lint\`
 
 Programming environments:
+- Node.js with npm
 - Swift on Linux
 - Python
 

@@ -59,9 +59,9 @@ mounts that subtree. The `--cmd` checks should work even when Ollama is not runn
 the host.
 
 ```bash
-agentctl run --image agent-plain --temp --workdir testing/agent-plain --cmd bash -lc 'zsh --version && bash --version && git --version && rg --version && jq --version && codex --version && test -x ~/.local/bin/codex && ! command -v node && ! command -v npm'
-agentctl run --image agent-python --temp --workdir testing/agent-python --cmd bash -lc 'zsh --version && which python && python -c "import sys; print(sys.executable)" && ! command -v node && ! command -v npm'
-agentctl run --image agent-swift --temp --workdir testing/agent-swift --cmd bash -lc 'zsh --version && swift --version && swift-format --version && command -v format >/dev/null && command -v lint >/dev/null && ! command -v node && ! command -v npm'
+agentctl run --image agent-plain --temp --workdir testing/agent-plain --cmd bash -lc 'zsh --version && bash --version && git --version && rg --version && jq --version && node --version && npm --version && codex --version && test -x ~/.local/bin/codex'
+agentctl run --image agent-python --temp --workdir testing/agent-python --cmd bash -lc 'zsh --version && which python && python -c "import sys; print(sys.executable)" && node --version && npm --version'
+agentctl run --image agent-swift --temp --workdir testing/agent-swift --cmd bash -lc 'zsh --version && swift --version && swift-format --version && command -v format >/dev/null && command -v lint >/dev/null && node --version && npm --version'
 agentctl run --image agent-office --temp --workdir testing/agent-office --cmd bash -lc 'zsh --version && python -c "import docx, openpyxl, reportlab; print(\"python-ok\")" && node -e "require(\"pptxgenjs\"); console.log(\"node-ok\")"'
 ```
 

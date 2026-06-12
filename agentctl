@@ -2880,7 +2880,7 @@ EOF
 
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
     set -e
-    apk add --no-cache bash zsh file curl git ripgrep jq util-linux bubblewrap
+    apk add --no-cache bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm
     addgroup -S coder >/dev/null 2>&1 || true
     if ! id -u coder >/dev/null 2>&1; then
       adduser -S -G coder -h /home/coder -s /bin/bash coder >/dev/null
@@ -2946,7 +2946,7 @@ EOF
     set -e
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y --no-install-recommends bash zsh file curl git ripgrep jq util-linux bubblewrap ca-certificates
+    apt-get install -y --no-install-recommends bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm ca-certificates
     rm -rf /var/lib/apt/lists/*
     if ! getent group coder >/dev/null 2>&1; then
       groupadd coder

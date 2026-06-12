@@ -1125,7 +1125,7 @@ test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state() {
   assert_contains "Bootstrap complete: unit-bootstrap-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "apk add --no-cache bash zsh file curl git ripgrep jq util-linux bubblewrap" || fail "Expected root bootstrap install commands"
+  printf '%s\n' "$exec_log" | grep -Fq "apk add --no-cache bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm" || fail "Expected root bootstrap install commands"
   printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
   printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/runtimes.d" || fail "Expected bootstrap to install runtime manifests"
   printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/features.d" || fail "Expected bootstrap to install feature manifests"
@@ -1249,7 +1249,7 @@ test_bootstrap_cmd_bootstraps_apt_container() {
   assert_contains "Bootstrap complete: unit-bootstrap-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "apt-get install -y --no-install-recommends bash zsh file curl git ripgrep jq util-linux bubblewrap ca-certificates" || fail "Expected apt bootstrap install commands"
+  printf '%s\n' "$exec_log" | grep -Fq "apt-get install -y --no-install-recommends bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm ca-certificates" || fail "Expected apt bootstrap install commands"
   printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
   printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/runtimes.d" || fail "Expected bootstrap to install runtime manifests"
   printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/features.d" || fail "Expected bootstrap to install feature manifests"
@@ -5411,19 +5411,19 @@ test_upgrade_warns_about_image_packages_removed_from_target() {
     unit-test-container \
     agent-python \
     agent-python \
-    '{"package_manager":"apk","packages":["bash","git","nodejs","npm"],"requested_packages":["bash","git","npm"]}' \
-    '{"package_manager":"apk","packages":["bash","git","nodejs","npm"],"requested_packages":["bash","git","npm"]}' \
+    '{"package_manager":"apk","packages":["bash","git","legacy-lib","legacy-tool"],"requested_packages":["bash","git","legacy-tool"]}' \
+    '{"package_manager":"apk","packages":["bash","git","legacy-lib","legacy-tool"],"requested_packages":["bash","git","legacy-tool"]}' \
     '{"package_manager":"apk","packages":["bash","git"],"requested_packages":["bash","git"]}' \
     unit-test-container
 
   assert_status 0
   assert_contains "Upgrade will also remove 2 image-provided apk package(s) from agent-python that are no longer present in agent-python:"
-  assert_contains "  - nodejs"
-  assert_contains "  - npm"
+  assert_contains "  - legacy-lib"
+  assert_contains "  - legacy-tool"
   assert_contains "If you still need them, reinstall top-level packages after upgrade:"
-  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache npm"
+  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache legacy-tool"
   assert_not_contains "Upgrade will remove 2 extra apk package(s)"
-  assert_not_contains "apk add --no-cache nodejs"
+  assert_not_contains "apk add --no-cache legacy-lib"
 }
 
 test_upgrade_reinstall_command_prefers_requested_dpkg_packages() {

@@ -6,7 +6,7 @@ ARG AGENT_DEFAULT_RUNTIME=codex
 
 # --- Core tooling ---
 RUN apk add --no-cache \
-        bash zsh file curl git perl ripgrep jq util-linux bubblewrap libgcc libstdc++
+        bash zsh file curl git perl ripgrep jq util-linux bubblewrap nodejs npm libgcc libstdc++
 
 # --- Add user ---
 RUN addgroup -S coder \
@@ -71,6 +71,7 @@ Image metadata:
 Built-in CLI tools:
 - base tools: \`bash\`, \`zsh\`, \`git\`, \`curl\`, \`file\`, \`jq\`, \`rg\`, \`bwrap\`
 - control tools: \`agent.sh\`
+- programming tools: \`node\`, \`npm\`
 
 Use this image for general shell work, Git operations, repository maintenance, and light scripting.
 EOF
