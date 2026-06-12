@@ -1,5 +1,6 @@
 # For Python environment
 FROM agent-plain
+ARG BUILD_TIME=""
 
 USER root
 
@@ -26,7 +27,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH" \
 
 RUN mkdir -p /etc/codexctl /etc/agentctl \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
- && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+ && BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
  && cat > /etc/codexctl/image.md <<EOF
 You are running inside the \`agent-python\` image.
 

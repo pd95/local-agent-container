@@ -3,6 +3,7 @@ FROM swift:latest
 
 ARG AGENT_RUNTIMES=codex
 ARG AGENT_DEFAULT_RUNTIME=codex
+ARG BUILD_TIME=""
 
 # --- Core dev tooling (keep lean, no recommends) ---
 RUN DEBIAN_FRONTEND=noninteractive \
@@ -92,7 +93,7 @@ RUN printf "%s\n" "$AGENT_DEFAULT_RUNTIME" > /etc/agentctl/preferred-runtime \
 RUN mkdir -p /etc/codexctl /etc/agentctl \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
  && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
- && BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+ && BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
  && cat > /etc/codexctl/image.md <<EOF
 You are running inside the \`agent-swift\` image.
 

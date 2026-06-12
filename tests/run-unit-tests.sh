@@ -252,6 +252,7 @@ test_build_cmd_passes_runtime_list_build_args() {
   assert_status 0
   printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_RUNTIMES=codex,claude' || fail "Expected build arg for runtime list, got: $build_call"
   printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_DEFAULT_RUNTIME=claude' || fail "Expected build arg for default runtime, got: $build_call"
+  printf '%s\n' "$build_call" | grep -Eq -- '--build-arg BUILD_TIME=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' || fail "Expected shared build time build arg, got: $build_call"
 }
 
 test_build_cmd_uses_first_runtime_as_default_when_unspecified() {
@@ -328,6 +329,7 @@ test_build_cmd_rebuilds_and_snapshots_local_dependencies() {
   load_codexctl_functions
 
   local build_calls=""
+  local build_times=""
   local tag_calls=""
 
   require_container() { return 0; }
@@ -337,10 +339,12 @@ test_build_cmd_rebuilds_and_snapshots_local_dependencies() {
     case "$*" in
       build\ -t\ agent-plain\ *)
         build_calls="${build_calls}agent-plain"$'\n'
+        build_times="${build_times}$(printf '%s\n' "$*" | sed -n 's/.*--build-arg BUILD_TIME=\([^ ]*\).*/\1/p')"$'\n'
         printf '%s\n' "$*" | grep -Fq -- '--no-cache' || fail "Expected agent-plain rebuild to use --no-cache, got: $*"
         ;;
       build\ -t\ agent-python\ *)
         build_calls="${build_calls}agent-python"$'\n'
+        build_times="${build_times}$(printf '%s\n' "$*" | sed -n 's/.*--build-arg BUILD_TIME=\([^ ]*\).*/\1/p')"$'\n'
         printf '%s\n' "$*" | grep -Fq -- '--no-cache' || fail "Expected agent-python rebuild to use --no-cache, got: $*"
         ;;
       image\ tag\ agent-plain\ agent-plain:*)
@@ -360,6 +364,7 @@ test_build_cmd_rebuilds_and_snapshots_local_dependencies() {
   assert_status 0
   [ "$build_calls" = $'agent-plain\nagent-python\n' ] || fail "Expected agent-plain then agent-python rebuilds, got: $build_calls"
   [ "$tag_calls" = $'agent-plain\nagent-python\n' ] || fail "Expected timestamp tags for both rebuilt images, got: $tag_calls"
+  [ "$(printf '%s' "$build_times" | sort -u | wc -l | tr -d ' ')" = "1" ] || fail "Expected one shared build time across rebuilt images, got: $build_times"
   CONTAINER_CMD=container
 }
 

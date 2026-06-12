@@ -1434,6 +1434,7 @@ build_cmd() {
   local pull_base=0
   local no_cache=""
   local build_stamp
+  local build_time_utc
   local first_runtime=""
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -1509,6 +1510,7 @@ build_cmd() {
     no_cache="--no-cache"
   fi
   build_stamp="$(date -u +%Y%m%d-%H%M%S)"
+  build_time_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   remove_image() {
     local name="$1"
@@ -1733,7 +1735,7 @@ build_cmd() {
       fi
     fi
     echo "Building image tags: $name, $versioned_name"
-    build_args=(build -t "$name" -f "$file_path" --build-arg "AGENT_RUNTIMES=$runtimes_csv" --build-arg "AGENT_DEFAULT_RUNTIME=$default_runtime")
+    build_args=(build -t "$name" -f "$file_path" --build-arg "AGENT_RUNTIMES=$runtimes_csv" --build-arg "AGENT_DEFAULT_RUNTIME=$default_runtime" --build-arg "BUILD_TIME=$build_time_utc")
     if [ -n "$no_cache" ]; then
       build_args+=("$no_cache")
       build_args+=("$context")
