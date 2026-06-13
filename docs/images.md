@@ -207,6 +207,9 @@ multiple inspection commands:
 agentctl rescue --image agent-my-project-backup-20260516113757 --name recover-my-project --keep
 ```
 
+For a fuller recovery checklist, runtime state counting, and restore examples,
+see [rescue.md](rescue.md).
+
 ## Snapshots, Rebuilds, and Cache
 
 Snapshot and rebuild options:

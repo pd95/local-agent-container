@@ -1597,10 +1597,12 @@ test_agent_sh_system_manifest_reports_apk_requested_packages() {
   local temp_home
   local fake_bin
   local apk_world_file
+  local apk_repositories_file
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$temp_home/bin"
   apk_world_file="$temp_home/world"
+  apk_repositories_file="$temp_home/repositories"
   mkdir -p "$fake_bin"
 
   cat >"$fake_bin/apk" <<'EOF'
@@ -1611,13 +1613,18 @@ fi
 EOF
   chmod +x "$fake_bin/apk"
   printf '%s\n' git bash >"$apk_world_file"
+  printf '%s\n' \
+    'https://dl-cdn.alpinelinux.org/alpine/v3.22/main' \
+    '@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community' \
+    >"$apk_repositories_file"
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_APK_WORLD_FILE="$apk_world_file" \
+    AGENTCTL_APK_REPOSITORIES_FILE="$apk_repositories_file" \
     -- system manifest
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.package_manager == "apk" and .packages == ["bash","git","libc-utils"] and .requested_packages == ["bash","git"]' >/dev/null || fail "Expected apk requested packages in system manifest, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.package_manager == "apk" and .packages == ["bash","git","libc-utils"] and .requested_packages == ["bash","git"] and (.apk_repositories | index("@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"))' >/dev/null || fail "Expected apk requested packages and repositories in system manifest, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_system_manifest_reports_dpkg_requested_packages() {
@@ -3436,6 +3443,42 @@ test_agent_sh_state_import_uses_installed_runtime_hooks() {
   jq -er '.claudeAiOauth.refreshToken == "keep"' "$target_home/home/.claude/.credentials.json" >/dev/null || fail "Expected unrelated Claude legacy state to remain untouched when Claude is not installed"
 }
 
+test_agent_sh_state_import_preserves_image_owned_codex_packages() {
+  begin_test "agent.sh state import preserves image-owned codex packages"
+
+  local source_home
+  local target_home
+  local fake_bin
+  local tar_file
+  source_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  target_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$source_home"
+  register_dir_cleanup "$target_home"
+  tar_file="$source_home/state.tar"
+  fake_bin="$(make_fake_runtime_bin "$target_home" codex)"
+
+  mkdir -p \
+    "$source_home/home/.codex/packages/standalone/current/bin" \
+    "$target_home/home/.codex/packages/standalone/current/bin"
+  printf '%s' 'restored-auth' >"$source_home/home/.codex/auth.json"
+  printf '%s' 'stale-codex-binary' >"$source_home/home/.codex/packages/standalone/current/bin/codex"
+  printf '%s' 'image-codex-binary' >"$target_home/home/.codex/packages/standalone/current/bin/codex"
+  tar -C "$source_home/home" -cf "$tar_file" .codex
+
+  env -i \
+    "HOME=$target_home/home" \
+    "XDG_CONFIG_HOME=$target_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state import <"$tar_file"
+
+  [ "$(cat "$target_home/home/.codex/auth.json")" = "restored-auth" ] || fail "Expected Codex auth state to be restored"
+  [ "$(cat "$target_home/home/.codex/packages/standalone/current/bin/codex")" = "image-codex-binary" ] || fail "Expected image-owned Codex packages to survive stale package state import"
+}
+
 test_agent_sh_state_import_with_empty_stdin_preserves_existing_state() {
   begin_test "agent.sh state import with empty stdin preserves existing state"
 
@@ -3482,6 +3525,7 @@ test_verify_restored_codex_state_passes_when_counts_match() {
 
   run_capture verify_restored_codex_state unit-test-container "$backup_file"
   assert_status 0
+  assert_contains "Restored Codex state in unit-test-container: history lines 2/2, session files 2/2, session index lines 1/1"
 }
 
 test_verify_restored_codex_state_fails_when_counts_drop() {
@@ -3509,6 +3553,64 @@ test_verify_restored_codex_state_fails_when_counts_drop() {
   assert_contains "Codex history restore verification failed"
   assert_contains "Codex session restore verification failed"
   assert_contains "Restored Codex state verification failed"
+}
+
+test_verify_restored_claude_state_passes_when_counts_match() {
+  begin_test "verify_restored_claude_state accepts restored Claude state"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local backup_file
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-state-verify.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  backup_file="$temp_dir/state.tar"
+
+  mkdir -p "$temp_dir/home/.claude/projects/project-a"
+  printf '{}\n' >"$temp_dir/home/.claude/.credentials.json"
+  printf '{}\n' >"$temp_dir/home/.claude/settings.json"
+  printf '{}\n' >"$temp_dir/home/.claude.json"
+  printf 'session\n' >"$temp_dir/home/.claude/projects/project-a/session.jsonl"
+  tar -C "$temp_dir/home" -cf "$backup_file" .claude .claude.json
+
+  claude_state_summary_from_container() {
+    printf '1\t1\t1\t1\n'
+  }
+
+  run_capture verify_restored_claude_state unit-test-container "$backup_file"
+  assert_status 0
+  assert_contains "Restored Claude state in unit-test-container: credentials files 1/1, settings files 1/1, home state files 1/1, project files 1/1"
+}
+
+test_verify_restored_claude_state_fails_when_counts_drop() {
+  begin_test "verify_restored_claude_state rejects missing restored Claude state"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local backup_file
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-state-verify.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  backup_file="$temp_dir/state.tar"
+
+  mkdir -p "$temp_dir/home/.claude/projects/project-a"
+  printf '{}\n' >"$temp_dir/home/.claude/.credentials.json"
+  printf '{}\n' >"$temp_dir/home/.claude/settings.json"
+  printf '{}\n' >"$temp_dir/home/.claude.json"
+  printf 'session\n' >"$temp_dir/home/.claude/projects/project-a/session.jsonl"
+  tar -C "$temp_dir/home" -cf "$backup_file" .claude .claude.json
+
+  claude_state_summary_from_container() {
+    printf '0\t0\t0\t0\n'
+  }
+
+  run_capture verify_restored_claude_state unit-test-container "$backup_file"
+  assert_status 1
+  assert_contains "Claude credentials restore verification failed"
+  assert_contains "Claude settings restore verification failed"
+  assert_contains "Claude home state restore verification failed"
+  assert_contains "Claude project restore verification failed"
+  assert_contains "Restored Claude state verification failed"
 }
 
 test_container_auth_info_uses_agent_sh_auth_read() {
@@ -5435,6 +5537,55 @@ test_upgrade_reinstall_command_prefers_requested_apk_packages() {
   assert_not_contains "apk add --no-cache musl-dev"
 }
 
+test_upgrade_reinstall_command_restores_missing_apk_repository_tags() {
+  begin_test "upgrade reinstall command restores missing apk repository tags"
+
+  load_codexctl_functions
+
+  CLI_NAME=agentctl
+
+  run_capture warn_upgrade_package_loss \
+    unit-test-container \
+    agent-plain \
+    agent-python \
+    '{"package_manager":"apk","packages":["bash","go","golangci-lint","zstd"],"requested_packages":["bash","go@edgecommunity","golangci-lint@edgecommunity","zstd"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main","@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main"]}' \
+    unit-test-container
+
+  assert_status 0
+  assert_contains "Upgrade will remove 3 extra apk package(s) not present in agent-python:"
+  assert_contains "To reinstall top-level packages after upgrade:"
+  assert_contains "Restore APK repository tag(s) before reinstalling tagged packages:"
+  assert_contains "agentctl su-exec --name unit-test-container sh -lc 'grep -Fxq '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' /etc/apk/repositories || printf \"%s\\\\n\" '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' >> /etc/apk/repositories'"
+  assert_contains "agentctl su-exec --name unit-test-container apk update"
+  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache go@edgecommunity golangci-lint@edgecommunity zstd"
+}
+
+test_upgrade_reinstall_command_suggests_default_apk_edge_tags() {
+  begin_test "upgrade reinstall command suggests default apk edge tags"
+
+  load_codexctl_functions
+
+  CLI_NAME=agentctl
+
+  run_capture warn_upgrade_package_loss \
+    unit-test-container \
+    agent-plain \
+    agent-python \
+    '{"package_manager":"apk","packages":["bash","go","golangci-lint","zstd"],"requested_packages":["bash","go@edgecommunity","golangci-lint@edgecommunity","zstd"],"apk_repositories":[]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":[]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":[]}' \
+    unit-test-container
+
+  assert_status 0
+  assert_contains "Restore APK repository tag(s) before reinstalling tagged packages:"
+  assert_contains "agentctl su-exec --name unit-test-container sh -lc 'grep -Fxq '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' /etc/apk/repositories || printf \"%s\\\\n\" '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' >> /etc/apk/repositories'"
+  assert_contains "agentctl su-exec --name unit-test-container apk update"
+  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache go@edgecommunity golangci-lint@edgecommunity zstd"
+  assert_not_contains "original repository URL was not available"
+}
+
 test_upgrade_warns_about_image_packages_removed_from_target() {
   begin_test "upgrade warns about image-provided packages removed from the target image"
 
@@ -5535,6 +5686,13 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
     fi
     fail "Unexpected run_agent_sh_in_container call: $*"
   }
+  run_agent_sh_in_container_env() {
+    if [ "$2" = "AGENTCTL_SKIP_PREFERRED_SET=1" ] && [ "$3" = "--" ] && [ "$4" = "runtime" ] && [ "$5" = "install" ] && [ "$6" = "claude" ]; then
+      user_call_log="${user_call_log}$4 $5 $6 skip-preferred"$'\n'
+      return 0
+    fi
+    fail "Unexpected run_agent_sh_in_container_env call: $*"
+  }
   run_agent_sh_in_container_root() {
     root_call_log="${root_call_log}$2 $3 $4"$'\n'
   }
@@ -5584,6 +5742,83 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   printf '%s\n' "$stop_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected source container stop after backup, got: $stop_log"
 }
 
+test_upgrade_reinstalls_missing_default_runtime_after_restore() {
+  begin_test "upgrade reinstalls missing default runtime after restore"
+
+  load_codexctl_functions
+
+  local create_log=""
+  local install_log=""
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  warn_upgrade_package_loss() { :; }
+  upgrade_added_runtimes_json() { printf '[]\n'; }
+  upgrade_added_features_json() { printf '[]\n'; }
+  container_preferred_runtime() { printf '\n'; }
+  target_default_runtime_for_upgrade() { printf 'codex\n'; }
+  container_supports_state_contract() { return 0; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 1; }
+  ensure_started_container_is_running() { return 0; }
+  image_exists() { return 0; }
+  codex_agents_state() { printf 'missing\n'; }
+  backup_codex_config() { :; }
+  restore_codex_config() { :; }
+  verify_restored_codex_state() { return 0; }
+  persist_container_system_manifest_baseline() { :; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  collect_upgrade_container_preflight() {
+    UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":[]}'
+    UPGRADE_PREFLIGHT_BASELINE_MANIFEST=''
+    UPGRADE_PREFLIGHT_SOURCE_SUPPORTS_STATE_CONTRACT=1
+  }
+  image_system_manifest_json() { return 1; }
+  sanitize_image_name() { printf '%s\n' "$1"; }
+  build_backup_image_from_export() { :; }
+  run_agent_sh_in_container() {
+    if [ "$2" = "runtime" ] && [ "$3" = "info" ] && [ "$4" = "codex" ]; then
+      printf '{"runtime":"codex","installed":false,"capabilities":{"install":true}}\n'
+      return 0
+    fi
+    fail "Unexpected run_agent_sh_in_container call: $*"
+  }
+  run_agent_sh_in_container_env() {
+    install_log="${install_log}$*"$'\n'
+    return 0
+  }
+  trap() { :; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect)
+        printf 'placeholder\n'
+        ;;
+      create)
+        create_log="${create_log}$(printf '%s\n' "$*")"$'\n'
+        ;;
+      start|stop|rm)
+        ;;
+      export)
+        fail "export should not be called for --no-backup"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  container_upgrade_info() {
+    printf 'agent-python\t%s\trw\t2\t4G\n' "$TEST_ROOT"
+  }
+
+  run_capture upgrade_cmd --name unit-test-container --image agent-python --no-backup
+  assert_status 0
+  assert_contains "Reinstalling target default runtime in unit-test-container: codex"
+  printf '%s\n' "$install_log" | grep -Fq -- "unit-test-container AGENTCTL_SKIP_PREFERRED_SET=1 -- runtime install codex" || fail "Expected default runtime reinstall without preferred-runtime side effect, got: $install_log"
+  printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
+}
+
 test_upgrade_warns_and_clears_missing_preferred_runtime() {
   begin_test "upgrade warns and clears a preferred runtime that is unavailable in the target"
 
@@ -5617,6 +5852,10 @@ test_upgrade_warns_and_clears_missing_preferred_runtime() {
   sanitize_image_name() { printf '%s\n' "$1"; }
   build_backup_image_from_export() { :; }
   run_agent_sh_in_container() {
+    if [ "$2" = "runtime" ] && [ "$3" = "info" ] && [ "$4" = "codex" ]; then
+      printf '{"runtime":"codex","installed":true,"capabilities":{"install":true}}\n'
+      return 0
+    fi
     if [ "$2" = "runtime" ] && [ "$3" = "info" ] && [ "$4" = "claude" ]; then
       printf '{"runtime":"claude","installed":false,"capabilities":{"install":false}}\n'
       return 0
@@ -5977,6 +6216,104 @@ test_container_baseline_manifest_starts_stopped_container_and_restores_state() {
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
 }
 
+test_image_system_manifest_removes_temp_container_after_success() {
+  begin_test "image_system_manifest_json removes temporary container after success"
+
+  load_codexctl_functions
+
+  local create_calls=0
+  local start_calls=0
+  local stop_calls=0
+  local rm_calls=0
+
+  temporary_system_manifest_container_name() { printf 'unit-manifest-temp\n'; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create)
+        create_calls=$((create_calls + 1))
+        [ "$4" = "unit-manifest-temp" ] || fail "Expected temp container name, got: $*"
+        ;;
+      start)
+        start_calls=$((start_calls + 1))
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp start, got: $*"
+        ;;
+      stop)
+        stop_calls=$((stop_calls + 1))
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp stop, got: $*"
+        ;;
+      rm)
+        rm_calls=$((rm_calls + 1))
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp rm, got: $*"
+        ;;
+      exec)
+        shift
+        [ "$1" = "unit-manifest-temp" ] || fail "Unexpected exec target: $*"
+        shift
+        if [ "${1:-}" = "setpriv" ]; then
+          shift 5
+        fi
+        [ "$*" = "bash /usr/local/bin/agent.sh system manifest" ] || fail "Unexpected exec command: $*"
+        printf '{"package_manager":"none"}\n'
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture image_system_manifest_json agent-plain target
+  assert_status 0
+  assert_contains '"package_manager":"none"'
+  [ "$create_calls" -eq 1 ] || fail "Expected 1 create call, got: $create_calls"
+  [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
+  [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
+  [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
+}
+
+test_image_system_manifest_removes_temp_container_after_exec_failure() {
+  begin_test "image_system_manifest_json removes temporary container after exec failure"
+
+  load_codexctl_functions
+
+  local stop_calls=0
+  local rm_calls=0
+
+  temporary_system_manifest_container_name() { printf 'unit-manifest-temp\n'; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create)
+        [ "$4" = "unit-manifest-temp" ] || fail "Expected temp container name, got: $*"
+        ;;
+      start)
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp start, got: $*"
+        ;;
+      stop)
+        stop_calls=$((stop_calls + 1))
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp stop, got: $*"
+        ;;
+      rm)
+        rm_calls=$((rm_calls + 1))
+        [ "$2" = "unit-manifest-temp" ] || fail "Expected temp rm, got: $*"
+        ;;
+      exec)
+        return 1
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture image_system_manifest_json agent-plain target
+  assert_status 1
+  [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
+  [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
+}
+
 test_collect_upgrade_container_preflight_starts_stopped_container_once() {
   begin_test "collect_upgrade_container_preflight reuses one start for manifest, baseline, and capability checks"
 
@@ -6121,6 +6458,8 @@ test_doctor_reports_state_permission_problems() {
     printf '%s\n' '.codex/config.toml' '.codex/history.jsonl'
     return 1
   }
+  doctor_runtime_health() { return 0; }
+  doctor_runtime_state_summary() { return 0; }
 
   CONTAINER_CMD=container
   container() {
@@ -6182,6 +6521,8 @@ test_doctor_fix_repairs_state_permission_problems() {
     printf '%s\n' '.codex/config.toml'
     return 1
   }
+  doctor_runtime_health() { return 0; }
+  doctor_runtime_state_summary() { return 0; }
 
   CONTAINER_CMD=container
   container() {
@@ -6192,6 +6533,174 @@ test_doctor_fix_repairs_state_permission_problems() {
   assert_status 0
   assert_contains "Doctor repaired user-state ownership/readability problems in unit-test-container:"
   assert_contains "  - .codex/config.toml"
+}
+
+test_doctor_reports_runtime_health_problems() {
+  begin_test "doctor reports runtime health problems"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  doctor_state_permissions() { return 0; }
+  doctor_runtime_state_summary() { return 0; }
+  doctor_runtime_health() {
+    [ "$1" = "unit-test-container" ] || fail "Unexpected doctor target: $1"
+    [ "$2" = "0" ] || fail "Did not expect fix mode: $2"
+    printf '%s\n' 'preferred runtime not installed: codex'
+    printf '%s\n' 'codex config missing model provider: myollama'
+    printf '%s\n' 'codex AGENTS.md missing'
+    return 1
+  }
+
+  CONTAINER_CMD=container
+  container() {
+    fail "Did not expect container lifecycle changes for a running container: $*"
+  }
+
+  run_capture doctor_cmd --name unit-test-container
+  assert_status 1
+  assert_contains "Doctor found no user-state ownership/readability problems in unit-test-container"
+  assert_contains "Doctor found runtime health problems in unit-test-container:"
+  assert_contains "  - preferred runtime not installed: codex"
+  assert_contains "  - codex config missing model provider: myollama"
+  assert_contains "  - codex AGENTS.md missing"
+  assert_contains "doctor --name unit-test-container --fix"
+}
+
+test_doctor_fix_repairs_runtime_health_problems() {
+  begin_test "doctor --fix repairs runtime health problems"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  doctor_state_permissions() { return 0; }
+  doctor_runtime_state_summary() { return 0; }
+  doctor_runtime_health() {
+    [ "$1" = "unit-test-container" ] || fail "Unexpected doctor target: $1"
+    [ "$2" = "1" ] || fail "Expected fix mode, got: $2"
+    printf '%s\n' 'codex config missing model provider: myollama'
+    printf '%s\n' 'codex AGENTS.md missing'
+    return 1
+  }
+
+  CONTAINER_CMD=container
+  container() {
+    fail "Did not expect container lifecycle changes for a running container: $*"
+  }
+
+  run_capture doctor_cmd --name unit-test-container --fix
+  assert_status 0
+  assert_contains "Doctor found no user-state ownership/readability problems in unit-test-container"
+  assert_contains "Doctor repaired runtime health problems in unit-test-container:"
+  assert_contains "  - codex config missing model provider: myollama"
+  assert_contains "  - codex AGENTS.md missing"
+}
+
+test_doctor_runtime_health_detects_codex_config_and_agents_problems() {
+  begin_test "doctor runtime health detects Codex config and AGENTS problems"
+
+  load_codexctl_functions
+
+  run_agent_sh_in_container() {
+    case "$2 $3" in
+      "runtime list") printf '%s\n' codex ;;
+      "preferred get") printf '%s\n' codex ;;
+      "runtime info")
+        [ "$4" = "codex" ] || fail "Unexpected runtime info target: $4"
+        printf '%s\n' '{"id":"codex","command":"codex","installed":true,"capabilities":{"install":true}}'
+        ;;
+      *) fail "Unexpected agent.sh invocation: $*" ;;
+    esac
+  }
+  doctor_runtime_command_available() { return 0; }
+  doctor_codex_config_has_myollama() { return 1; }
+  codex_agents_state() { printf '%s\n' missing; }
+
+  run_capture doctor_runtime_health unit-test-container 0
+  assert_status 1
+  assert_contains "codex config missing model provider: myollama"
+  assert_contains "codex AGENTS.md missing"
+}
+
+test_doctor_runtime_health_fix_reinstalls_runtime_and_restores_agents() {
+  begin_test "doctor runtime health --fix reinstalls missing runtime and restores AGENTS"
+
+  load_codexctl_functions
+
+  local installed_runtime=""
+  local reset_runtime=""
+  local fixed_agents=0
+
+  run_agent_sh_in_container() {
+    case "$2 $3" in
+      "runtime list") printf '%s\n' codex ;;
+      "preferred get") printf '%s\n' codex ;;
+      "runtime info")
+        [ "$4" = "codex" ] || fail "Unexpected runtime info target: $4"
+        printf '%s\n' '{"id":"codex","command":"codex","installed":false,"capabilities":{"install":true}}'
+        ;;
+      *) fail "Unexpected agent.sh invocation: $*" ;;
+    esac
+  }
+  doctor_runtime_command_available() { return 1; }
+  doctor_codex_config_has_myollama() { return 1; }
+  codex_agents_state() { printf '%s\n' missing; }
+  install_runtime_in_container() {
+    installed_runtime="$2:$3"
+    return 0
+  }
+  reset_runtime_config_in_container() {
+    reset_runtime="$2"
+    return 0
+  }
+  doctor_fix_missing_codex_agents() {
+    fixed_agents=1
+    return 0
+  }
+
+  run_capture doctor_runtime_health unit-test-container 1
+  assert_status 1
+  assert_contains "preferred runtime not installed: codex"
+  assert_contains "runtime command unavailable: codex (codex)"
+  assert_contains "codex config missing model provider: myollama"
+  assert_contains "codex AGENTS.md missing"
+  [ "$installed_runtime" = "codex:1" ] || fail "Expected Codex reinstall with skip preferred, got: $installed_runtime"
+  [ "$reset_runtime" = "codex" ] || fail "Expected Codex reset-config, got: $reset_runtime"
+  [ "$fixed_agents" -eq 1 ] || fail "Expected missing AGENTS.md to be restored"
+}
+
+test_doctor_reports_runtime_state_summary() {
+  begin_test "doctor reports runtime state summary"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  doctor_state_permissions() { return 0; }
+  doctor_runtime_health() { return 0; }
+  doctor_runtime_state_summary() {
+    printf '%s\n' 'Codex state: history lines 12, session files 3, session index lines 2'
+    printf '%s\n' 'Claude state: credentials files 1, settings files 1, home state files 1, project files 4'
+  }
+
+  CONTAINER_CMD=container
+  container() {
+    fail "Did not expect container lifecycle changes for a running container: $*"
+  }
+
+  run_capture doctor_cmd --name unit-test-container
+  assert_status 0
+  assert_contains "Doctor runtime state summary in unit-test-container:"
+  assert_contains "  - Codex state: history lines 12, session files 3, session index lines 2"
+  assert_contains "  - Claude state: credentials files 1, settings files 1, home state files 1, project files 4"
 }
 
 test_container_state_permission_script_repairs_unreadable_state() {
@@ -6889,9 +7398,12 @@ main() {
   run_selected_test test_agent_sh_state_export_uses_installed_runtime_hooks "test_agent_sh_state_export_uses_installed_runtime_hooks"
   run_selected_test test_agent_sh_state_import_restores_known_user_state "test_agent_sh_state_import_restores_known_user_state"
   run_selected_test test_agent_sh_state_import_uses_installed_runtime_hooks "test_agent_sh_state_import_uses_installed_runtime_hooks"
+  run_selected_test test_agent_sh_state_import_preserves_image_owned_codex_packages "test_agent_sh_state_import_preserves_image_owned_codex_packages"
   run_selected_test test_agent_sh_state_import_with_empty_stdin_preserves_existing_state "test_agent_sh_state_import_with_empty_stdin_preserves_existing_state"
   run_selected_test test_verify_restored_codex_state_passes_when_counts_match "test_verify_restored_codex_state_passes_when_counts_match"
   run_selected_test test_verify_restored_codex_state_fails_when_counts_drop "test_verify_restored_codex_state_fails_when_counts_drop"
+  run_selected_test test_verify_restored_claude_state_passes_when_counts_match "test_verify_restored_claude_state_passes_when_counts_match"
+  run_selected_test test_verify_restored_claude_state_fails_when_counts_drop "test_verify_restored_claude_state_fails_when_counts_drop"
   run_selected_test test_container_auth_info_uses_agent_sh_auth_read "test_container_auth_info_uses_agent_sh_auth_read"
   run_selected_test test_write_auth_blob_to_container_uses_agent_sh_auth_write "test_write_auth_blob_to_container_uses_agent_sh_auth_write"
   run_selected_test test_write_auth_blob_to_container_falls_back_for_legacy_codex "test_write_auth_blob_to_container_falls_back_for_legacy_codex"
@@ -6929,19 +7441,29 @@ main() {
   run_selected_test test_upgrade_copy_dry_run_reports_copy_plan "test_upgrade_copy_dry_run_reports_copy_plan"
   run_selected_test test_upgrade_warns_about_added_packages_missing_from_target_image "test_upgrade_warns_about_added_packages_missing_from_target_image"
   run_selected_test test_upgrade_reinstall_command_prefers_requested_apk_packages "test_upgrade_reinstall_command_prefers_requested_apk_packages"
+  run_selected_test test_upgrade_reinstall_command_restores_missing_apk_repository_tags "test_upgrade_reinstall_command_restores_missing_apk_repository_tags"
+  run_selected_test test_upgrade_reinstall_command_suggests_default_apk_edge_tags "test_upgrade_reinstall_command_suggests_default_apk_edge_tags"
   run_selected_test test_upgrade_warns_about_image_packages_removed_from_target "test_upgrade_warns_about_image_packages_removed_from_target"
   run_selected_test test_upgrade_reinstall_command_prefers_requested_dpkg_packages "test_upgrade_reinstall_command_prefers_requested_dpkg_packages"
   run_selected_test test_upgrade_reinstalls_added_runtimes_and_features_in_target "test_upgrade_reinstalls_added_runtimes_and_features_in_target"
+  run_selected_test test_upgrade_reinstalls_missing_default_runtime_after_restore "test_upgrade_reinstalls_missing_default_runtime_after_restore"
   run_selected_test test_upgrade_warns_and_clears_missing_preferred_runtime "test_upgrade_warns_and_clears_missing_preferred_runtime"
   run_selected_test test_upgrade_uses_stored_baseline_when_current_image_is_missing "test_upgrade_uses_stored_baseline_when_current_image_is_missing"
   run_selected_test test_upgrade_accepts_workdir_override_when_original_mount_is_missing "test_upgrade_accepts_workdir_override_when_original_mount_is_missing"
   run_selected_test test_upgrade_allows_no_backup_for_modern_export_source "test_upgrade_allows_no_backup_for_modern_export_source"
   run_selected_test test_container_baseline_manifest_starts_stopped_container_and_restores_state "test_container_baseline_manifest_starts_stopped_container_and_restores_state"
+  run_selected_test test_image_system_manifest_removes_temp_container_after_success "test_image_system_manifest_removes_temp_container_after_success"
+  run_selected_test test_image_system_manifest_removes_temp_container_after_exec_failure "test_image_system_manifest_removes_temp_container_after_exec_failure"
   run_selected_test test_collect_upgrade_container_preflight_starts_stopped_container_once "test_collect_upgrade_container_preflight_starts_stopped_container_once"
   run_selected_test test_refresh_updates_managed_files_without_recreate "test_refresh_updates_managed_files_without_recreate"
   run_selected_test test_doctor_reports_state_permission_problems "test_doctor_reports_state_permission_problems"
   run_selected_test test_doctor_reports_container_startup_problem "test_doctor_reports_container_startup_problem"
   run_selected_test test_doctor_fix_repairs_state_permission_problems "test_doctor_fix_repairs_state_permission_problems"
+  run_selected_test test_doctor_reports_runtime_health_problems "test_doctor_reports_runtime_health_problems"
+  run_selected_test test_doctor_fix_repairs_runtime_health_problems "test_doctor_fix_repairs_runtime_health_problems"
+  run_selected_test test_doctor_runtime_health_detects_codex_config_and_agents_problems "test_doctor_runtime_health_detects_codex_config_and_agents_problems"
+  run_selected_test test_doctor_runtime_health_fix_reinstalls_runtime_and_restores_agents "test_doctor_runtime_health_fix_reinstalls_runtime_and_restores_agents"
+  run_selected_test test_doctor_reports_runtime_state_summary "test_doctor_reports_runtime_state_summary"
   run_selected_test test_container_state_permission_script_repairs_unreadable_state "test_container_state_permission_script_repairs_unreadable_state"
   run_selected_test test_refresh_container_file_streams_source_via_stdin "test_refresh_container_file_streams_source_via_stdin"
   run_selected_test test_refresh_container_tree_suppresses_host_xattrs "test_refresh_container_tree_suppresses_host_xattrs"

@@ -794,10 +794,11 @@ Options:
   --name NAME  Container name (default: agent-<dir>)
   --fix        Repair detected user-state ownership and readability problems
 
-Doctor checks that the container can stay running for exec-based maintenance and
-checks known agentctl user-state paths in /home/coder. With --fix, it hands
-those paths back to coder:coder and restores owner read/write and directory
-traverse bits needed for state backup and upgrade.
+Doctor checks that the container can stay running for exec-based maintenance,
+checks known agentctl user-state paths in /home/coder, and verifies installed
+runtimes plus image-managed Codex local-mode config. With --fix, it repairs
+state permissions, reinstalls missing installable runtimes, restores missing
+Codex AGENTS.md, and resets broken Codex runtime config when needed.
 EOF
 }
 
@@ -1942,8 +1943,13 @@ restore_codex_config() {
   fi
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
 mkdir -p /home/coder
+mkdir -p /home/coder/.codex
+for path in /home/coder/.codex/* /home/coder/.codex/.[!.]* /home/coder/.codex/..?*; do
+  [ -e "$path" ] || continue
+  [ "$(basename "$path")" = packages ] && continue
+  rm -rf "$path"
+done
 rm -rf \
-  /home/coder/.codex \
   /home/coder/.config/agentctl \
   /home/coder/.claude \
   /home/coder/.claude.json
@@ -1953,7 +1959,20 @@ chown -R coder:coder /home/coder
   if target_supports_state_contract "$name"; then
     "$CONTAINER_CMD" exec -i "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh state import <"$backup_file"
   else
-    "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc 'cd /home/coder && tar -xf -' <"$backup_file"
+    "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc '
+packages_backup="$(mktemp -d)"
+if [ -e /home/coder/.codex/packages ]; then
+  mkdir -p "$packages_backup/.codex"
+  mv /home/coder/.codex/packages "$packages_backup/.codex/packages"
+fi
+cd /home/coder && tar -xf -
+rm -rf /home/coder/.codex/packages
+if [ -e "$packages_backup/.codex/packages" ]; then
+  mkdir -p /home/coder/.codex
+  mv "$packages_backup/.codex/packages" /home/coder/.codex/packages
+fi
+rm -rf "$packages_backup"
+' <"$backup_file"
   fi
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'chown -R coder:coder /home/coder >/dev/null 2>&1 || true'
 }
@@ -2035,6 +2054,103 @@ verify_restored_codex_state() {
     warn "Restored Codex state verification failed for $name"
     return 1
   fi
+  echo "Restored Codex state in $name: history lines $actual_history/$expected_history, session files $actual_sessions/$expected_sessions, session index lines $actual_index/$expected_index" >&2
+}
+
+claude_state_summary_from_tar() {
+  local backup_file="$1"
+  local credentials_files=0
+  local settings_files=0
+  local home_state_files=0
+  local project_files=0
+
+  if tar -tf "$backup_file" 2>/dev/null | grep -Fqx '.claude/.credentials.json'; then
+    credentials_files=1
+  fi
+  if tar -tf "$backup_file" 2>/dev/null | grep -Fqx '.claude/settings.json'; then
+    settings_files=1
+  fi
+  if tar -tf "$backup_file" 2>/dev/null | grep -Fqx '.claude.json'; then
+    home_state_files=1
+  fi
+  project_files="$(tar -tf "$backup_file" 2>/dev/null \
+    | awk '/^\.claude\/projects\/.+[^\/]$/ { count++ } END { print count + 0 }' \
+    | tr -d '[:space:]')"
+  printf '%s\t%s\t%s\t%s\n' "$credentials_files" "$settings_files" "$home_state_files" "$project_files"
+}
+
+claude_state_summary_from_container() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
+credentials_files=0
+settings_files=0
+home_state_files=0
+project_files=0
+[ -f /home/coder/.claude/.credentials.json ] && credentials_files=1
+[ -f /home/coder/.claude/settings.json ] && settings_files=1
+[ -f /home/coder/.claude.json ] && home_state_files=1
+if [ -d /home/coder/.claude/projects ]; then
+  project_files="$(find /home/coder/.claude/projects -type f 2>/dev/null | wc -l | tr -d "[:space:]")"
+fi
+printf "%s\t%s\t%s\t%s\n" "$credentials_files" "$settings_files" "$home_state_files" "$project_files"
+'
+}
+
+verify_restored_claude_state() {
+  local name="$1"
+  local backup_file="$2"
+  local expected=""
+  local actual=""
+  local expected_credentials=0
+  local expected_settings=0
+  local expected_home_state=0
+  local expected_projects=0
+  local actual_credentials=0
+  local actual_settings=0
+  local actual_home_state=0
+  local actual_projects=0
+  local failed=0
+
+  [ -s "$backup_file" ] || return 0
+  expected="$(claude_state_summary_from_tar "$backup_file")"
+  IFS=$'\t' read -r expected_credentials expected_settings expected_home_state expected_projects <<<"$expected"
+  if [ "$expected_credentials" -eq 0 ] && [ "$expected_settings" -eq 0 ] && [ "$expected_home_state" -eq 0 ] && [ "$expected_projects" -eq 0 ]; then
+    return 0
+  fi
+
+  actual="$(claude_state_summary_from_container "$name")" || return 2
+  IFS=$'\t' read -r actual_credentials actual_settings actual_home_state actual_projects <<<"$actual"
+
+  if [ "$actual_credentials" -lt "$expected_credentials" ]; then
+    warn "Claude credentials restore verification failed in $name: expected credentials file, found none"
+    failed=1
+  fi
+  if [ "$actual_settings" -lt "$expected_settings" ]; then
+    warn "Claude settings restore verification failed in $name: expected settings file, found none"
+    failed=1
+  fi
+  if [ "$actual_home_state" -lt "$expected_home_state" ]; then
+    warn "Claude home state restore verification failed in $name: expected ~/.claude.json, found none"
+    failed=1
+  fi
+  if [ "$actual_projects" -lt "$expected_projects" ]; then
+    warn "Claude project restore verification failed in $name: expected at least $expected_projects project file(s), found $actual_projects"
+    failed=1
+  fi
+  if [ "$failed" -ne 0 ]; then
+    warn "Restored Claude state verification failed for $name"
+    return 1
+  fi
+  echo "Restored Claude state in $name: credentials files $actual_credentials/$expected_credentials, settings files $actual_settings/$expected_settings, home state files $actual_home_state/$expected_home_state, project files $actual_projects/$expected_projects" >&2
+}
+
+verify_restored_runtime_state() {
+  local name="$1"
+  local backup_file="$2"
+
+  verify_restored_codex_state "$name" "$backup_file" || return $?
+  verify_restored_claude_state "$name" "$backup_file" || return $?
 }
 
 backup_known_state_from_container() {
@@ -2151,6 +2267,150 @@ doctor_state_permissions() {
   fi
   printf '%s\n' "$output"
   return 1
+}
+
+doctor_runtime_command_available() {
+  local name="$1"
+  local command="$2"
+
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc 'command -v "$1" >/dev/null 2>&1' sh "$command"
+}
+
+doctor_codex_config_has_myollama() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc '
+config=/home/coder/.codex/config.toml
+[ -f "$config" ] || exit 1
+awk "
+  BEGIN { found = 0 }
+  /^[[:space:]]*\\[model_providers\\.myollama\\][[:space:]]*$/ { found = 1 }
+  END { exit found ? 0 : 1 }
+" "$config"
+'
+}
+
+doctor_fix_missing_codex_agents() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
+mkdir -p /home/coder/.codex
+ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
+chown -h coder:coder /home/coder/.codex/AGENTS.md
+'
+}
+
+doctor_runtime_health() {
+  local name="$1"
+  local fix="${2:-0}"
+  local runtime_list=""
+  local preferred_runtime=""
+  local runtime=""
+  local runtime_info=""
+  local command=""
+  local installed=""
+  local installable=""
+  local issue_count=0
+  local codex_seen=0
+  local agents_state=""
+
+  runtime_list="$(run_agent_sh_in_container "$name" runtime list 2>/dev/null)" || {
+    printf '%s\n' 'agent.sh runtime list failed'
+    return 2
+  }
+  preferred_runtime="$(run_agent_sh_in_container "$name" preferred get 2>/dev/null || true)"
+
+  if [ -n "$preferred_runtime" ]; then
+    runtime_info="$(run_agent_sh_in_container "$name" runtime info "$preferred_runtime" 2>/dev/null || true)"
+    installed="$(printf '%s' "$runtime_info" | jq -r '.installed // false' 2>/dev/null || printf 'false')"
+    installable="$(printf '%s' "$runtime_info" | jq -r '.capabilities.install // false' 2>/dev/null || printf 'false')"
+    if [ "$installed" != "true" ]; then
+      printf 'preferred runtime not installed: %s\n' "$preferred_runtime"
+      issue_count=$((issue_count + 1))
+      if [ "$fix" -eq 1 ] && [ "$installable" = "true" ]; then
+        install_runtime_in_container "$name" "$preferred_runtime" 1 || return 2
+      fi
+    fi
+  fi
+
+  while IFS= read -r runtime; do
+    [ -n "$runtime" ] || continue
+    [ "$runtime" = "codex" ] && codex_seen=1
+    runtime_info="$(run_agent_sh_in_container "$name" runtime info "$runtime" 2>/dev/null || true)"
+    command="$(printf '%s' "$runtime_info" | jq -r '.command // empty' 2>/dev/null || true)"
+    [ -n "$command" ] || command="$runtime"
+    if ! doctor_runtime_command_available "$name" "$command"; then
+      printf 'runtime command unavailable: %s (%s)\n' "$runtime" "$command"
+      issue_count=$((issue_count + 1))
+      installable="$(printf '%s' "$runtime_info" | jq -r '.capabilities.install // false' 2>/dev/null || printf 'false')"
+      if [ "$fix" -eq 1 ] && [ "$installable" = "true" ]; then
+        install_runtime_in_container "$name" "$runtime" 1 || return 2
+      fi
+    fi
+  done <<EOF
+$runtime_list
+EOF
+
+  if [ "$preferred_runtime" = "codex" ]; then
+    codex_seen=1
+  fi
+  if [ "$codex_seen" -eq 1 ] && ! doctor_codex_config_has_myollama "$name"; then
+    printf '%s\n' 'codex config missing model provider: myollama'
+    issue_count=$((issue_count + 1))
+    if [ "$fix" -eq 1 ]; then
+      reset_runtime_config_in_container "$name" codex || return 2
+    fi
+  fi
+  if [ "$codex_seen" -eq 1 ]; then
+    agents_state="$(codex_agents_state "$name")"
+    case "$agents_state" in
+      symlink)
+        ;;
+      missing)
+        printf '%s\n' 'codex AGENTS.md missing'
+        issue_count=$((issue_count + 1))
+        if [ "$fix" -eq 1 ]; then
+          doctor_fix_missing_codex_agents "$name" || return 2
+        fi
+        ;;
+      file)
+        printf '%s\n' 'codex AGENTS.md is a regular file; leaving custom project instructions untouched'
+        issue_count=$((issue_count + 1))
+        ;;
+      *)
+        printf 'codex AGENTS.md is not a symlink: %s\n' "$agents_state"
+        issue_count=$((issue_count + 1))
+        ;;
+    esac
+  fi
+
+  [ "$issue_count" -eq 0 ] && return 0
+  return 1
+}
+
+doctor_runtime_state_summary() {
+  local name="$1"
+  local codex_summary=""
+  local claude_summary=""
+  local history_lines=0
+  local session_files=0
+  local session_index_lines=0
+  local credentials_files=0
+  local settings_files=0
+  local home_state_files=0
+  local project_files=0
+
+  codex_summary="$(codex_state_summary_from_container "$name" 2>/dev/null || true)"
+  if [ -n "$codex_summary" ]; then
+    IFS=$'\t' read -r history_lines session_files session_index_lines <<<"$codex_summary"
+    printf 'Codex state: history lines %s, session files %s, session index lines %s\n' "$history_lines" "$session_files" "$session_index_lines"
+  fi
+
+  claude_summary="$(claude_state_summary_from_container "$name" 2>/dev/null || true)"
+  if [ -n "$claude_summary" ]; then
+    IFS=$'\t' read -r credentials_files settings_files home_state_files project_files <<<"$claude_summary"
+    printf 'Claude state: credentials files %s, settings files %s, home state files %s, project files %s\n' "$credentials_files" "$settings_files" "$home_state_files" "$project_files"
+  fi
 }
 
 repair_state_permissions_for_upgrade() {
@@ -3135,6 +3395,8 @@ doctor_cmd() {
   local was_running=0
   local started_for_doctor=0
   local permission_output=""
+  local runtime_output=""
+  local state_summary_output=""
   local doctor_status=0
   local status=0
 
@@ -3187,6 +3449,31 @@ doctor_cmd() {
     fi
   fi
 
+  if runtime_output="$(doctor_runtime_health "$name" "$fix")"; then
+    echo "Doctor found no runtime health problems in $name" >&2
+  else
+    doctor_status=$?
+    if [ "$doctor_status" -gt 1 ]; then
+      echo "Doctor could not inspect runtime health in $name:" >&2
+      [ -n "$runtime_output" ] && printf '%s\n' "$runtime_output" | sed 's/^/  - /' >&2
+      status="$doctor_status"
+    elif [ "$fix" -eq 1 ]; then
+      echo "Doctor repaired runtime health problems in $name:" >&2
+      printf '%s\n' "$runtime_output" | sed 's/^/  - /' >&2
+    else
+      echo "Doctor found runtime health problems in $name:" >&2
+      printf '%s\n' "$runtime_output" | sed 's/^/  - /' >&2
+      echo "Re-run with: $CLI_NAME doctor --name $name --fix" >&2
+      status=1
+    fi
+  fi
+
+  state_summary_output="$(doctor_runtime_state_summary "$name" 2>/dev/null || true)"
+  if [ -n "$state_summary_output" ]; then
+    echo "Doctor runtime state summary in $name:" >&2
+    printf '%s\n' "$state_summary_output" | sed 's/^/  - /' >&2
+  fi
+
   if [ "$started_for_doctor" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     echo "Stopping container: $name" >&2
     "$CONTAINER_CMD" stop "$name" >/dev/null
@@ -3213,6 +3500,54 @@ run_agent_sh_in_container() {
   fi
 
   if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  if [ "$started_for_command" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+    "$CONTAINER_CMD" stop "$name" >/dev/null
+  fi
+
+  return "$status"
+}
+
+run_agent_sh_in_container_env() {
+  local name="$1"
+  shift
+  local was_running=0
+  local started_for_command=0
+  local status=0
+  local -a env_args=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --)
+        shift
+        break
+        ;;
+      *=*)
+        env_args+=("$1")
+        shift
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if ! container_exists "$name"; then
+    die "Container not found: $name"
+  fi
+
+  if container_running "$name"; then
+    was_running=1
+  else
+    "$CONTAINER_CMD" start "$name" >/dev/null
+    started_for_command=1
+  fi
+
+  if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" env "${env_args[@]}" bash /usr/local/bin/agent.sh "$@"; then
     status=0
   else
     status=$?
@@ -3343,6 +3678,7 @@ runtime_install_memory_pressure_limit() {
 install_runtime_in_container() {
   local name="$1"
   local runtime="$2"
+  local skip_preferred="${3:-0}"
   local low_mem_limit=""
   local status=0
 
@@ -3351,7 +3687,11 @@ install_runtime_in_container() {
     warn "Container $name is limited to $low_mem_limit. Claude install may be killed by memory pressure; if that happens, recreate it with: ${CLI_NAME} upgrade --name $name --mem $CLAUDE_MIN_INSTALL_MEM"
   fi
 
-  if run_agent_sh_in_container "$name" runtime install "$runtime"; then
+  if [ "$skip_preferred" -eq 1 ]; then
+    if run_agent_sh_in_container_env "$name" AGENTCTL_SKIP_PREFERRED_SET=1 -- runtime install "$runtime"; then
+      return 0
+    fi
+  elif run_agent_sh_in_container "$name" runtime install "$runtime"; then
     return 0
   fi
   status=$?
@@ -3360,6 +3700,77 @@ install_runtime_in_container() {
     die "Claude runtime install failed in $name. The container is limited to $low_mem_limit, and the installer can be killed by memory pressure. Recreate it with: ${CLI_NAME} upgrade --name $name --mem $CLAUDE_MIN_INSTALL_MEM"
   fi
   return "$status"
+}
+
+ensure_target_default_runtime_installed() {
+  local name="$1"
+  local runtime="$2"
+  local reason="${3:-runtime}"
+  local required="${4:-0}"
+
+  [ -n "$runtime" ] || return 0
+  if target_runtime_installed "$name" "$runtime"; then
+    return 0
+  fi
+  if target_runtime_installable "$name" "$runtime"; then
+    echo "Reinstalling $reason in $name: $runtime" >&2
+    install_runtime_in_container "$name" "$runtime" 1 || die "Failed to install required runtime during upgrade: $runtime"
+    return 0
+  fi
+  if [ "$required" -eq 1 ]; then
+    die "Required runtime $runtime is not available after upgrade and cannot be installed automatically"
+  fi
+  warn "Runtime $runtime is not available after upgrade and cannot be reinstalled automatically"
+  return 1
+}
+
+target_feature_installed() {
+  local name="$1"
+  local feature="$2"
+  local feature_info=""
+
+  feature_info="$(run_agent_sh_in_container "$name" feature info "$feature" 2>/dev/null)" || return 1
+  printf '%s' "$feature_info" | jq -e '.installed == true' >/dev/null 2>&1
+}
+
+ensure_target_feature_installed() {
+  local name="$1"
+  local feature="$2"
+
+  [ -n "$feature" ] || return 0
+  if target_feature_installed "$name" "$feature"; then
+    return 0
+  fi
+  if target_feature_installable "$name" "$feature"; then
+    echo "Reinstalling added feature in $name after restore: $feature" >&2
+    run_agent_sh_in_container_root "$name" feature install "$feature" || die "Failed to reinstall feature after restore during upgrade: $feature"
+    return 0
+  fi
+  warn "Feature $feature is not available after upgrade and cannot be reinstalled automatically"
+  return 1
+}
+
+ensure_relevant_runtimes_and_features_after_restore() {
+  local name="$1"
+  local target_default_runtime="${2:-}"
+  local current_preferred_runtime="${3:-}"
+  local added_runtimes_json="${4:-[]}"
+  local added_features_json="${5:-[]}"
+  local runtime=""
+  local feature=""
+
+  ensure_target_default_runtime_installed "$name" "$target_default_runtime" "target default runtime" 1
+  ensure_target_default_runtime_installed "$name" "$current_preferred_runtime" "preferred runtime" 0 || true
+
+  while IFS= read -r runtime; do
+    [ -n "$runtime" ] || continue
+    ensure_target_default_runtime_installed "$name" "$runtime" "added runtime" 0 || true
+  done < <(printf '%s' "$added_runtimes_json" | jq -r '.[]' 2>/dev/null || true)
+
+  while IFS= read -r feature; do
+    [ -n "$feature" ] || continue
+    ensure_target_feature_installed "$name" "$feature" || true
+  done < <(printf '%s' "$added_features_json" | jq -r '.[]' 2>/dev/null || true)
 }
 
 runtime_cmd() {
@@ -3548,6 +3959,127 @@ manifest_requested_packages_json() {
   printf '%s' "$manifest" | jq -c '.requested_packages // []' 2>/dev/null || printf '[]\n'
 }
 
+manifest_apk_repositories_json() {
+  local manifest="${1:-}"
+
+  [ -n "$manifest" ] || manifest='{}'
+
+  printf '%s' "$manifest" | jq -c '.apk_repositories // []' 2>/dev/null || printf '[]\n'
+}
+
+manifest_with_apk_repositories_json() {
+  local manifest="${1:-}"
+  local repositories_json="${2:-[]}"
+
+  [ -n "$manifest" ] || manifest='{}'
+
+  printf '%s' "$manifest" | jq -c \
+    --argjson repositories "$repositories_json" \
+    'if (.package_manager // "unknown") == "apk" and ((.apk_repositories // []) | length) == 0 then
+       . + {apk_repositories: $repositories}
+     else
+       .
+     end'
+}
+
+apk_repositories_json_from_container() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -c '
+if [ -f /etc/apk/repositories ]; then
+  sed "/^[[:space:]]*#/d;/^[[:space:]]*$/d" /etc/apk/repositories | sort -u
+fi
+' 2>/dev/null | jq -R . | jq -s .
+}
+
+augment_manifest_with_container_apk_repositories() {
+  local name="$1"
+  local manifest="$2"
+  local repositories_json="[]"
+
+  [ "$(manifest_package_manager "$manifest")" = "apk" ] || {
+    printf '%s\n' "$manifest"
+    return 0
+  }
+  [ "$(printf '%s' "$(manifest_apk_repositories_json "$manifest")" | jq -r 'length' 2>/dev/null || printf '0\n')" -eq 0 ] || {
+    printf '%s\n' "$manifest"
+    return 0
+  }
+  repositories_json="$(apk_repositories_json_from_container "$name" 2>/dev/null || printf '[]\n')"
+  manifest_with_apk_repositories_json "$manifest" "$repositories_json"
+}
+
+apk_package_tags_json() {
+  local packages_json="${1:-[]}"
+
+  printf '%s' "$packages_json" | jq -c '
+    [
+      .[]?
+      | select(test("@"))
+      | split("@")[1]
+      | sub("[<>=~].*$"; "")
+      | select(length > 0)
+    ]
+    | unique
+    | sort
+  ' 2>/dev/null || printf '[]\n'
+}
+
+apk_repository_tags_json() {
+  local repositories_json="${1:-[]}"
+
+  printf '%s' "$repositories_json" | jq -c '
+    [
+      .[]?
+      | capture("^@(?<tag>[^[:space:]]+)[[:space:]]+.+")?
+      | .tag
+    ]
+    | unique
+    | sort
+  ' 2>/dev/null || printf '[]\n'
+}
+
+apk_repository_lines_for_tags_json() {
+  local repositories_json="${1:-[]}"
+  local tags_json="${2:-[]}"
+
+  jq -cn \
+    --argjson repositories "$repositories_json" \
+    --argjson tags "$tags_json" \
+    '
+      ($tags | map({key: ., value: true}) | from_entries) as $wanted
+      | [
+          $repositories[]?
+          | capture("^@(?<tag>[^[:space:]]+)[[:space:]]+(?<repository>.+)")?
+          | select($wanted[.tag] == true)
+          | "@" + .tag + " " + .repository
+        ]
+      | unique
+      | sort
+    '
+}
+
+apk_default_repository_lines_for_tags_json() {
+  local tags_json="${1:-[]}"
+
+  printf '%s' "$tags_json" | jq -c '
+    [
+      .[]?
+      | if . == "edgemain" then
+          "@edgemain https://dl-cdn.alpinelinux.org/alpine/edge/main"
+        elif . == "edgecommunity" then
+          "@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"
+        elif . == "edgetesting" then
+          "@edgetesting https://dl-cdn.alpinelinux.org/alpine/edge/testing"
+        else
+          empty
+        end
+    ]
+    | unique
+    | sort
+  ' 2>/dev/null || printf '[]\n'
+}
+
 manifest_installed_runtimes_json() {
   local manifest="${1:-}"
 
@@ -3652,6 +4184,7 @@ container_system_manifest_json() {
     fi
     return 1
   fi
+  manifest="$(augment_manifest_with_container_apk_repositories "$name" "$manifest")"
 
   if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     "$CONTAINER_CMD" stop "$name" >/dev/null
@@ -3707,35 +4240,45 @@ image_system_manifest_json() {
   local manifest=""
 
   temp_name="$(temporary_system_manifest_container_name "$role")"
-  if ! "$CONTAINER_CMD" create -t --name "$temp_name" "$image" sh -c 'sleep infinity' >/dev/null; then
-    return 1
-  fi
-  created=1
-
-  if ! "$CONTAINER_CMD" start "$temp_name" >/dev/null; then
-    if [ "$created" -eq 1 ]; then
-      "$CONTAINER_CMD" rm "$temp_name" >/dev/null 2>&1 || true
-    fi
-    return 1
-  fi
-  started=1
-
-  if ! manifest="$("$CONTAINER_CMD" exec "$temp_name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh system manifest)"; then
+  cleanup_system_manifest_container() {
     if [ "$started" -eq 1 ]; then
       "$CONTAINER_CMD" stop "$temp_name" >/dev/null 2>&1 || true
     fi
     if [ "$created" -eq 1 ]; then
       "$CONTAINER_CMD" rm "$temp_name" >/dev/null 2>&1 || true
     fi
+  }
+  cleanup_system_manifest_container_on_signal() {
+    cleanup_system_manifest_container
+    trap - EXIT INT TERM HUP
+    exit 130
+  }
+
+  trap cleanup_system_manifest_container EXIT
+  trap cleanup_system_manifest_container_on_signal INT TERM HUP
+
+  if ! "$CONTAINER_CMD" create -t --name "$temp_name" "$image" sh -c 'sleep infinity' >/dev/null; then
+    trap - EXIT INT TERM HUP
     return 1
   fi
+  created=1
 
-  if [ "$started" -eq 1 ]; then
-    "$CONTAINER_CMD" stop "$temp_name" >/dev/null 2>&1 || true
+  if ! "$CONTAINER_CMD" start "$temp_name" >/dev/null; then
+    cleanup_system_manifest_container
+    trap - EXIT INT TERM HUP
+    return 1
   fi
-  if [ "$created" -eq 1 ]; then
-    "$CONTAINER_CMD" rm "$temp_name" >/dev/null 2>&1 || true
+  started=1
+
+  if ! manifest="$("$CONTAINER_CMD" exec "$temp_name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh system manifest)"; then
+    cleanup_system_manifest_container
+    trap - EXIT INT TERM HUP
+    return 1
   fi
+  manifest="$(augment_manifest_with_container_apk_repositories "$temp_name" "$manifest")"
+
+  cleanup_system_manifest_container
+  trap - EXIT INT TERM HUP
 
   printf '%s\n' "$manifest"
 }
@@ -3959,6 +4502,8 @@ warn_upgrade_package_loss() {
   local current_requested_packages_json='[]'
   local source_requested_packages_json='[]'
   local target_requested_packages_json='[]'
+  local current_apk_repositories_json='[]'
+  local target_apk_repositories_json='[]'
   local added_packages_json='[]'
   local lost_packages_json='[]'
   local baseline_packages_in_current_json='[]'
@@ -3975,6 +4520,13 @@ warn_upgrade_package_loss() {
   local reinstall_label="To reinstall after upgrade:"
   local requested_package_count=0
   local requested_package_data_available=0
+  local missing_apk_repository_tags_json='[]'
+  local missing_apk_repository_lines_json='[]'
+  local missing_apk_repository_tag_count=0
+  local missing_apk_repository_line_count=0
+  local repository_line=""
+  local quoted_repository_line=""
+  local shell_repository_line=""
   local lost_count=""
 
   if [ -z "$current_manifest" ] && ! current_manifest="$(container_system_manifest_json "$name")"; then
@@ -3984,6 +4536,7 @@ warn_upgrade_package_loss() {
   current_package_manager="$(manifest_package_manager "$current_manifest")"
   current_packages_json="$(manifest_packages_json "$current_manifest")"
   current_requested_packages_json="$(manifest_requested_packages_json "$current_manifest")"
+  current_apk_repositories_json="$(manifest_apk_repositories_json "$current_manifest")"
   requested_package_count="$(printf '%s' "$current_requested_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
   if [ "$requested_package_count" -gt 0 ]; then
     requested_package_data_available=1
@@ -4000,6 +4553,7 @@ warn_upgrade_package_loss() {
   target_package_manager="$(manifest_package_manager "$target_manifest")"
   target_packages_json="$(manifest_packages_json "$target_manifest")"
   target_requested_packages_json="$(manifest_requested_packages_json "$target_manifest")"
+  target_apk_repositories_json="$(manifest_apk_repositories_json "$target_manifest")"
 
   if [ -z "$source_manifest" ]; then
     if stored_manifest="$(container_baseline_manifest_json "$name")"; then
@@ -4102,6 +4656,38 @@ warn_upgrade_package_loss() {
         reinstall_label="To reinstall top-level packages after upgrade:"
       fi
       printf '%s\n' "$reinstall_label" >&2
+      if [ "$reinstall_package_manager" = "apk" ]; then
+        missing_apk_repository_tags_json="$(
+          json_string_array_difference \
+            "$(apk_package_tags_json "$reinstall_packages_json")" \
+            "$(apk_repository_tags_json "$target_apk_repositories_json")"
+        )"
+        missing_apk_repository_tag_count="$(printf '%s' "$missing_apk_repository_tags_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
+        if [ "$missing_apk_repository_tag_count" -gt 0 ]; then
+          missing_apk_repository_lines_json="$(apk_repository_lines_for_tags_json "$current_apk_repositories_json" "$missing_apk_repository_tags_json")"
+          missing_apk_repository_line_count="$(printf '%s' "$missing_apk_repository_lines_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
+          if [ "$missing_apk_repository_line_count" -eq 0 ]; then
+            missing_apk_repository_lines_json="$(apk_default_repository_lines_for_tags_json "$missing_apk_repository_tags_json")"
+            missing_apk_repository_line_count="$(printf '%s' "$missing_apk_repository_lines_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
+          fi
+          if [ "$missing_apk_repository_line_count" -gt 0 ]; then
+            printf 'Restore APK repository tag(s) before reinstalling tagged packages:\n' >&2
+            while IFS= read -r repository_line; do
+              [ -n "$repository_line" ] || continue
+              quoted_repository_line="$(printf '%s' "$repository_line" | jq -Rr '@sh')"
+              shell_repository_line="$(printf 'grep -Fxq %s /etc/apk/repositories || printf "%%s\\\\n" %s >> /etc/apk/repositories' "$quoted_repository_line" "$quoted_repository_line" | jq -Rr '@sh')"
+              printf '  %s su-exec --name %s sh -lc %s\n' \
+                "$CLI_NAME" \
+                "$target_name" \
+                "$shell_repository_line" >&2
+            done < <(printf '%s' "$missing_apk_repository_lines_json" | jq -r '.[]' 2>/dev/null || true)
+            printf '  %s su-exec --name %s apk update\n' "$CLI_NAME" "$target_name" >&2
+          else
+            warn "Tagged APK package reinstall needs missing repository tag(s), but the original repository URL was not available:"
+            printf '%s' "$missing_apk_repository_tags_json" | jq -r '.[] | "  - @" + .' >&2
+          fi
+        fi
+      fi
       if [ "$reinstall_package_manager" = "apt-get" ]; then
         printf '  %s su-exec --name %s apt-get update\n' "$CLI_NAME" "$target_name" >&2
       fi
@@ -4917,8 +5503,14 @@ upgrade_cmd() {
 
   echo "Restoring user state into $target_name" >&2
   restore_codex_config "$target_name" "$state_backup_file"
-  verify_restored_codex_state "$target_name" "$state_backup_file" \
-    || die "Restored Codex state verification failed for $target_name; inspect the backup image before continuing."
+  verify_restored_runtime_state "$target_name" "$state_backup_file" \
+    || die "Restored runtime state verification failed for $target_name; inspect the backup image before continuing."
+  ensure_relevant_runtimes_and_features_after_restore \
+    "$target_name" \
+    "$target_default_runtime" \
+    "$current_preferred_runtime" \
+    "$added_runtimes_json" \
+    "$added_features_json"
   warn_if_preferred_runtime_lost "$target_name" "$current_preferred_runtime" "$target_default_runtime"
   if [ "$overwrite_config" -eq 1 ]; then
     echo "Overwriting config.toml, default profiles, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $target_name" >&2
