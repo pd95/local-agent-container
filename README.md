@@ -198,6 +198,9 @@ refreshing it or mounting the current workdir, use `rescue`:
 agentctl rescue --image <container>-backup-<timestamp>
 ```
 
+For upgrade recovery workflows, backup state inventory, and restore examples,
+see [docs/rescue.md](docs/rescue.md).
+
 If you already have a compatible base container and want to bring the managed
 control surface onto it, use `agentctl bootstrap` instead of starting from a
 curated image. More on that in [docs/bootstrap.md](docs/bootstrap.md).
@@ -218,6 +221,7 @@ bash tests/run-tests.sh
 Deeper documentation now lives under `docs/`:
 
 - [docs/getting-started.md](docs/getting-started.md)
+- [docs/rescue.md](docs/rescue.md)
 - [docs/networking.md](docs/networking.md)
 - [docs/runtimes.md](docs/runtimes.md)
 - [docs/local-vs-online.md](docs/local-vs-online.md)
