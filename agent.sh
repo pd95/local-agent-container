@@ -63,6 +63,48 @@ home_owner() {
     || printf '%s\n' "coder:coder"
 }
 
+agent_tools_home() {
+  printf '%s\n' "${AGENTCTL_TOOLS_HOME:-/opt/agentctl}"
+}
+
+agent_tools_bin_dir() {
+  printf '%s\n' "${AGENTCTL_TOOLS_BIN_DIR:-$(agent_tools_home)/bin}"
+}
+
+runtime_tool_home() {
+  local runtime="$1"
+  local env_name=""
+  local value=""
+
+  env_name="AGENTCTL_$(printf '%s' "$runtime" | tr '[:lower:]-' '[:upper:]_')_TOOLS_HOME"
+  eval "value=\"\${$env_name:-}\""
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+  printf '%s/%s\n' "$(agent_tools_home)" "$runtime"
+}
+
+agent_export_tools_path() {
+  local tools_bin=""
+
+  tools_bin="$(agent_tools_bin_dir)"
+  case ":$PATH:" in
+    *":$tools_bin:"*) ;;
+    *) export PATH="$tools_bin:$PATH" ;;
+  esac
+}
+
+runtime_tool_env() {
+  local runtime="$1"
+  shift
+
+  env \
+    "AGENTCTL_TOOLS_HOME=$(agent_tools_home)" \
+    "PATH=$(agent_tools_bin_dir):$PATH" \
+    "$@"
+}
+
 runtime_manifest_path() {
   local runtime="$1"
   local path="${RUNTIME_REGISTRY_DIR}/${runtime}.json"
@@ -188,6 +230,11 @@ runtime_command_path() {
   local command_path=""
 
   command_name="$(runtime_command_name "$runtime")" || return 1
+  candidate="$(agent_tools_bin_dir)/$command_name"
+  if [ -x "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
   command_path="$(command -v "$command_name" 2>/dev/null || true)"
   if [ -n "$command_path" ] && [ -x "$command_path" ]; then
     printf '%s\n' "$command_path"
@@ -445,13 +492,18 @@ Host-side fixes:
 
 json_runtime_info() {
   local runtime="$1"
-  local installed_json preferred_json commands_json capabilities_json launch_configs_json
+  local installed_json preferred_json commands_json capabilities_json launch_configs_json command_path_json command_path
 
   ensure_runtime_known "$runtime"
   installed_json="$(runtime_installed_json "$runtime")"
   commands_json="$(runtime_commands_json "$runtime")"
   capabilities_json="$(runtime_capabilities_json "$runtime")"
   launch_configs_json="$(runtime_launch_configs_json "$runtime")"
+  if command_path="$(runtime_command_path "$runtime" 2>/dev/null)"; then
+    command_path_json="$(printf '%s' "$command_path" | jq -R .)"
+  else
+    command_path_json='null'
+  fi
   if [ "$(runtime_preferred)" = "$runtime" ]; then
     preferred_json=true
   else
@@ -464,12 +516,16 @@ json_runtime_info() {
     --arg preferred "$(runtime_preferred)" \
     --arg launcher "/usr/local/bin/agent.sh run" \
     --arg command_name "$(runtime_command_name "$runtime")" \
+    --arg tools_home "$(agent_tools_home)" \
+    --arg tools_bin_dir "$(agent_tools_bin_dir)" \
+    --arg runtime_tool_home "$(runtime_tool_home "$runtime")" \
     --arg install_method "$(runtime_install_method "$runtime")" \
     --arg config_dir "$(runtime_default_config_dir "$runtime")" \
     --argjson auth_formats "$(runtime_auth_formats_json "$runtime")" \
     --argjson capabilities "$capabilities_json" \
     --argjson commands "$commands_json" \
     --argjson launch_configs "$launch_configs_json" \
+    --argjson command_path "$command_path_json" \
     --argjson installed "$installed_json" \
     --argjson selected "$preferred_json" \
     '{
@@ -480,6 +536,10 @@ json_runtime_info() {
       preferred_runtime: $preferred,
       launcher: $launcher,
       command: $command_name,
+      command_path: $command_path,
+      tools_home: $tools_home,
+      tools_bin_dir: $tools_bin_dir,
+      runtime_tool_home: $runtime_tool_home,
       install_method: $install_method,
       auth_formats: $auth_formats,
       capabilities: $capabilities,
@@ -582,6 +642,8 @@ json_system_manifest() {
 
   jq -n \
     --arg package_manager "$package_manager" \
+    --arg tools_home "$(agent_tools_home)" \
+    --arg tools_bin_dir "$(agent_tools_bin_dir)" \
     --argjson packages "$packages_json" \
     --argjson requested_packages "$requested_packages_json" \
     --argjson apk_repositories "$apk_repositories_json" \
@@ -594,6 +656,8 @@ json_system_manifest() {
       packages: $packages,
       requested_packages: $requested_packages,
       apk_repositories: $apk_repositories,
+      tools_home: $tools_home,
+      tools_bin_dir: $tools_bin_dir,
       installed_runtimes: $installed_runtimes,
       installed_features: $installed_features,
       default_runtime: $default_runtime,
@@ -620,8 +684,17 @@ state_legacy_paths() {
   local codex_home_dir="${HOME}/.codex"
   local claude_home_dir="${HOME}/.claude"
   local claude_home_state_file="${HOME}/.claude.json"
+  local path=""
 
-  [ -e "$codex_home_dir" ] && printf '%s\n' ".codex"
+  if [ -e "$codex_home_dir" ]; then
+    while IFS= read -r path; do
+      [ -n "$path" ] || continue
+      printf '%s\n' ".codex/$path"
+    done < <(
+      cd "$codex_home_dir" && \
+        find . -mindepth 1 -maxdepth 1 ! -name packages -exec basename {} \;
+    )
+  fi
   [ -e "$claude_home_dir" ] && printf '%s\n' ".claude"
   [ -e "$claude_home_state_file" ] && printf '%s\n' ".claude.json"
   return 0

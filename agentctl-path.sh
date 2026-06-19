@@ -1,1 +1,1 @@
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="/opt/agentctl/bin:$HOME/.local/bin:$PATH"

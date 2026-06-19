@@ -738,8 +738,9 @@ Options:
   --name NAME     Container name (default: agent-<dir>)
   --image NAME    Image to use (default: agent-plain)
   --workdir PATH  Host directory to mount at /workdir (default: cwd)
+  --home PATH     Host directory to mount at /home/coder (requires new container)
   --runtime NAME  Preferred runtime to launch in the container (e.g. codex, claude)
-  --install-runtime  Install the selected runtime before launch (default for new containers)
+  --install-runtime  Install the selected runtime before launch
   -c, --config KEY=VALUE  Pass runtime-specific launch config (repeatable)
   --model NAME    Override the launch model for the selected runtime
   --online        Use the runtime's online/provider-backed mode
@@ -913,6 +914,7 @@ Usage: $CLI_NAME exec [options] [command...]
 
 Options:
   --name NAME  Container name (default: agent-<dir>)
+  --no-tty     Do not allocate a TTY, for scripted commands
 
 If no command is provided, exec runs the default shell.
 EOF
@@ -1879,13 +1881,15 @@ backup_codex_config_from_export() {
   local backup_file="$2"
   local extract_root="$3"
   local home_dir=""
-  local -a state_paths=()
+  local paths_file=""
   local path=""
+  local tar_status=0
 
   extract_export_root "$export_file" "$extract_root"
   home_dir="$extract_root/home/coder"
   [ -d "$home_dir" ] || return 0
 
+  paths_file="$(mktemp "${TMPDIR:-/tmp}/agentctl-state-paths.XXXXXX")"
   for path in \
     .codex \
     .config/agentctl \
@@ -1906,12 +1910,27 @@ backup_codex_config_from_export() {
     .ash_history \
     .sh_history; do
     if [ -e "$home_dir/$path" ]; then
-      state_paths+=("$path")
+      case "$path" in
+        .codex)
+          (
+            cd "$home_dir" || exit 1
+            find .codex \( -path .codex/packages -o -path '.codex/packages/*' \) -prune -o ! -type d -print
+          ) >>"$paths_file"
+          ;;
+        *)
+          printf '%s\n' "$path" >>"$paths_file"
+          ;;
+      esac
     fi
   done
-  [ "${#state_paths[@]}" -gt 0 ] || return 0
+  if [ ! -s "$paths_file" ]; then
+    rm -f "$paths_file"
+    return 0
+  fi
 
-  tar -C "$home_dir" -cf "$backup_file" "${state_paths[@]}"
+  tar -C "$home_dir" -cf "$backup_file" -T "$paths_file" || tar_status=$?
+  rm -f "$paths_file"
+  return "$tar_status"
 }
 
 export_container_for_upgrade() {
@@ -2159,6 +2178,7 @@ backup_known_state_from_container() {
   local path_list=""
 
   path_list="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc '
+cd /home/coder || exit 0
 for path in \
   .codex \
   .config/agentctl \
@@ -2178,8 +2198,15 @@ for path in \
   .zsh_history \
   .ash_history \
   .sh_history; do
-  if [ -e "/home/coder/$path" ]; then
-    printf "%s\n" "$path"
+  if [ -e "$path" ]; then
+    case "$path" in
+      .codex)
+        find .codex \( -path .codex/packages -o -path ".codex/packages/*" \) -prune -o ! -type d -print
+        ;;
+      *)
+        printf "%s\n" "$path"
+        ;;
+    esac
   fi
 done
 ' 2>/dev/null || true)"
@@ -3147,8 +3174,8 @@ EOF
     if ! id -u coder >/dev/null 2>&1; then
       adduser -S -G coder -h /home/coder -s /bin/bash coder >/dev/null
     fi
-    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/codexctl /etc/claudectl /etc/agentctl /var/lib/agentctl
-    chown -R coder:coder /home/coder
+    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/codexctl /etc/claudectl /etc/agentctl /var/lib/agentctl /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude
+    chown -R coder:coder /home/coder /opt/agentctl
     chown coder:coder /workdir >/dev/null 2>&1 || true
   '
 
@@ -3216,8 +3243,8 @@ EOF
     if ! id -u coder >/dev/null 2>&1; then
       useradd -m -g coder -d /home/coder -s /bin/bash coder
     fi
-    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/codexctl /etc/claudectl /etc/agentctl /var/lib/agentctl
-    chown -R coder:coder /home/coder
+    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/codexctl /etc/claudectl /etc/agentctl /var/lib/agentctl /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude
+    chown -R coder:coder /home/coder /opt/agentctl
     chown coder:coder /workdir >/dev/null 2>&1 || true
   '
 
@@ -3378,6 +3405,7 @@ refresh_cmd() {
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/features" "/usr/local/lib/agentctl/features" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/features.d" "/etc/agentctl/features.d" "root:root" "644" "755"
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'mkdir -p /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude && chown -R coder:coder /opt/agentctl' >/dev/null 2>&1 || true
   if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -x /usr/local/bin/agent.sh; then
     "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh refresh >/dev/null 2>&1 || true
   fi
@@ -4821,10 +4849,11 @@ run_container() {
   local mem="$6"
   local read_only="$7"
   local workdir="$8"
-  local pre_exec="$9"
-  local post_exec="${10}"
-  local reset_config="${11}"
-  shift 11
+  local home_mount="$9"
+  local pre_exec="${10}"
+  local post_exec="${11}"
+  local reset_config="${12}"
+  shift 12
   local cmd=("$@")
   local exit_code=0
   local started=0
@@ -4875,10 +4904,11 @@ run_container() {
       if [ "$read_only" -eq 1 ]; then
         mount_opts="${mount_opts},readonly"
       fi
-      create_cmd+=(
-        --mount "$mount_opts"
-        "$image" sh -c 'sleep infinity'
-      )
+      create_cmd+=(--mount "$mount_opts")
+      if [ -n "$home_mount" ]; then
+        create_cmd+=(--mount "type=bind,src=$home_mount,dst=/home/coder")
+      fi
+      create_cmd+=("$image" sh -c 'sleep infinity')
       if [ -z "$actual_name" ]; then
         actual_name="$("${create_cmd[@]}")"
         [ -n "$actual_name" ] || die "Failed to create temporary container"
@@ -4935,10 +4965,11 @@ run_mode() {
   local mem="$9"
   local read_only="${10}"
   local workdir="${11}"
-  local reset_config="${12}"
-  local runtime_config_json="${13}"
-  local model_override="${14}"
-  shift 14
+  local home_mount="${12}"
+  local reset_config="${13}"
+  local runtime_config_json="${14}"
+  local model_override="${15}"
+  shift 15
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
@@ -4959,7 +4990,7 @@ run_mode() {
     shell=0
   fi
 
-  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$pre_exec" "$post_exec" "$reset_config" "${cmd[@]}"
+  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "${cmd[@]}"
 }
 
 RUN_SELECTED_RUNTIME=""
@@ -5057,7 +5088,6 @@ run_cmd() {
   local image=""
   local runtime=""
   local install_runtime=0
-  local auto_install_runtime=0
   local online=0
   local auth=0
   local update=0
@@ -5069,6 +5099,7 @@ run_cmd() {
   local read_only=0
   local cpu=""
   local mem=""
+  local home_mount=""
   local workdir=""
   local -a runtime_config_entries=()
   local -a cmd_override=()
@@ -5080,6 +5111,7 @@ run_cmd() {
       --name) name="$2"; shift 2 ;;
       --image) image="$2"; shift 2 ;;
       --workdir) workdir="$2"; shift 2 ;;
+      --home) home_mount="$2"; shift 2 ;;
       --runtime) runtime="$2"; shift 2 ;;
       --install-runtime) install_runtime=1; shift ;;
       --model) model_override="$2"; shift 2 ;;
@@ -5125,6 +5157,10 @@ run_cmd() {
     die "Workdir not found: $workdir"
   fi
   workdir="$(CDPATH= cd -- "$workdir" && pwd)"
+  if [ -n "$home_mount" ]; then
+    [ -d "$home_mount" ] || die "Home mount not found: $home_mount"
+    home_mount="$(CDPATH= cd -- "$home_mount" && pwd)"
+  fi
 
   [ -n "$image" ] || image="$DEFAULT_IMAGE"
   image="$(image_ref_for_runtime "$image")"
@@ -5132,17 +5168,14 @@ run_cmd() {
   if [ -z "$name" ] && [ "$temp" -eq 0 ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
   fi
-  if [ -n "$runtime" ] && { [ "$temp" -eq 1 ] || [ -z "$name" ] || ! container_exists "$name"; }; then
-    auto_install_runtime=1
-  fi
-  if [ "$auto_install_runtime" -eq 1 ]; then
-    install_runtime=1
-  fi
   if [ "$install_runtime" -eq 1 ] && [ "$runtime" = "claude" ] && [ -z "$mem" ] && { [ "$temp" -eq 1 ] || [ -z "$name" ] || ! container_exists "$name"; }; then
     mem="$CLAUDE_MIN_INSTALL_MEM"
   fi
   if [ "$temp" -eq 0 ] && [ -n "$name" ] && container_exists "$name" && { [ -n "$cpu" ] || [ -n "$mem" ]; }; then
     die "--cpu and --mem only apply when creating a new container. Use ${CLI_NAME} upgrade --name $name${image:+ --image $image}${cpu:+ --cpu $cpu}${mem:+ --mem $mem} to recreate the container with updated resources"
+  fi
+  if [ "$temp" -eq 0 ] && [ -n "$name" ] && container_exists "$name" && [ -n "$home_mount" ]; then
+    die "--home only applies when creating a new container"
   fi
   if [ "${#runtime_config_entries[@]}" -gt 0 ]; then
     runtime_config_json="$(runtime_config_json_from_entries "${runtime_config_entries[@]}")"
@@ -5170,7 +5203,7 @@ run_cmd() {
     RUN_UPDATE_CODEX=1
   fi
 
-  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$reset_config" "$runtime_config_json" "$model_override" ${cmd_override[@]+"${cmd_override[@]}"}
+  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" ${cmd_override[@]+"${cmd_override[@]}"}
 }
 
 auth_cmd() {
@@ -5654,10 +5687,12 @@ rescue_cmd() {
 exec_cmd() {
   local name=""
   local cmd=()
+  local tty=1
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
+      --no-tty) tty=0; shift ;;
       --help) usage_exec; return 0 ;;
       --) shift; cmd=("$@"); break ;;
       --*) die "Unknown option for exec: $1" ;;
@@ -5684,7 +5719,11 @@ exec_cmd() {
     die "Container not running: $name"
   fi
 
-  "$CONTAINER_CMD" exec -it "$name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"
+  if [ "$tty" -eq 1 ]; then
+    "$CONTAINER_CMD" exec -it "$name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"
+  else
+    "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"
+  fi
 }
 
 su_exec_cmd() {

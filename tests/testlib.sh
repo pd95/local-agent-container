@@ -88,10 +88,7 @@ register_image_cleanup() {
 
 register_dir_cleanup() {
   local path="$1"
-  case " $CLEANUP_DIRS " in
-    *" $path "*) return 0 ;;
-  esac
-  CLEANUP_DIRS="$CLEANUP_DIRS $path"
+  CLEANUP_DIRS="${CLEANUP_DIRS}${path}"$'\n'
 }
 
 container_exists() {
@@ -265,7 +262,8 @@ cleanup() {
     rm -f "$cleanup_log" >/dev/null 2>&1 || true
   done
 
-  for path in $CLEANUP_DIRS; do
+  printf '%s' "$CLEANUP_DIRS" | while IFS= read -r path; do
+    [ -n "$path" ] || continue
     rm -rf "$path" >/dev/null 2>&1 || true
   done
 

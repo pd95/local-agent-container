@@ -84,6 +84,15 @@ ensure_runtime_fixture_running() {
   assert_status 0
 }
 
+ensure_agent_plain_image() {
+  if image_exists agent-plain; then
+    return 0
+  fi
+
+  run_capture "$AGENTCTL" build --image agent-plain
+  assert_status 0
+}
+
 ensure_feature_fixture() {
   if [ -n "$FEATURE_FIXTURE_NAME" ] && container_exists "$FEATURE_FIXTURE_NAME"; then
     return 0
@@ -94,6 +103,215 @@ ensure_feature_fixture() {
   register_container_cleanup "$FEATURE_FIXTURE_NAME"
 
   run_capture "$AGENTCTL" run --name "$FEATURE_FIXTURE_NAME" --image agent-python --workdir "$FEATURE_FIXTURE_WORKDIR" --cmd true
+  assert_status 0
+}
+
+test_tool_home_smoke_codex_external_home() {
+  begin_test "tool-home smoke keeps Codex tools outside mounted home"
+
+  local name
+  local temp_root
+  local home_mount
+  local work_mount
+  name="$(unique_name tool-home-smoke)"
+  temp_root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl tool home.XXXXXX")"
+  register_dir_cleanup "$temp_root"
+  home_mount="$temp_root/home"
+  work_mount="$temp_root/workdir"
+  mkdir -p "$home_mount" "$work_mount"
+  printf 'host-marker\n' >"$home_mount/.agentctl-host-home-marker"
+  register_container_cleanup "$name"
+
+  ensure_agent_plain_image
+
+  run_capture "$AGENTCTL" run \
+    --name "$name" \
+    --image agent-plain \
+    --workdir "$work_mount" \
+    --home "$home_mount" \
+    --cmd true
+  assert_status 0
+
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- bash -lc '
+set -euo pipefail
+
+dump_diagnostics() {
+  status=$?
+  printf "\n--- tool-home diagnostics (exit %s) ---\n" "$status" >&2
+  printf "PATH=%s\n" "$PATH" >&2 || true
+  command -v codex >&2 || true
+  command -v claude >&2 || true
+  agent.sh runtime info codex >&2 || true
+  agent.sh runtime info claude >&2 || true
+  agent.sh system manifest >&2 || true
+  find /home/coder -maxdepth 3 -print >&2 || true
+  find /opt/agentctl -maxdepth 4 -print >&2 || true
+  exit "$status"
+}
+trap dump_diagnostics ERR
+
+test -f /home/coder/.agentctl-host-home-marker
+grep -Fxq "host-marker" /home/coder/.agentctl-host-home-marker
+printf "container-marker\n" >/home/coder/.agentctl-container-home-marker
+
+assert_not_under_home() {
+  case "$1" in
+    /home/coder/*)
+      printf "launcher resolved under mounted home: %s\n" "$1" >&2
+      exit 1
+      ;;
+  esac
+}
+
+path_index() {
+  needle="$1"
+  printf "%s" "$PATH" | awk -v RS=: -v needle="$needle" '\''$0 == needle { print NR; found = 1; exit } END { if (!found) exit 1 }'\''
+}
+
+tools_idx="$(path_index /opt/agentctl/bin)"
+local_idx="$(path_index /home/coder/.local/bin || true)"
+if [ -n "$local_idx" ] && [ "$tools_idx" -ge "$local_idx" ]; then
+  printf "/opt/agentctl/bin must precede /home/coder/.local/bin in PATH\n" >&2
+  exit 1
+fi
+
+codex_info="$(agent.sh runtime info codex)"
+printf "%s" "$codex_info" | jq -e \
+  ".installed == true
+  and (.command_path | startswith(\"/opt/agentctl/bin/\"))
+  and ((.command_path | startswith(\"/home/coder/\")) | not)
+  and .tools_home == \"/opt/agentctl\"
+  and .tools_bin_dir == \"/opt/agentctl/bin\"
+  and .runtime_tool_home == \"/opt/agentctl/codex\"" >/dev/null
+
+codex_path="$(command -v codex)"
+[ "$codex_path" = "/opt/agentctl/bin/codex" ] || {
+  printf "expected codex at /opt/agentctl/bin/codex, got %s\n" "$codex_path" >&2
+  exit 1
+}
+assert_not_under_home "$codex_path"
+
+codex --version
+CODEX_HOME=/home/coder/.codex codex app-server --help >/tmp/codex-app-server-help.txt
+agent.sh runtime update codex
+codex_after_update="$(command -v codex)"
+assert_not_under_home "$codex_after_update"
+[ "$codex_after_update" = "/opt/agentctl/bin/codex" ]
+
+test ! -e /home/coder/.codex/packages
+
+manifest="$(agent.sh system manifest)"
+printf "%s" "$manifest" | jq -e \
+  ".tools_home == \"/opt/agentctl\"
+  and .tools_bin_dir == \"/opt/agentctl/bin\"
+  and (.installed_runtimes | index(\"codex\") != null)" >/dev/null
+
+state_tar=/tmp/agentctl-state.tar
+mkdir -p /home/coder/.codex/packages/standalone/current/bin
+printf "stale-package\n" >/home/coder/.codex/packages/standalone/current/bin/codex
+printf "{\"refresh_token\":\"dummy\"}\n" >/home/coder/.codex/auth.json
+bash /usr/local/bin/agent.sh state export >"$state_tar"
+if tar -tf "$state_tar" | grep -Eq "^\\.codex/packages(/|$)|^opt/agentctl(/|$)"; then
+  tar -tf "$state_tar" >&2
+  exit 1
+fi
+  '
+  assert_status 0
+  if ! grep -Fxq "container-marker" "$home_mount/.agentctl-container-home-marker"; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    fail "Expected /home/coder marker written in container to appear in host home mount"
+  fi
+
+  run_capture "$AGENTCTL" rm --name "$name" --force
+  assert_status 0
+}
+
+test_tool_home_smoke_claude_external_home_when_installed() {
+  begin_test "tool-home smoke keeps Claude tools outside mounted home when installed"
+
+  local name
+  local temp_root
+  local home_mount
+  local work_mount
+  name="$(unique_name tool-home-claude)"
+  temp_root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-tool-home-claude.XXXXXX")"
+  register_dir_cleanup "$temp_root"
+  home_mount="$temp_root/home"
+  work_mount="$temp_root/workdir"
+  mkdir -p "$home_mount" "$work_mount"
+  register_container_cleanup "$name"
+
+  ensure_agent_plain_image
+
+  run_capture "$AGENTCTL" run \
+    --name "$name" \
+    --image agent-plain \
+    --workdir "$work_mount" \
+    --home "$home_mount" \
+    --cmd true
+  assert_status 0
+
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- bash -lc '
+set -euo pipefail
+
+dump_diagnostics() {
+  status=$?
+  printf "\n--- tool-home Claude diagnostics (exit %s) ---\n" "$status" >&2
+  printf "PATH=%s\n" "$PATH" >&2 || true
+  command -v claude >&2 || true
+  agent.sh runtime info claude >&2 || true
+  agent.sh system manifest >&2 || true
+  find /home/coder -maxdepth 3 -print >&2 || true
+  find /opt/agentctl -maxdepth 4 -print >&2 || true
+  exit "$status"
+}
+trap dump_diagnostics ERR
+
+assert_not_under_home() {
+  case "$1" in
+    /home/coder/*)
+      printf "launcher resolved under mounted home: %s\n" "$1" >&2
+      exit 1
+      ;;
+  esac
+}
+
+claude_info="$(agent.sh runtime info claude)"
+if ! printf "%s" "$claude_info" | jq -e ".installed == true" >/dev/null; then
+  printf "Skipping Claude tool-home smoke because claude is not installed in this image.\n"
+  exit 0
+fi
+
+printf "%s" "$claude_info" | jq -e \
+  ".installed == true
+  and (.command_path | startswith(\"/opt/agentctl/bin/\"))
+  and ((.command_path | startswith(\"/home/coder/\")) | not)
+  and .runtime_tool_home == \"/opt/agentctl/claude\"" >/dev/null
+
+claude_path="$(command -v claude)"
+assert_not_under_home "$claude_path"
+case "$claude_path" in
+  /opt/agentctl/bin/claude) ;;
+  *) printf "expected claude at /opt/agentctl/bin/claude, got %s\n" "$claude_path" >&2; exit 1 ;;
+esac
+
+claude --version
+agent.sh runtime update claude
+claude_after_update="$(command -v claude)"
+assert_not_under_home "$claude_after_update"
+[ "$claude_after_update" = "/opt/agentctl/bin/claude" ]
+
+agent.sh system manifest | jq -e ".installed_runtimes | index(\"claude\") != null" >/dev/null
+'
+  assert_status 0
+
+  run_capture "$AGENTCTL" rm --name "$name" --force
   assert_status 0
 }
 
@@ -658,6 +876,8 @@ main() {
   run_selected_test test_runtime_management_commands_work_for_existing_container "runtime list, info, capabilities, and use work for an existing container" smoke
   run_selected_test test_refresh_pushes_runtime_registry_into_existing_container "refresh updates the runtime registry in an existing container" smoke
   run_selected_test test_runtime_info_claude_works_after_refresh_on_stopped_container "runtime info claude works after refresh when the container is stopped" smoke
+  run_selected_test test_tool_home_smoke_codex_external_home "tool-home smoke keeps Codex tools outside mounted home" smoke
+  run_selected_test test_tool_home_smoke_claude_external_home_when_installed "tool-home smoke keeps Claude tools outside mounted home when installed" smoke
   run_selected_test test_feature_office_install_works_on_agent_python "feature install office works on agent-python" full
   run_selected_test test_bootstrap_works_on_existing_alpine_container "bootstrap works on an existing Alpine container" full
   run_selected_test test_bootstrap_can_create_and_bootstrap_new_alpine_container "bootstrap can create and bootstrap a new Alpine container" full

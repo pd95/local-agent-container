@@ -13,12 +13,14 @@ RUN apk add --no-cache \
 RUN addgroup -S coder \
  && adduser  -S -G coder -h /home/coder -s /bin/bash coder \
  && mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir \
- && chown -R coder:coder /home/coder /workdir
+      /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude \
+ && chown -R coder:coder /home/coder /workdir /opt/agentctl
 
 # Make sure HOME is correct for subsequent RUNs when we switch user
 ENV HOME=/home/coder \
     IMAGE_NAME=agent-plain \
-    PATH=/home/coder/.local/bin:$PATH
+    AGENTCTL_TOOLS_HOME=/opt/agentctl \
+    PATH=/opt/agentctl/bin:/home/coder/.local/bin:$PATH
 
 # Copy Codex default configuration, profiles, and local model metadata config
 COPY --chown=coder:coder config.toml gpt-oss.config.toml gemma.config.toml qwen.config.toml local_models.json /home/coder/.codex/
