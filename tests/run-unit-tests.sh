@@ -2204,6 +2204,59 @@ EOF
   grep -Fq -- 'ARGS=--cd /workdir' "$run_log" || fail "Expected codex run to include --cd /workdir"
 }
 
+test_agent_sh_codex_run_repairs_broken_bundled_rg() {
+  begin_test "agent.sh codex run repairs broken bundled ripgrep"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local run_log
+  local bundled_rg
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  run_log="$temp_home/codex-run.log"
+  bundled_rg="$tools_home/codex/packages/standalone/current/codex-path/rg"
+  mkdir -p "$fake_bin" "$(dirname "$bundled_rg")"
+
+  cat >"$fake_bin/codex" <<EOF
+#!/bin/sh
+printf 'CODEX_HOME=%s\nARGS=%s\n' "\$CODEX_HOME" "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  cat >"$fake_bin/rg" <<'EOF'
+#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' 'ripgrep 15.1.0'; exit 0 ;;
+esac
+exit 0
+EOF
+  chmod +x "$fake_bin/rg"
+
+  cat >"$bundled_rg" <<'EOF'
+#!/bin/sh
+exit 127
+EOF
+  chmod +x "$bundled_rg"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    AGENTCTL_RUN_MODE=online \
+    -- run
+  assert_status 0
+  [ -L "$bundled_rg" ] || fail "Expected broken bundled rg to be replaced with a symlink"
+  case "$(readlink "$bundled_rg")" in
+    "$tools_home"/*) fail "Expected bundled rg to point outside tool home" ;;
+  esac
+  "$bundled_rg" --version >/dev/null 2>&1 || fail "Expected repaired bundled rg to execute"
+  grep -Fxq "CODEX_HOME=$temp_home/home/.codex" "$run_log" || fail "Expected codex run to continue after rg repair"
+  assert_contains "Repaired Codex bundled ripgrep:"
+}
+
 test_agent_sh_codex_run_uses_runtime_profile_config() {
   begin_test "agent.sh codex run maps runtime config profile to --profile"
 
@@ -7708,6 +7761,7 @@ main() {
   run_selected_test test_agent_sh_claude_runtime_reset_config_restores_settings "test_agent_sh_claude_runtime_reset_config_restores_settings"
   run_selected_test test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration "test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration"
   run_selected_test test_agent_sh_codex_run_defaults_to_workdir_cd "test_agent_sh_codex_run_defaults_to_workdir_cd"
+  run_selected_test test_agent_sh_codex_run_repairs_broken_bundled_rg "test_agent_sh_codex_run_repairs_broken_bundled_rg"
   run_selected_test test_agent_sh_codex_run_uses_runtime_profile_config "test_agent_sh_codex_run_uses_runtime_profile_config"
   run_selected_test test_agent_sh_accepts_explicit_empty_runtime_config_json "test_agent_sh_accepts_explicit_empty_runtime_config_json"
   run_selected_test test_agent_sh_codex_run_uses_model_override "test_agent_sh_codex_run_uses_model_override"

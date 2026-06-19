@@ -116,6 +116,45 @@ codex_install_standalone_package_direct() {
   trap - RETURN
 }
 
+codex_working_system_rg() {
+  local install_home="$1"
+  local candidate=""
+
+  for candidate in /usr/bin/rg /bin/rg "$(command -v rg 2>/dev/null || true)"; do
+    [ -n "$candidate" ] || continue
+    case "$candidate" in
+      "$install_home"/*) continue ;;
+    esac
+    [ -x "$candidate" ] || continue
+    "$candidate" --version >/dev/null 2>&1 || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+codex_repair_bundled_rg() {
+  local install_home="$1"
+  local bundled_rg=""
+  local bundled_rg_dir=""
+  local system_rg=""
+
+  bundled_rg="$install_home/packages/standalone/current/codex-path/rg"
+  bundled_rg_dir="$(dirname "$bundled_rg")"
+  [ -d "$bundled_rg_dir" ] || return 0
+  if [ -e "$bundled_rg" ] && "$bundled_rg" --version >/dev/null 2>&1; then
+    return 0
+  fi
+  system_rg="$(codex_working_system_rg "$install_home" || true)"
+  if [ -z "$system_rg" ]; then
+    printf 'Warning: Codex bundled ripgrep is not executable and no working system rg was found: %s\n' "$bundled_rg" >&2
+    return 0
+  fi
+  rm -f "$bundled_rg"
+  ln -s "$system_rg" "$bundled_rg"
+  printf 'Repaired Codex bundled ripgrep: %s -> %s\n' "$bundled_rg" "$system_rg" >&2
+}
+
 codex_home_dir() {
   printf '%s\n' "${HOME}/.codex"
 }
@@ -667,9 +706,12 @@ agent_runtime_run() {
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   local -a codex_args=()
   local codex_command=""
+  local install_home=""
   local profile=""
 
   codex_command="$(runtime_command_path "$runtime")" || die "runtime not installed: $runtime (run: agent.sh runtime install $runtime)"
+  install_home="$(runtime_tool_home "$runtime")"
+  codex_repair_bundled_rg "$install_home"
   export CODEX_HOME="$(codex_home_dir)"
 
   if [ "$#" -gt 0 ]; then
@@ -745,6 +787,7 @@ agent_runtime_install() {
     cat "$install_log"
   fi
   rm -f "$install_log"
+  codex_repair_bundled_rg "$install_home"
   runtime_command_path "$runtime" >/dev/null 2>&1 || die "codex installer finished but launcher was not found in $(agent_tools_bin_dir) or legacy user bin dirs"
   if [ "${AGENTCTL_SKIP_PREFERRED_SET:-0}" != "1" ]; then
     preferred_set "$runtime"
@@ -764,6 +807,7 @@ agent_runtime_update() {
     CODEX_INSTALL_DIR="$install_dir" \
     PATH="$install_dir:$PATH" \
     "$(runtime_command_path "$runtime")" update
+  codex_repair_bundled_rg "$install_home"
 }
 
 agent_runtime_reset_config() {
