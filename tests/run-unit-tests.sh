@@ -144,8 +144,8 @@ test_run_config_wires_runtime_config_json() {
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
   run_container() {
-    captured_pre_exec="$9"
-    shift 11
+    captured_pre_exec="${10}"
+    shift 12
     captured_cmd="$(printf '%s\n' "$*")"
   }
 
@@ -169,9 +169,36 @@ test_run_help_reports_runtime_options() {
   run_capture "$AGENTCTL" run --help
   assert_status 0
   assert_contains "--runtime NAME  Preferred runtime to launch"
+  assert_contains "--home PATH     Host directory to mount at /home/coder"
   assert_contains "--install-runtime  Install the selected runtime before launch"
   assert_contains "--model NAME    Override the launch model for the selected runtime"
   assert_contains "--online        Use the runtime's online/provider-backed mode"
+}
+
+test_run_cmd_wires_home_mount() {
+  begin_test "run_cmd wires --home into container creation"
+
+  load_codexctl_functions
+
+  local workdir
+  local home_mount
+  local expected_home_mount
+  local captured_home_mount=""
+
+  workdir="$(new_workdir)"
+  home_mount="$(new_workdir)"
+  expected_home_mount="$(CDPATH= cd -- "$home_mount" && pwd)"
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { return 1; }
+  run_container() {
+    captured_home_mount="$9"
+  }
+
+  run_cmd --name unit-test-container --workdir "$workdir" --home "$home_mount" --cmd true
+
+  [ "$captured_home_mount" = "$expected_home_mount" ] || fail "Expected home mount $expected_home_mount, got: $captured_home_mount"
 }
 
 test_doctor_help_reports_fix_option() {
@@ -208,7 +235,7 @@ test_run_model_wires_selected_model() {
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
   run_container() {
-    shift 11
+    shift 12
     captured_cmd="$(printf '%s\n' "$*")"
   }
 
@@ -442,8 +469,8 @@ EOF
   CONTAINER_CMD=container
 }
 
-test_run_cmd_runtime_selection_auto_installs_for_new_container() {
-  begin_test "run_cmd auto-installs a selected runtime for a new container"
+test_run_cmd_runtime_selection_does_not_auto_install_for_new_container() {
+  begin_test "run_cmd does not auto-install a selected runtime for a new container"
 
   load_codexctl_functions
 
@@ -456,7 +483,7 @@ test_run_cmd_runtime_selection_auto_installs_for_new_container() {
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
   run_container() {
-    captured_pre_exec="$9"
+    captured_pre_exec="${10}"
     captured_mem="$6"
   }
 
@@ -466,10 +493,10 @@ test_run_cmd_runtime_selection_auto_installs_for_new_container() {
 
   [ "$captured_pre_exec" = "run_pre_exec" ] || fail "Expected run_pre_exec, got: $captured_pre_exec"
   [ "$RUN_SELECTED_RUNTIME" = "claude" ] || fail "Expected runtime claude, got: $RUN_SELECTED_RUNTIME"
-  [ "$RUN_INSTALL_RUNTIME" -eq 1 ] || fail "Expected runtime auto-install to be enabled"
+  [ "$RUN_INSTALL_RUNTIME" -eq 0 ] || fail "Did not expect runtime auto-install for a new container"
   [ "$RUN_SYNC_RUNTIME_AUTH" -eq 0 ] || fail "Did not expect online auth sync for local Claude shell launch"
   [ "$RUN_LOCAL_MODEL_PREFLIGHT" -eq 0 ] || fail "Did not expect local-model preflight for Claude shell launch"
-  [ "$captured_mem" = "4G" ] || fail "Expected Claude bootstrap run to request 4G, got: $captured_mem"
+  [ -z "$captured_mem" ] || fail "Did not expect Claude install memory override without explicit install, got: $captured_mem"
 }
 
 test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container() {
@@ -487,7 +514,7 @@ test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container() {
   default_name() { printf 'unit-test-container\n'; }
   container_exists() { [ "$1" = "unit-test-container" ]; }
   run_container() {
-    captured_pre_exec="$9"
+    captured_pre_exec="${10}"
     captured_mem="$6"
   }
 
@@ -685,6 +712,40 @@ test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
   printf '%s' "$call_log" | grep -Fq $'sync:unit-test-container:claude:claude_ai_oauth_json' || fail "Expected runtime auth sync call, got: $call_log"
 }
 
+test_exec_cmd_no_tty_omits_interactive_flags() {
+  begin_test "exec --no-tty omits interactive container flags"
+
+  load_codexctl_functions
+
+  local exec_log=""
+  local old_container_cmd="$CONTAINER_CMD"
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_running() { [ "$1" = "unit-test-container" ]; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      exec)
+        shift
+        exec_log="$(printf '%s\n' "$*")"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture exec_cmd --name unit-test-container --no-tty -- bash -lc 'true'
+  assert_status 0
+  if printf '%s\n' "$exec_log" | grep -Fq -- '-it'; then
+    fail "Did not expect -it for --no-tty exec, got: $exec_log"
+  fi
+  printf '%s\n' "$exec_log" | grep -Fq -- 'unit-test-container' || fail "Expected exec target container, got: $exec_log"
+  printf '%s\n' "$exec_log" | grep -Fq -- 'bash' || fail "Expected exec command, got: $exec_log"
+  CONTAINER_CMD="$old_container_cmd"
+}
+
 test_run_pre_exec_updates_codex_via_runtime_helper() {
   begin_test "run_pre_exec updates codex via the runtime user helper"
 
@@ -775,7 +836,7 @@ test_run_container_reset_config_uses_runtime_helper() {
     helper_log="${helper_log}$1:$2"$'\n'
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" 1 true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:codex' || fail "Expected runtime reset-config helper call, got: $helper_log"
 }
@@ -889,7 +950,7 @@ test_run_cmd_default_entrypoint_enables_local_runtime_preflight() {
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
   run_container() {
-    captured_pre_exec="$9"
+    captured_pre_exec="${10}"
   }
 
   run_cmd --name unit-test-container --workdir "$workdir"
@@ -1544,6 +1605,30 @@ test_agent_sh_runtime_list_ignores_dangling_runtime_launcher() {
   assert_not_contains "claude"
 }
 
+test_agent_sh_runtime_info_prefers_tool_bin_over_user_path() {
+  begin_test "agent.sh runtime info prefers tool bin over user-local launcher"
+
+  local temp_home
+  local tools_home
+  local user_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  tools_home="$temp_home/tools"
+  user_bin="$temp_home/home/.local/bin"
+  mkdir -p "$tools_home/bin" "$user_bin"
+
+  printf '#!/bin/sh\nexit 0\n' >"$tools_home/bin/codex"
+  printf '#!/bin/sh\nexit 0\n' >"$user_bin/codex"
+  chmod +x "$tools_home/bin/codex" "$user_bin/codex"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$user_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- runtime info codex
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er --arg path "$tools_home/bin/codex" --arg tools "$tools_home" '.installed == true and .command_path == $path and .tools_home == $tools and .tools_bin_dir == ($tools + "/bin") and .runtime_tool_home == ($tools + "/codex")' >/dev/null || fail "Expected runtime info to prefer tool bin, got: $RUN_OUTPUT"
+}
+
 test_agent_sh_runtime_capabilities_reports_manifest_commands() {
   begin_test "agent.sh runtime capabilities reports manifest-backed commands"
 
@@ -1573,9 +1658,11 @@ test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state() {
 
   local temp_home
   local fake_bin
+  local tools_home
   local state_dir
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
+  tools_home="$temp_home/tools"
   fake_bin="$(make_fake_runtime_bin "$temp_home" codex)"
   make_fake_runtime_bin "$temp_home" claude >/dev/null
   state_dir="$temp_home/state"
@@ -1585,10 +1672,11 @@ test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state() {
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
     AGENTCTL_FEATURE_STATE_DIR="$state_dir" \
     -- system manifest
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.installed_runtimes == ["claude","codex"] and .installed_features == ["office"] and .default_runtime == "codex" and .preferred_runtime == "claude"' >/dev/null || fail "Expected richer system manifest JSON, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er --arg tools "$tools_home" '.installed_runtimes == ["claude","codex"] and .installed_features == ["office"] and .default_runtime == "codex" and .preferred_runtime == "claude" and .tools_home == $tools and .tools_bin_dir == ($tools + "/bin")' >/dev/null || fail "Expected richer system manifest JSON, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_system_manifest_reports_apk_requested_packages() {
@@ -1661,11 +1749,13 @@ test_agent_sh_claude_runtime_install_runs_native_installer() {
 
   local temp_home
   local fake_bin
+  local tools_home
   local install_log
   local expected_owner
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
   install_log="$temp_home/install.log"
   expected_owner="$(id -u):$(id -g)"
   mkdir -p "$fake_bin"
@@ -1693,12 +1783,13 @@ EOF
   cat >"$fake_bin/bash" <<EOF
 #!/bin/sh
 cat >/dev/null
-printf '%s\n' 'installer-bash' >>"$install_log"
-cat >"$fake_bin/claude" <<'SCRIPT'
+printf 'installer-bash HOME=%s PATH=%s\n' "\$HOME" "\$PATH" >>"$install_log"
+mkdir -p "\$HOME/.local/bin"
+cat >"\$HOME/.local/bin/claude" <<'SCRIPT'
 #!/bin/sh
 exit 0
 SCRIPT
-chmod +x "$fake_bin/claude"
+chmod +x "\$HOME/.local/bin/claude"
 EOF
   chmod +x "$fake_bin/bash"
 
@@ -1721,18 +1812,21 @@ EOF
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
     -- runtime install claude
   assert_status 0
-  [ -x "$fake_bin/claude" ] || fail "Expected fake claude launcher to be created by installer"
+  [ -L "$tools_home/bin/claude" ] || fail "Expected Claude launcher symlink in tool bin"
+  [ "$(readlink "$tools_home/bin/claude")" = "$tools_home/claude/.local/bin/claude" ] || fail "Expected Claude launcher to point at tool home"
   grep -Fq 'info -e libgcc' "$install_log" || fail "Expected Alpine dependency verification for libgcc"
   grep -Fq 'info -e libstdc++' "$install_log" || fail "Expected Alpine dependency verification for libstdc++"
   grep -Fq 'info -e ripgrep' "$install_log" || fail "Expected Alpine dependency verification for ripgrep"
-  grep -Fq 'installer-bash' "$install_log" || fail "Expected native installer script to be piped into bash"
+  grep -Fq "installer-bash HOME=$tools_home/claude" "$install_log" || fail "Expected native installer to run with Claude tool home"
   grep -Fq "chown -R $expected_owner $temp_home/home/.claude" "$install_log" || fail "Expected Claude install to hand .claude ownership back to the container user"
   jq -er '.env.USE_BUILTIN_RIPGREP == "0"' "$temp_home/home/.claude/settings.json" >/dev/null || fail "Expected Claude settings.json to disable builtin ripgrep"
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
     -- preferred get
   assert_status 0
   assert_contains "claude"
@@ -1743,25 +1837,35 @@ test_agent_sh_claude_runtime_update_calls_claude_update() {
 
   local temp_home
   local fake_bin
+  local tools_home
   local update_log
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
   update_log="$temp_home/update.log"
-  mkdir -p "$fake_bin"
+  mkdir -p "$fake_bin" "$tools_home/bin"
 
-  cat >"$fake_bin/claude" <<EOF
+  cat >"$tools_home/bin/claude" <<EOF
 #!/bin/sh
-printf '%s\n' "\$*" >"$update_log"
+printf 'HOME=%s\nPATH=%s\nARGS=%s\n' "\$HOME" "\$PATH" "\$*" >"$update_log"
 exit 0
 EOF
-  chmod +x "$fake_bin/claude"
+  chmod +x "$tools_home/bin/claude"
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
     -- runtime update claude
   assert_status 0
-  grep -Fxq 'update' "$update_log" || fail "Expected claude update to be invoked"
+  grep -Fxq "HOME=$tools_home/claude" "$update_log" || fail "Expected claude update to run with tool home"
+  grep -Fxq 'ARGS=update' "$update_log" || fail "Expected claude update to be invoked"
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$temp_home/home/.local/bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- runtime info claude
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er --arg path "$tools_home/bin/claude" '.installed == true and .command_path == $path' >/dev/null || fail "Expected Claude to remain resolved from tool bin after update, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_codex_runtime_install_runs_standalone_installer() {
@@ -1769,10 +1873,12 @@ test_agent_sh_codex_runtime_install_runs_standalone_installer() {
 
   local temp_home
   local fake_bin
+  local tools_home
   local install_log
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
   install_log="$temp_home/install.log"
   mkdir -p "$fake_bin"
 
@@ -1789,27 +1895,136 @@ EOF
   cat >"$fake_bin/sh" <<EOF
 #!/bin/sh
 cat >/dev/null
-printf 'sh CODEX_NON_INTERACTIVE=%s\n' "\${CODEX_NON_INTERACTIVE:-}" >>"$install_log"
-cat >"$fake_bin/codex" <<'SCRIPT'
+printf 'sh CODEX_HOME=%s\nCODEX_INSTALL_DIR=%s\nCODEX_NON_INTERACTIVE=%s\nPATH=%s\n' "\${CODEX_HOME:-}" "\${CODEX_INSTALL_DIR:-}" "\${CODEX_NON_INTERACTIVE:-}" "\$PATH" >>"$install_log"
+mkdir -p "\$CODEX_INSTALL_DIR"
+cat >"\$CODEX_INSTALL_DIR/codex" <<'SCRIPT'
 #!/bin/sh
 exit 0
 SCRIPT
-chmod +x "$fake_bin/codex"
+chmod +x "\$CODEX_INSTALL_DIR/codex"
 EOF
   chmod +x "$fake_bin/sh"
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
     -- runtime install codex
   assert_status 0
   grep -Fq 'https://chatgpt.com/codex/install.sh' "$install_log" || fail "Expected Codex standalone installer URL"
-  grep -Fxq 'sh CODEX_NON_INTERACTIVE=1' "$install_log" || fail "Expected non-interactive Codex installer"
+  grep -Fxq "sh CODEX_HOME=$tools_home/codex" "$install_log" || fail "Expected Codex installer to use tool CODEX_HOME"
+  grep -Fxq "CODEX_INSTALL_DIR=$tools_home/bin" "$install_log" || fail "Expected Codex installer to use tool bin install dir"
+  grep -Fxq 'CODEX_NON_INTERACTIVE=1' "$install_log" || fail "Expected non-interinteractive Codex installer"
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
     -- preferred get
   assert_status 0
   assert_contains "codex"
+}
+
+test_agent_sh_codex_runtime_install_falls_back_to_direct_package() {
+  begin_test "agent.sh codex runtime install falls back to direct package assets"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin"
+
+  cat >"$fake_bin/curl" <<EOF
+#!/bin/sh
+printf 'curl %s\n' "\$*" >>"$install_log"
+case "\$*" in
+  *"https://chatgpt.com/codex/install.sh"*)
+    cat <<'SCRIPT'
+#!/bin/sh
+printf '%s\n' 'Could not find Codex package or platform npm release assets for Codex 0.139.0.' >&2
+exit 1
+SCRIPT
+    ;;
+  *"https://api.github.com/repos/openai/codex/releases/latest"*)
+    printf '{"tag_name":"rust-v0.139.0"}\n'
+    ;;
+  *"codex-package_SHA256SUMS"*)
+    output=""
+    while [ "\$#" -gt 0 ]; do
+      if [ "\$1" = "-o" ]; then
+        output="\$2"
+        shift 2
+        continue
+      fi
+      shift
+    done
+    printf '%s  codex-package-aarch64-unknown-linux-musl.tar.gz\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" >"\$output"
+    ;;
+  *"codex-package-aarch64-unknown-linux-musl.tar.gz"*)
+    output=""
+    while [ "\$#" -gt 0 ]; do
+      if [ "\$1" = "-o" ]; then
+        output="\$2"
+        shift 2
+        continue
+      fi
+      shift
+    done
+    printf 'archive' >"\$output"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+
+  cat >"$fake_bin/uname" <<'EOF'
+#!/bin/sh
+case "$1" in
+  -s) printf '%s\n' Linux ;;
+  -m) printf '%s\n' aarch64 ;;
+  *) /usr/bin/uname "$@" ;;
+esac
+EOF
+  chmod +x "$fake_bin/uname"
+
+  cat >"$fake_bin/sha256sum" <<'EOF'
+#!/bin/sh
+printf '%s  %s\n' "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$1"
+EOF
+  chmod +x "$fake_bin/sha256sum"
+
+  cat >"$fake_bin/tar" <<'EOF'
+#!/bin/sh
+target=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-C" ]; then
+    target="$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "$target/bin" "$target/codex-path" "$target/codex-resources"
+printf '#!/bin/sh\nexit 0\n' >"$target/bin/codex"
+printf '#!/bin/sh\nexit 0\n' >"$target/codex-path/rg"
+printf '{}\n' >"$target/codex-package.json"
+EOF
+  chmod +x "$fake_bin/tar"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- runtime install codex
+  assert_status 0
+  [ -L "$tools_home/bin/codex" ] || fail "Expected fallback install to create tool-bin codex symlink"
+  [ -x "$tools_home/codex/packages/standalone/releases/0.139.0-aarch64-unknown-linux-musl/bin/codex" ] || fail "Expected fallback install to extract Codex package under tool home"
+  [ ! -e "$temp_home/home/.codex/packages" ] || fail "Did not expect fallback install to write package cache under user Codex state"
+  assert_contains "Falling back to direct Codex standalone package install."
 }
 
 test_agent_sh_codex_runtime_update_calls_codex_update() {
@@ -1817,25 +2032,30 @@ test_agent_sh_codex_runtime_update_calls_codex_update() {
 
   local temp_home
   local fake_bin
+  local tools_home
   local update_log
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
   update_log="$temp_home/update.log"
-  mkdir -p "$fake_bin"
+  mkdir -p "$fake_bin" "$tools_home/bin"
 
-  cat >"$fake_bin/codex" <<EOF
+  cat >"$tools_home/bin/codex" <<EOF
 #!/bin/sh
-printf '%s\n' "\$*" >"$update_log"
+printf 'CODEX_HOME=%s\nCODEX_INSTALL_DIR=%s\nPATH=%s\nARGS=%s\n' "\$CODEX_HOME" "\$CODEX_INSTALL_DIR" "\$PATH" "\$*" >"$update_log"
 exit 0
 EOF
-  chmod +x "$fake_bin/codex"
+  chmod +x "$tools_home/bin/codex"
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
     -- runtime update codex
   assert_status 0
-  grep -Fxq 'update' "$update_log" || fail "Expected codex update to be invoked"
+  grep -Fxq "CODEX_HOME=$tools_home/codex" "$update_log" || fail "Expected codex update to use tool CODEX_HOME"
+  grep -Fxq "CODEX_INSTALL_DIR=$tools_home/bin" "$update_log" || fail "Expected codex update to use tool install dir"
+  grep -Fxq 'ARGS=update' "$update_log" || fail "Expected codex update to be invoked"
 }
 
 test_agent_sh_claude_runtime_reset_config_restores_settings() {
@@ -1970,7 +2190,7 @@ test_agent_sh_codex_run_defaults_to_workdir_cd() {
 
   cat >"$fake_bin/codex" <<EOF
 #!/bin/sh
-printf '%s\n' "\$*" >"$run_log"
+printf 'CODEX_HOME=%s\nARGS=%s\n' "\$CODEX_HOME" "\$*" >"$run_log"
 exit 0
 EOF
   chmod +x "$fake_bin/codex"
@@ -1980,7 +2200,61 @@ EOF
     AGENTCTL_RUN_MODE=online \
     -- run
   assert_status 0
-  grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected codex run to include --cd /workdir"
+  grep -Fxq "CODEX_HOME=$temp_home/home/.codex" "$run_log" || fail "Expected codex run to use user CODEX_HOME"
+  grep -Fq -- 'ARGS=--cd /workdir' "$run_log" || fail "Expected codex run to include --cd /workdir"
+}
+
+test_agent_sh_codex_run_repairs_broken_bundled_rg() {
+  begin_test "agent.sh codex run repairs broken bundled ripgrep"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local run_log
+  local bundled_rg
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  run_log="$temp_home/codex-run.log"
+  bundled_rg="$tools_home/codex/packages/standalone/current/codex-path/rg"
+  mkdir -p "$fake_bin" "$(dirname "$bundled_rg")"
+
+  cat >"$fake_bin/codex" <<EOF
+#!/bin/sh
+printf 'CODEX_HOME=%s\nARGS=%s\n' "\$CODEX_HOME" "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  cat >"$fake_bin/rg" <<'EOF'
+#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' 'ripgrep 15.1.0'; exit 0 ;;
+esac
+exit 0
+EOF
+  chmod +x "$fake_bin/rg"
+
+  cat >"$bundled_rg" <<'EOF'
+#!/bin/sh
+exit 127
+EOF
+  chmod +x "$bundled_rg"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    AGENTCTL_RUN_MODE=online \
+    -- run
+  assert_status 0
+  [ -L "$bundled_rg" ] || fail "Expected broken bundled rg to be replaced with a symlink"
+  case "$(readlink "$bundled_rg")" in
+    "$tools_home"/*) fail "Expected bundled rg to point outside tool home" ;;
+  esac
+  "$bundled_rg" --version >/dev/null 2>&1 || fail "Expected repaired bundled rg to execute"
+  grep -Fxq "CODEX_HOME=$temp_home/home/.codex" "$run_log" || fail "Expected codex run to continue after rg repair"
+  assert_contains "Repaired Codex bundled ripgrep:"
 }
 
 test_agent_sh_codex_run_uses_runtime_profile_config() {
@@ -3261,9 +3535,11 @@ test_agent_sh_state_export_includes_known_user_state() {
 
   mkdir -p \
     "$temp_home/home/.codex" \
+    "$temp_home/home/.codex/packages/standalone/current/bin" \
     "$temp_home/home/.config/agentctl" \
     "$temp_home/home/.claude"
   printf '%s' 'codex-auth' >"$temp_home/home/.codex/auth.json"
+  printf '%s' 'codex-binary' >"$temp_home/home/.codex/packages/standalone/current/bin/codex"
   printf '%s' 'claude' >"$temp_home/home/.config/agentctl/preferred-runtime"
   printf '%s' '{"claudeAiOauth":{"accessToken":"a","refreshToken":"b","expiresAt":1}}' >"$temp_home/home/.claude/.credentials.json"
   printf '%s' '{"hasCompletedOnboarding":true}' >"$temp_home/home/.claude.json"
@@ -3282,6 +3558,9 @@ test_agent_sh_state_export_includes_known_user_state() {
     /bin/bash "$TEST_ROOT/agent.sh" state export >"$tar_file"
 
   tar -tf "$tar_file" | grep -Fx '.codex/auth.json' >/dev/null || fail "Expected .codex/auth.json in exported state"
+  if tar -tf "$tar_file" | grep -Fqx '.codex/packages/standalone/current/bin/codex'; then
+    fail "Did not expect Codex package artifacts in legacy exported state"
+  fi
   tar -tf "$tar_file" | grep -Fx '.config/agentctl/preferred-runtime' >/dev/null || fail "Expected preferred runtime in exported state"
   tar -tf "$tar_file" | grep -Fx '.claude/.credentials.json' >/dev/null || fail "Expected Claude credentials in exported state"
   tar -tf "$tar_file" | grep -Fx '.claude.json' >/dev/null || fail "Expected Claude home state in exported state"
@@ -3334,6 +3613,128 @@ test_agent_sh_state_export_uses_installed_runtime_hooks() {
   fi
   if tar -tf "$tar_file" | grep -Fqx '.claude.json'; then
     fail "Did not expect Claude home state to be exported when only Codex is installed"
+  fi
+}
+
+test_backup_codex_config_from_export_excludes_codex_packages() {
+  begin_test "export fallback backup excludes Codex package cache"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local export_file
+  local backup_file
+  local extract_root
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-fallback-export.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  export_file="$temp_dir/rootfs.tar"
+  backup_file="$temp_dir/state.tar"
+  extract_root="$temp_dir/extracted"
+  : >"$export_file"
+
+  extract_export_root() {
+    local extract_root="$2"
+    mkdir -p \
+      "$extract_root/home/coder/.codex/packages/standalone/current/bin" \
+      "$extract_root/home/coder/.codex/sessions" \
+      "$extract_root/home/coder/.config/agentctl" \
+      "$extract_root/opt/agentctl/codex"
+    printf '%s' 'token' >"$extract_root/home/coder/.codex/auth.json"
+    printf '%s' 'session' >"$extract_root/home/coder/.codex/sessions/session.jsonl"
+    printf '%s' 'binary-cache' >"$extract_root/home/coder/.codex/packages/standalone/current/bin/codex"
+    printf '%s' 'codex' >"$extract_root/home/coder/.config/agentctl/preferred-runtime"
+    printf '%s' 'tool-cache' >"$extract_root/opt/agentctl/codex/package"
+  }
+
+  run_capture backup_codex_config_from_export "$export_file" "$backup_file" "$extract_root"
+  assert_status 0
+
+  tar -tf "$backup_file" | grep -Fx '.codex/auth.json' >/dev/null || fail "Expected Codex auth in export fallback backup"
+  tar -tf "$backup_file" | grep -Fx '.codex/sessions/session.jsonl' >/dev/null || fail "Expected Codex sessions in export fallback backup"
+  tar -tf "$backup_file" | grep -Fx '.config/agentctl/preferred-runtime' >/dev/null || fail "Expected agentctl state in export fallback backup"
+  if tar -tf "$backup_file" | grep -Eq '^\.codex/packages(/|$)|^opt/agentctl(/|$)'; then
+    tar -tf "$backup_file" >&2
+    fail "Did not expect Codex packages or tool home in export fallback backup"
+  fi
+}
+
+test_backup_known_state_from_container_excludes_codex_packages() {
+  begin_test "legacy container backup excludes Codex package cache"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local fake_home
+  local fake_bin
+  local backup_file
+  local old_container_cmd
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-known-state.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  fake_home="$temp_dir/home/coder"
+  fake_bin="$temp_dir/bin"
+  backup_file="$temp_dir/state.tar"
+  mkdir -p \
+    "$fake_home/.codex/packages/standalone/current/bin" \
+    "$fake_home/.codex/sessions" \
+    "$fake_home/.config/agentctl" \
+    "$temp_dir/opt/agentctl/codex" \
+    "$fake_bin"
+  printf '%s' 'token' >"$fake_home/.codex/auth.json"
+  printf '%s' 'session' >"$fake_home/.codex/sessions/session.jsonl"
+  printf '%s' 'binary-cache' >"$fake_home/.codex/packages/standalone/current/bin/codex"
+  printf '%s' 'codex' >"$fake_home/.config/agentctl/preferred-runtime"
+  printf '%s' 'tool-cache' >"$temp_dir/opt/agentctl/codex/package"
+
+  cat >"$fake_bin/container" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "$1" != "exec" ]; then
+  printf 'unexpected container command: %s\n' "$*" >&2
+  exit 2
+fi
+shift
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i)
+      shift
+      ;;
+    unit-test-container)
+      shift
+      ;;
+    --inh-caps=*|--ambient-caps=*|--no-new-privs)
+      shift
+      ;;
+    sh)
+      shift
+      [ "${1:-}" = "-lc" ] || exit 2
+      shift
+      script="${1:-}"
+      script="${script//\/home\/coder/$FAKE_CONTAINER_HOME}"
+      exec sh -lc "$script"
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+EOF
+  chmod +x "$fake_bin/container"
+
+  old_container_cmd="$CONTAINER_CMD"
+  CONTAINER_CMD="$fake_bin/container"
+  FAKE_CONTAINER_HOME="$fake_home"
+  export FAKE_CONTAINER_HOME
+
+  run_capture backup_known_state_from_container unit-test-container "$backup_file"
+  assert_status 0
+  CONTAINER_CMD="$old_container_cmd"
+
+  tar -tf "$backup_file" | grep -Fx '.codex/auth.json' >/dev/null || fail "Expected Codex auth in legacy backup"
+  tar -tf "$backup_file" | grep -Fx '.codex/sessions/session.jsonl' >/dev/null || fail "Expected Codex sessions in legacy backup"
+  tar -tf "$backup_file" | grep -Fx '.config/agentctl/preferred-runtime' >/dev/null || fail "Expected agentctl state in legacy backup"
+  if tar -tf "$backup_file" | grep -Eq '^\.codex/packages(/|$)|^opt/agentctl(/|$)'; then
+    tar -tf "$backup_file" >&2
+    fail "Did not expect Codex packages or tool home in legacy backup"
   fi
 }
 
@@ -6782,14 +7183,7 @@ test_refresh_container_tree_suppresses_host_xattrs() {
   container() {
     case "$1" in
       exec)
-        shift
-        while [ "$#" -gt 0 ]; do
-          if [ "$1" = "-i" ]; then
-            cat >/dev/null || true
-            break
-          fi
-          shift
-        done
+        return 0
         ;;
       *)
         fail "Unexpected container invocation: $*"
@@ -7297,6 +7691,7 @@ main() {
   run_selected_test test_run_config_wires_runtime_config_json "test_run_config_wires_runtime_config_json"
   run_selected_test test_run_help_reports_generic_runtime_config "test_run_help_reports_generic_runtime_config"
   run_selected_test test_run_help_reports_runtime_options "test_run_help_reports_runtime_options"
+  run_selected_test test_run_cmd_wires_home_mount "test_run_cmd_wires_home_mount"
   run_selected_test test_doctor_help_reports_fix_option "test_doctor_help_reports_fix_option"
   run_selected_test test_rescue_help_reports_backup_image_options "test_rescue_help_reports_backup_image_options"
   run_selected_test test_run_model_wires_selected_model "test_run_model_wires_selected_model"
@@ -7308,7 +7703,7 @@ main() {
   run_selected_test test_build_cmd_rebuilds_and_snapshots_local_dependencies "test_build_cmd_rebuilds_and_snapshots_local_dependencies"
   run_selected_test test_build_cmd_snapshots_existing_image_when_timestamp_missing "test_build_cmd_snapshots_existing_image_when_timestamp_missing"
   run_selected_test test_build_cmd_skips_existing_image_when_timestamp_matches "test_build_cmd_skips_existing_image_when_timestamp_matches"
-  run_selected_test test_run_cmd_runtime_selection_auto_installs_for_new_container "test_run_cmd_runtime_selection_auto_installs_for_new_container"
+  run_selected_test test_run_cmd_runtime_selection_does_not_auto_install_for_new_container "test_run_cmd_runtime_selection_does_not_auto_install_for_new_container"
   run_selected_test test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container "test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container"
   run_selected_test test_build_cmd_warns_for_legacy_office_image "test_build_cmd_warns_for_legacy_office_image"
   run_selected_test test_build_cmd_rejects_runtime_override_snapshot_combo "test_build_cmd_rejects_runtime_override_snapshot_combo"
@@ -7325,6 +7720,7 @@ main() {
   run_selected_test test_run_pre_exec_runs_local_model_preflight_for_preferred_codex "test_run_pre_exec_runs_local_model_preflight_for_preferred_codex"
   run_selected_test test_run_cmd_default_entrypoint_enables_local_runtime_preflight "test_run_cmd_default_entrypoint_enables_local_runtime_preflight"
   run_selected_test test_sync_runtime_auth_to_container_if_available_skips_missing_keychain "test_sync_runtime_auth_to_container_if_available_skips_missing_keychain"
+  run_selected_test test_exec_cmd_no_tty_omits_interactive_flags "test_exec_cmd_no_tty_omits_interactive_flags"
   run_selected_test test_auth_cmd_warns_for_legacy_office_image "test_auth_cmd_warns_for_legacy_office_image"
   run_selected_test test_feature_cmd_installs_via_root_helper "test_feature_cmd_installs_via_root_helper"
   run_selected_test test_runtime_cmd_install_uses_user_helper "test_runtime_cmd_install_uses_user_helper"
@@ -7351,6 +7747,7 @@ main() {
   run_selected_test test_agent_sh_feature_info_reports_installed_after_office_install "test_agent_sh_feature_info_reports_installed_after_office_install"
   run_selected_test test_agent_sh_runtime_list_reports_installed_runtimes_only "test_agent_sh_runtime_list_reports_installed_runtimes_only"
   run_selected_test test_agent_sh_runtime_list_ignores_dangling_runtime_launcher "test_agent_sh_runtime_list_ignores_dangling_runtime_launcher"
+  run_selected_test test_agent_sh_runtime_info_prefers_tool_bin_over_user_path "test_agent_sh_runtime_info_prefers_tool_bin_over_user_path"
   run_selected_test test_agent_sh_runtime_capabilities_reports_manifest_commands "test_agent_sh_runtime_capabilities_reports_manifest_commands"
   run_selected_test test_agent_sh_claude_runtime_info_reports_skeleton_metadata "test_agent_sh_claude_runtime_info_reports_skeleton_metadata"
   run_selected_test test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state "test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state"
@@ -7359,10 +7756,12 @@ main() {
   run_selected_test test_agent_sh_claude_runtime_install_runs_native_installer "test_agent_sh_claude_runtime_install_runs_native_installer"
   run_selected_test test_agent_sh_claude_runtime_update_calls_claude_update "test_agent_sh_claude_runtime_update_calls_claude_update"
   run_selected_test test_agent_sh_codex_runtime_install_runs_standalone_installer "test_agent_sh_codex_runtime_install_runs_standalone_installer"
+  run_selected_test test_agent_sh_codex_runtime_install_falls_back_to_direct_package "test_agent_sh_codex_runtime_install_falls_back_to_direct_package"
   run_selected_test test_agent_sh_codex_runtime_update_calls_codex_update "test_agent_sh_codex_runtime_update_calls_codex_update"
   run_selected_test test_agent_sh_claude_runtime_reset_config_restores_settings "test_agent_sh_claude_runtime_reset_config_restores_settings"
   run_selected_test test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration "test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration"
   run_selected_test test_agent_sh_codex_run_defaults_to_workdir_cd "test_agent_sh_codex_run_defaults_to_workdir_cd"
+  run_selected_test test_agent_sh_codex_run_repairs_broken_bundled_rg "test_agent_sh_codex_run_repairs_broken_bundled_rg"
   run_selected_test test_agent_sh_codex_run_uses_runtime_profile_config "test_agent_sh_codex_run_uses_runtime_profile_config"
   run_selected_test test_agent_sh_accepts_explicit_empty_runtime_config_json "test_agent_sh_accepts_explicit_empty_runtime_config_json"
   run_selected_test test_agent_sh_codex_run_uses_model_override "test_agent_sh_codex_run_uses_model_override"
@@ -7396,6 +7795,8 @@ main() {
   run_selected_test test_agent_sh_claude_auth_write_rejects_invalid_payload "test_agent_sh_claude_auth_write_rejects_invalid_payload"
   run_selected_test test_agent_sh_state_export_includes_known_user_state "test_agent_sh_state_export_includes_known_user_state"
   run_selected_test test_agent_sh_state_export_uses_installed_runtime_hooks "test_agent_sh_state_export_uses_installed_runtime_hooks"
+  run_selected_test test_backup_codex_config_from_export_excludes_codex_packages "test_backup_codex_config_from_export_excludes_codex_packages"
+  run_selected_test test_backup_known_state_from_container_excludes_codex_packages "test_backup_known_state_from_container_excludes_codex_packages"
   run_selected_test test_agent_sh_state_import_restores_known_user_state "test_agent_sh_state_import_restores_known_user_state"
   run_selected_test test_agent_sh_state_import_uses_installed_runtime_hooks "test_agent_sh_state_import_uses_installed_runtime_hooks"
   run_selected_test test_agent_sh_state_import_preserves_image_owned_codex_packages "test_agent_sh_state_import_preserves_image_owned_codex_packages"

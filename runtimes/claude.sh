@@ -72,6 +72,26 @@ claude_verify_alpine_dependencies() {
   fi
 }
 
+claude_link_tool_launcher() {
+  local command_name="claude"
+  local tools_bin=""
+  local tool_home=""
+  local candidate=""
+
+  tools_bin="$(agent_tools_bin_dir)"
+  tool_home="$(runtime_tool_home claude)"
+  mkdir -p "$tools_bin"
+  for candidate in \
+    "$tool_home/.local/bin/$command_name" \
+    "$tool_home/bin/$command_name"; do
+    if [ -x "$candidate" ]; then
+      ln -sf "$candidate" "$tools_bin/$command_name"
+      return 0
+    fi
+  done
+  return 1
+}
+
 claude_auth_payload_valid() {
   jq -e '
     type == "object" and
@@ -160,11 +180,23 @@ agent_runtime_run() {
 
 agent_runtime_install() {
   local runtime="$1"
+  local install_home=""
+  local install_dir=""
 
   [ "$runtime" = "claude" ] || die "unsupported runtime adapter: $runtime"
   claude_verify_alpine_dependencies
-  curl -fsSL https://claude.ai/install.sh | bash
-  claude_command_path >/dev/null 2>&1 || die "claude installer finished but launcher was not found on PATH or in ~/.local/bin"
+  install_home="$(runtime_tool_home "$runtime")"
+  install_dir="$(agent_tools_bin_dir)"
+  mkdir -p "$install_home" "$install_dir"
+  curl -fsSL https://claude.ai/install.sh | \
+    HOME="$install_home" \
+    PATH="$install_dir:$PATH" \
+    bash
+  claude_link_tool_launcher || true
+  claude_command_path >/dev/null 2>&1 || die "claude installer finished but launcher was not found in $(agent_tools_bin_dir) or legacy user bin dirs"
+  case "$(claude_command_path)" in
+    "$HOME"/*) die "claude installer placed launcher under user home; expected tool-owned launcher outside /home/coder" ;;
+  esac
   agent_runtime_reset_config "$runtime" "$(runtime_default_config_dir "$runtime")"
   if [ "${AGENTCTL_SKIP_PREFERRED_SET:-0}" != "1" ]; then
     preferred_set "$runtime"
@@ -173,9 +205,18 @@ agent_runtime_install() {
 
 agent_runtime_update() {
   local runtime="$1"
+  local install_home=""
+  local install_dir=""
+  local claude_command=""
 
   [ "$runtime" = "claude" ] || die "unsupported runtime adapter: $runtime"
-  "$(claude_command_path)" update
+  install_home="$(runtime_tool_home "$runtime")"
+  install_dir="$(agent_tools_bin_dir)"
+  claude_command="$(claude_command_path)"
+  HOME="$install_home" \
+    PATH="$install_dir:$PATH" \
+    "$claude_command" update
+  claude_link_tool_launcher || true
 }
 
 agent_runtime_reset_config() {

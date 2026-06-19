@@ -46,14 +46,16 @@ RUN printf '%s\n' \
 RUN groupadd coder \
  && useradd -m -g coder -d /home/coder -s /bin/bash coder \
  && mkdir -p /home/coder/.codex /workdir \
- && chown -R coder:coder /home/coder /workdir
+      /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude \
+ && chown -R coder:coder /home/coder /workdir /opt/agentctl
 
 # Make sure HOME is correct for subsequent RUNs when we switch user
 ENV HOME=/home/coder \
     IMAGE_NAME=agent-swift \
+    AGENTCTL_TOOLS_HOME=/opt/agentctl \
     SWIFTLY_HOME_DIR=/home/coder/.swiftly \
     SWIFTLY_BIN_DIR=/home/coder/.local/bin \
-    PATH=/home/coder/.local/bin:$PATH
+    PATH=/opt/agentctl/bin:/home/coder/.local/bin:$PATH
 
 # Copy Codex default configuration, profiles, and local model metadata config
 COPY --chown=coder:coder config.toml gpt-oss.config.toml gemma.config.toml qwen.config.toml local_models.json /home/coder/.codex/

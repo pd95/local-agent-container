@@ -1,5 +1,160 @@
 CODEX_DEFAULT_PROFILE="${AGENTCTL_CODEX_PROFILE:-gpt-oss}"
 
+codex_normalize_release() {
+  case "$1" in
+    ""|latest) printf '%s\n' latest ;;
+    rust-v*) printf '%s\n' "${1#rust-v}" ;;
+    v*) printf '%s\n' "${1#v}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+codex_resolve_release() {
+  local release=""
+  local release_json=""
+  local resolved=""
+
+  release="$(codex_normalize_release "${CODEX_RELEASE:-latest}")"
+  if [ "$release" != "latest" ]; then
+    printf '%s\n' "$release"
+    return 0
+  fi
+  release_json="$(curl -fsSL https://api.github.com/repos/openai/codex/releases/latest)"
+  resolved="$(printf '%s\n' "$release_json" | sed -n 's/.*"tag_name":[[:space:]]*"rust-v\([^"]*\)".*/\1/p' | head -n 1)"
+  [ -n "$resolved" ] || die "Failed to resolve the latest Codex release version"
+  printf '%s\n' "$resolved"
+}
+
+codex_vendor_target() {
+  local os=""
+  local arch=""
+
+  os="$(uname -s)"
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) arch="x86_64" ;;
+    arm64|aarch64) arch="aarch64" ;;
+    *) die "Unsupported architecture for Codex install: $(uname -m)" ;;
+  esac
+
+  case "$os:$arch" in
+    Linux:aarch64) printf '%s\n' "aarch64-unknown-linux-musl" ;;
+    Linux:x86_64) printf '%s\n' "x86_64-unknown-linux-musl" ;;
+    Darwin:aarch64) printf '%s\n' "aarch64-apple-darwin" ;;
+    Darwin:x86_64) printf '%s\n' "x86_64-apple-darwin" ;;
+    *) die "Unsupported OS for Codex install: $os" ;;
+  esac
+}
+
+codex_file_sha256() {
+  local path="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+    return 0
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+    return 0
+  fi
+  die "sha256sum or shasum is required to verify Codex downloads"
+}
+
+codex_install_standalone_package_direct() {
+  local install_home="$1"
+  local install_dir="$2"
+  local version=""
+  local target=""
+  local asset=""
+  local base_url=""
+  local tmp_dir=""
+  local archive_path=""
+  local checksum_path=""
+  local expected_digest=""
+  local actual_digest=""
+  local release_name=""
+  local release_dir=""
+  local releases_dir=""
+  local standalone_root=""
+  local stage_release=""
+
+  version="$(codex_resolve_release)"
+  target="$(codex_vendor_target)"
+  asset="codex-package-${target}.tar.gz"
+  base_url="https://github.com/openai/codex/releases/download/rust-v${version}"
+  tmp_dir="$(mktemp -d)"
+  archive_path="$tmp_dir/$asset"
+  checksum_path="$tmp_dir/codex-package_SHA256SUMS"
+  standalone_root="$install_home/packages/standalone"
+  releases_dir="$standalone_root/releases"
+  release_name="${version}-${target}"
+  release_dir="$releases_dir/$release_name"
+  stage_release="$releases_dir/.staging.$release_name.$$"
+
+  trap 'rm -rf "${tmp_dir:-}" "${stage_release:-}"' RETURN
+  mkdir -p "$releases_dir" "$install_dir"
+  curl -fsSL "$base_url/codex-package_SHA256SUMS" -o "$checksum_path"
+  expected_digest="$(awk -v asset="$asset" '$2 == asset && $1 ~ /^[0-9a-fA-F]{64}$/ { print tolower($1); found = 1; exit } END { if (!found) exit 1 }' "$checksum_path" 2>/dev/null || true)"
+  [ -n "$expected_digest" ] || die "Could not find SHA-256 digest for $asset in codex-package_SHA256SUMS"
+  curl -fsSL "$base_url/$asset" -o "$archive_path"
+  actual_digest="$(codex_file_sha256 "$archive_path")"
+  [ "$actual_digest" = "$expected_digest" ] || die "Downloaded Codex archive checksum did not match expected digest"
+
+  rm -rf "$stage_release"
+  mkdir -p "$stage_release"
+  tar -xzf "$archive_path" -C "$stage_release"
+  chmod 0755 "$stage_release/bin/codex" "$stage_release/codex-path/rg"
+  if [ -f "$stage_release/codex-resources/bwrap" ]; then
+    chmod 0755 "$stage_release/codex-resources/bwrap"
+  fi
+  ln -sf "bin/codex" "$stage_release/codex"
+  rm -rf "$release_dir"
+  mv "$stage_release" "$release_dir"
+  ln -sfn "$release_dir" "$standalone_root/current"
+  ln -sfn "$standalone_root/current/bin/codex" "$install_dir/codex"
+  rm -rf "$tmp_dir"
+  trap - RETURN
+}
+
+codex_working_system_rg() {
+  local install_home="$1"
+  local candidate=""
+
+  for candidate in /usr/bin/rg /bin/rg "$(command -v rg 2>/dev/null || true)"; do
+    [ -n "$candidate" ] || continue
+    case "$candidate" in
+      "$install_home"/*) continue ;;
+    esac
+    [ -x "$candidate" ] || continue
+    "$candidate" --version >/dev/null 2>&1 || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+codex_repair_bundled_rg() {
+  local install_home="$1"
+  local bundled_rg=""
+  local bundled_rg_dir=""
+  local system_rg=""
+
+  bundled_rg="$install_home/packages/standalone/current/codex-path/rg"
+  bundled_rg_dir="$(dirname "$bundled_rg")"
+  [ -d "$bundled_rg_dir" ] || return 0
+  if [ -e "$bundled_rg" ] && "$bundled_rg" --version >/dev/null 2>&1; then
+    return 0
+  fi
+  system_rg="$(codex_working_system_rg "$install_home" || true)"
+  if [ -z "$system_rg" ]; then
+    printf 'Warning: Codex bundled ripgrep is not executable and no working system rg was found: %s\n' "$bundled_rg" >&2
+    return 0
+  fi
+  rm -f "$bundled_rg"
+  ln -s "$system_rg" "$bundled_rg"
+  printf 'Repaired Codex bundled ripgrep: %s -> %s\n' "$bundled_rg" "$system_rg" >&2
+}
+
 codex_home_dir() {
   printf '%s\n' "${HOME}/.codex"
 }
@@ -550,7 +705,14 @@ agent_runtime_run() {
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   local -a codex_args=()
+  local codex_command=""
+  local install_home=""
   local profile=""
+
+  codex_command="$(runtime_command_path "$runtime")" || die "runtime not installed: $runtime (run: agent.sh runtime install $runtime)"
+  install_home="$(runtime_tool_home "$runtime")"
+  codex_repair_bundled_rg "$install_home"
+  export CODEX_HOME="$(codex_home_dir)"
 
   if [ "$#" -gt 0 ]; then
     codex_args=("$@")
@@ -572,7 +734,7 @@ agent_runtime_run() {
       if [ -n "$profile" ] && ! codex_has_explicit_profile "${codex_args[@]}"; then
         codex_args=(--profile "$profile" "${codex_args[@]}")
       fi
-      exec codex "${codex_args[@]}"
+      exec "$codex_command" "${codex_args[@]}"
       ;;
   esac
   if [ "${#codex_args[@]}" -gt 0 ] && codex_has_explicit_profile "${codex_args[@]}"; then
@@ -581,24 +743,52 @@ agent_runtime_run() {
       profile="${profile:-$CODEX_DEFAULT_PROFILE}"
       codex_prepare_local_ollama_model "$profile" "${codex_args[@]}"
     fi
-    exec codex "${codex_args[@]}"
+    exec "$codex_command" "${codex_args[@]}"
   fi
   profile="${profile:-$(runtime_config_value profile "$CODEX_DEFAULT_PROFILE")}"
   if [ "$RUN_MODE" = "local" ]; then
     codex_prepare_local_ollama_model "$profile" "${codex_args[@]}"
   fi
   if [ "${#codex_args[@]}" -eq 0 ]; then
-    exec codex --profile "$profile"
+    exec "$codex_command" --profile "$profile"
   fi
-  exec codex --profile "$profile" "${codex_args[@]}"
+  exec "$codex_command" --profile "$profile" "${codex_args[@]}"
 }
 
 agent_runtime_install() {
   local runtime="$1"
+  local install_home=""
+  local install_dir=""
+  local install_log=""
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
-  curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh
-  runtime_command_path "$runtime" >/dev/null 2>&1 || die "codex installer finished but launcher was not found on PATH or in ~/.local/bin"
+  install_home="$(runtime_tool_home "$runtime")"
+  install_dir="$(agent_tools_bin_dir)"
+  mkdir -p "$install_home" "$install_dir"
+  install_log="$(mktemp)"
+  if ! {
+    curl -fsSL https://chatgpt.com/codex/install.sh | \
+      CODEX_HOME="$install_home" \
+      CODEX_INSTALL_DIR="$install_dir" \
+      CODEX_NON_INTERACTIVE=1 \
+      PATH="$install_dir:$PATH" \
+      sh
+  } >"$install_log" 2>&1; then
+    if grep -Fq "Could not find Codex package or platform npm release assets" "$install_log"; then
+      cat "$install_log" >&2
+      printf '%s\n' "Falling back to direct Codex standalone package install." >&2
+      codex_install_standalone_package_direct "$install_home" "$install_dir"
+    else
+      cat "$install_log" >&2
+      rm -f "$install_log"
+      return 1
+    fi
+  else
+    cat "$install_log"
+  fi
+  rm -f "$install_log"
+  codex_repair_bundled_rg "$install_home"
+  runtime_command_path "$runtime" >/dev/null 2>&1 || die "codex installer finished but launcher was not found in $(agent_tools_bin_dir) or legacy user bin dirs"
   if [ "${AGENTCTL_SKIP_PREFERRED_SET:-0}" != "1" ]; then
     preferred_set "$runtime"
   fi
@@ -606,9 +796,18 @@ agent_runtime_install() {
 
 agent_runtime_update() {
   local runtime="$1"
+  local install_home=""
+  local install_dir=""
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
-  "$(runtime_command_path "$runtime")" update
+  install_home="$(runtime_tool_home "$runtime")"
+  install_dir="$(agent_tools_bin_dir)"
+  mkdir -p "$install_home" "$install_dir"
+  CODEX_HOME="$install_home" \
+    CODEX_INSTALL_DIR="$install_dir" \
+    PATH="$install_dir:$PATH" \
+    "$(runtime_command_path "$runtime")" update
+  codex_repair_bundled_rg "$install_home"
 }
 
 agent_runtime_reset_config() {
@@ -695,7 +894,9 @@ agent_runtime_auth_write() {
 
 agent_runtime_auth_login() {
   local runtime="$1"
+  local codex_command=""
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
-  exec codex login --device-auth
+  codex_command="$(runtime_command_path "$runtime")" || die "runtime not installed: $runtime (run: agent.sh runtime install $runtime)"
+  CODEX_HOME="$(codex_home_dir)" exec "$codex_command" login --device-auth
 }

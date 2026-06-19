@@ -33,6 +33,29 @@ Run the suite from the repository root on the host:
 bash tests/run-tests.sh
 ```
 
+Focused integration filters are available for narrower validation. The tool-home smoke
+builds or requires `agent-plain`, creates a real container with host directories mounted
+over both `/workdir` and `/home/coder`, then verifies runtime launchers and package
+caches stay under `/opt/agentctl` while user state remains under `/home/coder`:
+
+```bash
+bash tests/run-integration-tests.sh --filter tool-home
+```
+
+This test requires macOS with Apple's `container` CLI. It uses `agentctl run --cmd true`
+to create the container with a long-running internal `sleep infinity` command, then
+starts it again and runs assertions with `agentctl exec --no-tty`. The image's default
+command is not used for this smoke because `agent.sh run` launches a runtime and is not a
+daemon.
+
+To exercise the optional Claude tool-home assertions, rebuild the image with Claude
+included first:
+
+```bash
+./agentctl build --image agent-plain --runtimes codex,claude --rebuild
+bash tests/run-integration-tests.sh --filter tool-home
+```
+
 You can point the harness at another `agentctl` binary or container runtime command:
 
 ```bash
@@ -59,7 +82,7 @@ mounts that subtree. The `--cmd` checks should work even when Ollama is not runn
 the host.
 
 ```bash
-agentctl run --image agent-plain --temp --workdir testing/agent-plain --cmd bash -lc 'zsh --version && bash --version && git --version && rg --version && jq --version && node --version && npm --version && codex --version && test -x ~/.local/bin/codex'
+agentctl run --image agent-plain --temp --workdir testing/agent-plain --cmd bash -lc 'zsh --version && bash --version && git --version && rg --version && jq --version && node --version && npm --version && printf "%s" "$PATH" | grep -q /opt/agentctl/bin && codex_path="$(command -v codex)" && case "$codex_path" in /home/coder/*) exit 1 ;; esac && codex --version'
 agentctl run --image agent-python --temp --workdir testing/agent-python --cmd bash -lc 'zsh --version && which python && python -c "import sys; print(sys.executable)" && node --version && npm --version'
 agentctl run --image agent-swift --temp --workdir testing/agent-swift --cmd bash -lc 'zsh --version && swift --version && swift-format --version && command -v format >/dev/null && command -v lint >/dev/null && node --version && npm --version'
 agentctl run --image agent-office --temp --workdir testing/agent-office --cmd bash -lc 'zsh --version && python -c "import docx, openpyxl, reportlab; print(\"python-ok\")" && node -e "require(\"pptxgenjs\"); console.log(\"node-ok\")"'

@@ -24,16 +24,20 @@ agentctl runtime install codex
 agentctl runtime install claude
 ```
 
-`agentctl run` auto-installs an explicitly selected runtime when it creates a new container:
+Curated image builds install configured runtimes during image creation. Runtime
+install/update commands place launchers and package caches under `/opt/agentctl`
+so mounting external state over `/home/coder` does not hide image-baked tools.
+Runtime config, auth, history, and sessions remain under `/home/coder`.
 
-```bash
-agentctl run --runtime claude
-```
-
-For an existing container, use `--install-runtime` to install before launch:
+To install before launch, opt in explicitly:
 
 ```bash
 agentctl run --runtime claude --install-runtime
+```
+Running a selected runtime does not install it automatically:
+
+```bash
+agentctl run --runtime claude
 ```
 
 ## Select the preferred runtime
