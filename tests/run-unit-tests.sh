@@ -175,6 +175,15 @@ test_run_help_reports_runtime_options() {
   assert_contains "--online        Use the runtime's online/provider-backed mode"
 }
 
+test_exec_help_reports_stdio_option() {
+  begin_test "exec help reports stdio protocol option"
+
+  run_capture "$AGENTCTL" exec --help
+  assert_status 0
+  assert_contains "--stdio      Keep stdin open without a TTY"
+  assert_contains "With --stdio, provide an explicit command after --"
+}
+
 test_run_cmd_wires_home_mount() {
   begin_test "run_cmd wires --home into container creation"
 
@@ -744,6 +753,118 @@ test_exec_cmd_no_tty_omits_interactive_flags() {
   printf '%s\n' "$exec_log" | grep -Fq -- 'unit-test-container' || fail "Expected exec target container, got: $exec_log"
   printf '%s\n' "$exec_log" | grep -Fq -- 'bash' || fail "Expected exec command, got: $exec_log"
   CONTAINER_CMD="$old_container_cmd"
+}
+
+test_exec_cmd_stdio_uses_interactive_without_tty() {
+  begin_test "exec --stdio keeps stdin open without tty flags"
+
+  load_codexctl_functions
+
+  local exec_log=""
+  local old_container_cmd="$CONTAINER_CMD"
+
+  require_container() { return 0; }
+  container_running() { [ "$1" = "unit-test-container" ]; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      exec)
+        shift
+        exec_log="$(printf '%s\n' "$*")"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture exec_cmd --name unit-test-container --stdio -- sh -lc 'printf ok'
+  assert_status 0
+  printf '%s\n' "$exec_log" | grep -Fq -- '--interactive' || fail "Expected --interactive for --stdio exec, got: $exec_log"
+  if printf '%s\n' "$exec_log" | grep -Eq -- '(^|[[:space:]])(-it|-t|--tty)([[:space:]]|$)'; then
+    fail "Did not expect tty flags for --stdio exec, got: $exec_log"
+  fi
+  printf '%s\n' "$exec_log" | grep -Fq -- 'unit-test-container' || fail "Expected exec target container, got: $exec_log"
+  printf '%s\n' "$exec_log" | grep -Fq -- 'sh' || fail "Expected explicit command, got: $exec_log"
+  printf '%s\n' "$exec_log" | grep -Fq -- 'printf ok' || fail "Expected command arguments to be preserved, got: $exec_log"
+  CONTAINER_CMD="$old_container_cmd"
+}
+
+test_exec_cmd_stdio_requires_delimiter_and_command() {
+  begin_test "exec --stdio requires command after delimiter"
+
+  local temp_dir
+  local harness
+  local unit_script
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-stdio-invalid.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  harness="$temp_dir/harness.sh"
+
+  sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
+    -e '/^cmd="${1:-}"/,$d' \
+    "$CODEXCTL" >"$harness"
+
+  unit_script="$temp_dir/no-delimiter.sh"
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$harness"
+require_container() { return 0; }
+container_running() { [ "\$1" = "unit-test-container" ]; }
+exec_cmd --name unit-test-container --stdio sh -lc true
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 1
+  assert_contains "exec --stdio requires an explicit command after --"
+
+  unit_script="$temp_dir/no-command.sh"
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$harness"
+require_container() { return 0; }
+container_running() { [ "\$1" = "unit-test-container" ]; }
+exec_cmd --name unit-test-container --stdio --
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 1
+  assert_contains "Missing command after --"
+}
+
+test_exec_cmd_stdio_requires_running_container() {
+  begin_test "exec --stdio requires running container"
+
+  local temp_dir
+  local harness
+  local unit_script
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-stdio-stopped.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  harness="$temp_dir/harness.sh"
+
+  sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
+    -e '/^cmd="${1:-}"/,$d' \
+    "$CODEXCTL" >"$harness"
+
+  unit_script="$temp_dir/stopped.sh"
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$harness"
+require_container() { return 0; }
+container_running() { return 1; }
+exec_cmd --name stopped-container --stdio -- cat
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 1
+  assert_contains "Container not running: stopped-container"
 }
 
 test_run_pre_exec_updates_codex_via_runtime_helper() {
@@ -7691,6 +7812,7 @@ main() {
   run_selected_test test_run_config_wires_runtime_config_json "test_run_config_wires_runtime_config_json"
   run_selected_test test_run_help_reports_generic_runtime_config "test_run_help_reports_generic_runtime_config"
   run_selected_test test_run_help_reports_runtime_options "test_run_help_reports_runtime_options"
+  run_selected_test test_exec_help_reports_stdio_option "test_exec_help_reports_stdio_option"
   run_selected_test test_run_cmd_wires_home_mount "test_run_cmd_wires_home_mount"
   run_selected_test test_doctor_help_reports_fix_option "test_doctor_help_reports_fix_option"
   run_selected_test test_rescue_help_reports_backup_image_options "test_rescue_help_reports_backup_image_options"
@@ -7721,6 +7843,9 @@ main() {
   run_selected_test test_run_cmd_default_entrypoint_enables_local_runtime_preflight "test_run_cmd_default_entrypoint_enables_local_runtime_preflight"
   run_selected_test test_sync_runtime_auth_to_container_if_available_skips_missing_keychain "test_sync_runtime_auth_to_container_if_available_skips_missing_keychain"
   run_selected_test test_exec_cmd_no_tty_omits_interactive_flags "test_exec_cmd_no_tty_omits_interactive_flags"
+  run_selected_test test_exec_cmd_stdio_uses_interactive_without_tty "test_exec_cmd_stdio_uses_interactive_without_tty"
+  run_selected_test test_exec_cmd_stdio_requires_delimiter_and_command "test_exec_cmd_stdio_requires_delimiter_and_command"
+  run_selected_test test_exec_cmd_stdio_requires_running_container "test_exec_cmd_stdio_requires_running_container"
   run_selected_test test_auth_cmd_warns_for_legacy_office_image "test_auth_cmd_warns_for_legacy_office_image"
   run_selected_test test_feature_cmd_installs_via_root_helper "test_feature_cmd_installs_via_root_helper"
   run_selected_test test_runtime_cmd_install_uses_user_helper "test_runtime_cmd_install_uses_user_helper"

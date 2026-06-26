@@ -915,8 +915,10 @@ Usage: $CLI_NAME exec [options] [command...]
 Options:
   --name NAME  Container name (default: agent-<dir>)
   --no-tty     Do not allocate a TTY, for scripted commands
+  --stdio      Keep stdin open without a TTY, for stdio protocols such as ACP or MCP
 
 If no command is provided, exec runs the default shell.
+With --stdio, provide an explicit command after --.
 EOF
 }
 
@@ -5688,13 +5690,16 @@ exec_cmd() {
   local name=""
   local cmd=()
   local tty=1
+  local stdio=0
+  local saw_command_delimiter=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
       --no-tty) tty=0; shift ;;
+      --stdio) stdio=1; tty=0; shift ;;
       --help) usage_exec; return 0 ;;
-      --) shift; cmd=("$@"); break ;;
+      --) saw_command_delimiter=1; shift; cmd=("$@"); break ;;
       --*) die "Unknown option for exec: $1" ;;
       *) cmd=("$@"); break ;;
     esac
@@ -5706,10 +5711,13 @@ exec_cmd() {
     name="$(default_name "$DEFAULT_NAME_PREFIX")"
   fi
 
-  if [ "${#cmd[@]}" -eq 0 ]; then
+  if [ "$stdio" -eq 1 ]; then
+    [ "$saw_command_delimiter" -eq 1 ] || die "exec --stdio requires an explicit command after --"
+    [ "${#cmd[@]}" -gt 0 ] || die "Missing command after --"
+  elif [ "${#cmd[@]}" -eq 0 ]; then
     cmd=("$DEFAULT_LOGIN_SHELL" "-l")
   fi
-  if [ "${#cmd[@]}" -eq 1 ]; then
+  if [ "$stdio" -eq 0 ] && [ "${#cmd[@]}" -eq 1 ]; then
     case "${cmd[0]}" in
       *[[:space:]]*) cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "${cmd[0]}") ;;
     esac
@@ -5719,7 +5727,9 @@ exec_cmd() {
     die "Container not running: $name"
   fi
 
-  if [ "$tty" -eq 1 ]; then
+  if [ "$stdio" -eq 1 ]; then
+    "$CONTAINER_CMD" exec --interactive "$name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"
+  elif [ "$tty" -eq 1 ]; then
     "$CONTAINER_CMD" exec -it "$name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"
   else
     "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"

@@ -159,6 +159,16 @@ agentctl runtime install claude
 agentctl runtime use claude
 ```
 
+Run stdio-based protocol servers inside an already-running container:
+
+```bash
+# ACP agent runtime for tools such as Xcode custom agents
+agentctl exec --stdio --name my-agent -- sh -lc 'cd /workdir && npx -y @agentclientprotocol/codex-acp'
+
+# MCP stdio server
+agentctl exec --stdio --name my-agent -- sh -lc 'cd /workdir && node ./my-mcp-server.js'
+```
+
 Use the `office` feature on an `agent-python` container:
 
 ```bash

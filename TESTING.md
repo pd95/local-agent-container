@@ -74,6 +74,59 @@ bash tests/run-unit-tests.sh
 Use the image-specific manual checks below when you need broader smoke coverage,
 interactive Codex validation, or image/toolchain verification that is not yet automated.
 
+## Manual stdio protocol bridge tests
+
+Use these host-side checks when validating `agentctl exec --stdio` for local
+stdio protocols such as ACP or MCP. Start or create a persistent container first:
+
+```bash
+agentctl run --name agent-stdio-smoke --image agent-python --cmd true
+```
+
+Verify stdin/stdout round-trip behavior:
+
+```bash
+printf 'ping\n' | agentctl exec --stdio --name agent-stdio-smoke -- cat
+```
+
+Expected output:
+
+```text
+ping
+```
+
+Verify the command is not attached to a TTY:
+
+```bash
+agentctl exec --stdio --name agent-stdio-smoke -- \
+  sh -lc 'test ! -t 0 && test ! -t 1 && echo no-tty'
+```
+
+Expected output:
+
+```text
+no-tty
+```
+
+Verify newline-delimited JSON-RPC can pass through unchanged:
+
+```bash
+printf '{"jsonrpc":"2.0","id":1,"method":"ping"}\n' | \
+  agentctl exec --stdio --name agent-stdio-smoke -- \
+  node -e 'process.stdin.pipe(process.stdout)'
+```
+
+Expected output:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"ping"}
+```
+
+For an MCP server smoke, start Codex as an MCP stdio server through the bridge
+and initialize it with an MCP client. At minimum, a client should send
+`initialize`, `notifications/initialized`, and `tools/list`; a healthy Codex MCP
+server reports tools such as `codex` and `codex-reply`.
+
 ## Smoke tests
 
 These checks confirm the curated image set is present and the expected tools exist. Run
