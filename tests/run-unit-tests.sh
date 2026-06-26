@@ -2055,6 +2055,18 @@ test_agent_sh_claude_runtime_info_reports_skeleton_metadata() {
   printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "claude" and .installed == false and .install_method == "native-installer" and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.local_mode == true and .capabilities.online_mode == true and (.auth_formats | index("claude_ai_oauth_json") != null) and (.commands | index("runtime install claude") != null) and (.commands | index("auth login claude") != null)' >/dev/null || fail "Expected runtime info JSON for claude runtime, got: $RUN_OUTPUT"
 }
 
+test_agent_sh_opencode_runtime_info_reports_local_only_metadata() {
+  begin_test "agent.sh runtime info reports opencode local-only metadata"
+
+  local temp_home
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+
+  run_agent_sh_capture "$temp_home" runtime info opencode
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "opencode" and .installed == false and .install_method == "npm-prefix" and .default_config_dir == "/etc/opencodectl" and .auth_formats == [] and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == false and .capabilities.auth_read == false and .capabilities.auth_write == false and .capabilities.local_mode == true and .capabilities.online_mode == false and (.commands | index("runtime install opencode") != null)' >/dev/null || fail "Expected runtime info JSON for opencode runtime, got: $RUN_OUTPUT"
+}
+
 test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state() {
   begin_test "agent.sh system manifest includes installed runtimes, features, and preferred runtime state"
 
@@ -2460,6 +2472,93 @@ EOF
   grep -Fxq 'ARGS=update' "$update_log" || fail "Expected codex update to be invoked"
 }
 
+test_agent_sh_opencode_runtime_install_uses_npm_prefix() {
+  begin_test "agent.sh opencode runtime install uses npm prefix and links launcher"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin"
+
+  cat >"$fake_bin/npm" <<EOF
+#!/bin/sh
+printf 'npm %s\n' "\$*" >>"$install_log"
+prefix=""
+while [ "\$#" -gt 0 ]; do
+  if [ "\$1" = "--prefix" ]; then
+    prefix="\$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "\$prefix/node_modules/.bin"
+cat >"\$prefix/node_modules/.bin/opencode" <<'SCRIPT'
+#!/bin/sh
+exit 0
+SCRIPT
+chmod +x "\$prefix/node_modules/.bin/opencode"
+EOF
+  chmod +x "$fake_bin/npm"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- runtime install opencode
+  assert_status 0
+  grep -Fq "npm install --prefix $tools_home/opencode opencode-ai@latest" "$install_log" || fail "Expected OpenCode install to use npm prefix under tool home"
+  [ -L "$tools_home/bin/opencode" ] || fail "Expected OpenCode launcher symlink in tool bin"
+  [ "$(readlink "$tools_home/bin/opencode")" = "$tools_home/opencode/node_modules/.bin/opencode" ] || fail "Expected OpenCode launcher to point at tool home"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- preferred get
+  assert_status 0
+  assert_contains "opencode"
+}
+
+test_agent_sh_opencode_runtime_update_uses_npm_prefix() {
+  begin_test "agent.sh opencode runtime update reinstalls with npm prefix"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin" "$tools_home/opencode/node_modules/.bin"
+  printf '#!/bin/sh\nexit 0\n' >"$tools_home/opencode/node_modules/.bin/opencode"
+  chmod +x "$tools_home/opencode/node_modules/.bin/opencode"
+  ln -s "$tools_home/opencode/node_modules/.bin/opencode" "$tools_home/bin/opencode" 2>/dev/null || {
+    mkdir -p "$tools_home/bin"
+    ln -s "$tools_home/opencode/node_modules/.bin/opencode" "$tools_home/bin/opencode"
+  }
+
+  cat >"$fake_bin/npm" <<EOF
+#!/bin/sh
+printf 'npm %s\n' "\$*" >>"$install_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/npm"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- runtime update opencode
+  assert_status 0
+  grep -Fq "npm install --prefix $tools_home/opencode opencode-ai@latest" "$install_log" || fail "Expected OpenCode update to use npm prefix under tool home"
+}
+
 test_agent_sh_claude_runtime_reset_config_restores_settings() {
   begin_test "agent.sh claude runtime reset-config restores settings"
 
@@ -2576,6 +2675,38 @@ EOF
   jq -er '.models == []' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected Codex local_models.json to reset to image defaults"
   [ -L "$temp_home/home/.codex/AGENTS.md" ] || fail "Expected Codex AGENTS.md to reset to a symlink"
   [ "$(readlink "$temp_home/home/.codex/AGENTS.md")" = "$config_dir/image.md" ] || fail "Expected Codex AGENTS.md to point at image defaults"
+}
+
+test_agent_sh_opencode_runtime_reset_config_writes_ollama_config() {
+  begin_test "agent.sh opencode runtime reset-config writes Ollama provider config"
+
+  local temp_home
+  local fake_bin
+  local config_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  config_file="$temp_home/home/.config/opencode/opencode.json"
+  mkdir -p "$fake_bin" "$(dirname "$config_file")"
+  printf '{"provider":{"custom":{}}}\n' >"$config_file"
+
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- runtime reset-config opencode
+  assert_status 0
+  assert_contains "Warning: resetting OpenCode configuration will replace ~/.config/opencode/opencode.json"
+  jq -er '.model == "ollama/gpt-oss:20b" and .provider.ollama.npm == "@ai-sdk/openai-compatible" and .provider.ollama.options.baseURL == "http://192.168.0.1:11434/v1" and .provider.ollama.options.apiKey == "ollama" and .provider.ollama.models["gpt-oss:20b"].name == "gpt-oss:20b (local)"' "$config_file" >/dev/null || fail "Expected OpenCode reset-config to write Ollama config"
 }
 
 test_agent_sh_codex_run_defaults_to_workdir_cd() {
@@ -3711,6 +3842,122 @@ EOF
   grep -Fq 'ARGS=--model gpt-oss:20b --dangerously-skip-permissions' "$run_log" || fail "Expected Claude runtime config flag to be passed through"
 }
 
+test_agent_sh_opencode_run_uses_local_ollama_defaults() {
+  begin_test "agent.sh opencode run writes default Ollama config and model"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  local config_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/opencode-run.log"
+  config_file="$temp_home/home/.config/opencode/opencode.json"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' opencode >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/opencode" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/opencode"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  grep -Fq 'ARGS=--model ollama/gpt-oss:20b' "$run_log" || fail "Expected OpenCode run to inject the default local model"
+  jq -er '.provider.ollama.options.baseURL == "http://192.168.0.1:11434/v1" and .provider.ollama.models["gpt-oss:20b"].name == "gpt-oss:20b (local)"' "$config_file" >/dev/null || fail "Expected OpenCode run to write default Ollama config"
+}
+
+test_agent_sh_opencode_run_uses_model_override() {
+  begin_test "agent.sh opencode run maps the generic model override to provider/model"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/opencode-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' opencode >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/opencode" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/opencode"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  grep -Fq 'ARGS=--model ollama/qwen3:14b' "$run_log" || fail "Expected OpenCode model override to use provider/model format"
+}
+
+test_agent_sh_opencode_run_respects_explicit_model() {
+  begin_test "agent.sh opencode run keeps an explicit model argument"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/opencode-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' opencode >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/opencode" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/opencode"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0   0  00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run --model custom/model run hello
+  assert_status 0
+  grep -Fq 'ARGS=--model custom/model run hello' "$run_log" || fail "Expected explicit OpenCode model to be preserved"
+}
+
 test_agent_sh_rejects_unknown_runtime() {
   begin_test "agent.sh rejects unknown runtimes predictably"
 
@@ -4015,6 +4262,45 @@ test_agent_sh_state_export_uses_installed_runtime_hooks() {
   fi
   if tar -tf "$tar_file" | grep -Fqx '.claude.json'; then
     fail "Did not expect Claude home state to be exported when only Codex is installed"
+  fi
+}
+
+test_agent_sh_opencode_state_export_uses_runtime_hooks() {
+  begin_test "agent.sh state export includes installed OpenCode state"
+
+  local temp_home
+  local fake_bin
+  local tar_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  tar_file="$temp_home/state.tar"
+  fake_bin="$(make_fake_runtime_bin "$temp_home" opencode)"
+
+  mkdir -p \
+    "$temp_home/home/.config/opencode" \
+    "$temp_home/home/.local/share/opencode" \
+    "$temp_home/home/.config/agentctl" \
+    "$temp_home/home/.codex"
+  printf '%s' '{"provider":{}}' >"$temp_home/home/.config/opencode/opencode.json"
+  printf '%s' 'session' >"$temp_home/home/.local/share/opencode/session.db"
+  printf '%s' 'token' >"$temp_home/home/.codex/auth.json"
+  printf '%s' 'opencode' >"$temp_home/home/.config/agentctl/preferred-runtime"
+
+  env -i \
+    "HOME=$temp_home/home" \
+    "XDG_CONFIG_HOME=$temp_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state export >"$tar_file"
+
+  tar -tf "$tar_file" | grep -Fx '.config/opencode/opencode.json' >/dev/null || fail "Expected OpenCode config in exported state"
+  tar -tf "$tar_file" | grep -Fx '.local/share/opencode/session.db' >/dev/null || fail "Expected OpenCode share state in exported state"
+  tar -tf "$tar_file" | grep -Fx '.config/agentctl/preferred-runtime' >/dev/null || fail "Expected agentctl state in exported state"
+  if tar -tf "$tar_file" | grep -Fqx '.codex/auth.json'; then
+    fail "Did not expect Codex legacy state to be exported when only OpenCode is installed"
   fi
 }
 
@@ -8163,6 +8449,7 @@ main() {
   run_selected_test test_agent_sh_runtime_info_prefers_tool_bin_over_user_path "test_agent_sh_runtime_info_prefers_tool_bin_over_user_path"
   run_selected_test test_agent_sh_runtime_capabilities_reports_manifest_commands "test_agent_sh_runtime_capabilities_reports_manifest_commands"
   run_selected_test test_agent_sh_claude_runtime_info_reports_skeleton_metadata "test_agent_sh_claude_runtime_info_reports_skeleton_metadata"
+  run_selected_test test_agent_sh_opencode_runtime_info_reports_local_only_metadata "test_agent_sh_opencode_runtime_info_reports_local_only_metadata"
   run_selected_test test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state "test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state"
   run_selected_test test_agent_sh_system_manifest_reports_apk_requested_packages "test_agent_sh_system_manifest_reports_apk_requested_packages"
   run_selected_test test_agent_sh_system_manifest_reports_dpkg_requested_packages "test_agent_sh_system_manifest_reports_dpkg_requested_packages"
@@ -8171,8 +8458,11 @@ main() {
   run_selected_test test_agent_sh_codex_runtime_install_runs_standalone_installer "test_agent_sh_codex_runtime_install_runs_standalone_installer"
   run_selected_test test_agent_sh_codex_runtime_install_falls_back_to_direct_package "test_agent_sh_codex_runtime_install_falls_back_to_direct_package"
   run_selected_test test_agent_sh_codex_runtime_update_calls_codex_update "test_agent_sh_codex_runtime_update_calls_codex_update"
+  run_selected_test test_agent_sh_opencode_runtime_install_uses_npm_prefix "test_agent_sh_opencode_runtime_install_uses_npm_prefix"
+  run_selected_test test_agent_sh_opencode_runtime_update_uses_npm_prefix "test_agent_sh_opencode_runtime_update_uses_npm_prefix"
   run_selected_test test_agent_sh_claude_runtime_reset_config_restores_settings "test_agent_sh_claude_runtime_reset_config_restores_settings"
   run_selected_test test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration "test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration"
+  run_selected_test test_agent_sh_opencode_runtime_reset_config_writes_ollama_config "test_agent_sh_opencode_runtime_reset_config_writes_ollama_config"
   run_selected_test test_agent_sh_codex_run_defaults_to_workdir_cd "test_agent_sh_codex_run_defaults_to_workdir_cd"
   run_selected_test test_agent_sh_codex_run_repairs_broken_bundled_rg "test_agent_sh_codex_run_repairs_broken_bundled_rg"
   run_selected_test test_agent_sh_codex_run_uses_runtime_profile_config "test_agent_sh_codex_run_uses_runtime_profile_config"
@@ -8195,6 +8485,9 @@ main() {
   run_selected_test test_agent_sh_claude_run_respects_explicit_model "test_agent_sh_claude_run_respects_explicit_model"
   run_selected_test test_agent_sh_claude_run_uses_model_override "test_agent_sh_claude_run_uses_model_override"
   run_selected_test test_agent_sh_claude_run_uses_runtime_flag_config "test_agent_sh_claude_run_uses_runtime_flag_config"
+  run_selected_test test_agent_sh_opencode_run_uses_local_ollama_defaults "test_agent_sh_opencode_run_uses_local_ollama_defaults"
+  run_selected_test test_agent_sh_opencode_run_uses_model_override "test_agent_sh_opencode_run_uses_model_override"
+  run_selected_test test_agent_sh_opencode_run_respects_explicit_model "test_agent_sh_opencode_run_respects_explicit_model"
   run_selected_test test_agent_sh_rejects_unknown_runtime "test_agent_sh_rejects_unknown_runtime"
   run_selected_test test_agent_sh_preferred_round_trip "test_agent_sh_preferred_round_trip"
   run_selected_test test_agent_sh_preferred_set_as_root_repairs_ownership "test_agent_sh_preferred_set_as_root_repairs_ownership"
@@ -8208,6 +8501,7 @@ main() {
   run_selected_test test_agent_sh_claude_auth_write_rejects_invalid_payload "test_agent_sh_claude_auth_write_rejects_invalid_payload"
   run_selected_test test_agent_sh_state_export_includes_known_user_state "test_agent_sh_state_export_includes_known_user_state"
   run_selected_test test_agent_sh_state_export_uses_installed_runtime_hooks "test_agent_sh_state_export_uses_installed_runtime_hooks"
+  run_selected_test test_agent_sh_opencode_state_export_uses_runtime_hooks "test_agent_sh_opencode_state_export_uses_runtime_hooks"
   run_selected_test test_backup_codex_config_from_export_excludes_codex_packages "test_backup_codex_config_from_export_excludes_codex_packages"
   run_selected_test test_backup_known_state_from_container_excludes_codex_packages "test_backup_known_state_from_container_excludes_codex_packages"
   run_selected_test test_agent_sh_state_import_restores_known_user_state "test_agent_sh_state_import_restores_known_user_state"

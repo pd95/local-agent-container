@@ -5,6 +5,7 @@
 Examples of runtimes currently wired into the runtime contract:
 - `codex`
 - `claude`
+- `opencode`
 
 ## Inspect runtimes
 
@@ -22,6 +23,7 @@ runtime contract.
 ```bash
 agentctl runtime install codex
 agentctl runtime install claude
+agentctl runtime install opencode
 ```
 
 Curated image builds install configured runtimes during image creation. Runtime
@@ -66,15 +68,19 @@ Managed runtime metadata lives at:
 Images can preinstall multiple runtimes:
 
 ```bash
-agentctl build --runtimes codex,claude --default-runtime claude
+agentctl build --runtimes codex,claude,opencode --default-runtime opencode
 ```
 
-That image starts with Claude as the default runtime, but you can later switch
+That image starts with OpenCode as the default runtime, but you can later switch
 back to Codex inside a container with:
 
 ```bash
 agentctl runtime use codex
 ```
+
+OpenCode is wired as a local-first Ollama runtime. It writes a default
+`~/.config/opencode/opencode.json` only when the file is missing or when you run
+`runtime reset-config opencode`.
 
 ## Related docs
 
