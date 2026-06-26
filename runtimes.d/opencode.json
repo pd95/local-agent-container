@@ -1,0 +1,33 @@
+{
+  "id": "opencode",
+  "command": "opencode",
+  "install_method": "npm-prefix",
+  "default_config_dir": "/etc/opencodectl",
+  "capabilities": {
+    "install": true,
+    "update": true,
+    "reset_config": true,
+    "auth_login": false,
+    "auth_read": false,
+    "auth_write": false,
+    "local_mode": true,
+    "online_mode": false
+  },
+  "auth_formats": [],
+  "launch_configs": {},
+  "commands": [
+    "help",
+    "run",
+    "version",
+    "refresh",
+    "runtime list",
+    "preferred get",
+    "preferred set opencode",
+    "runtime info opencode",
+    "runtime capabilities opencode",
+    "runtime install opencode",
+    "runtime update opencode",
+    "runtime reset-config opencode",
+    "system manifest"
+  ]
+}
