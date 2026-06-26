@@ -6,6 +6,8 @@ Examples of runtimes currently wired into the runtime contract:
 - `codex`
 - `claude`
 - `opencode`
+- `qwen`
+- `pi`
 
 ## Inspect runtimes
 
@@ -24,6 +26,8 @@ runtime contract.
 agentctl runtime install codex
 agentctl runtime install claude
 agentctl runtime install opencode
+agentctl runtime install qwen
+agentctl runtime install pi
 ```
 
 Curated image builds install configured runtimes during image creation. Runtime
@@ -68,7 +72,7 @@ Managed runtime metadata lives at:
 Images can preinstall multiple runtimes:
 
 ```bash
-agentctl build --runtimes codex,claude,opencode --default-runtime opencode
+agentctl build --runtimes codex,claude,opencode,qwen,pi --default-runtime opencode
 ```
 
 That image starts with OpenCode as the default runtime, but you can later switch
@@ -81,6 +85,11 @@ agentctl runtime use codex
 OpenCode is wired as a local-first Ollama runtime. It writes a default
 `~/.config/opencode/opencode.json` only when the file is missing or when you run
 `runtime reset-config opencode`.
+
+Qwen Code and Pi are also wired as local-first Ollama runtimes. Qwen writes
+`~/.qwen/settings.json`; Pi writes `~/.pi/agent/models.json`. These files are
+created at runtime when missing so mounted `/home/coder` state can use
+image-baked runtime tools without needing image-baked home config.
 
 ## Related docs
 

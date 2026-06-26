@@ -50,6 +50,28 @@ has_explicit_runtime_model() {
   return 1
 }
 
+runtime_model_arg_value() {
+  local arg
+  local next_is_model=0
+
+  for arg in "$@"; do
+    if [ "$next_is_model" -eq 1 ]; then
+      printf '%s\n' "$arg"
+      return 0
+    fi
+    case "$arg" in
+      -m|--model)
+        next_is_model=1
+        ;;
+      -m=*|--model=*)
+        printf '%s\n' "${arg#*=}"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
 ensure_user_config_dir() {
   mkdir -p "$USER_CONFIG_DIR"
   if [ "$(id -u)" -eq 0 ]; then
@@ -488,6 +510,32 @@ Host-side fixes:
 
 - Proxy localhost with socat (needs \`brew install socat\`):
   socat TCP-LISTEN:${ollama_port},fork,bind=${gateway} TCP:127.0.0.1:${ollama_port}"
+}
+
+ollama_show_model() {
+  local ollama_base_url="$1"
+  local model="$2"
+  local output_file="$3"
+
+  command -v curl >/dev/null 2>&1 || die "Missing curl required for local Ollama model checks"
+  command -v jq >/dev/null 2>&1 || die "Missing jq required for local Ollama model checks"
+  if ! jq -n --arg model "$model" '{model: $model}' \
+    | curl -fsS --max-time 10 \
+      -H 'Content-Type: application/json' \
+      -d @- \
+      "${ollama_base_url%/}/api/show" >"$output_file"; then
+    die "Local Ollama model is not available: $model
+
+Pull it on the host first:
+  ollama pull $model"
+  fi
+}
+
+ollama_require_model() {
+  local ollama_base_url="$1"
+  local model="$2"
+
+  ollama_show_model "$ollama_base_url" "$model" /dev/null
 }
 
 json_runtime_info() {
