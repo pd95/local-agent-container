@@ -745,7 +745,7 @@ Options:
   --model NAME    Override the launch model for the selected runtime
   --online        Use the runtime's online/provider-backed mode
   --auth          Force an online login flow before launch
-  --reset-config  Replace ~/.codex/config.toml, default profiles, and local_models.json from the image and recreate ~/.codex/AGENTS.md as a symlink
+  --reset-config  Replace the selected/preferred runtime's managed default configuration
   --update        Update the Codex CLI in the target container before launch
   --temp          Create a throwaway container (auto-removed after exit)
   --read-only     Mount workdir as read-only (requires new container)
@@ -4944,7 +4944,15 @@ run_container() {
   fi
 
   if [ "$reset_config" -eq 1 ]; then
-    reset_runtime_config_in_container "$actual_name" codex
+    local reset_runtime="${RUN_SELECTED_RUNTIME:-}"
+    if [ -z "$reset_runtime" ]; then
+      reset_runtime="$(run_agent_sh_in_container "$actual_name" preferred get 2>/dev/null || true)"
+    fi
+    reset_runtime="${reset_runtime:-codex}"
+    reset_runtime_config_in_container "$actual_name" "$reset_runtime"
+    if ! run_agent_sh_in_container "$actual_name" preferred set "$reset_runtime"; then
+      warn "Failed to preserve preferred runtime after reset-config: $reset_runtime"
+    fi
   fi
   if [ -n "$pre_exec" ]; then
     if [ "$stdio" -eq 1 ]; then

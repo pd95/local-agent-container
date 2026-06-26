@@ -1128,6 +1128,7 @@ test_run_container_reset_config_uses_runtime_helper() {
 
   local helper_log=""
 
+  RUN_SELECTED_RUNTIME=""
   require_container() { return 0; }
   container_exists() { [ "$1" = "unit-test-container" ]; }
   container_running() { return 0; }
@@ -1144,10 +1145,102 @@ test_run_container_reset_config_uses_runtime_helper() {
   reset_runtime_config_in_container() {
     helper_log="${helper_log}$1:$2"$'\n'
   }
+  run_agent_sh_in_container() {
+    if [ "$2" = "preferred" ] && [ "$3" = "get" ]; then
+      printf '%s\n' codex
+      return 0
+    fi
+    if [ "$2" = "preferred" ] && [ "$3" = "set" ] && [ "$4" = "codex" ]; then
+      helper_log="${helper_log}$1:preferred-set:$4"$'\n'
+      return 0
+    fi
+    fail "Unexpected agent.sh invocation: $*"
+  }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:codex' || fail "Expected runtime reset-config helper call, got: $helper_log"
+  printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:codex' || fail "Expected preferred runtime to be preserved, got: $helper_log"
+}
+
+test_run_container_reset_config_uses_selected_runtime() {
+  begin_test "run_container reset-config uses the selected runtime when provided"
+
+  load_codexctl_functions
+
+  local helper_log=""
+
+  RUN_SELECTED_RUNTIME="opencode"
+  require_container() { return 0; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  validate_mount_mode() { :; }
+  local CONTAINER_CMD=mock_reset_config_container
+  mock_reset_config_container() {
+    case "$1" in
+      start) : ;;
+      stop) : ;;
+      exec) : ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  reset_runtime_config_in_container() {
+    helper_log="${helper_log}$1:$2"$'\n'
+  }
+  run_agent_sh_in_container() {
+    if [ "$2" = "preferred" ] && [ "$3" = "set" ] && [ "$4" = "opencode" ]; then
+      helper_log="${helper_log}$1:preferred-set:$4"$'\n'
+      return 0
+    fi
+    fail "Did not expect preferred runtime lookup when selected runtime is set: $*"
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 true
+  assert_status 0
+  printf '%s' "$helper_log" | grep -Fq $'unit-test-container:opencode' || fail "Expected selected runtime reset-config helper call, got: $helper_log"
+  printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:opencode' || fail "Expected selected runtime to be preserved, got: $helper_log"
+}
+
+test_run_container_reset_config_preserves_preferred_runtime() {
+  begin_test "run_container reset-config preserves the resolved preferred runtime"
+
+  load_codexctl_functions
+
+  local helper_log=""
+
+  RUN_SELECTED_RUNTIME=""
+  require_container() { return 0; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  validate_mount_mode() { :; }
+  local CONTAINER_CMD=mock_reset_config_container
+  mock_reset_config_container() {
+    case "$1" in
+      start) : ;;
+      stop) : ;;
+      exec) : ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  reset_runtime_config_in_container() {
+    helper_log="${helper_log}$1:reset:$2"$'\n'
+  }
+  run_agent_sh_in_container() {
+    if [ "$2" = "preferred" ] && [ "$3" = "get" ]; then
+      printf '%s\n' opencode
+      return 0
+    fi
+    if [ "$2" = "preferred" ] && [ "$3" = "set" ] && [ "$4" = "opencode" ]; then
+      helper_log="${helper_log}$1:preferred-set:$4"$'\n'
+      return 0
+    fi
+    fail "Unexpected agent.sh invocation: $*"
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 true
+  assert_status 0
+  printf '%s' "$helper_log" | grep -Fq $'unit-test-container:reset:opencode' || fail "Expected preferred runtime reset-config helper call, got: $helper_log"
+  printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:opencode' || fail "Expected preferred runtime to be restored after reset, got: $helper_log"
 }
 
 test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified() {
@@ -8025,6 +8118,8 @@ main() {
   run_selected_test test_run_pre_exec_updates_codex_via_runtime_helper "test_run_pre_exec_updates_codex_via_runtime_helper"
   run_selected_test test_run_pre_exec_updates_legacy_npm_codex_via_root_helper "test_run_pre_exec_updates_legacy_npm_codex_via_root_helper"
   run_selected_test test_run_container_reset_config_uses_runtime_helper "test_run_container_reset_config_uses_runtime_helper"
+  run_selected_test test_run_container_reset_config_uses_selected_runtime "test_run_container_reset_config_uses_selected_runtime"
+  run_selected_test test_run_container_reset_config_preserves_preferred_runtime "test_run_container_reset_config_preserves_preferred_runtime"
   run_selected_test test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified "test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified"
   run_selected_test test_run_pre_exec_runs_local_model_preflight_for_preferred_claude "test_run_pre_exec_runs_local_model_preflight_for_preferred_claude"
   run_selected_test test_run_pre_exec_runs_local_model_preflight_for_preferred_codex "test_run_pre_exec_runs_local_model_preflight_for_preferred_codex"
