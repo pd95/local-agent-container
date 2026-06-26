@@ -173,6 +173,7 @@ test_run_help_reports_runtime_options() {
   assert_contains "--install-runtime  Install the selected runtime before launch"
   assert_contains "--model NAME    Override the launch model for the selected runtime"
   assert_contains "--online        Use the runtime's online/provider-backed mode"
+  assert_contains "--stdio         With --cmd, keep stdin open without a TTY"
 }
 
 test_exec_help_reports_stdio_option() {
@@ -865,6 +866,193 @@ EOF
   run_capture bash "$unit_script"
   assert_status 1
   assert_contains "Container not running: stopped-container"
+}
+
+test_run_cmd_stdio_uses_interactive_without_tty() {
+  begin_test "run --stdio uses interactive exec without tty flags"
+
+  load_codexctl_functions
+
+  local exec_log=""
+  local old_container_cmd="$CONTAINER_CMD"
+  local workdir
+
+  workdir="$(new_workdir)"
+
+  require_container() { return 0; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { [ "$1" = "unit-test-container" ]; }
+  validate_mount_mode() { :; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      exec)
+        shift
+        exec_log="$(printf '%s\n' "$*")"
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture run_cmd --name unit-test-container --workdir "$workdir" --stdio --cmd sh -lc 'printf ok'
+  assert_status 0
+  printf '%s\n' "$exec_log" | grep -Fq -- '--interactive' || fail "Expected --interactive for run --stdio, got: $exec_log"
+  if printf '%s\n' "$exec_log" | grep -Eq -- '(^|[[:space:]])(-it|-t|--tty)([[:space:]]|$)'; then
+    fail "Did not expect tty flags for run --stdio, got: $exec_log"
+  fi
+  printf '%s\n' "$exec_log" | grep -Fq -- 'unit-test-container' || fail "Expected exec target container, got: $exec_log"
+  printf '%s\n' "$exec_log" | grep -Fq -- 'sh' || fail "Expected explicit command, got: $exec_log"
+  printf '%s\n' "$exec_log" | grep -Fq -- 'printf ok' || fail "Expected command arguments to be preserved, got: $exec_log"
+  CONTAINER_CMD="$old_container_cmd"
+}
+
+test_run_cmd_stdio_suppresses_lifecycle_stdout() {
+  begin_test "run --stdio suppresses lifecycle command stdout"
+
+  load_codexctl_functions
+
+  local old_container_cmd="$CONTAINER_CMD"
+  local workdir
+
+  workdir="$(new_workdir)"
+
+  require_container() { return 0; }
+  container_exists() { return 1; }
+  container_running() { return 1; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  validate_mount_mode() { :; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create)
+        printf 'container-create-stdout\n'
+        ;;
+      start)
+        printf 'container-start-stdout\n'
+        ;;
+      exec)
+        printf 'protocol-stdout\n'
+        ;;
+      stop)
+        :
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture run_cmd --name unit-test-container --workdir "$workdir" --stdio --cmd cat
+  assert_status 0
+  assert_contains "protocol-stdout"
+  if printf '%s\n' "$RUN_OUTPUT" | grep -Fq -- 'container-create-stdout'; then
+    fail "Did not expect create stdout in run --stdio output: $RUN_OUTPUT"
+  fi
+  if printf '%s\n' "$RUN_OUTPUT" | grep -Fq -- 'container-start-stdout'; then
+    fail "Did not expect start stdout in run --stdio output: $RUN_OUTPUT"
+  fi
+  CONTAINER_CMD="$old_container_cmd"
+}
+
+test_run_container_stdio_detaches_pre_exec_stdin() {
+  begin_test "run --stdio keeps protocol stdin away from pre-exec"
+
+  local temp_dir
+  local unit_script
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-run-stdio-preexec.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  unit_script="$temp_dir/check.sh"
+
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$CODEXCTL"
+require_container() { return 0; }
+container_exists() { [ "\$1" = "unit-test-container" ]; }
+container_running() { [ "\$1" = "unit-test-container" ]; }
+validate_mount_mode() { :; }
+pre_reads_stdin() {
+  local line=""
+  if IFS= read -r line; then
+    printf 'pre:%s\n' "\$line"
+  fi
+}
+CONTAINER_CMD=container
+container() {
+  case "\$1" in
+    exec)
+      local line=""
+      if IFS= read -r line; then
+        printf 'exec:%s\n' "\$line"
+      fi
+      ;;
+    *)
+      printf 'unexpected:%s\n' "\$*" >&2
+      return 1
+      ;;
+  esac
+}
+printf 'protocol-input\n' | run_container unit-test-container agent-python 0 0 "" "" 0 "$TEST_ROOT" "" pre_reads_stdin "" 0 1 cat
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 0
+  assert_contains "exec:protocol-input"
+  if printf '%s\n' "$RUN_OUTPUT" | grep -Fq -- 'pre:protocol-input'; then
+    fail "pre-exec consumed protocol stdin: $RUN_OUTPUT"
+  fi
+}
+
+test_run_cmd_stdio_requires_cmd() {
+  begin_test "run --stdio requires --cmd"
+
+  local temp_dir
+  local unit_script
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-run-stdio-invalid.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  unit_script="$temp_dir/check.sh"
+
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$CODEXCTL"
+require_container() { return 0; }
+run_cmd --stdio
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 1
+  assert_contains "--stdio requires --cmd"
+}
+
+test_run_cmd_stdio_rejects_shell() {
+  begin_test "run --stdio rejects --shell"
+
+  local temp_dir
+  local unit_script
+
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-run-stdio-shell.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  unit_script="$temp_dir/check.sh"
+
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$CODEXCTL"
+require_container() { return 0; }
+run_cmd --stdio --shell --cmd true
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 1
+  assert_contains "Cannot combine --shell with --cmd"
 }
 
 test_run_pre_exec_updates_codex_via_runtime_helper() {
@@ -7846,6 +8034,11 @@ main() {
   run_selected_test test_exec_cmd_stdio_uses_interactive_without_tty "test_exec_cmd_stdio_uses_interactive_without_tty"
   run_selected_test test_exec_cmd_stdio_requires_delimiter_and_command "test_exec_cmd_stdio_requires_delimiter_and_command"
   run_selected_test test_exec_cmd_stdio_requires_running_container "test_exec_cmd_stdio_requires_running_container"
+  run_selected_test test_run_cmd_stdio_uses_interactive_without_tty "test_run_cmd_stdio_uses_interactive_without_tty"
+  run_selected_test test_run_cmd_stdio_suppresses_lifecycle_stdout "test_run_cmd_stdio_suppresses_lifecycle_stdout"
+  run_selected_test test_run_container_stdio_detaches_pre_exec_stdin "test_run_container_stdio_detaches_pre_exec_stdin"
+  run_selected_test test_run_cmd_stdio_requires_cmd "test_run_cmd_stdio_requires_cmd"
+  run_selected_test test_run_cmd_stdio_rejects_shell "test_run_cmd_stdio_rejects_shell"
   run_selected_test test_auth_cmd_warns_for_legacy_office_image "test_auth_cmd_warns_for_legacy_office_image"
   run_selected_test test_feature_cmd_installs_via_root_helper "test_feature_cmd_installs_via_root_helper"
   run_selected_test test_runtime_cmd_install_uses_user_helper "test_runtime_cmd_install_uses_user_helper"
