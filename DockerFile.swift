@@ -46,7 +46,7 @@ RUN printf '%s\n' \
 RUN groupadd coder \
  && useradd -m -g coder -d /home/coder -s /bin/bash coder \
  && mkdir -p /home/coder/.codex /workdir \
-      /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude /opt/agentctl/opencode \
+      /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude /opt/agentctl/opencode /opt/agentctl/qwen /opt/agentctl/pi \
  && chown -R coder:coder /home/coder /workdir /opt/agentctl
 
 # Make sure HOME is correct for subsequent RUNs when we switch user

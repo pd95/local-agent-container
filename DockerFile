@@ -13,7 +13,7 @@ RUN apk add --no-cache \
 RUN addgroup -S coder \
  && adduser  -S -G coder -h /home/coder -s /bin/bash coder \
  && mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir \
-      /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude /opt/agentctl/opencode \
+      /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude /opt/agentctl/opencode /opt/agentctl/qwen /opt/agentctl/pi \
  && chown -R coder:coder /home/coder /workdir /opt/agentctl
 
 # Make sure HOME is correct for subsequent RUNs when we switch user

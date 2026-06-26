@@ -475,15 +475,7 @@ codex_show_model() {
   local model="$2"
   local show_file="$3"
 
-  command -v jq >/dev/null 2>&1 || die "Missing jq required for Codex model metadata"
-  command -v curl >/dev/null 2>&1 || die "Missing curl required for Codex model metadata"
-  if ! jq -n --arg model "$model" '{model: $model}' \
-    | curl -fsS --max-time 10 \
-      -H 'Content-Type: application/json' \
-      -d @- \
-      "${ollama_base_url%/}/api/show" >"$show_file"; then
-    die "failed to query Ollama model metadata for: $model"
-  fi
+  ollama_show_model "$ollama_base_url" "$model" "$show_file"
   jq -e 'type == "object"' "$show_file" >/dev/null || die "invalid Ollama /api/show response for: $model"
 }
 

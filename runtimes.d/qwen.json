@@ -1,0 +1,33 @@
+{
+  "id": "qwen",
+  "command": "qwen",
+  "install_method": "npm-prefix",
+  "default_config_dir": "/etc/qwenctl",
+  "capabilities": {
+    "install": true,
+    "update": true,
+    "reset_config": true,
+    "auth_login": false,
+    "auth_read": false,
+    "auth_write": false,
+    "local_mode": true,
+    "online_mode": false
+  },
+  "auth_formats": [],
+  "launch_configs": {},
+  "commands": [
+    "help",
+    "run",
+    "version",
+    "refresh",
+    "runtime list",
+    "preferred get",
+    "preferred set qwen",
+    "runtime info qwen",
+    "runtime capabilities qwen",
+    "runtime install qwen",
+    "runtime update qwen",
+    "runtime reset-config qwen",
+    "system manifest"
+  ]
+}

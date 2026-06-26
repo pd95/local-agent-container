@@ -2067,6 +2067,30 @@ test_agent_sh_opencode_runtime_info_reports_local_only_metadata() {
   printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "opencode" and .installed == false and .install_method == "npm-prefix" and .default_config_dir == "/etc/opencodectl" and .auth_formats == [] and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == false and .capabilities.auth_read == false and .capabilities.auth_write == false and .capabilities.local_mode == true and .capabilities.online_mode == false and (.commands | index("runtime install opencode") != null)' >/dev/null || fail "Expected runtime info JSON for opencode runtime, got: $RUN_OUTPUT"
 }
 
+test_agent_sh_qwen_runtime_info_reports_local_only_metadata() {
+  begin_test "agent.sh runtime info reports qwen local-only metadata"
+
+  local temp_home
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+
+  run_agent_sh_capture "$temp_home" runtime info qwen
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "qwen" and .installed == false and .install_method == "npm-prefix" and .default_config_dir == "/etc/qwenctl" and .auth_formats == [] and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == false and .capabilities.auth_read == false and .capabilities.auth_write == false and .capabilities.local_mode == true and .capabilities.online_mode == false and (.commands | index("runtime install qwen") != null)' >/dev/null || fail "Expected runtime info JSON for qwen runtime, got: $RUN_OUTPUT"
+}
+
+test_agent_sh_pi_runtime_info_reports_local_only_metadata() {
+  begin_test "agent.sh runtime info reports pi local-only metadata"
+
+  local temp_home
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+
+  run_agent_sh_capture "$temp_home" runtime info pi
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "pi" and .installed == false and .install_method == "npm-prefix" and .default_config_dir == "/etc/pictl" and .auth_formats == [] and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == false and .capabilities.auth_read == false and .capabilities.auth_write == false and .capabilities.local_mode == true and .capabilities.online_mode == false and (.commands | index("runtime install pi") != null)' >/dev/null || fail "Expected runtime info JSON for pi runtime, got: $RUN_OUTPUT"
+}
+
 test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state() {
   begin_test "agent.sh system manifest includes installed runtimes, features, and preferred runtime state"
 
@@ -2559,6 +2583,246 @@ EOF
   grep -Fq "npm install --prefix $tools_home/opencode opencode-ai@latest" "$install_log" || fail "Expected OpenCode update to use npm prefix under tool home"
 }
 
+test_agent_sh_qwen_runtime_install_uses_npm_prefix() {
+  begin_test "agent.sh qwen runtime install uses npm prefix and links launcher"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin"
+
+  cat >"$fake_bin/node" <<'EOF'
+#!/bin/sh
+case "$1" in
+  -p) printf '%s\n' 24.16.0 ;;
+  -e) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  cat >"$fake_bin/npm" <<EOF
+#!/bin/sh
+printf 'npm %s\n' "\$*" >>"$install_log"
+prefix=""
+while [ "\$#" -gt 0 ]; do
+  if [ "\$1" = "--prefix" ]; then
+    prefix="\$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "\$prefix/node_modules/.bin"
+cat >"\$prefix/node_modules/.bin/qwen" <<'SCRIPT'
+#!/bin/sh
+exit 0
+SCRIPT
+chmod +x "\$prefix/node_modules/.bin/qwen"
+EOF
+  chmod +x "$fake_bin/node" "$fake_bin/npm"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- runtime install qwen
+  assert_status 0
+  grep -Fq "npm install --prefix $tools_home/qwen @qwen-code/qwen-code@latest" "$install_log" || fail "Expected Qwen install to use npm prefix under tool home"
+  [ -L "$tools_home/bin/qwen" ] || fail "Expected Qwen launcher symlink in tool bin"
+  [ "$(readlink "$tools_home/bin/qwen")" = "$tools_home/qwen/node_modules/.bin/qwen" ] || fail "Expected Qwen launcher to point at tool home"
+}
+
+test_agent_sh_pi_runtime_install_uses_npm_prefix() {
+  begin_test "agent.sh pi runtime install uses npm prefix and links launcher"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin"
+
+  cat >"$fake_bin/node" <<'EOF'
+#!/bin/sh
+case "$1" in
+  -p) printf '%s\n' 24.16.0 ;;
+  -e) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  cat >"$fake_bin/npm" <<EOF
+#!/bin/sh
+printf 'npm %s\n' "\$*" >>"$install_log"
+prefix=""
+while [ "\$#" -gt 0 ]; do
+  if [ "\$1" = "--prefix" ]; then
+    prefix="\$2"
+    shift 2
+    continue
+  fi
+  shift
+done
+mkdir -p "\$prefix/node_modules/.bin"
+cat >"\$prefix/node_modules/.bin/pi" <<'SCRIPT'
+#!/bin/sh
+exit 0
+SCRIPT
+chmod +x "\$prefix/node_modules/.bin/pi"
+EOF
+  chmod +x "$fake_bin/node" "$fake_bin/npm"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- runtime install pi
+  assert_status 0
+  grep -Fq "npm install --prefix $tools_home/pi @earendil-works/pi-coding-agent@latest" "$install_log" || fail "Expected Pi install to use npm prefix under tool home"
+  [ -L "$tools_home/bin/pi" ] || fail "Expected Pi launcher symlink in tool bin"
+  [ "$(readlink "$tools_home/bin/pi")" = "$tools_home/pi/node_modules/.bin/pi" ] || fail "Expected Pi launcher to point at tool home"
+}
+
+test_agent_sh_qwen_runtime_install_rejects_old_node() {
+  begin_test "agent.sh qwen runtime install rejects old Node.js"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin"
+
+  cat >"$fake_bin/node" <<'EOF'
+#!/bin/sh
+case "$1" in
+  -p) printf '%s\n' 21.9.0 ;;
+  -e) exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/node"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    -- runtime install qwen
+  assert_status 1
+  assert_contains "Qwen Code requires Node.js >= 22.0.0; found 21.9.0"
+}
+
+test_agent_sh_pi_runtime_install_rejects_old_node() {
+  begin_test "agent.sh pi runtime install rejects old Node.js"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin"
+
+  cat >"$fake_bin/node" <<'EOF'
+#!/bin/sh
+case "$1" in
+  -p) printf '%s\n' 22.18.0 ;;
+  -e) exit 1 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/node"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    -- runtime install pi
+  assert_status 1
+  assert_contains "Pi requires Node.js >= 22.19.0; found 22.18.0"
+}
+
+test_agent_sh_qwen_runtime_update_uses_npm_prefix() {
+  begin_test "agent.sh qwen runtime update reinstalls with npm prefix"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin" "$tools_home/qwen/node_modules/.bin" "$tools_home/bin"
+  printf '#!/bin/sh\nexit 0\n' >"$tools_home/qwen/node_modules/.bin/qwen"
+  chmod +x "$tools_home/qwen/node_modules/.bin/qwen"
+  ln -s "$tools_home/qwen/node_modules/.bin/qwen" "$tools_home/bin/qwen"
+
+  cat >"$fake_bin/node" <<'EOF'
+#!/bin/sh
+case "$1" in
+  -p) printf '%s\n' 24.16.0 ;;
+  -e) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  cat >"$fake_bin/npm" <<EOF
+#!/bin/sh
+printf 'npm %s\n' "\$*" >>"$install_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/node" "$fake_bin/npm"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- runtime update qwen
+  assert_status 0
+  grep -Fq "npm install --prefix $tools_home/qwen @qwen-code/qwen-code@latest" "$install_log" || fail "Expected Qwen update to use npm prefix under tool home"
+}
+
+test_agent_sh_pi_runtime_update_uses_npm_prefix() {
+  begin_test "agent.sh pi runtime update reinstalls with npm prefix"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin" "$tools_home/pi/node_modules/.bin" "$tools_home/bin"
+  printf '#!/bin/sh\nexit 0\n' >"$tools_home/pi/node_modules/.bin/pi"
+  chmod +x "$tools_home/pi/node_modules/.bin/pi"
+  ln -s "$tools_home/pi/node_modules/.bin/pi" "$tools_home/bin/pi"
+
+  cat >"$fake_bin/node" <<'EOF'
+#!/bin/sh
+case "$1" in
+  -p) printf '%s\n' 24.16.0 ;;
+  -e) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  cat >"$fake_bin/npm" <<EOF
+#!/bin/sh
+printf 'npm %s\n' "\$*" >>"$install_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/node" "$fake_bin/npm"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- runtime update pi
+  assert_status 0
+  grep -Fq "npm install --prefix $tools_home/pi @earendil-works/pi-coding-agent@latest" "$install_log" || fail "Expected Pi update to use npm prefix under tool home"
+}
+
 test_agent_sh_claude_runtime_reset_config_restores_settings() {
   begin_test "agent.sh claude runtime reset-config restores settings"
 
@@ -2692,7 +2956,10 @@ test_agent_sh_opencode_runtime_reset_config_writes_ollama_config() {
 
   cat >"$fake_bin/curl" <<'EOF'
 #!/bin/sh
-exit 0
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
 EOF
   chmod +x "$fake_bin/curl"
   cat >"$temp_home/proc-net-route" <<'EOF'
@@ -2707,6 +2974,76 @@ EOF
   assert_status 0
   assert_contains "Warning: resetting OpenCode configuration will replace ~/.config/opencode/opencode.json"
   jq -er '.model == "ollama/gpt-oss:20b" and .provider.ollama.npm == "@ai-sdk/openai-compatible" and .provider.ollama.options.baseURL == "http://192.168.0.1:11434/v1" and .provider.ollama.options.apiKey == "ollama" and .provider.ollama.models["gpt-oss:20b"].name == "gpt-oss:20b (local)"' "$config_file" >/dev/null || fail "Expected OpenCode reset-config to write Ollama config"
+}
+
+test_agent_sh_qwen_runtime_reset_config_writes_ollama_config() {
+  begin_test "agent.sh qwen runtime reset-config writes Ollama provider config"
+
+  local temp_home
+  local fake_bin
+  local settings_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  settings_file="$temp_home/home/.qwen/settings.json"
+  mkdir -p "$fake_bin" "$(dirname "$settings_file")"
+  printf '{"model":{"name":"custom"}}\n' >"$settings_file"
+
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- runtime reset-config qwen
+  assert_status 0
+  assert_contains "Warning: resetting Qwen Code configuration will replace ~/.qwen/settings.json"
+  jq -er '.model.name == "gpt-oss:20b" and .security.auth.selectedType == "openai" and .env.OLLAMA_API_KEY == "ollama" and .modelProviders.openai.protocol == "openai" and .modelProviders.openai.models[0].id == "gpt-oss:20b" and .modelProviders.openai.models[0].baseUrl == "http://192.168.0.1:11434/v1" and .modelProviders.openai.models[0].envKey == "OLLAMA_API_KEY" and .telemetry.enabled == false and .privacy.usageStatisticsEnabled == false' "$settings_file" >/dev/null || fail "Expected Qwen reset-config to write Ollama config"
+}
+
+test_agent_sh_pi_runtime_reset_config_writes_ollama_config() {
+  begin_test "agent.sh pi runtime reset-config writes Ollama provider config"
+
+  local temp_home
+  local fake_bin
+  local models_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  models_file="$temp_home/home/.pi/agent/models.json"
+  mkdir -p "$fake_bin" "$(dirname "$models_file")"
+  printf '{"providers":{"custom":{}}}\n' >"$models_file"
+
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- runtime reset-config pi
+  assert_status 0
+  assert_contains "Warning: resetting Pi configuration will replace ~/.pi/agent/models.json"
+  jq -er '.providers.ollama.baseUrl == "http://192.168.0.1:11434/v1" and .providers.ollama.api == "openai-completions" and .providers.ollama.apiKey == "ollama" and .providers.ollama.compat.supportsDeveloperRole == false and .providers.ollama.models[0].id == "gpt-oss:20b" and .providers.ollama.models[0].name == "gpt-oss:20b (local Ollama)"' "$models_file" >/dev/null || fail "Expected Pi reset-config to write Ollama config"
 }
 
 test_agent_sh_codex_run_defaults_to_workdir_cd() {
@@ -3678,7 +4015,8 @@ EOF
     AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
     -- run
   assert_status 1
-  assert_contains "failed to query Ollama model metadata for: gpt-oss:20b"
+  assert_contains "Local Ollama model is not available: gpt-oss:20b"
+  assert_contains "ollama pull gpt-oss:20b"
   jq -er '.models == [{"slug":"keep"}]' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected catalog to remain untouched after /api/show failure"
 }
 
@@ -3706,7 +4044,10 @@ EOF
   chmod +x "$fake_bin/claude"
   cat >"$fake_bin/curl" <<'EOF'
 #!/bin/sh
-exit 0
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
 EOF
   chmod +x "$fake_bin/curl"
 
@@ -3747,7 +4088,10 @@ EOF
   chmod +x "$fake_bin/claude"
   cat >"$fake_bin/curl" <<'EOF'
 #!/bin/sh
-exit 0
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
 EOF
   chmod +x "$fake_bin/curl"
 
@@ -3785,7 +4129,10 @@ EOF
   chmod +x "$fake_bin/claude"
   cat >"$fake_bin/curl" <<'EOF'
 #!/bin/sh
-exit 0
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
 EOF
   chmod +x "$fake_bin/curl"
 
@@ -3824,7 +4171,10 @@ EOF
   chmod +x "$fake_bin/claude"
   cat >"$fake_bin/curl" <<'EOF'
 #!/bin/sh
-exit 0
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
 EOF
   chmod +x "$fake_bin/curl"
 
@@ -3865,7 +4215,10 @@ EOF
   chmod +x "$fake_bin/opencode"
   cat >"$fake_bin/curl" <<'EOF'
 #!/bin/sh
-exit 0
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
 EOF
   chmod +x "$fake_bin/curl"
   cat >"$temp_home/proc-net-route" <<'EOF'
@@ -3903,7 +4256,10 @@ EOF
   chmod +x "$fake_bin/opencode"
   cat >"$fake_bin/curl" <<'EOF'
 #!/bin/sh
-exit 0
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
 EOF
   chmod +x "$fake_bin/curl"
   cat >"$temp_home/proc-net-route" <<'EOF'
@@ -3941,7 +4297,10 @@ EOF
   chmod +x "$fake_bin/opencode"
   cat >"$fake_bin/curl" <<'EOF'
 #!/bin/sh
-exit 0
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
 EOF
   chmod +x "$fake_bin/curl"
   cat >"$temp_home/proc-net-route" <<'EOF'
@@ -3956,6 +4315,481 @@ EOF
     -- run --model custom/model run hello
   assert_status 0
   grep -Fq 'ARGS=--model custom/model run hello' "$run_log" || fail "Expected explicit OpenCode model to be preserved"
+}
+
+test_agent_sh_qwen_run_uses_local_ollama_defaults() {
+  begin_test "agent.sh qwen run writes default Ollama config and model"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  local settings_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/qwen-run.log"
+  settings_file="$temp_home/home/.qwen/settings.json"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' qwen >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/qwen" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\nOLLAMA_API_KEY=%s\nOPENAI_BASE_URL=%s\nOPENAI_MODEL=%s\n' "\$*" "\$OLLAMA_API_KEY" "\$OPENAI_BASE_URL" "\$OPENAI_MODEL" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/qwen"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  grep -Fq 'ARGS=--auth-type openai --model gpt-oss:20b' "$run_log" || fail "Expected Qwen run to inject OpenAI auth type and default local model"
+  grep -Fq 'OLLAMA_API_KEY=ollama' "$run_log" || fail "Expected Qwen run to provide dummy Ollama API key"
+  grep -Fq 'OPENAI_BASE_URL=http://192.168.0.1:11434/v1' "$run_log" || fail "Expected Qwen run to provide OpenAI-compatible Ollama base URL"
+  grep -Fq 'OPENAI_MODEL=gpt-oss:20b' "$run_log" || fail "Expected Qwen run to provide OpenAI model env"
+  jq -er '.model.name == "gpt-oss:20b" and .modelProviders.openai.models[0].baseUrl == "http://192.168.0.1:11434/v1" and .privacy.usageStatisticsEnabled == false' "$settings_file" >/dev/null || fail "Expected Qwen run to write default Ollama config"
+}
+
+test_agent_sh_qwen_run_uses_model_override() {
+  begin_test "agent.sh qwen run maps the generic model override"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/qwen-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' qwen >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/qwen" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/qwen"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  grep -Fq 'ARGS=--auth-type openai --model qwen3:14b' "$run_log" || fail "Expected Qwen model override to be passed through with OpenAI auth type"
+}
+
+test_agent_sh_qwen_run_respects_explicit_model() {
+  begin_test "agent.sh qwen run keeps an explicit model argument"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/qwen-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' qwen >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/qwen" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/qwen"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run --model custom-model hello
+  assert_status 0
+  grep -Fq 'ARGS=--auth-type openai --model custom-model hello' "$run_log" || fail "Expected explicit Qwen model to be preserved with OpenAI auth type"
+}
+
+test_agent_sh_qwen_run_merges_existing_settings() {
+  begin_test "agent.sh qwen run merges Ollama config into existing settings"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  local settings_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/qwen-run.log"
+  settings_file="$temp_home/home/.qwen/settings.json"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl" "$(dirname "$settings_file")"
+  printf '%s\n' qwen >"$temp_home/config/agentctl/preferred-runtime"
+  cat >"$settings_file" <<'EOF'
+{
+  "modelProviders": {
+    "anthropic": {
+      "protocol": "anthropic",
+      "models": [
+        {
+          "id": "claude",
+          "envKey": "ANTHROPIC_API_KEY"
+        }
+      ]
+    }
+  },
+  "security": {
+    "auth": {
+      "selectedType": "anthropic"
+    }
+  },
+  "telemetry": {
+    "enabled": true
+  },
+  "privacy": {
+    "usageStatisticsEnabled": true
+  }
+}
+EOF
+
+  cat >"$fake_bin/qwen" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/qwen"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen2.5-coder:7b" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  grep -Fq 'ARGS=--auth-type openai --model qwen2.5-coder:7b' "$run_log" || fail "Expected Qwen run to force OpenAI auth for local Ollama"
+  jq -er '.modelProviders.anthropic.models[0].id == "claude" and any(.modelProviders.openai.models[]; .id == "qwen2.5-coder:7b" and .baseUrl == "http://192.168.0.1:11434/v1")' "$settings_file" >/dev/null || fail "Expected Qwen run to preserve existing providers and add Ollama model"
+  jq -er '.security.auth.selectedType == "openai" and .model.name == "qwen2.5-coder:7b" and .telemetry.enabled == false and .privacy.usageStatisticsEnabled == false' "$settings_file" >/dev/null || fail "Expected Qwen run to force local OpenAI auth and privacy settings"
+}
+
+test_agent_sh_qwen_run_rejects_missing_ollama_model() {
+  begin_test "agent.sh qwen run rejects a missing Ollama model before launch"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/qwen-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' qwen >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/qwen" <<EOF
+#!/bin/sh
+printf 'SHOULD_NOT_RUN\n' >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/qwen"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/version'*) printf '{"version":"0.0.0"}\n'; exit 0 ;;
+  *'/api/show'*) cat >/dev/null; exit 22 ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen2.5-coder:7b" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 1
+  assert_contains "Local Ollama model is not available: qwen2.5-coder:7b"
+  assert_contains "ollama pull qwen2.5-coder:7b"
+  [ ! -e "$run_log" ] || fail "Did not expect Qwen to launch when Ollama model is missing"
+}
+
+test_agent_sh_pi_run_uses_local_ollama_defaults() {
+  begin_test "agent.sh pi run writes default Ollama config and model"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  local models_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/pi-run.log"
+  models_file="$temp_home/home/.pi/agent/models.json"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' pi >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/pi" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\nPI_TELEMETRY=%s\nPI_OFFLINE=%s\nPI_SKIP_VERSION_CHECK=%s\n' "\$*" "\$PI_TELEMETRY" "\$PI_OFFLINE" "\$PI_SKIP_VERSION_CHECK" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/pi"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  grep -Fq 'ARGS=--model ollama/gpt-oss:20b' "$run_log" || fail "Expected Pi run to inject the default local model"
+  grep -Fq 'PI_TELEMETRY=0' "$run_log" || fail "Expected Pi telemetry to be disabled"
+  grep -Fq 'PI_OFFLINE=1' "$run_log" || fail "Expected Pi offline mode to disable startup network operations"
+  grep -Fq 'PI_SKIP_VERSION_CHECK=1' "$run_log" || fail "Expected Pi version checks to be disabled"
+  jq -er '.providers.ollama.baseUrl == "http://192.168.0.1:11434/v1" and .providers.ollama.models[0].id == "gpt-oss:20b"' "$models_file" >/dev/null || fail "Expected Pi run to write default Ollama config"
+}
+
+test_agent_sh_pi_run_uses_model_override() {
+  begin_test "agent.sh pi run maps the generic model override to provider/model"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/pi-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' pi >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/pi" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/pi"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  grep -Fq 'ARGS=--model ollama/qwen3:14b' "$run_log" || fail "Expected Pi model override to use provider/model format"
+}
+
+test_agent_sh_pi_run_respects_explicit_model() {
+  begin_test "agent.sh pi run keeps an explicit model argument"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/pi-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' pi >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/pi" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/pi"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen3:14b" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run --model custom/model hello
+  assert_status 0
+  grep -Fq 'ARGS=--model custom/model hello' "$run_log" || fail "Expected explicit Pi model to be preserved"
+}
+
+test_agent_sh_pi_run_merges_existing_models_config() {
+  begin_test "agent.sh pi run merges Ollama provider into existing models config"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  local models_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/pi-run.log"
+  models_file="$temp_home/home/.pi/agent/models.json"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl" "$(dirname "$models_file")"
+  printf '%s\n' pi >"$temp_home/config/agentctl/preferred-runtime"
+  cat >"$models_file" <<'EOF'
+{
+  "providers": {
+    "custom": {
+      "baseUrl": "https://example.test/v1",
+      "api": "openai-completions",
+      "apiKey": "custom",
+      "models": [
+        {
+          "id": "custom-model"
+        }
+      ]
+    }
+  }
+}
+EOF
+
+  cat >"$fake_bin/pi" <<EOF
+#!/bin/sh
+printf 'ARGS=%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/pi"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/show'*) cat >/dev/null; printf '{}\n'; exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen2.5-coder:7b" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 0
+  grep -Fq 'ARGS=--model ollama/qwen2.5-coder:7b' "$run_log" || fail "Expected Pi run to use Ollama provider model"
+  jq -er '.providers.custom.models[0].id == "custom-model" and .providers.ollama.baseUrl == "http://192.168.0.1:11434/v1" and any(.providers.ollama.models[]; .id == "qwen2.5-coder:7b")' "$models_file" >/dev/null || fail "Expected Pi run to preserve existing providers and add Ollama model"
+}
+
+test_agent_sh_pi_run_rejects_missing_ollama_model() {
+  begin_test "agent.sh pi run rejects a missing Ollama model before launch"
+
+  local temp_home
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/pi-run.log"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  printf '%s\n' pi >"$temp_home/config/agentctl/preferred-runtime"
+
+  cat >"$fake_bin/pi" <<EOF
+#!/bin/sh
+printf 'SHOULD_NOT_RUN\n' >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/pi"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+case "$*" in
+  *'/api/version'*) printf '{"version":"0.0.0"}\n'; exit 0 ;;
+  *'/api/show'*) cat >/dev/null; exit 22 ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$temp_home/proc-net-route" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_MODEL_OVERRIDE="qwen2.5-coder:7b" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
+    -- run
+  assert_status 1
+  assert_contains "Local Ollama model is not available: qwen2.5-coder:7b"
+  assert_contains "ollama pull qwen2.5-coder:7b"
+  [ ! -e "$run_log" ] || fail "Did not expect Pi to launch when Ollama model is missing"
 }
 
 test_agent_sh_rejects_unknown_runtime() {
@@ -4301,6 +5135,82 @@ test_agent_sh_opencode_state_export_uses_runtime_hooks() {
   tar -tf "$tar_file" | grep -Fx '.config/agentctl/preferred-runtime' >/dev/null || fail "Expected agentctl state in exported state"
   if tar -tf "$tar_file" | grep -Fqx '.codex/auth.json'; then
     fail "Did not expect Codex legacy state to be exported when only OpenCode is installed"
+  fi
+}
+
+test_agent_sh_qwen_state_export_uses_runtime_hooks() {
+  begin_test "agent.sh state export includes installed Qwen state"
+
+  local temp_home
+  local fake_bin
+  local tar_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  tar_file="$temp_home/state.tar"
+  fake_bin="$(make_fake_runtime_bin "$temp_home" qwen)"
+
+  mkdir -p \
+    "$temp_home/home/.qwen" \
+    "$temp_home/home/.config/agentctl" \
+    "$temp_home/home/.codex"
+  printf '%s' '{"model":{"name":"gpt-oss:20b"}}' >"$temp_home/home/.qwen/settings.json"
+  printf '%s' 'session' >"$temp_home/home/.qwen/session.json"
+  printf '%s' 'token' >"$temp_home/home/.codex/auth.json"
+  printf '%s' 'qwen' >"$temp_home/home/.config/agentctl/preferred-runtime"
+
+  env -i \
+    "HOME=$temp_home/home" \
+    "XDG_CONFIG_HOME=$temp_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state export >"$tar_file"
+
+  tar -tf "$tar_file" | grep -Fx '.qwen/settings.json' >/dev/null || fail "Expected Qwen settings in exported state"
+  tar -tf "$tar_file" | grep -Fx '.qwen/session.json' >/dev/null || fail "Expected Qwen runtime state in exported state"
+  tar -tf "$tar_file" | grep -Fx '.config/agentctl/preferred-runtime' >/dev/null || fail "Expected agentctl state in exported state"
+  if tar -tf "$tar_file" | grep -Fqx '.codex/auth.json'; then
+    fail "Did not expect Codex legacy state to be exported when only Qwen is installed"
+  fi
+}
+
+test_agent_sh_pi_state_export_uses_runtime_hooks() {
+  begin_test "agent.sh state export includes installed Pi state"
+
+  local temp_home
+  local fake_bin
+  local tar_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  tar_file="$temp_home/state.tar"
+  fake_bin="$(make_fake_runtime_bin "$temp_home" pi)"
+
+  mkdir -p \
+    "$temp_home/home/.pi/agent/sessions" \
+    "$temp_home/home/.config/agentctl" \
+    "$temp_home/home/.codex"
+  printf '%s' '{"providers":{"ollama":{}}}' >"$temp_home/home/.pi/agent/models.json"
+  printf '%s' 'session' >"$temp_home/home/.pi/agent/sessions/session.jsonl"
+  printf '%s' 'token' >"$temp_home/home/.codex/auth.json"
+  printf '%s' 'pi' >"$temp_home/home/.config/agentctl/preferred-runtime"
+
+  env -i \
+    "HOME=$temp_home/home" \
+    "XDG_CONFIG_HOME=$temp_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state export >"$tar_file"
+
+  tar -tf "$tar_file" | grep -Fx '.pi/agent/models.json' >/dev/null || fail "Expected Pi models config in exported state"
+  tar -tf "$tar_file" | grep -Fx '.pi/agent/sessions/session.jsonl' >/dev/null || fail "Expected Pi session state in exported state"
+  tar -tf "$tar_file" | grep -Fx '.config/agentctl/preferred-runtime' >/dev/null || fail "Expected agentctl state in exported state"
+  if tar -tf "$tar_file" | grep -Fqx '.codex/auth.json'; then
+    fail "Did not expect Codex legacy state to be exported when only Pi is installed"
   fi
 }
 
@@ -8450,6 +9360,8 @@ main() {
   run_selected_test test_agent_sh_runtime_capabilities_reports_manifest_commands "test_agent_sh_runtime_capabilities_reports_manifest_commands"
   run_selected_test test_agent_sh_claude_runtime_info_reports_skeleton_metadata "test_agent_sh_claude_runtime_info_reports_skeleton_metadata"
   run_selected_test test_agent_sh_opencode_runtime_info_reports_local_only_metadata "test_agent_sh_opencode_runtime_info_reports_local_only_metadata"
+  run_selected_test test_agent_sh_qwen_runtime_info_reports_local_only_metadata "test_agent_sh_qwen_runtime_info_reports_local_only_metadata"
+  run_selected_test test_agent_sh_pi_runtime_info_reports_local_only_metadata "test_agent_sh_pi_runtime_info_reports_local_only_metadata"
   run_selected_test test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state "test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state"
   run_selected_test test_agent_sh_system_manifest_reports_apk_requested_packages "test_agent_sh_system_manifest_reports_apk_requested_packages"
   run_selected_test test_agent_sh_system_manifest_reports_dpkg_requested_packages "test_agent_sh_system_manifest_reports_dpkg_requested_packages"
@@ -8460,9 +9372,17 @@ main() {
   run_selected_test test_agent_sh_codex_runtime_update_calls_codex_update "test_agent_sh_codex_runtime_update_calls_codex_update"
   run_selected_test test_agent_sh_opencode_runtime_install_uses_npm_prefix "test_agent_sh_opencode_runtime_install_uses_npm_prefix"
   run_selected_test test_agent_sh_opencode_runtime_update_uses_npm_prefix "test_agent_sh_opencode_runtime_update_uses_npm_prefix"
+  run_selected_test test_agent_sh_qwen_runtime_install_uses_npm_prefix "test_agent_sh_qwen_runtime_install_uses_npm_prefix"
+  run_selected_test test_agent_sh_pi_runtime_install_uses_npm_prefix "test_agent_sh_pi_runtime_install_uses_npm_prefix"
+  run_selected_test test_agent_sh_qwen_runtime_install_rejects_old_node "test_agent_sh_qwen_runtime_install_rejects_old_node"
+  run_selected_test test_agent_sh_pi_runtime_install_rejects_old_node "test_agent_sh_pi_runtime_install_rejects_old_node"
+  run_selected_test test_agent_sh_qwen_runtime_update_uses_npm_prefix "test_agent_sh_qwen_runtime_update_uses_npm_prefix"
+  run_selected_test test_agent_sh_pi_runtime_update_uses_npm_prefix "test_agent_sh_pi_runtime_update_uses_npm_prefix"
   run_selected_test test_agent_sh_claude_runtime_reset_config_restores_settings "test_agent_sh_claude_runtime_reset_config_restores_settings"
   run_selected_test test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration "test_agent_sh_codex_runtime_reset_config_warns_about_lost_configuration"
   run_selected_test test_agent_sh_opencode_runtime_reset_config_writes_ollama_config "test_agent_sh_opencode_runtime_reset_config_writes_ollama_config"
+  run_selected_test test_agent_sh_qwen_runtime_reset_config_writes_ollama_config "test_agent_sh_qwen_runtime_reset_config_writes_ollama_config"
+  run_selected_test test_agent_sh_pi_runtime_reset_config_writes_ollama_config "test_agent_sh_pi_runtime_reset_config_writes_ollama_config"
   run_selected_test test_agent_sh_codex_run_defaults_to_workdir_cd "test_agent_sh_codex_run_defaults_to_workdir_cd"
   run_selected_test test_agent_sh_codex_run_repairs_broken_bundled_rg "test_agent_sh_codex_run_repairs_broken_bundled_rg"
   run_selected_test test_agent_sh_codex_run_uses_runtime_profile_config "test_agent_sh_codex_run_uses_runtime_profile_config"
@@ -8488,6 +9408,16 @@ main() {
   run_selected_test test_agent_sh_opencode_run_uses_local_ollama_defaults "test_agent_sh_opencode_run_uses_local_ollama_defaults"
   run_selected_test test_agent_sh_opencode_run_uses_model_override "test_agent_sh_opencode_run_uses_model_override"
   run_selected_test test_agent_sh_opencode_run_respects_explicit_model "test_agent_sh_opencode_run_respects_explicit_model"
+  run_selected_test test_agent_sh_qwen_run_uses_local_ollama_defaults "test_agent_sh_qwen_run_uses_local_ollama_defaults"
+  run_selected_test test_agent_sh_qwen_run_uses_model_override "test_agent_sh_qwen_run_uses_model_override"
+  run_selected_test test_agent_sh_qwen_run_respects_explicit_model "test_agent_sh_qwen_run_respects_explicit_model"
+  run_selected_test test_agent_sh_qwen_run_merges_existing_settings "test_agent_sh_qwen_run_merges_existing_settings"
+  run_selected_test test_agent_sh_qwen_run_rejects_missing_ollama_model "test_agent_sh_qwen_run_rejects_missing_ollama_model"
+  run_selected_test test_agent_sh_pi_run_uses_local_ollama_defaults "test_agent_sh_pi_run_uses_local_ollama_defaults"
+  run_selected_test test_agent_sh_pi_run_uses_model_override "test_agent_sh_pi_run_uses_model_override"
+  run_selected_test test_agent_sh_pi_run_respects_explicit_model "test_agent_sh_pi_run_respects_explicit_model"
+  run_selected_test test_agent_sh_pi_run_merges_existing_models_config "test_agent_sh_pi_run_merges_existing_models_config"
+  run_selected_test test_agent_sh_pi_run_rejects_missing_ollama_model "test_agent_sh_pi_run_rejects_missing_ollama_model"
   run_selected_test test_agent_sh_rejects_unknown_runtime "test_agent_sh_rejects_unknown_runtime"
   run_selected_test test_agent_sh_preferred_round_trip "test_agent_sh_preferred_round_trip"
   run_selected_test test_agent_sh_preferred_set_as_root_repairs_ownership "test_agent_sh_preferred_set_as_root_repairs_ownership"
@@ -8502,6 +9432,8 @@ main() {
   run_selected_test test_agent_sh_state_export_includes_known_user_state "test_agent_sh_state_export_includes_known_user_state"
   run_selected_test test_agent_sh_state_export_uses_installed_runtime_hooks "test_agent_sh_state_export_uses_installed_runtime_hooks"
   run_selected_test test_agent_sh_opencode_state_export_uses_runtime_hooks "test_agent_sh_opencode_state_export_uses_runtime_hooks"
+  run_selected_test test_agent_sh_qwen_state_export_uses_runtime_hooks "test_agent_sh_qwen_state_export_uses_runtime_hooks"
+  run_selected_test test_agent_sh_pi_state_export_uses_runtime_hooks "test_agent_sh_pi_state_export_uses_runtime_hooks"
   run_selected_test test_backup_codex_config_from_export_excludes_codex_packages "test_backup_codex_config_from_export_excludes_codex_packages"
   run_selected_test test_backup_known_state_from_container_excludes_codex_packages "test_backup_known_state_from_container_excludes_codex_packages"
   run_selected_test test_agent_sh_state_import_restores_known_user_state "test_agent_sh_state_import_restores_known_user_state"
