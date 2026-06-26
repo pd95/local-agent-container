@@ -751,6 +751,7 @@ Options:
   --read-only     Mount workdir as read-only (requires new container)
   --shell         Start a shell (default shell) instead of default CMD
   --cmd ...       Run a custom command (must be last; cannot combine with --shell)
+  --stdio         With --cmd, keep stdin open without a TTY for stdio protocols such as ACP or MCP
   --cpu NUM       CPU cores for container
   --mem SIZE      Memory limit (e.g. 8G)
 EOF
@@ -4855,7 +4856,8 @@ run_container() {
   local pre_exec="${10}"
   local post_exec="${11}"
   local reset_config="${12}"
-  shift 12
+  local stdio="${13}"
+  shift 13
   local cmd=("$@")
   local exit_code=0
   local started=0
@@ -4865,7 +4867,11 @@ run_container() {
 
   # Execute command inside the container and preserve the exit code.
   run_exec() {
-    if [ "$shell" -eq 1 ]; then
+    if [ "$stdio" -eq 1 ]; then
+      if ! "$CONTAINER_CMD" exec --interactive "$actual_name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"; then
+        exit_code=$?
+      fi
+    elif [ "$shell" -eq 1 ]; then
       if ! "$CONTAINER_CMD" exec -it "$actual_name" "${SETPRIV_ARGS[@]}" "$DEFAULT_LOGIN_SHELL" "-l"; then
         exit_code=$?
       fi
@@ -4915,13 +4921,21 @@ run_container() {
         actual_name="$("${create_cmd[@]}")"
         [ -n "$actual_name" ] || die "Failed to create temporary container"
       else
-        "${create_cmd[@]}"
+        if [ "$stdio" -eq 1 ]; then
+          "${create_cmd[@]}" >/dev/null
+        else
+          "${create_cmd[@]}"
+        fi
       fi
       created=1
     fi
 
     echo "Starting container: $actual_name" >&2
-    "$CONTAINER_CMD" start "$actual_name"
+    if [ "$stdio" -eq 1 ]; then
+      "$CONTAINER_CMD" start "$actual_name" >/dev/null
+    else
+      "$CONTAINER_CMD" start "$actual_name"
+    fi
     started=1
   fi
 
@@ -4933,11 +4947,19 @@ run_container() {
     reset_runtime_config_in_container "$actual_name" codex
   fi
   if [ -n "$pre_exec" ]; then
-    "$pre_exec" "$actual_name"
+    if [ "$stdio" -eq 1 ]; then
+      "$pre_exec" "$actual_name" </dev/null
+    else
+      "$pre_exec" "$actual_name"
+    fi
   fi
   run_exec
   if [ -n "$post_exec" ]; then
-    if ! "$post_exec" "$actual_name"; then
+    if [ "$stdio" -eq 1 ]; then
+      if ! "$post_exec" "$actual_name" </dev/null; then
+        warn "post-run step failed for $actual_name"
+      fi
+    elif ! "$post_exec" "$actual_name"; then
       warn "post-run step failed for $actual_name"
     fi
   fi
@@ -4971,7 +4993,8 @@ run_mode() {
   local reset_config="${13}"
   local runtime_config_json="${14}"
   local model_override="${15}"
-  shift 15
+  local stdio="${16}"
+  shift 16
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
@@ -4992,7 +5015,7 @@ run_mode() {
     shell=0
   fi
 
-  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "${cmd[@]}"
+  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "$stdio" "${cmd[@]}"
 }
 
 RUN_SELECTED_RUNTIME=""
@@ -5103,6 +5126,7 @@ run_cmd() {
   local mem=""
   local home_mount=""
   local workdir=""
+  local stdio=0
   local -a runtime_config_entries=()
   local -a cmd_override=()
   local cmd_override_set=0
@@ -5124,6 +5148,7 @@ run_cmd() {
       --temp) temp=1; shift ;;
       --read-only) read_only=1; shift ;;
       --shell) shell=1; shell_set=1; shift ;;
+      --stdio) stdio=1; shift ;;
       -c|--config) runtime_config_entries+=("$2"); shift 2 ;;
       --cmd) shift; cmd_override_set=1; cmd_override=("$@"); break ;;
       --cpu) cpu="$2"; shift 2 ;;
@@ -5137,10 +5162,16 @@ run_cmd() {
   if [ "$shell_set" -eq 1 ] && [ "$cmd_override_set" -eq 1 ]; then
     die "Cannot combine --shell with --cmd"
   fi
+  if [ "$stdio" -eq 1 ] && [ "$cmd_override_set" -eq 0 ]; then
+    die "--stdio requires --cmd"
+  fi
+  if [ "$stdio" -eq 1 ] && [ "$shell_set" -eq 1 ]; then
+    die "Cannot combine --stdio with --shell"
+  fi
   if [ "$cmd_override_set" -eq 1 ] && [ "${#cmd_override[@]}" -eq 0 ]; then
     die "Missing command after --cmd"
   fi
-  if [ "$cmd_override_set" -eq 1 ] && [ "${#cmd_override[@]}" -eq 1 ]; then
+  if [ "$stdio" -eq 0 ] && [ "$cmd_override_set" -eq 1 ] && [ "${#cmd_override[@]}" -eq 1 ]; then
     case "${cmd_override[0]}" in
       *[[:space:]]*) cmd_override=("$DEFAULT_LOGIN_SHELL" "-lc" "${cmd_override[0]}") ;;
     esac
@@ -5205,7 +5236,7 @@ run_cmd() {
     RUN_UPDATE_CODEX=1
   fi
 
-  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" ${cmd_override[@]+"${cmd_override[@]}"}
+  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" "$stdio" ${cmd_override[@]+"${cmd_override[@]}"}
 }
 
 auth_cmd() {

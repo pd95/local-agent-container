@@ -63,7 +63,12 @@ stderr or a file; protocol servers must not write non-protocol text to stdout.
 Examples:
 
 ```bash
-# ACP agent runtime for an editor such as Xcode.
+# ACP agent runtime for an editor such as Xcode, with run lifecycle and auth sync.
+agentctl run --stdio --name my-agent --image agent-swift --workdir /path/to/project \
+  --runtime codex --online --cmd \
+  sh -lc 'cd /workdir && npx -y @agentclientprotocol/codex-acp'
+
+# ACP agent runtime for an already-running container.
 agentctl exec --stdio --name my-agent -- \
   sh -lc 'cd /workdir && npx -y @agentclientprotocol/codex-acp'
 

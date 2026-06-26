@@ -76,8 +76,9 @@ interactive Codex validation, or image/toolchain verification that is not yet au
 
 ## Manual stdio protocol bridge tests
 
-Use these host-side checks when validating `agentctl exec --stdio` for local
-stdio protocols such as ACP or MCP. Start or create a persistent container first:
+Use these host-side checks when validating `agentctl exec --stdio` and
+`agentctl run --stdio` for local stdio protocols such as ACP or MCP. Start or
+create a persistent container first for the `exec --stdio` checks:
 
 ```bash
 agentctl run --name agent-stdio-smoke --image agent-python --cmd true
@@ -113,6 +114,21 @@ Verify newline-delimited JSON-RPC can pass through unchanged:
 ```bash
 printf '{"jsonrpc":"2.0","id":1,"method":"ping"}\n' | \
   agentctl exec --stdio --name agent-stdio-smoke -- \
+  node -e 'process.stdin.pipe(process.stdout)'
+```
+
+Expected output:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"ping"}
+```
+
+Verify the same bridge through `run` lifecycle handling:
+
+```bash
+printf '{"jsonrpc":"2.0","id":1,"method":"ping"}\n' | \
+  agentctl run --stdio --name agent-stdio-smoke --image agent-python \
+  --workdir testing/agent-python --cmd \
   node -e 'process.stdin.pipe(process.stdout)'
 ```
 
