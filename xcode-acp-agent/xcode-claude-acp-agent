@@ -1,0 +1,7 @@
+#!/bin/zsh
+set -euo pipefail
+
+SCRIPT_DIR="${0:A:h}"
+export AGENTCTL_XCODE_AGENT="${AGENTCTL_XCODE_AGENT:-claude}"
+
+exec "$SCRIPT_DIR/xcode-acp-agent"
