@@ -163,6 +163,37 @@ test_run_config_wires_runtime_config_json() {
   fi
 }
 
+test_run_cmd_wires_ollama_host_to_custom_command() {
+  begin_test "run_cmd wires Ollama host config and env into custom command"
+
+  load_codexctl_functions
+
+  local captured_cmd=""
+  local workdir
+
+  workdir="$(new_workdir)"
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  run_container() {
+    shift 13
+    captured_cmd="$(printf '%s\n' "$*")"
+  }
+
+  OLLAMA_HOST=http://192.168.64.1:11439 run_cmd \
+    --name unit-test-container \
+    --workdir "$workdir" \
+    -c ollama_host=http://192.168.64.1:11439 \
+    --cmd agent.sh run exec
+
+  printf '%s\n' "$captured_cmd" | grep -Fq 'env' || fail "Expected custom command to be wrapped with env, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fq 'OLLAMA_HOST=http://192.168.64.1:11439' || fail "Expected OLLAMA_HOST to be forwarded, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fq 'AGENTCTL_RUNTIME_CONFIG_JSON=' || fail "Expected runtime config JSON to be passed to custom command, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fq '"ollama_host":"http://192.168.64.1:11439"' || fail "Expected ollama_host launch config in custom command env, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fq 'agent.sh' || fail "Expected custom command to be preserved, got: $captured_cmd"
+  printf '%s\n' "$captured_cmd" | grep -Fq 'run' || fail "Expected custom command args to be preserved, got: $captured_cmd"
+}
+
 test_run_help_reports_runtime_options() {
   begin_test "run help reports runtime selection options"
 
@@ -3345,6 +3376,173 @@ EOF
       and (.supported_reasoning_levels | length) == 3)
   ' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected Codex model catalog metadata to be generated"
   grep -Fq -- '--profile gpt-oss --cd /workdir' "$run_log" || fail "Expected codex run to launch after local metadata update"
+}
+
+test_agent_sh_codex_local_run_uses_ollama_host_env() {
+  begin_test "agent.sh codex local run uses OLLAMA_HOST for Ollama config"
+
+  local temp_home
+  local fake_bin
+  local url_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  url_log="$temp_home/urls.log"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  cat >"$fake_bin/curl" <<EOF
+#!/bin/sh
+last=
+for arg in "\$@"; do
+  last="\$arg"
+done
+printf '%s\n' "\$last" >>"$url_log"
+case "\$last" in
+  http://192.168.64.1:11439/api/version)
+    printf '{"version":"0.0.0"}\n'
+    exit 0
+    ;;
+  http://192.168.64.1:11439/api/show)
+    cat >/dev/null
+    printf '{"system":"","capabilities":[],"details":{"format":"safetensors"},"model_info":{"llama.context_length":4096}}\n'
+    exit 0
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+base_url = "http://old-host:11434/v1"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    OLLAMA_HOST="http://192.168.64.1:11439/" \
+    -- run
+  assert_status 0
+  grep -Fq 'http://192.168.64.1:11439/api/version' "$url_log" || fail "Expected explicit Ollama host version probe"
+  grep -Fq 'http://192.168.64.1:11439/api/show' "$url_log" || fail "Expected explicit Ollama host model probe"
+  grep -Fq 'base_url = "http://192.168.64.1:11439/v1"' "$temp_home/home/.codex/config.toml" || fail "Expected Codex myollama base_url to use explicit Ollama host"
+}
+
+test_agent_sh_codex_local_run_config_ollama_host_overrides_env() {
+  begin_test "agent.sh codex local run runtime config ollama_host overrides OLLAMA_HOST"
+
+  local temp_home
+  local fake_bin
+  local url_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  url_log="$temp_home/urls.log"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  cat >"$fake_bin/curl" <<EOF
+#!/bin/sh
+last=
+for arg in "\$@"; do
+  last="\$arg"
+done
+printf '%s\n' "\$last" >>"$url_log"
+case "\$last" in
+  http://192.168.64.1:11439/api/version)
+    printf '{"version":"0.0.0"}\n'
+    exit 0
+    ;;
+  http://192.168.64.1:11439/api/show)
+    cat >/dev/null
+    printf '{"system":"","capabilities":[],"details":{"format":"safetensors"},"model_info":{"llama.context_length":4096}}\n'
+    exit 0
+    ;;
+  http://wrong-host:11434/*)
+    exit 1
+    ;;
+esac
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+base_url = "http://old-host:11434/v1"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    OLLAMA_HOST="http://wrong-host:11434" \
+    AGENTCTL_RUNTIME_CONFIG_JSON='{"ollama_host":"http://192.168.64.1:11439/"}' \
+    -- run
+  assert_status 0
+  grep -Fq 'http://192.168.64.1:11439/api/version' "$url_log" || fail "Expected runtime config Ollama host version probe"
+  if grep -Fq 'http://wrong-host:11434' "$url_log"; then
+    fail "Did not expect OLLAMA_HOST to be used when runtime config ollama_host is set"
+  fi
+  grep -Fq 'base_url = "http://192.168.64.1:11439/v1"' "$temp_home/home/.codex/config.toml" || fail "Expected Codex myollama base_url to use runtime config Ollama host"
+}
+
+test_agent_sh_codex_local_run_reports_unreachable_ollama_host() {
+  begin_test "agent.sh codex local run reports unreachable explicit Ollama host"
+
+  local temp_home
+  local fake_bin
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+base_url = "http://old-host:11434/v1"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    OLLAMA_HOST="http://192.168.64.1:11439" \
+    -- run
+  assert_status 1
+  assert_contains "Configured Ollama host: http://192.168.64.1:11439/api/version"
+  assert_contains "Use a URL reachable from inside the container"
 }
 
 test_agent_sh_codex_local_metadata_status_uses_stderr() {
@@ -9287,6 +9485,7 @@ main() {
   fi
 
   run_selected_test test_run_config_wires_runtime_config_json "test_run_config_wires_runtime_config_json"
+  run_selected_test test_run_cmd_wires_ollama_host_to_custom_command "test_run_cmd_wires_ollama_host_to_custom_command"
   run_selected_test test_run_help_reports_generic_runtime_config "test_run_help_reports_generic_runtime_config"
   run_selected_test test_run_help_reports_runtime_options "test_run_help_reports_runtime_options"
   run_selected_test test_exec_help_reports_stdio_option "test_exec_help_reports_stdio_option"
@@ -9390,6 +9589,9 @@ main() {
   run_selected_test test_agent_sh_codex_run_uses_model_override "test_agent_sh_codex_run_uses_model_override"
   run_selected_test test_agent_sh_codex_online_run_skips_catalog_update "test_agent_sh_codex_online_run_skips_catalog_update"
   run_selected_test test_agent_sh_codex_local_run_updates_config_and_catalog "test_agent_sh_codex_local_run_updates_config_and_catalog"
+  run_selected_test test_agent_sh_codex_local_run_uses_ollama_host_env "test_agent_sh_codex_local_run_uses_ollama_host_env"
+  run_selected_test test_agent_sh_codex_local_run_config_ollama_host_overrides_env "test_agent_sh_codex_local_run_config_ollama_host_overrides_env"
+  run_selected_test test_agent_sh_codex_local_run_reports_unreachable_ollama_host "test_agent_sh_codex_local_run_reports_unreachable_ollama_host"
   run_selected_test test_agent_sh_codex_local_metadata_status_uses_stderr "test_agent_sh_codex_local_metadata_status_uses_stderr"
   run_selected_test test_agent_sh_codex_local_run_with_explicit_profile_updates_catalog "test_agent_sh_codex_local_run_with_explicit_profile_updates_catalog"
   run_selected_test test_agent_sh_codex_local_run_updates_stale_catalog_entry "test_agent_sh_codex_local_run_updates_stale_catalog_entry"

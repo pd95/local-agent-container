@@ -53,6 +53,18 @@ Ollama itself usually listens only on:
 
 So the container often cannot reach it until you expose or proxy it.
 
+For an isolated Ollama server or a non-default port, pass the base URL that is
+reachable from inside the container:
+
+```bash
+OLLAMA_HOST=http://192.168.64.1:11439 agentctl run ...
+agentctl run -c ollama_host=http://192.168.64.1:11439 ...
+```
+
+The `-c ollama_host=...` value takes precedence over `OLLAMA_HOST`. Use the
+container-reachable address, not the macOS listener value such as
+`http://0.0.0.0:11439`.
+
 ## Quick verification
 
 If `192.168.64.1` is your container-visible host address, run this on the
@@ -70,12 +82,15 @@ In local mode, `agentctl run` performs a runtime-aware Ollama preflight for the
 default entrypoint:
 
 - Codex:
-  - validates the configured `base_url`
-  - also probes the detected host gateway
+  - probes `<ollama_host>/api/version` when an explicit host is provided
+  - otherwise probes the detected host gateway on port `11434`
+  - writes the Codex provider `base_url` as `<ollama_host>/v1`
 - Claude:
-  - probes the detected host gateway and uses the Anthropic-compatible endpoint
+  - uses the same explicit-host or detected-gateway Ollama resolution and sets
+    the Anthropic-compatible endpoint
 
-`--cmd` and `--shell` skip this preflight.
+`--shell` skips this preflight. `--cmd` only performs it when the command runs
+through `agent.sh run`.
 
 ## Options
 

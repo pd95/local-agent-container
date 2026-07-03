@@ -73,6 +73,15 @@ version is:
 
 Details and options are in [docs/networking.md](docs/networking.md).
 
+For isolated Ollama listeners or non-default ports, pass the container-reachable
+base URL explicitly:
+
+```bash
+OLLAMA_HOST=http://192.168.64.1:11439 agentctl run ...
+# or
+agentctl run -c ollama_host=http://192.168.64.1:11439 ...
+```
+
 ## Workspace model
 
 `agentctl run` starts an agent inside a container, but it mounts a host

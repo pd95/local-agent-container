@@ -482,12 +482,46 @@ ollama_detect_gateway() {
   ' "$route_file" 2>/dev/null || true
 }
 
+ollama_configured_base_url() {
+  local value=""
+
+  value="$(runtime_config_value ollama_host)"
+  if [ -z "$value" ]; then
+    value="${OLLAMA_HOST:-}"
+  fi
+  [ -n "$value" ] || return 1
+
+  while [ "${value%/}" != "$value" ]; do
+    value="${value%/}"
+  done
+  [ -n "$value" ] || die "invalid Ollama host: $value"
+  printf '%s\n' "$value"
+}
+
 ollama_resolve_base_url() {
+  local configured_base_url=""
   local gateway=""
   local api_url=""
   local ollama_port="11434"
 
   command -v curl >/dev/null 2>&1 || die "Missing curl required for local Ollama connectivity checks"
+  configured_base_url="$(ollama_configured_base_url || true)"
+  if [ -n "$configured_base_url" ]; then
+    api_url="${configured_base_url}/api/version"
+    if curl -fsS --max-time 3 "$api_url" >/dev/null 2>&1; then
+      printf '%s\n' "$configured_base_url"
+      return 0
+    fi
+
+    die "Local Ollama is not reachable from the container.
+
+Tried:
+- Configured Ollama host: $api_url
+
+Use a URL reachable from inside the container, for example:
+  OLLAMA_HOST=http://192.168.64.1:11439"
+  fi
+
   gateway="$(ollama_detect_gateway)"
   [ -n "$gateway" ] || die "Unable to determine the container host gateway for local Ollama"
   api_url="http://${gateway}:${ollama_port}/api/version"
