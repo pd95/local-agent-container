@@ -5007,19 +5007,34 @@ run_mode() {
   local pre_exec=""
   local post_exec=""
   local runtime_mode="local"
-  local cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_RUNTIME_CONFIG_JSON=\$2 AGENTCTL_MODEL_OVERRIDE=\$3 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override")
+  local ollama_host="${OLLAMA_HOST:-}"
+  local launch_env="AGENTCTL_RUN_MODE=\$1 AGENTCTL_RUNTIME_CONFIG_JSON=\$2 AGENTCTL_MODEL_OVERRIDE=\$3"
+  local -a cmd_env=("AGENTCTL_RUN_MODE=$runtime_mode" "AGENTCTL_RUNTIME_CONFIG_JSON=$runtime_config_json" "AGENTCTL_MODEL_OVERRIDE=$model_override")
+  local cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "$launch_env exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override")
+  if [ -n "$ollama_host" ]; then
+    launch_env="$launch_env OLLAMA_HOST=\$4"
+    cmd_env+=("OLLAMA_HOST=$ollama_host")
+    cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "$launch_env exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override" "$ollama_host")
+  fi
 
   if [ "$online" -eq 1 ]; then
     runtime_mode="online"
     post_exec="run_post_exec"
-    cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "AGENTCTL_RUN_MODE=\$1 AGENTCTL_RUNTIME_CONFIG_JSON=\$2 AGENTCTL_MODEL_OVERRIDE=\$3 exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override")
+    cmd_env=("AGENTCTL_RUN_MODE=$runtime_mode" "AGENTCTL_RUNTIME_CONFIG_JSON=$runtime_config_json" "AGENTCTL_MODEL_OVERRIDE=$model_override")
+    launch_env="AGENTCTL_RUN_MODE=\$1 AGENTCTL_RUNTIME_CONFIG_JSON=\$2 AGENTCTL_MODEL_OVERRIDE=\$3"
+    cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "$launch_env exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override")
+    if [ -n "$ollama_host" ]; then
+      launch_env="$launch_env OLLAMA_HOST=\$4"
+      cmd_env+=("OLLAMA_HOST=$ollama_host")
+      cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "$launch_env exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override" "$ollama_host")
+    fi
   fi
   if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ]; then
     pre_exec="run_pre_exec"
   fi
 
   if [ "${#cmd_override[@]}" -gt 0 ]; then
-    cmd=("${cmd_override[@]}")
+    cmd=(env "${cmd_env[@]}" "${cmd_override[@]}")
     shell=0
   fi
 
