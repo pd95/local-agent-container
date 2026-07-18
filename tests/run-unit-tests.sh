@@ -8663,6 +8663,51 @@ test_upgrade_reinstall_command_prefers_requested_dpkg_packages() {
   assert_contains "agentctl su-exec --name unit-test-container apt-get install -y tree"
 }
 
+test_upgrade_package_warning_excludes_reinstalled_feature_packages() {
+  begin_test "upgrade package warning excludes packages owned by reinstalled features"
+
+  load_agentctl_functions
+
+  local feature_registry
+  feature_registry="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-feature-registry.XXXXXX")"
+  register_dir_cleanup "$feature_registry"
+  printf '%s\n' '{
+    "id":"office",
+    "supported_image_families":["agent-python"],
+    "system_packages":{"apk":["build-base","pandoc-cli"]}
+  }' >"$feature_registry/office.json"
+  AGENTCTL_HOST_FEATURE_REGISTRY_DIR="$feature_registry"
+  CLI_NAME=agentctl
+
+  run_capture warn_upgrade_package_loss \
+    unit-test-container \
+    agent-python \
+    agent-python \
+    '{"package_manager":"apk","packages":["bash","build-base","pandoc-cli","ripgrep"],"requested_packages":["bash","build-base","pandoc-cli","ripgrep"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
+    unit-test-container \
+    '["office"]'
+
+  assert_status 0
+  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache ripgrep"
+  assert_not_contains "apk add --no-cache build-base"
+  assert_not_contains "apk add --no-cache pandoc-cli"
+
+  run_capture warn_upgrade_package_loss \
+    unit-test-container \
+    agent-python \
+    agent-python \
+    '{"package_manager":"apk","packages":["bash","build-base","pandoc-cli"],"requested_packages":["bash","build-base","pandoc-cli"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
+    unit-test-container \
+    '["office"]'
+
+  assert_status 0
+  [ -z "$RUN_OUTPUT" ] || fail "Expected feature-owned package warning to be suppressed, got: $RUN_OUTPUT"
+}
+
 test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   begin_test "upgrade reinstalls added runtimes and features in the target container"
 
@@ -10592,6 +10637,7 @@ main() {
   run_selected_test test_upgrade_reinstall_command_suggests_default_apk_edge_tags "test_upgrade_reinstall_command_suggests_default_apk_edge_tags"
   run_selected_test test_upgrade_warns_about_image_packages_removed_from_target "test_upgrade_warns_about_image_packages_removed_from_target"
   run_selected_test test_upgrade_reinstall_command_prefers_requested_dpkg_packages "test_upgrade_reinstall_command_prefers_requested_dpkg_packages"
+  run_selected_test test_upgrade_package_warning_excludes_reinstalled_feature_packages "test_upgrade_package_warning_excludes_reinstalled_feature_packages"
   run_selected_test test_upgrade_reinstalls_added_runtimes_and_features_in_target "test_upgrade_reinstalls_added_runtimes_and_features_in_target"
   run_selected_test test_upgrade_reinstalls_missing_default_runtime_after_restore "test_upgrade_reinstalls_missing_default_runtime_after_restore"
   run_selected_test test_upgrade_warns_and_clears_missing_preferred_runtime "test_upgrade_warns_and_clears_missing_preferred_runtime"
