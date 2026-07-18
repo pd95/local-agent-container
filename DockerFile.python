@@ -25,9 +25,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     IMAGE_NAME=agent-python
 
-RUN mkdir -p /etc/agentctl/codex /etc/agentctl \
- && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/agentctl/codex/ \
- && BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+RUN BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
  && cat > /etc/agentctl/image.md <<EOF
 You are running inside the \`agent-python\` image.
 

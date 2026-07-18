@@ -120,8 +120,14 @@ qwen_ensure_settings_file() {
   local ollama_base_url="$1"
   local model="$2"
   local settings_file=""
+  local default_file=""
 
   settings_file="$(qwen_settings_file)"
+  default_file="$(runtime_default_config_dir qwen)/settings.json"
+  if [ ! -f "$settings_file" ] && [ -f "$default_file" ]; then
+    mkdir -p "$(dirname "$settings_file")"
+    cp "$default_file" "$settings_file"
+  fi
   if [ -f "$settings_file" ]; then
     qwen_merge_settings "$settings_file" "$ollama_base_url" "$model"
   else

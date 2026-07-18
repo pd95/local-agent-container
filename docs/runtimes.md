@@ -34,6 +34,10 @@ Curated image builds install configured runtimes during image creation. Runtime
 install/update commands place launchers and package caches under `/opt/agentctl`
 so mounting external state over `/home/coder` does not hide image-baked tools.
 Runtime config, auth, history, and sessions remain under `/home/coder`.
+Image-owned default configuration is grouped under `/etc/agentctl/<runtime>`;
+it is copied into runtime-owned home directories only when needed.
+Tracked host baselines mirror that structure under `defaults/<runtime>`, with
+ignored personal overrides under `defaults.local/<runtime>`.
 
 To install before launch, opt in explicitly:
 

@@ -2,7 +2,7 @@
   "id": "pi",
   "command": "pi",
   "install_method": "npm-prefix",
-  "default_config_dir": "/etc/pictl",
+  "default_config_dir": "/etc/agentctl/pi",
   "capabilities": {
     "install": true,
     "update": true,

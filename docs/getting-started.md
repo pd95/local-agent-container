@@ -151,6 +151,11 @@ agentctl refresh
 
 This is the normal non-destructive update path.
 
+Tracked image defaults live in `defaults/<runtime>/`. To customize them without
+creating Git changes, copy the relevant file to the ignored
+`defaults.local/<runtime>/` directory and edit that copy. Local files override
+tracked files during builds and refreshes.
+
 To restore image-owned defaults such as `config.toml`, `local_models.json`, or
 the `AGENTS.md` symlink:
 

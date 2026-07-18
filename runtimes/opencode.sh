@@ -62,9 +62,16 @@ opencode_ensure_config_file() {
   local ollama_base_url="$1"
   local model="$2"
   local config_file=""
+  local default_file=""
 
   config_file="$(opencode_config_file)"
   [ -f "$config_file" ] && return 0
+  default_file="$(runtime_default_config_dir opencode)/opencode.json"
+  if [ -f "$default_file" ]; then
+    mkdir -p "$(dirname "$config_file")"
+    cp "$default_file" "$config_file"
+    return 0
+  fi
   opencode_write_config "$config_file" "$ollama_base_url" "$model"
 }
 
