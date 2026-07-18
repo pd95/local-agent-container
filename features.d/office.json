@@ -3,6 +3,41 @@
   "display_name": "Office Compatibility Tooling",
   "install_method": "apk+npm+pip",
   "description": "Document, PDF, spreadsheet, OCR, and report-generation tooling layered onto agent-python.",
+  "supported_image_families": [
+    "agent-python"
+  ],
+  "system_packages": {
+    "apk": [
+      "build-base",
+      "ca-certificates",
+      "fd",
+      "fontconfig",
+      "freetype",
+      "ghostscript",
+      "jpeg",
+      "libpng",
+      "musl-dev",
+      "npm",
+      "openssh-client",
+      "pandoc-cli",
+      "poppler-utils",
+      "py3-matplotlib",
+      "py3-numpy",
+      "py3-openpyxl",
+      "py3-pandas",
+      "py3-pdfminer",
+      "py3-pillow",
+      "py3-pypdf",
+      "py3-pytest",
+      "py3-reportlab",
+      "py3-xlsxwriter",
+      "python3-dev",
+      "qpdf",
+      "tesseract-ocr",
+      "ttf-dejavu",
+      "zlib"
+    ]
+  },
   "capabilities": {
     "install": true,
     "remove": false,

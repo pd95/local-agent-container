@@ -2498,6 +2498,93 @@ test_images_help_reports_subcommand_options() {
   assert_not_contains "Options for :"
 }
 
+test_images_print_sorted_keeps_compact_output() {
+  begin_test "raw images listing keeps compact output"
+
+  load_agentctl_functions
+
+  run_capture images_print_sorted $'agent-python:20260718-180539\nagent-plain:20260718-180539\nagent-project-backup-20260718174529\nagent-python\nagent-plain' 0 "" 0
+
+  assert_status 0
+  [ "$RUN_OUTPUT" = $'agent-plain\nagent-plain:20260718-180539\nagent-python\nagent-python:20260718-180539\nagent-project-backup-20260718174529' ] \
+    || fail "Expected compact image output, got: $RUN_OUTPUT"
+}
+
+test_images_print_metadata_uses_runtime_image_details() {
+  begin_test "images metadata uses runtime creation, size, platform, and digest details"
+
+  load_agentctl_functions
+
+  run_capture images_print_metadata $'agent-plain\nagent-plain:20260718-180539\nlocalhost:5000/team/image' '[
+    {"configuration":{"name":"agent-plain:latest","creationDate":"2026-07-18T18:05:54Z","descriptor":{"digest":"sha256:7726e80cafd612345678","size":374}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"size":179522222}]},
+    {"configuration":{"name":"docker.io/library/agent-plain:20260718-180539","creationDate":"2026-07-18T18:05:54Z","descriptor":{"digest":"sha256:7726e80cafd612345678","size":374}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"size":179522222}]},
+    {"configuration":{"name":"localhost:5000/team/image:latest","creationDate":"2026-07-18T19:00:00Z","descriptor":{"digest":"sha256:abcdef1234567890"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"}}]}
+  ]'
+
+  assert_status 0
+  assert_contains "IMAGE"
+  assert_contains "CREATED"
+  assert_contains "SIZE"
+  assert_contains "PLATFORM"
+  assert_contains "IMAGE ID"
+  assert_contains "agent-plain"
+  assert_contains "2026-07-18 18:05:54Z"
+  assert_contains "171.2 MiB"
+  assert_contains "linux/arm64"
+  assert_contains "7726e80cafd6"
+  assert_contains "localhost:5000/team/image"
+  assert_contains "2026-07-18 19:00:00Z"
+  printf '%s\n' "$RUN_OUTPUT" | grep -E '^localhost:5000/team/image +2026-07-18 19:00:00Z +unknown +linux/arm64 +abcdef123456$' >/dev/null \
+    || fail "Expected registry-port image metadata with unknown size, got: $RUN_OUTPUT"
+}
+
+test_images_list_defaults_to_metadata_and_supports_raw_output() {
+  begin_test "images list defaults to metadata and supports raw output"
+
+  load_agentctl_functions
+
+  require_container() { :; }
+  parse_image_list() {
+    printf '%s\n' agent-plain agent-plain:20260718-180539 agent-project-backup-20260718174529
+  }
+  image_list_json() {
+    printf '%s\n' '[
+      {"configuration":{"name":"agent-plain:latest","creationDate":"2026-07-18T18:05:54Z","descriptor":{"digest":"sha256:7726e80cafd612345678"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"size":179522222}]},
+      {"configuration":{"name":"agent-plain:20260718-180539","creationDate":"2026-07-18T18:05:54Z","descriptor":{"digest":"sha256:7726e80cafd612345678"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"size":179522222}]},
+      {"configuration":{"name":"agent-project-backup-20260718174529:latest","creationDate":"2026-07-18T17:47:51Z","descriptor":{"digest":"sha256:77ac1f1455a712345678"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"size":3139973763}]}
+    ]'
+  }
+
+  run_capture images_list_cmd
+  assert_status 0
+  assert_contains "CREATED"
+  assert_contains "171.2 MiB"
+  assert_contains "2.9 GiB"
+
+  image_list_json() { fail "raw image listing should not request JSON metadata"; }
+  run_capture images_list_cmd --raw
+  assert_status 0
+  assert_not_contains "CREATED"
+  assert_contains $'agent-plain\nagent-plain:20260718-180539\nagent-project-backup-20260718174529'
+}
+
+test_images_list_falls_back_to_refs_when_metadata_is_unavailable() {
+  begin_test "images list falls back to refs when metadata is unavailable"
+
+  load_agentctl_functions
+
+  require_container() { :; }
+  parse_image_list() { printf '%s\n' agent-plain agent-python; }
+  image_list_json() { printf '%s\n' 'not-json'; }
+
+  run_capture images_list_cmd
+  assert_status 0
+  assert_contains "Warning: Image metadata is unavailable; showing image refs only"
+  assert_contains $'agent-plain\nagent-python'
+  assert_not_contains "0 B"
+  assert_not_contains "CREATED"
+}
+
 test_rm_help_reports_force_option() {
   begin_test "rm help reports the force option"
 
@@ -7868,7 +7955,7 @@ test_upgrade_uses_explicit_resource_overrides() {
         rm_calls=$((rm_calls + 1))
         ;;
       export)
-        fail "export should not be called for --no-backup"
+        :
         ;;
       *)
         fail "Unexpected container invocation: $*"
@@ -7879,9 +7966,12 @@ test_upgrade_uses_explicit_resource_overrides() {
     printf 'codex\t%s\trw\t2\t4G\n' "$TEST_ROOT"
   }
 
-  run_capture upgrade_cmd --name unit-test-container --cpu 6 --mem 12G --no-backup
+  run_capture upgrade_cmd --name unit-test-container --cpu 6 --mem 12G
   assert_status 0
-  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  assert_contains "Upgrade complete: unit-test-container (backup image: unit-test-container-backup-20260406120000)"
+  assert_contains $'Starting container for state backup: unit-test-container\n\nBacking up user state from unit-test-container'
+  assert_contains $'Stopping container: unit-test-container\n\nExporting container state to image: unit-test-container-backup-20260406120000'
+  assert_contains $'Exporting container state to image: unit-test-container-backup-20260406120000\n\nRemoving container: unit-test-container'
   printf '%s\n' "$create_args" | grep -F -- "-c 6" >/dev/null || fail "Expected create args to include overridden cpu, got: $create_args"
   printf '%s\n' "$create_args" | grep -F -- "-m 12G" >/dev/null || fail "Expected create args to include overridden mem, got: $create_args"
   printf '%s\n' "$create_args" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected create args to include container name, got: $create_args"
@@ -8051,6 +8141,7 @@ test_upgrade_export_failure_restarts_running_source() {
   assert_contains "Backing up user state from unit-test-container"
   assert_contains "Stopping container: unit-test-container"
   assert_contains "Exporting container state to image: unit-test-container-backup-20260406120000"
+  assert_contains $'Stopping container: unit-test-container\n\nExporting container state to image: unit-test-container-backup-20260406120000'
   assert_contains "Restarting original container after failed export: unit-test-container"
   assert_contains "Failed to export container filesystem for backup image. The original container was not removed."
   assert_not_contains "Removing container: unit-test-container"
@@ -8352,7 +8443,7 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
   ensure_started_container_is_running() { return 0; }
   image_exists() {
     case "$1" in
-      agent-plain|agent-python) return 0 ;;
+      agent-plain|agent-swift) return 0 ;;
       *) return 1 ;;
     esac
   }
@@ -8362,7 +8453,7 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
   persist_container_system_manifest_baseline() { :; }
   persist_container_system_manifest_baseline_from_image() { :; }
   collect_upgrade_container_preflight() {
-    UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":["bash","git","curl","ripgrep"]}'
+    UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"dpkg","packages":["bash","git","curl","tree"]}'
     UPGRADE_PREFLIGHT_BASELINE_MANIFEST=''
     UPGRADE_PREFLIGHT_SOURCE_SUPPORTS_STATE_CONTRACT=1
   }
@@ -8398,13 +8489,13 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
       exec)
         case "$2" in
           unit-test-container)
-            printf '{"package_manager":"apk","packages":["bash","git","curl","ripgrep"]}\n'
+            printf '{"package_manager":"dpkg","packages":["bash","git","curl","tree"]}\n'
             ;;
           source-manifest)
-            printf '{"package_manager":"apk","packages":["bash","git"]}\n'
+            printf '{"package_manager":"dpkg","packages":["bash","git"]}\n'
             ;;
           target-manifest)
-            printf '{"package_manager":"apk","packages":["bash","git","curl","python3"]}\n'
+            printf '{"package_manager":"dpkg","packages":["bash","git","curl","python3"]}\n'
             ;;
           *)
             fail "Unexpected manifest exec target: $2"
@@ -8423,15 +8514,21 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
     printf 'agent-plain\t%s\trw\t2\t4G\n' "$TEST_ROOT"
   }
 
-  run_capture upgrade_cmd --name unit-test-container --image agent-python --no-backup
+  run_capture upgrade_cmd --name unit-test-container --image agent-swift --no-backup
   assert_status 0
-  assert_contains "Upgrade will remove 1 extra apk package(s) not present in agent-python:"
-  assert_contains "  - ripgrep"
+  assert_contains "Upgrade will remove 1 extra dpkg package(s) not present in agent-swift:"
+  assert_contains "  - tree"
   assert_contains "To reinstall after upgrade:"
-  assert_contains "su-exec --name unit-test-container apk add --no-cache ripgrep"
+  assert_contains "su-exec --name unit-test-container apt-get update"
+  assert_contains "su-exec --name unit-test-container apt-get install -y tree"
   assert_not_contains "  - curl"
   assert_not_contains "  - bash"
   assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  assert_contains "Reminder: reinstall top-level packages removed by the upgrade if you still need them:"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "su-exec --name unit-test-container apt-get update")" -eq 2 ] \
+    || fail "Expected apt-get update before and after upgrade"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "su-exec --name unit-test-container apt-get install -y tree")" -eq 2 ] \
+    || fail "Expected apt-get install before and after upgrade"
   printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
   [ "$start_calls" -eq 2 ] || fail "Expected 2 persisted start calls, got: $start_calls"
   [ "$stop_calls" -eq 2 ] || fail "Expected 2 persisted stop calls, got: $stop_calls"
@@ -8564,6 +8661,51 @@ test_upgrade_reinstall_command_prefers_requested_dpkg_packages() {
   assert_contains "To reinstall top-level packages after upgrade:"
   assert_contains "agentctl su-exec --name unit-test-container apt-get update"
   assert_contains "agentctl su-exec --name unit-test-container apt-get install -y tree"
+}
+
+test_upgrade_package_warning_excludes_reinstalled_feature_packages() {
+  begin_test "upgrade package warning excludes packages owned by reinstalled features"
+
+  load_agentctl_functions
+
+  local feature_registry
+  feature_registry="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-feature-registry.XXXXXX")"
+  register_dir_cleanup "$feature_registry"
+  printf '%s\n' '{
+    "id":"office",
+    "supported_image_families":["agent-python"],
+    "system_packages":{"apk":["build-base","pandoc-cli"]}
+  }' >"$feature_registry/office.json"
+  AGENTCTL_HOST_FEATURE_REGISTRY_DIR="$feature_registry"
+  CLI_NAME=agentctl
+
+  run_capture warn_upgrade_package_loss \
+    unit-test-container \
+    agent-python \
+    agent-python \
+    '{"package_manager":"apk","packages":["bash","build-base","pandoc-cli","ripgrep"],"requested_packages":["bash","build-base","pandoc-cli","ripgrep"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
+    unit-test-container \
+    '["office"]'
+
+  assert_status 0
+  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache ripgrep"
+  assert_not_contains "apk add --no-cache build-base"
+  assert_not_contains "apk add --no-cache pandoc-cli"
+
+  run_capture warn_upgrade_package_loss \
+    unit-test-container \
+    agent-python \
+    agent-python \
+    '{"package_manager":"apk","packages":["bash","build-base","pandoc-cli"],"requested_packages":["bash","build-base","pandoc-cli"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
+    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
+    unit-test-container \
+    '["office"]'
+
+  assert_status 0
+  [ -z "$RUN_OUTPUT" ] || fail "Expected feature-owned package warning to be suppressed, got: $RUN_OUTPUT"
 }
 
 test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
@@ -10348,6 +10490,10 @@ main() {
   run_selected_test test_feature_help_reports_new_command "test_feature_help_reports_new_command"
   run_selected_test test_use_help_reports_new_command "test_use_help_reports_new_command"
   run_selected_test test_images_help_reports_subcommand_options "test_images_help_reports_subcommand_options"
+  run_selected_test test_images_print_sorted_keeps_compact_output "test_images_print_sorted_keeps_compact_output"
+  run_selected_test test_images_print_metadata_uses_runtime_image_details "test_images_print_metadata_uses_runtime_image_details"
+  run_selected_test test_images_list_defaults_to_metadata_and_supports_raw_output "test_images_list_defaults_to_metadata_and_supports_raw_output"
+  run_selected_test test_images_list_falls_back_to_refs_when_metadata_is_unavailable "test_images_list_falls_back_to_refs_when_metadata_is_unavailable"
   run_selected_test test_rm_help_reports_force_option "test_rm_help_reports_force_option"
   run_selected_test test_agent_sh_runtime_info_reports_registry_metadata "test_agent_sh_runtime_info_reports_registry_metadata"
   run_selected_test test_agent_sh_feature_list_reports_declared_features "test_agent_sh_feature_list_reports_declared_features"
@@ -10491,6 +10637,7 @@ main() {
   run_selected_test test_upgrade_reinstall_command_suggests_default_apk_edge_tags "test_upgrade_reinstall_command_suggests_default_apk_edge_tags"
   run_selected_test test_upgrade_warns_about_image_packages_removed_from_target "test_upgrade_warns_about_image_packages_removed_from_target"
   run_selected_test test_upgrade_reinstall_command_prefers_requested_dpkg_packages "test_upgrade_reinstall_command_prefers_requested_dpkg_packages"
+  run_selected_test test_upgrade_package_warning_excludes_reinstalled_feature_packages "test_upgrade_package_warning_excludes_reinstalled_feature_packages"
   run_selected_test test_upgrade_reinstalls_added_runtimes_and_features_in_target "test_upgrade_reinstalls_added_runtimes_and_features_in_target"
   run_selected_test test_upgrade_reinstalls_missing_default_runtime_after_restore "test_upgrade_reinstalls_missing_default_runtime_after_restore"
   run_selected_test test_upgrade_warns_and_clears_missing_preferred_runtime "test_upgrade_warns_and_clears_missing_preferred_runtime"

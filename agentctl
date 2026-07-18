@@ -886,6 +886,7 @@ Options for images:
   --backup      Show only backup image refs
   --all         Include non-agent images
   --latest      Show only stable tags and newest timestamp tag per family
+  --raw         Print image refs only, without metadata
 
 Options for images prune:
   --keep N      Keep the newest N timestamp tags per family (default: 1)
@@ -1119,6 +1120,77 @@ images_print_sorted() {
   fi
 }
 
+images_print_metadata() {
+  local refs="$1"
+  local images_json="$2"
+  local rows=""
+
+  rows="$(printf '%s' "$images_json" | jq -r --arg targets "$refs" '
+      def norm:
+        if type == "string" then sub("^docker\\.io/library/"; "") else "" end;
+      def ref:
+        (.reference // .configuration.name // .configuration.reference // "") | norm;
+      def target_refs($target):
+        if ($target | contains("@")) or ($target | split("/")[-1] | contains(":"))
+        then [$target]
+        else [$target, $target + ":latest"]
+        end;
+      def human_size:
+        if . >= 1073741824 then ((. / 1073741824 * 10 | round) / 10 | tostring) + " GiB"
+        elif . >= 1048576 then ((. / 1048576 * 10 | round) / 10 | tostring) + " MiB"
+        elif . >= 1024 then ((. / 1024 * 10 | round) / 10 | tostring) + " KiB"
+        else tostring + " B"
+        end;
+      if type != "array" then error("invalid image list") else . end as $images
+      | ($targets | split("\n") | map(select(length > 0)))[] as $target
+      | (target_refs($target)) as $candidate_refs
+      | ([$images[] | select(type == "object") | select(ref as $ref | $candidate_refs | index($ref))][0] // {}) as $image
+      | ($image.configuration // $image) as $configuration
+      | ($configuration.descriptor // $image.descriptor // {}) as $descriptor
+      | ($image.variants // []) as $variants
+      | (($configuration.creationDate // $configuration.created // $variants[0].config.created // "unknown")
+          | if . == "unknown" then . else sub("\\.[0-9]+Z$"; "Z") | sub("T"; " ") end) as $created
+      | ([$variants[]? | .size | numbers] | add // ($descriptor.size | numbers?) // null) as $size
+      | ([$variants[]? | .platform? // {}
+            | ((.os // "unknown") + "/" + (.architecture // "unknown") + (if .variant then "/" + .variant else "" end))]
+          | unique | if length == 0 then ["unknown"] else . end | join(",")) as $platform
+      | (($descriptor.digest // $image.id // "unknown")
+          | if startswith("sha256:") then .[7:19] else .[0:12] end) as $image_id
+      | [$target, $created, (if $size == null then "unknown" else ($size | human_size) end), $platform, $image_id] | @tsv
+    ' 2>/dev/null)" || return 1
+
+  printf '%s\n' "$rows" | awk -F '\t' '
+    BEGIN {
+      image_width = length("IMAGE")
+      created_width = length("CREATED")
+      size_width = length("SIZE")
+      platform_width = length("PLATFORM")
+    }
+    {
+      image[NR] = $1
+      created[NR] = $2
+      size[NR] = $3
+      platform[NR] = $4
+      image_id[NR] = $5
+      if (length($1) > image_width) image_width = length($1)
+      if (length($2) > created_width) created_width = length($2)
+      if (length($3) > size_width) size_width = length($3)
+      if (length($4) > platform_width) platform_width = length($4)
+    }
+    END {
+      format = "%-" image_width "s  %-" created_width "s  %" size_width "s  %-" platform_width "s  %s\n"
+      printf format, "IMAGE", "CREATED", "SIZE", "PLATFORM", "IMAGE ID"
+      for (i = 1; i <= NR; i++) {
+        if (image[i] == "") {
+          print ""
+        } else {
+          printf format, image[i], created[i], size[i], platform[i], image_id[i]
+        }
+      }
+    }
+  '
+}
+
 remove_image_ref() {
   local image_ref="$1"
   if "$CONTAINER_CMD" image rm "$image_ref" >/dev/null 2>&1; then
@@ -1135,8 +1207,11 @@ images_list_cmd() {
   local backup=0
   local include_all=0
   local latest=0
+  local raw=0
   local refs=""
+  local images_json=""
   local filtered_refs=""
+  local sorted_refs=""
   local ref
 
   while [ $# -gt 0 ]; do
@@ -1145,6 +1220,7 @@ images_list_cmd() {
       --backup) backup=1; shift ;;
       --all) include_all=1; shift ;;
       --latest) latest=1; shift ;;
+      --raw) raw=1; shift ;;
       --help) usage_images; return 0 ;;
       *) die "Unknown option for images: $1" ;;
     esac
@@ -1175,10 +1251,24 @@ images_list_cmd() {
   [ -z "$filtered_refs" ] && return 0
 
   if [ "$latest" -eq 1 ]; then
-    images_print_latest "$filtered_refs" "$image" "$backup"
-    return 0
+    sorted_refs="$(images_print_latest "$filtered_refs" "$image" "$backup")"
+  else
+    sorted_refs="$(images_print_sorted "$filtered_refs" "$include_all" "$image" "$backup")"
   fi
-  images_print_sorted "$filtered_refs" "$include_all" "$image" "$backup"
+  if [ "$raw" -eq 1 ]; then
+    printf '%s\n' "$sorted_refs"
+  else
+    images_json="$(image_list_json)"
+    if ! printf '%s' "$images_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+      warn "Image metadata is unavailable; showing image refs only"
+      printf '%s\n' "$sorted_refs"
+      return 0
+    fi
+    if ! images_print_metadata "$sorted_refs" "$images_json"; then
+      warn "Unable to parse image metadata; showing image refs only"
+      printf '%s\n' "$sorted_refs"
+    fi
+  fi
 }
 
 images_prune_cmd() {
@@ -4748,6 +4838,40 @@ upgrade_added_features_json() {
     "$(manifest_installed_features_json "$target_manifest")"
 }
 
+feature_managed_packages_json() {
+  local features_json="$1"
+  local target_image="$2"
+  local package_manager="$3"
+  local registry_dir="${AGENTCTL_HOST_FEATURE_REGISTRY_DIR:-$SCRIPT_DIR/features.d}"
+  local target_family="${target_image%%:*}"
+  local packages_json='[]'
+  local feature=""
+  local manifest=""
+  local feature_packages_json='[]'
+
+  while IFS= read -r feature; do
+    [ -n "$feature" ] || continue
+    case "$feature" in
+      *[!A-Za-z0-9_.-]*) continue ;;
+    esac
+    manifest="$registry_dir/$feature.json"
+    [ -f "$manifest" ] || continue
+    feature_packages_json="$(jq -c \
+      --arg target_family "$target_family" \
+      --arg package_manager "$package_manager" \
+      'if ((.supported_image_families // []) | index($target_family)) != null
+       then (.system_packages[$package_manager] // [])
+       else []
+       end' "$manifest" 2>/dev/null || printf '[]\n')"
+    packages_json="$(jq -cn \
+      --argjson existing "$packages_json" \
+      --argjson added "$feature_packages_json" \
+      '$existing + $added | unique')"
+  done < <(printf '%s' "$features_json" | jq -r '.[]' 2>/dev/null || true)
+
+  printf '%s\n' "$packages_json"
+}
+
 target_runtime_installable() {
   local name="$1"
   local runtime="$2"
@@ -4887,6 +5011,7 @@ warn_upgrade_package_loss() {
   local source_manifest="${5:-}"
   local target_manifest="${6:-}"
   local target_name="${7:-$name}"
+  local added_features_json="${8:-[]}"
   local stored_manifest=""
   local current_package_manager=""
   local source_package_manager=""
@@ -4909,6 +5034,7 @@ warn_upgrade_package_loss() {
   local removed_baseline_requested_package_count=0
   local added_requested_packages_json='[]'
   local reinstall_packages_json='[]'
+  local managed_feature_packages_json='[]'
   local reinstall_package_count=0
   local reinstall_package_manager=""
   local reinstall_command=""
@@ -4993,11 +5119,16 @@ warn_upgrade_package_loss() {
                 "$CLI_NAME" \
                 "$target_name" \
                 "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')" >&2
+              upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
+}  ${CLI_NAME} su-exec --name ${target_name} apt-get update
+  ${CLI_NAME} su-exec --name ${target_name} apt-get install -y $(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')"
             elif [ "$target_package_manager" = "apk" ]; then
               printf '  %s su-exec --name %s apk add --no-cache %s\n' \
                 "$CLI_NAME" \
                 "$target_name" \
                 "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')" >&2
+              upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
+}  ${CLI_NAME} su-exec --name ${target_name} apk add --no-cache $(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')"
             fi
           fi
         fi
@@ -5017,6 +5148,17 @@ warn_upgrade_package_loss() {
     reinstall_packages_json="$added_requested_packages_json"
   fi
 
+  managed_feature_packages_json="$(feature_managed_packages_json \
+    "$added_features_json" "$target_image" "$target_package_manager")"
+  reinstall_packages_json="$(json_string_array_difference \
+    "$reinstall_packages_json" "$managed_feature_packages_json")"
+
+  reinstall_package_count="$(printf '%s' "$reinstall_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
+  if [ "$requested_package_data_available" -eq 1 ] && [ "$reinstall_package_count" -eq 0 ] \
+    && [ "$(printf '%s' "$managed_feature_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')" -gt 0 ]; then
+    return 0
+  fi
+
   lost_count="$(printf '%s' "$lost_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
   [ "$lost_count" -gt 0 ] || return 0
 
@@ -5026,7 +5168,6 @@ warn_upgrade_package_loss() {
     warn "Upgrade changes package manager from $current_package_manager to $target_package_manager; reinstall these extra $current_package_manager packages manually if still needed:"
   fi
   printf '%s' "$lost_packages_json" | jq -r '.[] | "  - " + .' >&2
-  reinstall_package_count="$(printf '%s' "$reinstall_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
   if [ "$reinstall_package_count" -eq 0 ] && [ "$requested_package_data_available" -eq 0 ]; then
     reinstall_packages_json="$lost_packages_json"
     reinstall_package_count="$lost_count"
@@ -5085,12 +5226,16 @@ warn_upgrade_package_loss() {
       fi
       if [ "$reinstall_package_manager" = "apt-get" ]; then
         printf '  %s su-exec --name %s apt-get update\n' "$CLI_NAME" "$target_name" >&2
+        upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
+}  ${CLI_NAME} su-exec --name ${target_name} apt-get update"
       fi
       printf '  %s su-exec --name %s %s %s\n' \
         "$CLI_NAME" \
         "$target_name" \
         "$reinstall_command" \
         "$(printf '%s' "$reinstall_packages_json" | jq -r 'join(" ")')" >&2
+      upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
+}  ${CLI_NAME} su-exec --name ${target_name} ${reinstall_command} $(printf '%s' "$reinstall_packages_json" | jq -r 'join(" ")')"
     fi
   fi
 }
@@ -5733,6 +5878,7 @@ upgrade_cmd() {
   local preflight_source_manifest=""
   local preflight_target_manifest=""
   local inspect_info=""
+  local upgrade_package_reinstall_commands=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -5831,12 +5977,13 @@ upgrade_cmd() {
         preflight_source_manifest="$(image_system_manifest_json "$current_image" source 2>/dev/null || true)"
       fi
     fi
-    warn_upgrade_package_loss "$name" "$current_image" "$image" \
-      "$preflight_current_manifest" "$preflight_source_manifest" "$preflight_target_manifest" "$target_name"
     added_runtimes_json="$(upgrade_added_runtimes_json "$name" "$current_image" "$image" \
       "$preflight_current_manifest" "$preflight_source_manifest" "$preflight_target_manifest" 2>/dev/null || printf '[]\n')"
     added_features_json="$(upgrade_added_features_json "$name" "$current_image" "$image" \
       "$preflight_current_manifest" "$preflight_source_manifest" "$preflight_target_manifest" 2>/dev/null || printf '[]\n')"
+    warn_upgrade_package_loss "$name" "$current_image" "$image" \
+      "$preflight_current_manifest" "$preflight_source_manifest" "$preflight_target_manifest" "$target_name" \
+      "$added_features_json"
     current_preferred_runtime="$(container_preferred_runtime "$name" "$preflight_current_manifest" 2>/dev/null || true)"
     target_default_runtime="$(target_default_runtime_for_upgrade "$image" "$preflight_target_manifest" 2>/dev/null || true)"
     if [ "$was_running" -eq 0 ]; then
@@ -5940,9 +6087,11 @@ upgrade_cmd() {
   esac
 
   if [ "$used_export_for_config_backup" -eq 1 ]; then
+    echo >&2
     echo "Backing up user state from exported filesystem: $name" >&2
   else
     repair_state_permissions_for_upgrade "$name"
+    echo >&2
     echo "Backing up user state from $name" >&2
     backup_codex_config "$name" "$state_backup_file"
   fi
@@ -5953,6 +6102,7 @@ upgrade_cmd() {
   fi
 
   if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ]; then
+    echo >&2
     if [ "$used_export_for_config_backup" -eq 0 ]; then
       echo "Exporting container state to image: $backup_image" >&2
       export_container_for_upgrade "$name" "$export_file" "$was_running"
@@ -5960,6 +6110,7 @@ upgrade_cmd() {
       echo "Reusing exported container state for backup image: $backup_image" >&2
     fi
     build_backup_image_from_export "$backup_image" "$name" "$export_file" "$backup_root" "$backup_dockerfile"
+    echo >&2
   elif [ "$copy_mode" -eq 0 ]; then
     echo "Skipping backup image export for $name" >&2
   fi
@@ -6028,6 +6179,10 @@ upgrade_cmd() {
     echo "Upgrade complete: $target_name (backup skipped)" >&2
   fi
   echo >&2
+  if [ -n "$upgrade_package_reinstall_commands" ]; then
+    echo "Reminder: reinstall top-level packages removed by the upgrade if you still need them:" >&2
+    printf '%s\n\n' "$upgrade_package_reinstall_commands" >&2
+  fi
   echo "If no valid AGENTS.md configuration already exists, reset it with: ${CLI_NAME} run --name $target_name --reset-config" >&2
   if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ]; then
     echo "If everything works as expected, remove the backup image with: ${CLI_NAME} images prune --backup --image $backup_image --keep 0" >&2

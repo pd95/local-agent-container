@@ -18,6 +18,17 @@ Image naming convention:
 - `DockerFile` -> `agent-plain`
 - `DockerFile.<name>` -> `agent-<name>`
 
+## Listing images
+
+`agentctl images` shows each managed image with the creation time, total variant
+size, platform, and abbreviated image ID reported by Apple's container runtime.
+
+Use names-only output when feeding the result to another command:
+
+```bash
+agentctl images --raw
+```
+
 ## Building images
 
 Basic examples:
