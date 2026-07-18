@@ -75,12 +75,26 @@ container_list_running() {
   "$CONTAINER_CMD" ls 2>/dev/null || true
 }
 
+container_list_all_ids() {
+  if "$CONTAINER_CMD" ls -a --quiet 2>/dev/null; then
+    return 0
+  fi
+  container_list_all | awk 'NR > 1 && NF > 0 { print $1 }'
+}
+
+container_list_running_ids() {
+  if "$CONTAINER_CMD" ls --quiet 2>/dev/null; then
+    return 0
+  fi
+  container_list_running | awk 'NR > 1 && NF > 0 { print $1 }'
+}
+
 container_exists() {
-  container_list_all | grep -q -E "(^|[[:space:]])$1([[:space:]]|$)"
+  container_list_all_ids | grep -Fqx -- "$1"
 }
 
 container_running() {
-  container_list_running | grep -q -E "(^|[[:space:]])$1([[:space:]]|$)"
+  container_list_running_ids | grep -Fqx -- "$1"
 }
 
 stop_buildkit_container() {
@@ -404,6 +418,30 @@ def normalize_ref(ref):
         return ""
     return re.sub(r"^docker\.io/library/", "", ref)
 
+def entry_ref(entry):
+    configuration = entry.get("configuration") or {}
+    return normalize_ref(
+        entry.get("reference")
+        or configuration.get("name")
+        or configuration.get("reference")
+        or ""
+    )
+
+def entry_digests(entry):
+    digests = set()
+    descriptor = entry.get("descriptor") or {}
+    digest = descriptor.get("digest")
+    if isinstance(digest, str) and digest:
+        digests.add(digest)
+    for variant in entry.get("variants") or []:
+        if not isinstance(variant, dict):
+            continue
+        descriptor = variant.get("descriptor") or {}
+        digest = descriptor.get("digest")
+        if isinstance(digest, str) and digest:
+            digests.add(digest)
+    return digests
+
 try:
     images = json.loads(sys.stdin.read())
     if not isinstance(images, list):
@@ -411,25 +449,25 @@ try:
 except Exception:
     images = []
 
-target_digest = ""
+target_digests = set()
 for entry in images:
     if not isinstance(entry, dict):
         continue
-    ref = normalize_ref(entry.get("reference") or "")
+    ref = entry_ref(entry)
     if ref in (target, target_latest):
-        target_digest = ((entry.get("descriptor") or {}).get("digest") or "")
+        target_digests = entry_digests(entry)
         break
 
-if not target_digest:
+if not target_digests:
     sys.exit(2)
 
 matches = []
 for entry in images:
     if not isinstance(entry, dict):
         continue
-    if ((entry.get("descriptor") or {}).get("digest") or "") != target_digest:
+    if not target_digests.intersection(entry_digests(entry)):
         continue
-    ref = normalize_ref(entry.get("reference") or "")
+    ref = entry_ref(entry)
     if ref.rsplit(":", 1)[0] != target_family:
         continue
     if re.search(r":[0-9]{8}-[0-9]{6}$", ref):
@@ -795,6 +833,7 @@ Usage: $CLI_NAME doctor [options]
 Options:
   --name NAME  Container name (default: agent-<dir>)
   --fix        Repair detected user-state ownership and readability problems
+  --host       Check the host container CLI, service, and agentctl capabilities
 
 Doctor checks that the container can stay running for exec-based maintenance,
 checks known agentctl user-state paths in /home/coder, and verifies installed
@@ -3420,9 +3459,70 @@ refresh_cmd() {
   echo "Refresh complete: $name" >&2
 }
 
+host_capability() {
+  local label="$1"
+  shift
+
+  if "$@" >/dev/null 2>&1; then
+    printf '  %-24s %s\n' "$label" yes
+  else
+    printf '  %-24s %s\n' "$label" no
+  fi
+}
+
+container_help_contains() {
+  local pattern="$1"
+  shift
+
+  "$CONTAINER_CMD" "$@" --help 2>/dev/null | grep -Fq -- "$pattern"
+}
+
+container_command_available() {
+  local command_name="$1"
+
+  "$CONTAINER_CMD" --help 2>/dev/null \
+    | grep -Eq "^[[:space:]]+${command_name}([,[:space:]]|$)"
+}
+
+host_doctor() {
+  local cli_path=""
+  local cli_version=""
+  local system_version=""
+  local status=0
+
+  require_container
+  cli_path="$(command -v "$CONTAINER_CMD")"
+  cli_version="$("$CONTAINER_CMD" --version 2>&1)" || status=1
+
+  printf 'Container CLI\n'
+  printf '  %-24s %s\n' path "$cli_path"
+  printf '  %-24s %s\n' version "${cli_version:-unknown}"
+
+  printf 'Container service\n'
+  if system_version="$("$CONTAINER_CMD" system version --format json 2>&1)"; then
+    printf '%s\n' "$system_version" | sed 's/^/  /'
+  else
+    printf '  unavailable: %s\n' "$system_version"
+    status=1
+  fi
+
+  printf 'Capabilities\n'
+  host_capability 'quiet container list' container_help_contains --quiet list
+  host_capability 'JSON container list' container_help_contains --format list
+  host_capability 'container export file' container_help_contains --output export
+  host_capability 'container copy' container_command_available copy
+  host_capability 'SSH agent forwarding' container_help_contains --ssh run
+  host_capability 'Unix socket publish' container_help_contains --publish-socket run
+  host_capability 'shared memory size' container_help_contains --shm-size run
+  host_capability 'container machine' container_command_available machine
+
+  return "$status"
+}
+
 doctor_cmd() {
   local name=""
   local fix=0
+  local host=0
   local was_running=0
   local started_for_doctor=0
   local permission_output=""
@@ -3435,10 +3535,18 @@ doctor_cmd() {
     case "$1" in
       --name) name="$2"; shift 2 ;;
       --fix) fix=1; shift ;;
+      --host) host=1; shift ;;
       --help) usage_doctor; return 0 ;;
       *) die "Unknown option for doctor: $1" ;;
     esac
   done
+
+  if [ "$host" -eq 1 ]; then
+    [ -z "$name" ] || die "--host cannot be combined with --name"
+    [ "$fix" -eq 0 ] || die "--host cannot be combined with --fix"
+    host_doctor
+    return
+  fi
 
   require_container
   if [ -z "$name" ]; then

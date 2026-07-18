@@ -249,7 +249,60 @@ test_doctor_help_reports_fix_option() {
   assert_status 0
   assert_contains "Usage: agentctl doctor [options]"
   assert_contains "--fix"
+  assert_contains "--host"
   assert_contains "user-state ownership"
+}
+
+test_doctor_host_reports_runtime_and_capabilities() {
+  begin_test "doctor --host reports runtime and capabilities"
+
+  load_codexctl_functions
+
+  require_container() { return 0; }
+  command() {
+    if [ "$1" = "-v" ] && [ "$2" = "mock_container" ]; then
+      printf '/opt/homebrew/bin/container\n'
+      return 0
+    fi
+    builtin command "$@"
+  }
+  mock_container() {
+    case "$*" in
+      "--version")
+        printf 'container CLI version 1.1.0 (build: release, commit: test)\n'
+        ;;
+      "system version --format json")
+        printf '[{"name":"container-apiserver","version":"1.1.0"}]\n'
+        ;;
+      "list --help")
+        printf '%s\n' '  --quiet' '  --format <format>'
+        ;;
+      "export --help")
+        printf '%s\n' '  --output <output>'
+        ;;
+      "run --help")
+        printf '%s\n' '  --ssh' '  --publish-socket <spec>' '  --shm-size <size>'
+        ;;
+      "--help")
+        printf '%s\n' '  copy, cp  Copy files' '  machine  Manage machines'
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture doctor_cmd --host
+  assert_status 0
+  assert_contains "/opt/homebrew/bin/container"
+  assert_contains "container CLI version 1.1.0"
+  assert_contains '"container-apiserver"'
+  assert_contains "container copy           yes"
+  assert_contains "SSH agent forwarding     yes"
+  assert_contains "container machine        yes"
+  CONTAINER_CMD=container
+  unset -f command
 }
 
 test_rescue_help_reports_backup_image_options() {
@@ -507,6 +560,80 @@ EOF
   assert_status 0
   assert_contains "Image already exists: agent-plain (use --rebuild to rebuild)"
   [ "$tag_calls" -eq 0 ] || fail "Did not expect snapshot tag call, got $tag_calls"
+  CONTAINER_CMD=container
+}
+
+test_build_cmd_recognizes_container_1_image_snapshot_schema() {
+  begin_test "build_cmd recognizes timestamp tags in container 1 image JSON"
+
+  load_codexctl_functions
+
+  local tag_calls=0
+
+  require_container() { return 0; }
+  image_exists() { return 0; }
+  stop_buildkit_container() { :; }
+  mock_container() {
+    case "$*" in
+      "image ls --format json")
+        cat <<'EOF'
+[
+  {
+    "configuration":{"name":"agent-plain:latest"},
+    "variants":[{"descriptor":{"digest":"sha256:plain-latest"},"platform":{"architecture":"arm64","os":"linux"}}]
+  },
+  {
+    "configuration":{"name":"docker.io/library/agent-plain:20260718-120000"},
+    "variants":[{"descriptor":{"digest":"sha256:plain-latest"},"platform":{"architecture":"arm64","os":"linux"}}]
+  }
+]
+EOF
+        ;;
+      image\ tag*)
+        tag_calls=$((tag_calls + 1))
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture build_cmd --image agent-plain
+  assert_status 0
+  assert_contains "Image already exists: agent-plain (use --rebuild to rebuild)"
+  [ "$tag_calls" -eq 0 ] || fail "Did not expect snapshot tag call, got $tag_calls"
+  CONTAINER_CMD=container
+}
+
+test_container_lookup_uses_quiet_exact_ids() {
+  begin_test "container lookup uses quiet output and exact IDs"
+
+  load_codexctl_functions
+
+  mock_container() {
+    case "$*" in
+      "ls -a --quiet")
+        printf '%s\n' agent-project agent-project-copy
+        ;;
+      "ls --quiet")
+        printf '%s\n' agent-project-copy
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  CONTAINER_CMD="mock_container"
+
+  container_exists agent-project || fail "Expected exact container ID to exist"
+  if container_exists project; then
+    fail "Did not expect a partial container ID to match"
+  fi
+  container_running agent-project-copy || fail "Expected running container ID"
+  if container_running agent-project; then
+    fail "Did not expect stopped container to be reported as running"
+  fi
   CONTAINER_CMD=container
 }
 
@@ -2032,6 +2159,7 @@ test_agent_sh_runtime_list_ignores_dangling_runtime_launcher() {
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$temp_home/tools" \
     -- runtime list
   assert_status 0
   assert_not_contains "codex"
@@ -3595,6 +3723,7 @@ EOF
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -9491,6 +9620,7 @@ main() {
   run_selected_test test_exec_help_reports_stdio_option "test_exec_help_reports_stdio_option"
   run_selected_test test_run_cmd_wires_home_mount "test_run_cmd_wires_home_mount"
   run_selected_test test_doctor_help_reports_fix_option "test_doctor_help_reports_fix_option"
+  run_selected_test test_doctor_host_reports_runtime_and_capabilities "test_doctor_host_reports_runtime_and_capabilities"
   run_selected_test test_rescue_help_reports_backup_image_options "test_rescue_help_reports_backup_image_options"
   run_selected_test test_run_model_wires_selected_model "test_run_model_wires_selected_model"
   run_selected_test test_build_help_reports_primary_base_images "test_build_help_reports_primary_base_images"
@@ -9501,6 +9631,8 @@ main() {
   run_selected_test test_build_cmd_rebuilds_and_snapshots_local_dependencies "test_build_cmd_rebuilds_and_snapshots_local_dependencies"
   run_selected_test test_build_cmd_snapshots_existing_image_when_timestamp_missing "test_build_cmd_snapshots_existing_image_when_timestamp_missing"
   run_selected_test test_build_cmd_skips_existing_image_when_timestamp_matches "test_build_cmd_skips_existing_image_when_timestamp_matches"
+  run_selected_test test_build_cmd_recognizes_container_1_image_snapshot_schema "test_build_cmd_recognizes_container_1_image_snapshot_schema"
+  run_selected_test test_container_lookup_uses_quiet_exact_ids "test_container_lookup_uses_quiet_exact_ids"
   run_selected_test test_run_cmd_runtime_selection_does_not_auto_install_for_new_container "test_run_cmd_runtime_selection_does_not_auto_install_for_new_container"
   run_selected_test test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container "test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container"
   run_selected_test test_build_cmd_warns_for_legacy_office_image "test_build_cmd_warns_for_legacy_office_image"
