@@ -9436,6 +9436,51 @@ test_doctor_reports_container_startup_problem() {
   assert_contains "Doctor found a container startup problem in unit-test-container."
 }
 
+test_doctor_state_backup_readability_runs_real_export() {
+  begin_test "doctor verifies state readability with the real export command"
+
+  load_agentctl_functions
+
+  container_supports_state_contract() { return 0; }
+  CONTAINER_CMD=container
+  container() {
+    printf '%s\n' "tar: can't open '.codex/ollama-launch.config.toml': Permission denied" >&2
+    return 1
+  }
+
+  run_capture doctor_state_backup_readable unit-test-container
+  assert_status 1
+  assert_contains "state export is not readable by coder"
+  assert_contains ".codex/ollama-launch.config.toml"
+}
+
+test_doctor_state_permission_script_attaches_stdin() {
+  begin_test "doctor attaches stdin when running the state permission script"
+
+  load_agentctl_functions
+
+  local exec_args_file
+  local script_input_file
+
+  exec_args_file="$(mktemp "${TMPDIR:-/tmp}/agentctl-exec-args.XXXXXX")"
+  script_input_file="$(mktemp "${TMPDIR:-/tmp}/agentctl-script-input.XXXXXX")"
+  register_dir_cleanup "$exec_args_file"
+  register_dir_cleanup "$script_input_file"
+
+  CONTAINER_CMD=container
+  container() {
+    printf '%s\n' "$*" >"$exec_args_file"
+    cat >"$script_input_file"
+  }
+
+  run_capture doctor_state_permissions unit-test-container 1
+  assert_status 0
+  grep -Fq -- 'exec -i -u 0 unit-test-container sh -s 1' "$exec_args_file" \
+    || fail "Expected doctor permission repair to attach stdin, got: $(cat "$exec_args_file")"
+  grep -Fq 'home="/home/coder"' "$script_input_file" \
+    || fail "Expected doctor permission repair script on stdin"
+}
+
 test_doctor_fix_repairs_state_permission_problems() {
   begin_test "doctor --fix repairs user-state permission problems"
 
@@ -10459,6 +10504,8 @@ main() {
   run_selected_test test_refresh_updates_managed_files_without_recreate "test_refresh_updates_managed_files_without_recreate"
   run_selected_test test_doctor_reports_state_permission_problems "test_doctor_reports_state_permission_problems"
   run_selected_test test_doctor_reports_container_startup_problem "test_doctor_reports_container_startup_problem"
+  run_selected_test test_doctor_state_backup_readability_runs_real_export "test_doctor_state_backup_readability_runs_real_export"
+  run_selected_test test_doctor_state_permission_script_attaches_stdin "test_doctor_state_permission_script_attaches_stdin"
   run_selected_test test_doctor_fix_repairs_state_permission_problems "test_doctor_fix_repairs_state_permission_problems"
   run_selected_test test_doctor_reports_runtime_health_problems "test_doctor_reports_runtime_health_problems"
   run_selected_test test_doctor_fix_repairs_runtime_health_problems "test_doctor_fix_repairs_runtime_health_problems"

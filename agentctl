@@ -2202,7 +2202,11 @@ for path in \
   .ash_history \
   .sh_history; do
   [ -e "$home/$path" ] || continue
-  find "$home/$path" ! -type l ! \( -user coder -a -perm -u+r \( ! -type d -o -perm -u+x \) \) -print
+  find "$home/$path" ! -type l \( \
+    ! -user coder -o \
+    ! -perm -u+r -o \
+    \( -type d ! -perm -u+x \) \
+  \) -print
 done >"$tmp"
 if [ -s "$tmp" ]; then
   sed "s#^$home/##" "$tmp"
@@ -2228,7 +2232,7 @@ doctor_state_permissions() {
   local output=""
   local status=0
 
-  if output="$("$CONTAINER_CMD" exec -u 0 "$name" sh -s "$fix" <<<"$(container_state_permission_script)")"; then
+  if output="$("$CONTAINER_CMD" exec -i -u 0 "$name" sh -s "$fix" <<<"$(container_state_permission_script)")"; then
     :
   else
     status=$?
@@ -2239,6 +2243,21 @@ doctor_state_permissions() {
     return 0
   fi
   printf '%s\n' "$output"
+  return 1
+}
+
+doctor_state_backup_readable() {
+  local name="$1"
+  local output=""
+
+  if ! container_supports_state_contract "$name"; then
+    return 0
+  fi
+  if output="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh state export 2>&1 >/dev/null)"; then
+    return 0
+  fi
+  printf '%s\n' 'state export is not readable by coder'
+  [ -n "$output" ] && printf '%s\n' "$output"
   return 1
 }
 
@@ -3815,6 +3834,14 @@ doctor_cmd() {
       echo "Re-run with: $CLI_NAME doctor --name $name --fix" >&2
       status=1
     fi
+  fi
+
+  if permission_output="$(doctor_state_backup_readable "$name")"; then
+    echo "Doctor confirmed user state can be backed up from $name" >&2
+  else
+    echo "Doctor found a user-state backup readability problem in $name:" >&2
+    printf '%s\n' "$permission_output" | sed 's/^/  - /' >&2
+    status=1
   fi
 
   if runtime_output="$(doctor_runtime_health "$name" "$fix")"; then
