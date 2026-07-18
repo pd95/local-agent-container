@@ -2434,6 +2434,33 @@ test_agentctl_wrapper_usage_banner() {
   assert_contains "Usage: agentctl <command> [options]"
 }
 
+test_host_test_filter_normalizes_hyphens_spaces_and_underscores() {
+  begin_test "host test filter normalizes hyphens, spaces, and underscores"
+
+  local original_filter="$TEST_FILTER"
+  local original_start_from="$TEST_START_FROM"
+  local original_start_active="$TEST_START_ACTIVE"
+
+  TEST_FILTER="tagged-apk"
+  test_matches_filter \
+    test_upgrade_repeats_tagged_apk_reinstall_instructions \
+    "upgrade repeats complete tagged APK reinstall instructions" \
+    || fail "Expected a hyphenated filter to match underscore and space separators"
+
+  TEST_START_FROM="tagged-apk"
+  TEST_START_ACTIVE=0
+  test_matches_start_from \
+    test_upgrade_repeats_tagged_apk_reinstall_instructions \
+    "upgrade repeats complete tagged APK reinstall instructions" \
+    || fail "Expected a hyphenated --from value to match underscore and space separators"
+  [ "$TEST_START_ACTIVE" -eq 1 ] \
+    || fail "Expected a matching --from value to activate subsequent tests"
+
+  TEST_FILTER="$original_filter"
+  TEST_START_FROM="$original_start_from"
+  TEST_START_ACTIVE="$original_start_active"
+}
+
 test_refresh_help_reports_new_command() {
   begin_test "refresh help is available via the public CLI"
 
@@ -8571,11 +8598,18 @@ test_upgrade_reinstall_command_restores_missing_apk_repository_tags() {
 
   CLI_NAME=agentctl
 
-  run_capture warn_upgrade_package_loss \
+  warn_with_final_package_reminder() {
+    local upgrade_package_reinstall_commands=""
+
+    warn_upgrade_package_loss "$@"
+    printf 'Final reminder:\n%s\n' "$upgrade_package_reinstall_commands" >&2
+  }
+
+  run_capture warn_with_final_package_reminder \
     unit-test-container \
     agent-plain \
     agent-python \
-    '{"package_manager":"apk","packages":["bash","go","golangci-lint","zstd"],"requested_packages":["bash","go@edgecommunity","golangci-lint@edgecommunity","zstd"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main","@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"]}' \
+    '{"package_manager":"apk","packages":["bash","go","golangci-lint","zstd"],"requested_packages":["bash","go@customrepo","golangci-lint@edgecommunity","zstd"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main","@customrepo https://packages.example.test/alpine/community"]}' \
     '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main"]}' \
     '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main"]}' \
     unit-test-container
@@ -8584,9 +8618,19 @@ test_upgrade_reinstall_command_restores_missing_apk_repository_tags() {
   assert_contains "Upgrade will remove 3 extra apk package(s) not present in agent-python:"
   assert_contains "To reinstall top-level packages after upgrade:"
   assert_contains "Restore APK repository tag(s) before reinstalling tagged packages:"
+  assert_contains "@customrepo https://packages.example.test/alpine/community"
   assert_contains "agentctl su-exec --name unit-test-container sh -lc 'grep -Fxq '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' /etc/apk/repositories || printf \"%s\\\\n\" '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' >> /etc/apk/repositories'"
   assert_contains "agentctl su-exec --name unit-test-container apk update"
-  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache go@edgecommunity golangci-lint@edgecommunity zstd"
+  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache go@customrepo golangci-lint@edgecommunity zstd"
+  assert_contains "Final reminder:"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "Restore APK repository tag(s) before reinstalling tagged packages:")" -eq 2 ] \
+    || fail "Expected APK repository restore heading before and after upgrade"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "agentctl su-exec --name unit-test-container sh -lc")" -eq 4 ] \
+    || fail "Expected both APK repository restore commands before and after upgrade"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "agentctl su-exec --name unit-test-container apk update")" -eq 2 ] \
+    || fail "Expected apk update before and after upgrade"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "agentctl su-exec --name unit-test-container apk add --no-cache go@customrepo golangci-lint@edgecommunity zstd")" -eq 2 ] \
+    || fail "Expected APK reinstall command before and after upgrade"
 }
 
 test_upgrade_reinstall_command_suggests_default_apk_edge_tags() {
@@ -8624,9 +8668,9 @@ test_upgrade_warns_about_image_packages_removed_from_target() {
     unit-test-container \
     agent-python \
     agent-python \
-    '{"package_manager":"apk","packages":["bash","git","legacy-lib","legacy-tool"],"requested_packages":["bash","git","legacy-tool"]}' \
-    '{"package_manager":"apk","packages":["bash","git","legacy-lib","legacy-tool"],"requested_packages":["bash","git","legacy-tool"]}' \
-    '{"package_manager":"apk","packages":["bash","git"],"requested_packages":["bash","git"]}' \
+    '{"package_manager":"apk","packages":["bash","git","legacy-lib","legacy-tool"],"requested_packages":["bash","git","legacy-tool@edgecommunity"],"apk_repositories":["@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"]}' \
+    '{"package_manager":"apk","packages":["bash","git","legacy-lib","legacy-tool"],"requested_packages":["bash","git","legacy-tool@edgecommunity"],"apk_repositories":["@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"]}' \
+    '{"package_manager":"apk","packages":["bash","git"],"requested_packages":["bash","git"],"apk_repositories":[]}' \
     unit-test-container
 
   assert_status 0
@@ -8634,7 +8678,10 @@ test_upgrade_warns_about_image_packages_removed_from_target() {
   assert_contains "  - legacy-lib"
   assert_contains "  - legacy-tool"
   assert_contains "If you still need them, reinstall top-level packages after upgrade:"
-  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache legacy-tool"
+  assert_contains "Restore APK repository tag(s) before reinstalling tagged packages:"
+  assert_contains "@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"
+  assert_contains "agentctl su-exec --name unit-test-container apk update"
+  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache legacy-tool@edgecommunity"
   assert_not_contains "Upgrade will remove 2 extra apk package(s)"
   assert_not_contains "apk add --no-cache legacy-lib"
 }
@@ -10483,6 +10530,7 @@ main() {
   run_selected_test test_bootstrap_cmd_bootstraps_apt_container "test_bootstrap_cmd_bootstraps_apt_container"
   run_selected_test test_bootstrap_cmd_rejects_unsupported_base "test_bootstrap_cmd_rejects_unsupported_base"
   run_selected_test test_agentctl_wrapper_usage_banner "test_agentctl_wrapper_usage_banner"
+  run_selected_test test_host_test_filter_normalizes_hyphens_spaces_and_underscores "test_host_test_filter_normalizes_hyphens_spaces_and_underscores"
   run_selected_test test_refresh_help_reports_new_command "test_refresh_help_reports_new_command"
   run_selected_test test_bootstrap_help_reports_new_command "test_bootstrap_help_reports_new_command"
   run_selected_test test_system_manifest_help_reports_new_command "test_system_manifest_help_reports_new_command"
