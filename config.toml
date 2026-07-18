@@ -5,7 +5,7 @@ sandbox_mode = "danger-full-access"
 
 [model_providers.myollama]
 name = "Ollama"
-base_url = "http://192.168.64.1:11434/v1"
+base_url = "http://host.container.internal:11434/v1"
 wire_api = "responses"
 
 [projects."/workdir"]

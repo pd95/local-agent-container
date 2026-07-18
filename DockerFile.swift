@@ -92,11 +92,10 @@ USER root
 RUN printf "%s\n" "$AGENT_DEFAULT_RUNTIME" > /etc/agentctl/preferred-runtime \
  && chown -R coder:coder /home/coder /workdir
 
-RUN mkdir -p /etc/codexctl /etc/agentctl \
- && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/codexctl/ \
- && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/agentctl/ \
+RUN mkdir -p /etc/agentctl/codex /etc/agentctl \
+ && cp /home/coder/.codex/config.toml /home/coder/.codex/*.config.toml /home/coder/.codex/local_models.json /etc/agentctl/codex/ \
  && BUILD_TIME="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
- && cat > /etc/codexctl/image.md <<EOF
+ && cat > /etc/agentctl/image.md <<EOF
 You are running inside the \`agent-swift\` image.
 
 Environment:
@@ -121,8 +120,7 @@ Programming environments:
 
 Assume Linux Swift toolchains and Linux build behavior. Do not assume access to macOS, Xcode, iOS SDKs, or Apple simulator frameworks inside this container.
 EOF
-RUN ln -sf /etc/codexctl/image.md /etc/agentctl/image.md
-RUN ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
+RUN ln -sf /etc/agentctl/image.md /home/coder/.codex/AGENTS.md
 
 # From here on, run as coder so swiftly writes user-owned files
 USER coder

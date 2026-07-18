@@ -1,6 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
@@ -339,6 +338,9 @@ const startMcpRelay = (server) => new Promise((resolve, reject) => {
     }
   }
   env.MCP_RELAY_NAME = server.name || server.command;
+  if (!env.MCP_RELAY_ADVERTISE_HOST) {
+    env.MCP_RELAY_ADVERTISE_HOST = "host.container.internal";
+  }
 
   const relay = spawn(process.execPath, [relayScript, server.command, ...(server.args || [])], {
     env,

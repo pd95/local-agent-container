@@ -11,7 +11,11 @@ if (!command) {
 }
 
 const host = process.env.MCP_RELAY_HOST || "0.0.0.0";
-const advertisedHost = process.env.MCP_RELAY_ADVERTISE_HOST || "192.168.64.1";
+const advertisedHost = process.env.MCP_RELAY_ADVERTISE_HOST;
+if (!advertisedHost) {
+  console.error("MCP_RELAY_ADVERTISE_HOST must be set to a host address reachable from the container");
+  process.exit(2);
+}
 const requestedPort = Number(process.env.MCP_RELAY_PORT || 0);
 const logPrefix = process.env.MCP_RELAY_NAME || command;
 const sessions = new Map();

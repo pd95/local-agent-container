@@ -553,7 +553,7 @@ test_run_reset_config_restores_image_defaults() {
   run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# legacy-config\n" >/home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json && rm -f /home/coder/.codex/AGENTS.md && printf "legacy-agents\n" >/home/coder/.codex/AGENTS.md'
   assert_status 0
 
-  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --reset-config --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/codexctl/image.md" ]; then echo reset-config-ok; else exit 1; fi'
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --reset-config --cmd bash -lc 'if diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo reset-config-ok; else exit 1; fi'
   assert_status 0
   assert_contains "reset-config-ok"
 }
@@ -575,7 +575,7 @@ test_upgrade_overwrite_config_restores_image_defaults() {
   assert_contains "Overwriting config.toml, default profiles, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $name"
   assert_contains "Upgrade complete: $name (backup skipped)"
 
-  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/codexctl/image.md" ]; then echo overwrite-config-ok; else exit 1; fi'
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo overwrite-config-ok; else exit 1; fi'
   assert_status 0
   assert_contains "overwrite-config-ok"
 }
@@ -644,7 +644,7 @@ test_runtime_management_commands_work_for_existing_container() {
 
   run_capture "$AGENTCTL" runtime --name "$name" info codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "npm-global" and .preferred_runtime == "codex"' >/dev/null || fail "Expected runtime info JSON for codex, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "standalone-installer" and .preferred_runtime == "codex"' >/dev/null || fail "Expected runtime info JSON for codex, got: $RUN_OUTPUT"
 
   run_capture "$AGENTCTL" runtime --name "$name" capabilities codex
   assert_status 0
@@ -677,7 +677,7 @@ test_refresh_pushes_runtime_registry_into_existing_container() {
 
   run_capture "$CONTAINER_CMD" exec "$name" setpriv --inh-caps=-all --ambient-caps=-all --no-new-privs -- bash -lc '
     bash /usr/local/bin/agent.sh runtime info codex \
-      | jq -e '"'"'.runtime == "codex" and .install_method == "npm-global"'"'"' >/dev/null
+      | jq -e '"'"'.runtime == "codex" and .install_method == "standalone-installer"'"'"' >/dev/null
     bash /usr/local/bin/agent.sh runtime info claude \
       | jq -e '"'"'.runtime == "claude" and .installed == false and .install_method == "native-installer" and .capabilities.install == true and .capabilities.update == true'"'"' >/dev/null
     printf "%s\n" runtime-registry-ok > /workdir/runtime-registry.ok
@@ -763,7 +763,7 @@ test_bootstrap_works_on_existing_alpine_container() {
 
   run_capture "$AGENTCTL" runtime --name "$name" info codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "npm-global"' >/dev/null || fail "Expected runtime info JSON for codex after bootstrap, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "standalone-installer"' >/dev/null || fail "Expected runtime info JSON for codex after bootstrap, got: $RUN_OUTPUT"
 
   run_capture "$AGENTCTL" runtime --name "$name" install codex
   assert_status 0
@@ -807,7 +807,7 @@ test_bootstrap_can_create_and_bootstrap_new_alpine_container() {
 
   run_capture "$AGENTCTL" runtime --name "$name" info codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "npm-global"' >/dev/null || fail "Expected runtime info JSON for codex after create+bootstrap, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "standalone-installer"' >/dev/null || fail "Expected runtime info JSON for codex after create+bootstrap, got: $RUN_OUTPUT"
 
   run_capture "$AGENTCTL" feature --name "$name" info office
   assert_status 0
@@ -833,7 +833,7 @@ test_bootstrap_works_on_existing_debian_container() {
 
   run_capture "$AGENTCTL" runtime --name "$name" info codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "npm-global"' >/dev/null || fail "Expected runtime info JSON for codex after Debian bootstrap, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "standalone-installer"' >/dev/null || fail "Expected runtime info JSON for codex after Debian bootstrap, got: $RUN_OUTPUT"
 
   run_capture "$AGENTCTL" feature --name "$name" info office
   assert_status 0

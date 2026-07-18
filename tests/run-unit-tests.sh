@@ -49,15 +49,15 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-load_codexctl_functions() {
+load_agentctl_functions() {
   local harness
 
-  harness="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit.XXXXXX")"
+  harness="$(mktemp "${TMPDIR:-/tmp}/agentctl-unit.XXXXXX")"
   register_dir_cleanup "$harness"
 
   sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
     -e '/^cmd="${1:-}"/,$d' \
-    "$CODEXCTL" >"$harness"
+    "$AGENTCTL_IMPL" >"$harness"
   # shellcheck source=/dev/null
   . "$harness"
 }
@@ -96,6 +96,7 @@ run_agent_sh_capture_env() {
     "HOME=$temp_home/home"
     "XDG_CONFIG_HOME=$temp_home/config"
     "PATH=/usr/bin:/bin"
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools"
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d"
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes"
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d"
@@ -133,7 +134,7 @@ file_mtime() {
 test_run_config_wires_runtime_config_json() {
   begin_test "run_cmd wires repeated --config values into the launched agent.sh command"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local captured_pre_exec=""
   local captured_cmd=""
@@ -166,7 +167,7 @@ test_run_config_wires_runtime_config_json() {
 test_run_cmd_wires_ollama_host_to_custom_command() {
   begin_test "run_cmd wires Ollama host config and env into custom command"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local captured_cmd=""
   local workdir
@@ -219,7 +220,7 @@ test_exec_help_reports_stdio_option() {
 test_run_cmd_wires_home_mount() {
   begin_test "run_cmd wires --home into container creation"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local workdir
   local home_mount
@@ -249,7 +250,240 @@ test_doctor_help_reports_fix_option() {
   assert_status 0
   assert_contains "Usage: agentctl doctor [options]"
   assert_contains "--fix"
+  assert_contains "--host"
   assert_contains "user-state ownership"
+}
+
+test_agentctl_version_matches_version_file() {
+  begin_test "agentctl version matches the repository VERSION file"
+
+  local expected_version
+  expected_version="$(cat "$TEST_ROOT/VERSION")"
+
+  run_capture "$AGENTCTL" --version
+  assert_status 0
+  [ "$RUN_OUTPUT" = "agentctl $expected_version" ] \
+    || fail "Expected agentctl $expected_version, got: $RUN_OUTPUT"
+
+  run_capture "$AGENTCTL" version
+  assert_status 0
+  [ "$RUN_OUTPUT" = "agentctl $expected_version" ] \
+    || fail "Expected version subcommand to report agentctl $expected_version, got: $RUN_OUTPUT"
+}
+
+test_doctor_host_reports_runtime_and_capabilities() {
+  begin_test "doctor --host reports runtime and capabilities"
+
+  load_agentctl_functions
+
+  require_container() { return 0; }
+  command() {
+    if [ "$1" = "-v" ] && [ "$2" = "mock_container" ]; then
+      printf '/opt/homebrew/bin/container\n'
+      return 0
+    fi
+    builtin command "$@"
+  }
+  mock_container() {
+    case "$*" in
+      "--version")
+        printf 'container CLI version 1.1.0 (build: release, commit: test)\n'
+        ;;
+      "system version --format json")
+        printf '[{"name":"container-apiserver","version":"1.1.0"}]\n'
+        ;;
+      "list --help")
+        printf '%s\n' '  --quiet' '  --format <format>'
+        ;;
+      "export --help")
+        printf '%s\n' '  --output <output>'
+        ;;
+      "run --help")
+        printf '%s\n' '  --ssh' '  --publish-socket <spec>' '  --shm-size <size>'
+        ;;
+      "--help")
+        printf '%s\n' '  copy, cp  Copy files' '  machine  Manage machines'
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture doctor_cmd --host
+  assert_status 0
+  assert_contains "/opt/homebrew/bin/container"
+  assert_contains "container CLI version 1.1.0"
+  assert_contains '"container-apiserver"'
+  assert_contains "container copy           yes"
+  assert_contains "SSH agent forwarding     yes"
+  assert_contains "container machine        yes"
+  CONTAINER_CMD=container
+  unset -f command
+}
+
+test_host_address_reads_container_1_1_gateway() {
+  begin_test "host-address reads the Apple container 1.1 network gateway"
+
+  load_agentctl_functions
+
+  local output
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "--version") return 0 ;;
+      "network inspect default")
+        printf '%s\n' '[{"id":"default","configuration":{},"status":{"ipv4Subnet":"192.168.65.0/24","ipv4Gateway":"192.168.65.1"}}]'
+        ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  output="$(host_address_cmd)"
+  [ "$output" = "192.168.65.1" ] || fail "Expected 192.168.65.1, got: $output"
+  unset -f container
+}
+
+test_host_address_supports_custom_network_subnet_fallback() {
+  begin_test "host-address supports custom networks and subnet fallback"
+
+  load_agentctl_functions
+
+  local output
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "--version") return 0 ;;
+      "network inspect mcp")
+        printf '%s\n' '{"id":"mcp","status":{"ipv4Subnet":"10.42.7.0/24"}}'
+        ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  output="$(host_address_cmd --network mcp)"
+  [ "$output" = "10.42.7.1" ] || fail "Expected 10.42.7.1, got: $output"
+  unset -f container
+}
+
+test_configure_container_host_alias_replaces_stale_entry() {
+  begin_test "container host alias replaces a stale gateway entry"
+
+  load_agentctl_functions
+
+  local temp_dir
+  local hosts_file
+  local update_script=""
+  local update_address=""
+  local update_hostname=""
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-host-alias.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  hosts_file="$temp_dir/hosts"
+  printf '%s\n' \
+    '127.0.0.1 localhost' \
+    '192.168.64.1 host.container.internal old-alias' \
+    '10.0.0.2 unrelated.internal' >"$hosts_file"
+
+  container_network_host_address() { printf '%s\n' 192.168.65.1; }
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = "exec" ] || fail "Expected container exec, got: $*"
+    [ "$2" = "--user" ] && [ "$3" = "root" ] || fail "Expected root exec, got: $*"
+    [ "$4" = "unit-test-container" ] || fail "Expected target container, got: $*"
+    update_script="$7"
+    update_address="$9"
+    update_hostname="${10}"
+  }
+
+  configure_container_host_alias unit-test-container
+  sh -c "$update_script" sh "$update_address" "$update_hostname" "$hosts_file"
+
+  awk '$1 == "192.168.65.1" && $2 == "host.container.internal" { found = 1 } END { exit !found }' "$hosts_file" \
+    || fail "Expected refreshed host alias: $(cat "$hosts_file")"
+  if grep -Fq '192.168.64.1' "$hosts_file"; then
+    fail "Did not expect stale host gateway: $(cat "$hosts_file")"
+  fi
+  grep -Fqx '10.0.0.2 unrelated.internal' "$hosts_file" \
+    || fail "Expected unrelated host entry to remain"
+  unset -f container
+}
+
+test_remove_legacy_codex_files_preserves_image_metadata() {
+  begin_test "legacy Codex defaults migrate into the agentctl layout"
+
+  load_agentctl_functions
+
+  local temp_root
+  local migration_script=""
+  temp_root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-legacy-codex.XXXXXX")"
+  register_dir_cleanup "$temp_root"
+  mkdir -p "$temp_root/etc/codexctl" "$temp_root/etc/agentctl" "$temp_root/home/coder/.codex"
+  printf '%s\n' legacy-image >"$temp_root/etc/codexctl/image.md"
+  printf '%s\n' legacy-config >"$temp_root/etc/agentctl/config.toml"
+  ln -s "$temp_root/etc/codexctl/image.md" "$temp_root/etc/agentctl/image.md"
+  ln -s /etc/codexctl/image.md "$temp_root/home/coder/.codex/AGENTS.md"
+
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = "exec" ] || fail "Expected container exec, got: $*"
+    migration_script="$7"
+  }
+
+  remove_legacy_codex_files unit-test-container
+  sh -c "$migration_script" sh "$temp_root"
+
+  [ ! -e "$temp_root/etc/codexctl" ] || fail "Expected legacy /etc/codexctl to be removed"
+  [ ! -e "$temp_root/etc/agentctl/config.toml" ] || fail "Expected misplaced generic Codex config to be removed"
+  [ ! -L "$temp_root/etc/agentctl/image.md" ] || fail "Expected image metadata symlink to become a regular file"
+  [ "$(cat "$temp_root/etc/agentctl/image.md")" = "legacy-image" ] || fail "Expected image metadata to survive migration"
+  [ "$(readlink "$temp_root/home/coder/.codex/AGENTS.md")" = "/etc/agentctl/image.md" ] \
+    || fail "Expected legacy AGENTS.md symlink to use the agentctl image path"
+  unset -f container
+}
+
+test_run_container_refreshes_host_alias_before_exec() {
+  begin_test "run_container refreshes the host alias before agent exec"
+
+  load_agentctl_functions
+
+  local configured_name=""
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { return 0; }
+  validate_mount_mode() { :; }
+  configure_container_host_alias() { configured_name="$1"; }
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = "exec" ] || fail "Expected agent exec, got: $*"
+  }
+
+  run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 true
+  [ "$configured_name" = "unit-test-container" ] \
+    || fail "Expected host alias refresh before exec, got: $configured_name"
+  unset -f container
+}
+
+test_start_and_restart_refresh_host_alias() {
+  begin_test "start and restart refresh the container host alias"
+
+  load_agentctl_functions
+
+  local action_log=""
+  local alias_log=""
+  require_container() { :; }
+  configure_container_host_alias() { alias_log="${alias_log}$1"$'\n'; }
+  CONTAINER_CMD=container
+  container() { action_log="${action_log}$1:$2"$'\n'; }
+
+  simple_name_cmd start --name unit-test-container
+  simple_name_cmd restart --name unit-test-container
+
+  [ "${action_log%$'\n'}" = $'start:unit-test-container\nrestart:unit-test-container' ] \
+    || fail "Expected start and restart actions, got: $action_log"
+  [ "${alias_log%$'\n'}" = $'unit-test-container\nunit-test-container' ] \
+    || fail "Expected alias refresh after both actions, got: $alias_log"
+  unset -f container
 }
 
 test_rescue_help_reports_backup_image_options() {
@@ -266,7 +500,7 @@ test_rescue_help_reports_backup_image_options() {
 test_run_model_wires_selected_model() {
   begin_test "run_cmd wires --model into the launched agent.sh command"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local captured_cmd=""
   local workdir
@@ -302,7 +536,7 @@ test_build_help_reports_primary_base_images() {
 test_build_cmd_passes_runtime_list_build_args() {
   begin_test "build_cmd passes the configured runtime list into container builds"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local build_call=""
 
@@ -326,7 +560,7 @@ test_build_cmd_passes_runtime_list_build_args() {
 test_build_cmd_uses_first_runtime_as_default_when_unspecified() {
   begin_test "build_cmd uses the first runtime as default when unspecified"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local build_call=""
 
@@ -349,7 +583,7 @@ test_build_cmd_uses_first_runtime_as_default_when_unspecified() {
 test_build_cmd_default_runtime_alone_installs_only_that_runtime() {
   begin_test "build_cmd preserves single-runtime default-runtime behavior"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local build_call=""
 
@@ -372,7 +606,7 @@ test_build_cmd_default_runtime_alone_installs_only_that_runtime() {
 test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden() {
   begin_test "build_cmd rebuilds when runtime selection is overridden"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local build_calls=0
 
@@ -394,7 +628,7 @@ test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden() {
 test_build_cmd_rebuilds_and_snapshots_local_dependencies() {
   begin_test "build_cmd rebuilds and snapshots local image dependencies"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local build_calls=""
   local build_times=""
@@ -439,7 +673,7 @@ test_build_cmd_rebuilds_and_snapshots_local_dependencies() {
 test_build_cmd_snapshots_existing_image_when_timestamp_missing() {
   begin_test "build_cmd snapshots existing image when latest has no timestamp tag"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local tag_call=""
 
@@ -476,7 +710,7 @@ EOF
 test_build_cmd_skips_existing_image_when_timestamp_matches() {
   begin_test "build_cmd skips existing image when latest already has a timestamp tag"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local tag_calls=0
 
@@ -510,10 +744,84 @@ EOF
   CONTAINER_CMD=container
 }
 
+test_build_cmd_recognizes_container_1_image_snapshot_schema() {
+  begin_test "build_cmd recognizes timestamp tags in container 1 image JSON"
+
+  load_agentctl_functions
+
+  local tag_calls=0
+
+  require_container() { return 0; }
+  image_exists() { return 0; }
+  stop_buildkit_container() { :; }
+  mock_container() {
+    case "$*" in
+      "image ls --format json")
+        cat <<'EOF'
+[
+  {
+    "configuration":{"name":"agent-plain:latest","descriptor":{"digest":"sha256:plain-latest"}},
+    "variants":[{"digest":"sha256:plain-variant","platform":{"architecture":"arm64","os":"linux"}}]
+  },
+  {
+    "configuration":{"name":"docker.io/library/agent-plain:20260718-120000","descriptor":{"digest":"sha256:plain-latest"}},
+    "variants":[{"digest":"sha256:plain-variant","platform":{"architecture":"arm64","os":"linux"}}]
+  }
+]
+EOF
+        ;;
+      image\ tag*)
+        tag_calls=$((tag_calls + 1))
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture build_cmd --image agent-plain
+  assert_status 0
+  assert_contains "Image already exists: agent-plain (use --rebuild to rebuild)"
+  [ "$tag_calls" -eq 0 ] || fail "Did not expect snapshot tag call, got $tag_calls"
+  CONTAINER_CMD=container
+}
+
+test_container_lookup_uses_quiet_exact_ids() {
+  begin_test "container lookup uses quiet output and exact IDs"
+
+  load_agentctl_functions
+
+  mock_container() {
+    case "$*" in
+      "ls -a --quiet")
+        printf '%s\n' agent-project agent-project-copy
+        ;;
+      "ls --quiet")
+        printf '%s\n' agent-project-copy
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+  CONTAINER_CMD="mock_container"
+
+  container_exists agent-project || fail "Expected exact container ID to exist"
+  if container_exists project; then
+    fail "Did not expect a partial container ID to match"
+  fi
+  container_running agent-project-copy || fail "Expected running container ID"
+  if container_running agent-project; then
+    fail "Did not expect stopped container to be reported as running"
+  fi
+  CONTAINER_CMD=container
+}
+
 test_run_cmd_runtime_selection_does_not_auto_install_for_new_container() {
   begin_test "run_cmd does not auto-install a selected runtime for a new container"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local captured_pre_exec=""
   local captured_mem=""
@@ -543,7 +851,7 @@ test_run_cmd_runtime_selection_does_not_auto_install_for_new_container() {
 test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container() {
   begin_test "run_cmd does not auto-install a selected runtime for an existing container"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local captured_pre_exec=""
   local captured_mem=""
@@ -570,7 +878,7 @@ test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container() {
 test_run_cmd_warns_for_legacy_office_image() {
   begin_test "run_cmd warns when using the legacy office image"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local workdir
 
@@ -589,7 +897,7 @@ test_run_cmd_warns_for_legacy_office_image() {
 test_build_cmd_warns_for_legacy_office_image() {
   begin_test "build_cmd warns when building the legacy office image explicitly"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   image_exists() { return 0; }
@@ -608,14 +916,14 @@ test_build_cmd_rejects_runtime_override_snapshot_combo() {
   local temp_dir
   local unit_script
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-build-invalid.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-build-invalid.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
 
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 require_container() { return 0; }
 build_cmd --image agent-plain --runtimes codex,claude --default-runtime claude --snapshot
 EOF
@@ -632,14 +940,14 @@ test_build_cmd_rejects_default_runtime_outside_runtime_list() {
   local temp_dir
   local unit_script
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-build-invalid.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-build-invalid.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
 
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 require_container() { return 0; }
 build_cmd --image agent-plain --runtimes codex --default-runtime claude
 EOF
@@ -656,14 +964,14 @@ test_run_cmd_rejects_invalid_runtime_config() {
   local temp_dir
   local unit_script
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-run-invalid.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-run-invalid.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
 
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 require_container() { return 0; }
 run_cmd --runtime claude --config profile
 EOF
@@ -680,14 +988,14 @@ test_run_cmd_rejects_install_runtime_without_runtime() {
   local temp_dir
   local unit_script
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-run-invalid.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-run-invalid.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
 
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 require_container() { return 0; }
 run_cmd --install-runtime
 EOF
@@ -704,14 +1012,14 @@ test_run_cmd_rejects_auth_without_online() {
   local temp_dir
   local unit_script
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-run-invalid.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-run-invalid.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
 
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 require_container() { return 0; }
 run_cmd --runtime claude --auth
 EOF
@@ -725,7 +1033,7 @@ EOF
 test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
   begin_test "run_pre_exec syncs selected runtime auth when online mode is enabled"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local call_log=""
   RUN_SELECTED_RUNTIME="claude"
@@ -756,7 +1064,7 @@ test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
 test_exec_cmd_no_tty_omits_interactive_flags() {
   begin_test "exec --no-tty omits interactive container flags"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local exec_log=""
   local old_container_cmd="$CONTAINER_CMD"
@@ -790,7 +1098,7 @@ test_exec_cmd_no_tty_omits_interactive_flags() {
 test_exec_cmd_stdio_uses_interactive_without_tty() {
   begin_test "exec --stdio keeps stdin open without tty flags"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local exec_log=""
   local old_container_cmd="$CONTAINER_CMD"
@@ -829,13 +1137,13 @@ test_exec_cmd_stdio_requires_delimiter_and_command() {
   local harness
   local unit_script
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-stdio-invalid.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-stdio-invalid.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   harness="$temp_dir/harness.sh"
 
   sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
     -e '/^cmd="${1:-}"/,$d' \
-    "$CODEXCTL" >"$harness"
+    "$AGENTCTL_IMPL" >"$harness"
 
   unit_script="$temp_dir/no-delimiter.sh"
   cat >"$unit_script" <<EOF
@@ -875,13 +1183,13 @@ test_exec_cmd_stdio_requires_running_container() {
   local harness
   local unit_script
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-stdio-stopped.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-stdio-stopped.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   harness="$temp_dir/harness.sh"
 
   sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
     -e '/^cmd="${1:-}"/,$d' \
-    "$CODEXCTL" >"$harness"
+    "$AGENTCTL_IMPL" >"$harness"
 
   unit_script="$temp_dir/stopped.sh"
   cat >"$unit_script" <<EOF
@@ -902,7 +1210,7 @@ EOF
 test_run_cmd_stdio_uses_interactive_without_tty() {
   begin_test "run --stdio uses interactive exec without tty flags"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local exec_log=""
   local old_container_cmd="$CONTAINER_CMD"
@@ -942,7 +1250,7 @@ test_run_cmd_stdio_uses_interactive_without_tty() {
 test_run_cmd_stdio_suppresses_lifecycle_stdout() {
   begin_test "run --stdio suppresses lifecycle command stdout"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local old_container_cmd="$CONTAINER_CMD"
   local workdir
@@ -993,18 +1301,19 @@ test_run_container_stdio_detaches_pre_exec_stdin() {
   local temp_dir
   local unit_script
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-run-stdio-preexec.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-run-stdio-preexec.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
 
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 require_container() { return 0; }
 container_exists() { [ "\$1" = "unit-test-container" ]; }
 container_running() { [ "\$1" = "unit-test-container" ]; }
 validate_mount_mode() { :; }
+configure_container_host_alias() { :; }
 pre_reads_stdin() {
   local line=""
   if IFS= read -r line; then
@@ -1044,14 +1353,14 @@ test_run_cmd_stdio_requires_cmd() {
   local temp_dir
   local unit_script
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-run-stdio-invalid.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-run-stdio-invalid.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
 
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 require_container() { return 0; }
 run_cmd --stdio
 EOF
@@ -1068,14 +1377,14 @@ test_run_cmd_stdio_rejects_shell() {
   local temp_dir
   local unit_script
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-run-stdio-shell.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-run-stdio-shell.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
 
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 require_container() { return 0; }
 run_cmd --stdio --shell --cmd true
 EOF
@@ -1089,7 +1398,7 @@ EOF
 test_run_pre_exec_updates_codex_via_runtime_helper() {
   begin_test "run_pre_exec updates codex via the runtime user helper"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local helper_log=""
   local helper_log_file=""
@@ -1115,7 +1424,7 @@ test_run_pre_exec_updates_codex_via_runtime_helper() {
 test_run_pre_exec_updates_legacy_npm_codex_via_root_helper() {
   begin_test "run_pre_exec updates legacy npm-global codex via the runtime root helper"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local helper_log=""
   RUN_SELECTED_RUNTIME=""
@@ -1126,7 +1435,7 @@ test_run_pre_exec_updates_legacy_npm_codex_via_root_helper() {
   RUN_LOCAL_MODEL_PREFLIGHT=0
   RUN_UPDATE_CODEX=1
   RUN_REQUESTED_IMAGE="agent-plain"
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-legacy-update.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-legacy-update.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   helper_log_file="$temp_dir/helper.log"
   : >"$helper_log_file"
@@ -1155,7 +1464,7 @@ test_run_pre_exec_updates_legacy_npm_codex_via_root_helper() {
 test_run_container_reset_config_uses_runtime_helper() {
   begin_test "run_container reset-config uses the runtime reset helper"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local helper_log=""
 
@@ -1197,7 +1506,7 @@ test_run_container_reset_config_uses_runtime_helper() {
 test_run_container_reset_config_uses_selected_runtime() {
   begin_test "run_container reset-config uses the selected runtime when provided"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local helper_log=""
 
@@ -1235,7 +1544,7 @@ test_run_container_reset_config_uses_selected_runtime() {
 test_run_container_reset_config_preserves_preferred_runtime() {
   begin_test "run_container reset-config preserves the resolved preferred runtime"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local helper_log=""
 
@@ -1277,7 +1586,7 @@ test_run_container_reset_config_preserves_preferred_runtime() {
 test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified() {
   begin_test "run_pre_exec syncs auth for the preferred runtime when online mode is enabled"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local call_log=""
 
@@ -1311,7 +1620,7 @@ test_run_pre_exec_syncs_auth_for_preferred_runtime_when_unspecified() {
 test_run_pre_exec_runs_local_model_preflight_for_preferred_claude() {
   begin_test "run_pre_exec leaves local-mode preflight to agent.sh for claude"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local preflight_called=0
 
@@ -1342,7 +1651,7 @@ test_run_pre_exec_runs_local_model_preflight_for_preferred_claude() {
 test_run_pre_exec_runs_local_model_preflight_for_preferred_codex() {
   begin_test "run_pre_exec leaves local-mode preflight to agent.sh for codex"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local preflight_called=0
 
@@ -1373,7 +1682,7 @@ test_run_pre_exec_runs_local_model_preflight_for_preferred_codex() {
 test_run_cmd_default_entrypoint_enables_local_runtime_preflight() {
   begin_test "run_cmd lets agent.sh handle local runtime preflight"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local captured_pre_exec=""
   local workdir
@@ -1396,7 +1705,7 @@ test_run_cmd_default_entrypoint_enables_local_runtime_preflight() {
 test_sync_runtime_auth_to_container_if_available_skips_missing_keychain() {
   begin_test "sync_runtime_auth_to_container_if_available skips runtimes without keychain auth"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local sync_called=0
   runtime_info_in_container() {
@@ -1413,7 +1722,7 @@ test_sync_runtime_auth_to_container_if_available_skips_missing_keychain() {
 test_auth_cmd_warns_for_legacy_office_image() {
   begin_test "auth_cmd warns when using the legacy office image"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   default_name() { printf 'unit-auth-container\n'; }
@@ -1428,7 +1737,7 @@ test_auth_cmd_warns_for_legacy_office_image() {
 test_feature_cmd_installs_via_root_helper() {
   begin_test "feature_cmd install uses the root helper path"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local helper_log=""
 
@@ -1449,7 +1758,7 @@ test_feature_cmd_installs_via_root_helper() {
 test_runtime_cmd_install_uses_user_helper() {
   begin_test "runtime_cmd install uses the user helper path"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local helper_log=""
 
@@ -1470,7 +1779,7 @@ test_runtime_cmd_install_uses_user_helper() {
 test_runtime_cmd_install_claude_warns_on_undersized_container() {
   begin_test "runtime_cmd install claude warns on an undersized existing container"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local helper_log=""
 
@@ -1508,13 +1817,13 @@ test_runtime_cmd_install_claude_reports_memory_guidance_on_failure() {
   local harness
   local script
 
-  harness="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit.XXXXXX")"
+  harness="$(mktemp "${TMPDIR:-/tmp}/agentctl-unit.XXXXXX")"
   register_dir_cleanup "$harness"
   sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
     -e '/^cmd="${1:-}"/,$d' \
-    "$CODEXCTL" >"$harness"
+    "$AGENTCTL_IMPL" >"$harness"
 
-  script="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit-script.XXXXXX")"
+  script="$(mktemp "${TMPDIR:-/tmp}/agentctl-unit-script.XXXXXX")"
   register_dir_cleanup "$script"
   cat >"$script" <<EOF
 #!/usr/bin/env bash
@@ -1554,7 +1863,7 @@ EOF
 test_runtime_cmd_update_uses_user_helper() {
   begin_test "runtime_cmd update uses the user helper path"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local helper_log=""
 
@@ -1575,7 +1884,7 @@ test_runtime_cmd_update_uses_user_helper() {
 test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state() {
   begin_test "bootstrap_cmd bootstraps an Alpine container and restores stopped state"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_calls=0
   local stop_calls=0
@@ -1634,7 +1943,7 @@ test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state() {
 test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
   begin_test "bootstrap_cmd can create and bootstrap a new Alpine container"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_calls=0
   local stop_calls=0
@@ -1702,7 +2011,7 @@ test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
 test_bootstrap_cmd_bootstraps_apt_container() {
   begin_test "bootstrap_cmd bootstraps a Debian/Ubuntu container"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_calls=0
   local stop_calls=0
@@ -1757,7 +2066,7 @@ test_bootstrap_cmd_bootstraps_apt_container() {
 test_bootstrap_cmd_rejects_unsupported_base() {
   begin_test "bootstrap_cmd rejects unsupported container bases"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   default_name() { printf 'unit-bootstrap-container\n'; }
@@ -1894,7 +2203,7 @@ test_agent_sh_runtime_info_reports_registry_metadata() {
 
   run_agent_sh_capture "$temp_home" runtime info codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "standalone-installer" and .default_config_dir == "/etc/codexctl" and (.auth_formats | index("json_refresh_token") != null) and .launch_configs.profile.type == "string" and .launch_configs.profile.default == "gpt-oss"' >/dev/null || fail "Expected runtime info JSON for codex, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "standalone-installer" and .default_config_dir == "/etc/agentctl/codex" and (.auth_formats | index("json_refresh_token") != null) and .launch_configs.profile.type == "string" and .launch_configs.profile.default == "gpt-oss"' >/dev/null || fail "Expected runtime info JSON for codex, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_feature_list_reports_declared_features() {
@@ -2032,6 +2341,7 @@ test_agent_sh_runtime_list_ignores_dangling_runtime_launcher() {
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$temp_home/tools" \
     -- runtime list
   assert_status 0
   assert_not_contains "codex"
@@ -2969,7 +3279,7 @@ EOF
   grep -Fq 'model = "gpt-oss:20b"' "$temp_home/home/.codex/gpt-oss.config.toml" || fail "Expected Codex profile config to reset to image defaults"
   jq -er '.models == []' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected Codex local_models.json to reset to image defaults"
   [ -L "$temp_home/home/.codex/AGENTS.md" ] || fail "Expected Codex AGENTS.md to reset to a symlink"
-  [ "$(readlink "$temp_home/home/.codex/AGENTS.md")" = "$config_dir/image.md" ] || fail "Expected Codex AGENTS.md to point at image defaults"
+  [ "$(readlink "$temp_home/home/.codex/AGENTS.md")" = "/etc/agentctl/image.md" ] || fail "Expected Codex AGENTS.md to point at image defaults"
 }
 
 test_agent_sh_opencode_runtime_reset_config_writes_ollama_config() {
@@ -3595,6 +3905,7 @@ EOF
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5232,6 +5543,7 @@ test_agent_sh_state_export_includes_known_user_state() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5277,6 +5589,7 @@ test_agent_sh_state_export_uses_installed_runtime_hooks() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5322,6 +5635,7 @@ test_agent_sh_opencode_state_export_uses_runtime_hooks() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5360,6 +5674,7 @@ test_agent_sh_qwen_state_export_uses_runtime_hooks() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5398,6 +5713,7 @@ test_agent_sh_pi_state_export_uses_runtime_hooks() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5415,7 +5731,7 @@ test_agent_sh_pi_state_export_uses_runtime_hooks() {
 test_backup_codex_config_from_export_excludes_codex_packages() {
   begin_test "export fallback backup excludes Codex package cache"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local export_file
@@ -5457,7 +5773,7 @@ test_backup_codex_config_from_export_excludes_codex_packages() {
 test_backup_known_state_from_container_excludes_codex_packages() {
   begin_test "legacy container backup excludes Codex package cache"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local fake_home
@@ -5562,6 +5878,7 @@ test_agent_sh_state_import_restores_known_user_state() {
     "HOME=$source_home/home" \
     "XDG_CONFIG_HOME=$source_home/home/.config" \
     "PATH=/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$source_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5572,6 +5889,7 @@ test_agent_sh_state_import_restores_known_user_state() {
     "HOME=$target_home/home" \
     "XDG_CONFIG_HOME=$target_home/home/.config" \
     "PATH=/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$target_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5612,6 +5930,7 @@ test_agent_sh_state_import_uses_installed_runtime_hooks() {
     "HOME=$source_home/home" \
     "XDG_CONFIG_HOME=$source_home/home/.config" \
     "PATH=/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$source_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5627,6 +5946,7 @@ test_agent_sh_state_import_uses_installed_runtime_hooks() {
     "HOME=$target_home/home" \
     "XDG_CONFIG_HOME=$target_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$target_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5666,6 +5986,7 @@ test_agent_sh_state_import_preserves_image_owned_codex_packages() {
     "HOME=$target_home/home" \
     "XDG_CONFIG_HOME=$target_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$target_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5689,6 +6010,7 @@ test_agent_sh_state_import_with_empty_stdin_preserves_existing_state() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5701,11 +6023,11 @@ test_agent_sh_state_import_with_empty_stdin_preserves_existing_state() {
 test_verify_restored_codex_state_passes_when_counts_match() {
   begin_test "verify_restored_codex_state accepts restored Codex history and sessions"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local backup_file
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-state-verify.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-state-verify.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   backup_file="$temp_dir/state.tar"
 
@@ -5728,11 +6050,11 @@ test_verify_restored_codex_state_passes_when_counts_match() {
 test_verify_restored_codex_state_fails_when_counts_drop() {
   begin_test "verify_restored_codex_state rejects missing restored Codex sessions"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local backup_file
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-state-verify.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-state-verify.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   backup_file="$temp_dir/state.tar"
 
@@ -5755,11 +6077,11 @@ test_verify_restored_codex_state_fails_when_counts_drop() {
 test_verify_restored_claude_state_passes_when_counts_match() {
   begin_test "verify_restored_claude_state accepts restored Claude state"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local backup_file
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-state-verify.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-state-verify.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   backup_file="$temp_dir/state.tar"
 
@@ -5782,11 +6104,11 @@ test_verify_restored_claude_state_passes_when_counts_match() {
 test_verify_restored_claude_state_fails_when_counts_drop() {
   begin_test "verify_restored_claude_state rejects missing restored Claude state"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local backup_file
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-state-verify.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-state-verify.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   backup_file="$temp_dir/state.tar"
 
@@ -5813,12 +6135,12 @@ test_verify_restored_claude_state_fails_when_counts_drop() {
 test_container_auth_info_uses_agent_sh_auth_read() {
   begin_test "container_auth_info reads auth via agent.sh auth read"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local exec_log_file
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-read.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-auth-read.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   exec_log_file="$temp_dir/exec.log"
 
@@ -5856,13 +6178,13 @@ test_container_auth_info_uses_agent_sh_auth_read() {
 test_write_auth_blob_to_container_uses_agent_sh_auth_write() {
   begin_test "write_auth_blob_to_container writes auth via agent.sh auth write"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local exec_log_file
   local payload_file
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-write.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-auth-write.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   exec_log_file="$temp_dir/exec.log"
   payload_file="$temp_dir/payload.json"
@@ -5903,13 +6225,13 @@ test_write_auth_blob_to_container_uses_agent_sh_auth_write() {
 test_write_auth_blob_to_container_falls_back_for_legacy_codex() {
   begin_test "write_auth_blob_to_container falls back for legacy codex auth writes"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local exec_log_file
   local fallback_payload_file
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-write.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-auth-write.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   exec_log_file="$temp_dir/exec.log"
   fallback_payload_file="$temp_dir/fallback.json"
@@ -5969,12 +6291,12 @@ test_write_auth_blob_to_container_falls_back_for_legacy_codex() {
 test_write_auth_blob_to_container_does_not_fallback_on_non_legacy_error() {
   begin_test "write_auth_blob_to_container does not fall back on non-legacy auth write errors"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local exec_log_file
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-write.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-auth-write.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   exec_log_file="$temp_dir/exec.log"
 
@@ -6024,7 +6346,7 @@ test_write_auth_blob_to_container_does_not_fallback_on_non_legacy_error() {
 test_sync_runtime_auth_to_container_uses_runtime_parameters() {
   begin_test "sync_runtime_auth_to_container uses runtime-specific auth parameters"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local observed_runtime=""
   local observed_format=""
@@ -6063,7 +6385,7 @@ test_sync_runtime_auth_to_container_uses_runtime_parameters() {
 test_sync_runtime_auth_to_container_skips_matching_auth() {
   begin_test "sync_runtime_auth_to_container skips matching auth"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local writes=0
 
@@ -6089,7 +6411,7 @@ test_sync_runtime_auth_to_container_skips_matching_auth() {
 test_sync_runtime_auth_to_container_uses_newer_keychain_auth() {
   begin_test "sync_runtime_auth_to_container refreshes container from newer Keychain auth"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local written_payload=""
   local keychain_writes=0
@@ -6124,13 +6446,13 @@ test_sync_runtime_auth_to_container_uses_newer_keychain_auth() {
 test_sync_runtime_auth_to_container_promotes_newer_container_auth() {
   begin_test "sync_runtime_auth_to_container promotes newer container auth to Keychain"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local container_writes=0
   local written_blob_file
   local temp_dir
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-promote.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-auth-promote.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   written_blob_file="$temp_dir/written-auth.json"
 
@@ -6168,7 +6490,7 @@ test_sync_runtime_auth_to_container_promotes_newer_container_auth() {
 test_sync_runtime_auth_to_container_rejects_inconclusive_conflict() {
   begin_test "sync_runtime_auth_to_container rejects conflicting auth without freshness"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   ensure_keychain() { return 0; }
   keychain_auth_info() {
@@ -6195,14 +6517,14 @@ test_sync_runtime_auth_to_container_rejects_inconclusive_conflict() {
 test_sync_runtime_auth_from_container_uses_runtime_parameters() {
   begin_test "sync_runtime_auth_from_container uses runtime-specific auth parameters"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local observed_runtime=""
   local observed_format=""
   local written_blob_file=""
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-sync-from.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-auth-sync-from.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   written_blob_file="$temp_dir/written-auth.json"
 
@@ -6242,7 +6564,7 @@ test_sync_runtime_auth_from_container_uses_runtime_parameters() {
 test_auth_info_from_json_parses_claude_oauth_payload() {
   begin_test "auth_info_from_json parses claude oauth payloads"
 
-  load_codexctl_functions
+  load_agentctl_functions
   python_exec() {
     jq -r '
       . as $payload
@@ -6260,7 +6582,7 @@ test_auth_info_from_json_parses_claude_oauth_payload() {
 test_run_auth_flow_uses_agent_sh_auth_contract() {
   begin_test "run_auth_flow uses agent.sh auth login and auth read"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local fake_keychain
@@ -6268,7 +6590,7 @@ test_run_auth_flow_uses_agent_sh_auth_contract() {
   local exec_log_file
   local read_count_file
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-auth.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   fake_keychain="$temp_dir/fake-keychain.sh"
   stored_blob_file="$temp_dir/stored-auth.json"
@@ -6356,7 +6678,7 @@ test_run_auth_flow_skips_keychain_write_when_auth_unchanged() {
   local stored_blob_file
   local exec_log_file
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-unchanged.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-auth-unchanged.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
   fake_keychain="$temp_dir/fake-keychain.sh"
@@ -6380,7 +6702,7 @@ EOF
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 KEYCHAIN_SCRIPT="$fake_keychain"
 refresh_container_file() { :; }
 refresh_container_tree() { :; }
@@ -6435,7 +6757,7 @@ test_run_auth_flow_rejects_runtime_without_host_auth_support() {
   local fake_keychain
   local exec_log_file
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-unsupported.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-auth-unsupported.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
   fake_keychain="$temp_dir/fake-keychain.sh"
@@ -6451,7 +6773,7 @@ EOF
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 KEYCHAIN_SCRIPT="$fake_keychain"
 refresh_container_file() { :; }
 refresh_container_tree() { :; }
@@ -6510,7 +6832,7 @@ test_run_auth_flow_installs_runtime_before_claude_auth() {
   local runtime_info_count_file
   local auth_read_count_file
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-auth-claude.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-auth-claude.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   unit_script="$temp_dir/check.sh"
   fake_keychain="$temp_dir/fake-keychain.sh"
@@ -6539,7 +6861,7 @@ EOF
   cat >"$unit_script" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-source "$CODEXCTL"
+source "$AGENTCTL_IMPL"
 KEYCHAIN_SCRIPT="$fake_keychain"
 refresh_container_file() { :; }
 refresh_container_tree() { :; }
@@ -6607,13 +6929,13 @@ EOF
 test_run_keychain_for_runtime_uses_runtime_specific_codex_slot() {
   begin_test "run_keychain_for_runtime uses the runtime-specific codex slot first"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local fake_keychain
   local env_log_file
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-keychain-codex.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-keychain-codex.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   fake_keychain="$temp_dir/fake-keychain.sh"
   env_log_file="$temp_dir/env.log"
@@ -6641,13 +6963,13 @@ EOF
 test_run_keychain_for_runtime_uses_runtime_specific_slot() {
   begin_test "run_keychain_for_runtime uses runtime-specific keychain slots"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local fake_keychain
   local env_log_file
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-keychain-runtime.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-keychain-runtime.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   fake_keychain="$temp_dir/fake-keychain.sh"
   env_log_file="$temp_dir/env.log"
@@ -6675,7 +6997,7 @@ EOF
 test_rm_force_stops_running_container_before_remove() {
   begin_test "rm --force stops a running container before remove"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local stop_calls=0
   local rm_calls=0
@@ -6707,7 +7029,7 @@ test_rm_force_stops_running_container_before_remove() {
 test_rescue_runs_command_in_temporary_backup_container() {
   begin_test "rescue runs a command in a temporary backup container"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_log=""
   local exec_log=""
@@ -6762,7 +7084,7 @@ test_rescue_runs_command_in_temporary_backup_container() {
 test_rescue_keep_leaves_container_running() {
   begin_test "rescue --keep leaves the rescue container running"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local stop_calls=0
   local rm_calls=0
@@ -6792,7 +7114,7 @@ test_rescue_keep_leaves_container_running() {
 test_image_ref_for_runtime_falls_back_to_legacy_when_present() {
   begin_test "image_ref_for_runtime prefers canonical names but falls back to legacy refs"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   image_exists() {
     [ "$1" = "codex" ]
@@ -6804,7 +7126,7 @@ test_image_ref_for_runtime_falls_back_to_legacy_when_present() {
 test_ls_raw_filters_non_codex_containers() {
   begin_test "ls --raw hides non-Codex runtime containers"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   container_list_all() {
@@ -6831,31 +7153,27 @@ EOF
 test_ls_reports_matching_snapshot_ref_by_default() {
   begin_test "ls reports matching timestamp snapshot by image digest by default"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   CONTAINER_CMD=container
   container() {
     case "$*" in
-      "ls -a")
-        cat <<'EOF'
-ID                               IMAGE                                                OS     ARCH   STATE    ADDR              CPUS  MEMORY   STARTED
-converter                        docker.io/library/debian:latest                      linux  amd64  stopped                    4     1024 MB
-agent-local-agent-container      agent-python:latest                                  linux  arm64  running  192.168.64.253/24  4     4096 MB  2026-06-07T15:03:00Z
-EOF
+      "ls -a --quiet")
+        printf '%s\n' agent-local-agent-container
         ;;
       "image ls --format json")
         cat <<'EOF'
 [
-  {"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"agent-python:latest"},
-  {"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"docker.io/library/agent-python:20260607-150156"},
-  {"descriptor":{"digest":"sha256:other"},"reference":"agent-python:20260607-144649"}
+  {"configuration":{"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"name":"agent-python:latest"},"variants":[]},
+  {"configuration":{"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"name":"docker.io/library/agent-python:20260607-150156"},"variants":[]},
+  {"configuration":{"descriptor":{"digest":"sha256:other"},"name":"agent-python:20260607-144649"},"variants":[]}
 ]
 EOF
         ;;
       "inspect agent-local-agent-container")
         cat <<'EOF'
-[{"configuration":{"mounts":[{"source":"/Users/philipp/Developer/local-agent-container","options":[],"destination":"/workdir","type":{"virtiofs":{}}}],"resources":{"memoryInBytes":4294967296,"cpus":4},"image":{"descriptor":{"annotations":{"org.opencontainers.image.created":"2026-06-07T15:02:18Z"},"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"agent-python:latest"}},"status":"running"}]
+[{"configuration":{"mounts":[{"source":"/Users/philipp/Developer/local-agent-container","options":[],"destination":"/workdir","type":{"virtiofs":{}}}],"resources":{"memoryInBytes":4294967296,"cpus":4},"image":{"descriptor":{"annotations":{"org.opencontainers.image.created":"2026-06-07T15:02:18Z"},"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"agent-python:latest"}},"status":{"state":"running","networks":[]}}]
 EOF
         ;;
       *)
@@ -6879,17 +7197,14 @@ EOF
 test_ls_reports_unknown_snapshot_when_timestamp_missing() {
   begin_test "ls reports unknown snapshot when only latest matches digest"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   CONTAINER_CMD=container
   container() {
     case "$*" in
-      "ls -a")
-        cat <<'EOF'
-ID                          IMAGE                OS     ARCH   STATE
-agent-local-agent-container agent-python:latest  linux  arm64  running
-EOF
+      "ls -a --quiet")
+        printf '%s\n' agent-local-agent-container
         ;;
       "image ls --format json")
         cat <<'EOF'
@@ -6919,17 +7234,14 @@ EOF
 test_ls_keeps_row_when_inspect_fails() {
   begin_test "ls keeps a managed container row when inspect output is unavailable"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   CONTAINER_CMD=container
   container() {
     case "$*" in
-      "ls -a")
-        cat <<'EOF'
-ID                          IMAGE                OS     ARCH   STATE
-agent-local-agent-container agent-python:latest  linux  arm64  running
-EOF
+      "ls -a --quiet")
+        printf '%s\n' agent-local-agent-container
         ;;
       "image ls --format json")
         printf '[]\n'
@@ -6952,13 +7264,13 @@ EOF
 test_upgrade_backup_support_check() {
   begin_test "upgrade backup support check requires export support"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local fake_dir
   local fake_container
   local old_path
 
-  fake_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-fake-container.XXXXXX")"
+  fake_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-fake-container.XXXXXX")"
   register_dir_cleanup "$fake_dir"
   fake_container="$fake_dir/container"
   old_path="$PATH"
@@ -6995,7 +7307,7 @@ test_run_rejects_resource_flags_for_existing_container() {
   local fake_container
   local old_path
 
-  fake_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-fake-container.XXXXXX")"
+  fake_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-fake-container.XXXXXX")"
   register_dir_cleanup "$fake_dir"
   fake_container="$fake_dir/container"
   old_path="$PATH"
@@ -7003,6 +7315,11 @@ test_run_rejects_resource_flags_for_existing_container() {
   cat >"$fake_container" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [ "$*" = "ls -a --quiet" ]; then
+  printf '%s\n' unit-test-container
+  exit 0
+fi
 
 if [ "${1:-}" = "ls" ] && [ "${2:-}" = "-a" ]; then
   cat <<'OUT'
@@ -7030,13 +7347,13 @@ test_upgrade_rejects_no_backup_for_legacy_source() {
   local harness
   local script
 
-  harness="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit.XXXXXX")"
+  harness="$(mktemp "${TMPDIR:-/tmp}/agentctl-unit.XXXXXX")"
   register_dir_cleanup "$harness"
   sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
     -e '/^cmd="${1:-}"/,$d' \
-    "$CODEXCTL" >"$harness"
+    "$AGENTCTL_IMPL" >"$harness"
 
-  script="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit-script.XXXXXX")"
+  script="$(mktemp "${TMPDIR:-/tmp}/agentctl-unit-script.XXXXXX")"
   register_dir_cleanup "$script"
   cat >"$script" <<EOF
 #!/usr/bin/env bash
@@ -7084,7 +7401,7 @@ EOF
 test_upgrade_uses_explicit_resource_overrides() {
   begin_test "upgrade prefers explicit --cpu/--mem over inspected values"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_args=""
   local start_calls=0
@@ -7160,7 +7477,7 @@ test_upgrade_uses_explicit_resource_overrides() {
 test_upgrade_can_rename_container_during_recreation() {
   begin_test "upgrade can recreate the container under a new name"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_args=""
   local start_log=""
@@ -7251,7 +7568,7 @@ test_upgrade_can_rename_container_during_recreation() {
 test_upgrade_export_failure_restarts_running_source() {
   begin_test "upgrade export failure restarts running source"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_log=""
   local stop_log=""
@@ -7327,7 +7644,7 @@ test_upgrade_export_failure_restarts_running_source() {
 test_upgrade_copy_keeps_running_source_container() {
   begin_test "upgrade copy keeps the source container and creates a new target"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_args=""
   local start_log=""
@@ -7418,13 +7735,13 @@ test_upgrade_copy_requires_new_name() {
   local harness
   local script
 
-  harness="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit.XXXXXX")"
+  harness="$(mktemp "${TMPDIR:-/tmp}/agentctl-unit.XXXXXX")"
   register_dir_cleanup "$harness"
   sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
     -e '/^cmd="${1:-}"/,$d' \
-    "$CODEXCTL" >"$harness"
+    "$AGENTCTL_IMPL" >"$harness"
 
-  script="$(mktemp "${TMPDIR:-/tmp}/codexctl-unit-script.XXXXXX")"
+  script="$(mktemp "${TMPDIR:-/tmp}/agentctl-unit-script.XXXXXX")"
   register_dir_cleanup "$script"
   cat >"$script" <<EOF
 #!/usr/bin/env bash
@@ -7444,7 +7761,7 @@ EOF
 test_upgrade_dry_run_reports_plan_without_recreating_container() {
   begin_test "upgrade dry-run reports the plan without recreating the container"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_calls=0
   local export_calls=0
@@ -7527,7 +7844,7 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
 test_upgrade_copy_dry_run_reports_copy_plan() {
   begin_test "upgrade copy dry-run reports copy actions without recreating containers"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_calls=0
   local export_calls=0
@@ -7603,7 +7920,7 @@ test_upgrade_copy_dry_run_reports_copy_plan() {
 test_upgrade_warns_about_added_packages_missing_from_target_image() {
   begin_test "upgrade warns only for extra packages absent from the target image"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_log=""
   local start_calls=0
@@ -7708,7 +8025,7 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
 test_upgrade_reinstall_command_prefers_requested_apk_packages() {
   begin_test "upgrade reinstall command prefers requested apk packages"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   CLI_NAME=agentctl
 
@@ -7737,7 +8054,7 @@ test_upgrade_reinstall_command_prefers_requested_apk_packages() {
 test_upgrade_reinstall_command_restores_missing_apk_repository_tags() {
   begin_test "upgrade reinstall command restores missing apk repository tags"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   CLI_NAME=agentctl
 
@@ -7762,7 +8079,7 @@ test_upgrade_reinstall_command_restores_missing_apk_repository_tags() {
 test_upgrade_reinstall_command_suggests_default_apk_edge_tags() {
   begin_test "upgrade reinstall command suggests default apk edge tags"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   CLI_NAME=agentctl
 
@@ -7786,7 +8103,7 @@ test_upgrade_reinstall_command_suggests_default_apk_edge_tags() {
 test_upgrade_warns_about_image_packages_removed_from_target() {
   begin_test "upgrade warns about image-provided packages removed from the target image"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   CLI_NAME=agentctl
 
@@ -7812,7 +8129,7 @@ test_upgrade_warns_about_image_packages_removed_from_target() {
 test_upgrade_reinstall_command_prefers_requested_dpkg_packages() {
   begin_test "upgrade reinstall command prefers requested dpkg packages"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   CLI_NAME=agentctl
 
@@ -7836,7 +8153,7 @@ test_upgrade_reinstall_command_prefers_requested_dpkg_packages() {
 test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   begin_test "upgrade reinstalls added runtimes and features in the target container"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_log=""
   local start_log=""
@@ -7942,7 +8259,7 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
 test_upgrade_reinstalls_missing_default_runtime_after_restore() {
   begin_test "upgrade reinstalls missing default runtime after restore"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_log=""
   local install_log=""
@@ -8019,7 +8336,7 @@ test_upgrade_reinstalls_missing_default_runtime_after_restore() {
 test_upgrade_warns_and_clears_missing_preferred_runtime() {
   begin_test "upgrade warns and clears a preferred runtime that is unavailable in the target"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local cleared_name=""
 
@@ -8090,7 +8407,7 @@ test_upgrade_warns_and_clears_missing_preferred_runtime() {
 test_upgrade_uses_stored_baseline_when_current_image_is_missing() {
   begin_test "upgrade uses the stored baseline manifest when the current image is unavailable"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_log=""
   local start_calls=0
@@ -8196,7 +8513,7 @@ test_upgrade_uses_stored_baseline_when_current_image_is_missing() {
 test_upgrade_accepts_workdir_override_when_original_mount_is_missing() {
   begin_test "upgrade can replace a missing workdir mount source"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_args=""
   local export_calls=0
@@ -8215,7 +8532,7 @@ test_upgrade_accepts_workdir_override_when_original_mount_is_missing() {
   backup_codex_config_from_export() {
     local extract_root="$3"
     mkdir -p "$extract_root/home/coder/.codex"
-    ln -sf /etc/codexctl/image.md "$extract_root/home/coder/.codex/AGENTS.md"
+    ln -sf /etc/agentctl/image.md "$extract_root/home/coder/.codex/AGENTS.md"
   }
   extract_export_root() {
     local extract_root="$2"
@@ -8276,7 +8593,7 @@ test_upgrade_accepts_workdir_override_when_original_mount_is_missing() {
 test_upgrade_allows_no_backup_for_modern_export_source() {
   begin_test "upgrade allows --no-backup for a modern export-backed source"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_args=""
   local export_calls=0
@@ -8284,7 +8601,7 @@ test_upgrade_allows_no_backup_for_modern_export_source() {
   local stop_calls=0
   local rm_calls=0
   local export_root
-  export_root="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-export-root.XXXXXX")"
+  export_root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-export-root.XXXXXX")"
   register_dir_cleanup "$export_root"
   mkdir -p "$export_root/usr/local/bin"
   cat >"$export_root/usr/local/bin/agent.sh" <<'EOF'
@@ -8361,7 +8678,7 @@ EOF
 test_container_baseline_manifest_starts_stopped_container_and_restores_state() {
   begin_test "container_baseline_manifest_json starts a stopped container and restores stopped state"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_calls=0
   local stop_calls=0
@@ -8416,7 +8733,7 @@ test_container_baseline_manifest_starts_stopped_container_and_restores_state() {
 test_image_system_manifest_removes_temp_container_after_success() {
   begin_test "image_system_manifest_json removes temporary container after success"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local create_calls=0
   local start_calls=0
@@ -8472,7 +8789,7 @@ test_image_system_manifest_removes_temp_container_after_success() {
 test_image_system_manifest_removes_temp_container_after_exec_failure() {
   begin_test "image_system_manifest_json removes temporary container after exec failure"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local stop_calls=0
   local rm_calls=0
@@ -8514,13 +8831,13 @@ test_image_system_manifest_removes_temp_container_after_exec_failure() {
 test_collect_upgrade_container_preflight_starts_stopped_container_once() {
   begin_test "collect_upgrade_container_preflight reuses one start for manifest, baseline, and capability checks"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_calls=0
   local stop_calls=0
   local running=0
   local exec_log
-  exec_log="$(mktemp "${TMPDIR:-/tmp}/codexctl-preflight-exec.XXXXXX")"
+  exec_log="$(mktemp "${TMPDIR:-/tmp}/agentctl-preflight-exec.XXXXXX")"
   register_dir_cleanup "$exec_log"
 
   CONTAINER_CMD=container
@@ -8584,7 +8901,7 @@ test_collect_upgrade_container_preflight_starts_stopped_container_once() {
 test_refresh_updates_managed_files_without_recreate() {
   begin_test "refresh updates managed files and preserves stopped state"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_calls=0
   local stop_calls=0
@@ -8627,10 +8944,9 @@ test_refresh_updates_managed_files_without_recreate() {
   assert_contains "Refresh complete: unit-test-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/config.toml" || fail "Expected refresh to update /etc/agentctl/config.toml"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/gpt-oss.config.toml" || fail "Expected refresh to update /etc/agentctl/gpt-oss.config.toml"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/codexctl/config.toml" || fail "Expected refresh to update /etc/codexctl/config.toml"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/codexctl/gpt-oss.config.toml" || fail "Expected refresh to update /etc/codexctl/gpt-oss.config.toml"
+  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/codex/config.toml" || fail "Expected refresh to update /etc/agentctl/codex/config.toml"
+  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/codex/gpt-oss.config.toml" || fail "Expected refresh to update /etc/agentctl/codex/gpt-oss.config.toml"
+  printf '%s\n' "$exec_log" | grep -Fq "/etc/codexctl" || fail "Expected refresh to remove legacy Codex defaults"
   printf '%s\n' "$exec_log" | grep -Fq "/usr/local/bin/agent.sh" || fail "Expected refresh to update agent.sh"
   printf '%s\n' "$exec_log" | grep -Fq "/usr/local/lib/agentctl/runtimes" || fail "Expected refresh to update runtime adapters"
   printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/runtimes.d" || fail "Expected refresh to update runtime registry"
@@ -8641,7 +8957,7 @@ test_refresh_updates_managed_files_without_recreate() {
 test_doctor_reports_state_permission_problems() {
   begin_test "doctor reports user-state permission problems"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local running=0
 
@@ -8680,7 +8996,7 @@ test_doctor_reports_state_permission_problems() {
 test_doctor_reports_container_startup_problem() {
   begin_test "doctor reports containers that do not stay running"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -8706,7 +9022,7 @@ test_doctor_reports_container_startup_problem() {
 test_doctor_fix_repairs_state_permission_problems() {
   begin_test "doctor --fix repairs user-state permission problems"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -8735,7 +9051,7 @@ test_doctor_fix_repairs_state_permission_problems() {
 test_doctor_reports_runtime_health_problems() {
   begin_test "doctor reports runtime health problems"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -8770,7 +9086,7 @@ test_doctor_reports_runtime_health_problems() {
 test_doctor_fix_repairs_runtime_health_problems() {
   begin_test "doctor --fix repairs runtime health problems"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -8802,7 +9118,7 @@ test_doctor_fix_repairs_runtime_health_problems() {
 test_doctor_runtime_health_detects_codex_config_and_agents_problems() {
   begin_test "doctor runtime health detects Codex config and AGENTS problems"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   run_agent_sh_in_container() {
     case "$2 $3" in
@@ -8828,7 +9144,7 @@ test_doctor_runtime_health_detects_codex_config_and_agents_problems() {
 test_doctor_runtime_health_fix_reinstalls_runtime_and_restores_agents() {
   begin_test "doctor runtime health --fix reinstalls missing runtime and restores AGENTS"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local installed_runtime=""
   local reset_runtime=""
@@ -8875,7 +9191,7 @@ test_doctor_runtime_health_fix_reinstalls_runtime_and_restores_agents() {
 test_doctor_reports_runtime_state_summary() {
   begin_test "doctor reports runtime state summary"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -8903,12 +9219,12 @@ test_doctor_reports_runtime_state_summary() {
 test_container_state_permission_script_repairs_unreadable_state() {
   begin_test "container state permission script repairs unreadable user state"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_home
   local script_file
 
-  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-doctor-home.XXXXXX")"
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-doctor-home.XXXXXX")"
   register_dir_cleanup "$temp_home"
   script_file="$temp_home/doctor.sh"
   mkdir -p "$temp_home/.codex"
@@ -8931,12 +9247,12 @@ test_container_state_permission_script_repairs_unreadable_state() {
 test_refresh_container_file_streams_source_via_stdin() {
   begin_test "refresh_container_file uses interactive exec for stdin streaming"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local source_file
   local exec_log=""
 
-  source_file="$(mktemp "${TMPDIR:-/tmp}/codexctl-refresh-file.XXXXXX")"
+  source_file="$(mktemp "${TMPDIR:-/tmp}/agentctl-refresh-file.XXXXXX")"
   register_dir_cleanup "$source_file"
   printf 'hello-refresh\n' >"$source_file"
 
@@ -8963,12 +9279,12 @@ test_refresh_container_file_streams_source_via_stdin() {
 test_refresh_container_tree_suppresses_host_xattrs() {
   begin_test "refresh_container_tree suppresses host extended attributes"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local source_dir
   local tar_log
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-refresh-tree.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-refresh-tree.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   source_dir="$temp_dir/source"
   tar_log="$temp_dir/tar.log"
@@ -9011,7 +9327,7 @@ test_refresh_container_tree_suppresses_host_xattrs() {
 test_system_manifest_starts_stopped_container_and_restores_state() {
   begin_test "system-manifest starts a stopped container and restores stopped state"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_calls=0
   local stop_calls=0
@@ -9048,7 +9364,7 @@ test_system_manifest_starts_stopped_container_and_restores_state() {
 test_runtime_cmd_starts_stopped_container_and_restores_state() {
   begin_test "runtime list starts a stopped container and restores stopped state"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_calls=0
   local stop_calls=0
@@ -9095,7 +9411,7 @@ test_runtime_cmd_starts_stopped_container_and_restores_state() {
 test_runtime_cmd_propagates_exec_failures() {
   begin_test "runtime commands propagate container exec failures"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -9120,7 +9436,7 @@ test_runtime_cmd_propagates_exec_failures() {
 test_use_cmd_sets_preferred_runtime_in_stopped_container() {
   begin_test "use sets the preferred runtime inside a stopped container"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_calls=0
   local stop_calls=0
@@ -9166,7 +9482,7 @@ test_use_cmd_sets_preferred_runtime_in_stopped_container() {
 test_runtime_use_cmd_sets_preferred_runtime_in_stopped_container() {
   begin_test "runtime use sets the preferred runtime inside a stopped container"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local start_calls=0
   local stop_calls=0
@@ -9212,10 +9528,10 @@ test_runtime_use_cmd_sets_preferred_runtime_in_stopped_container() {
 test_cleanup_temp_dir_handles_read_only_trees() {
   begin_test "cleanup_temp_dir removes read-only extracted trees"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-cleanup.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-cleanup.XXXXXX")"
   register_dir_cleanup "$temp_dir"
 
   mkdir -p "$temp_dir/rootfs/pkg"
@@ -9231,7 +9547,7 @@ test_cleanup_temp_dir_handles_read_only_trees() {
 test_extract_container_export_rootfs_respects_oci_layer_order() {
   begin_test "extract_container_export_rootfs applies OCI layers in manifest order"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local export_file
@@ -9247,7 +9563,7 @@ test_extract_container_export_rootfs_respects_oci_layer_order() {
   local manifest_digest
   local nonce=0
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-oci-export.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-oci-export.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   export_file="$temp_dir/container-export.tar"
   rootfs_dir="$temp_dir/rootfs"
@@ -9297,10 +9613,10 @@ test_extract_container_export_rootfs_respects_oci_layer_order() {
 test_validate_backup_rootfs_accepts_shell_symlink() {
   begin_test "validate_backup_rootfs accepts shell symlinks"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-backup-rootfs.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-backup-rootfs.XXXXXX")"
   register_dir_cleanup "$temp_dir"
 
   mkdir -p "$temp_dir/rootfs/home/coder" "$temp_dir/rootfs/bin"
@@ -9312,7 +9628,7 @@ test_validate_backup_rootfs_accepts_shell_symlink() {
 test_build_backup_image_uses_clean_context_for_exported_rootfs() {
   begin_test "build_backup_image_from_export uses a tarred rootfs build context"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local export_root
@@ -9322,8 +9638,9 @@ test_build_backup_image_uses_clean_context_for_exported_rootfs() {
   local build_context=""
   local build_dockerfile=""
   local validated_image=""
+  local buildkit_stopped=0
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-backup-build.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-backup-build.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   export_root="$temp_dir/export-root"
   export_file="$temp_dir/export.tar"
@@ -9348,6 +9665,7 @@ test_build_backup_image_uses_clean_context_for_exported_rootfs() {
         ;;
     esac
   }
+  stop_buildkit_container() { buildkit_stopped=1; }
   validate_backup_image() { validated_image="$1"; }
 
   build_backup_image_from_export agent-test-backup unit-test-container "$export_file" "$backup_root" "$backup_dockerfile"
@@ -9362,12 +9680,13 @@ test_build_backup_image_uses_clean_context_for_exported_rootfs() {
   grep -Fq 'ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$backup_dockerfile" || fail "Expected backup Dockerfile to set PATH"
   grep -Fq 'ADD rootfs.tar /' "$backup_dockerfile" || fail "Expected backup Dockerfile to add tarred rootfs"
   [ "$validated_image" = "agent-test-backup" ] || fail "Expected backup image validation, got: $validated_image"
+  [ "$buildkit_stopped" -eq 1 ] || fail "Expected backup build to stop BuildKit"
 }
 
 test_build_backup_image_preserves_flat_export_tar() {
   begin_test "build_backup_image_from_export preserves flat export tar as build input"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local temp_dir
   local export_root
@@ -9376,7 +9695,7 @@ test_build_backup_image_preserves_flat_export_tar() {
   local backup_dockerfile
   local rootfs_tar
 
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-backup-flat.XXXXXX")"
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-backup-flat.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   export_root="$temp_dir/export-root"
   export_file="$temp_dir/export.tar"
@@ -9398,6 +9717,7 @@ test_build_backup_image_preserves_flat_export_tar() {
         ;;
     esac
   }
+  stop_buildkit_container() { :; }
   validate_backup_image() { :; }
 
   build_backup_image_from_export agent-test-backup unit-test-container "$export_file" "$backup_root" "$backup_dockerfile"
@@ -9408,7 +9728,7 @@ test_build_backup_image_preserves_flat_export_tar() {
 test_validate_backup_image_rejects_unbootable_backup() {
   begin_test "validate_backup_image rejects backup images that cannot start /bin/sh"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   sanitize_image_name() { printf '%s\n' "$1"; }
   CONTAINER_CMD=container
@@ -9439,7 +9759,7 @@ test_validate_backup_image_rejects_unbootable_backup() {
 test_validate_backup_image_stops_validation_container_before_remove() {
   begin_test "validate_backup_image stops validation container before remove"
 
-  load_codexctl_functions
+  load_agentctl_functions
 
   local call_log=""
 
@@ -9491,6 +9811,14 @@ main() {
   run_selected_test test_exec_help_reports_stdio_option "test_exec_help_reports_stdio_option"
   run_selected_test test_run_cmd_wires_home_mount "test_run_cmd_wires_home_mount"
   run_selected_test test_doctor_help_reports_fix_option "test_doctor_help_reports_fix_option"
+  run_selected_test test_agentctl_version_matches_version_file "test_agentctl_version_matches_version_file"
+  run_selected_test test_doctor_host_reports_runtime_and_capabilities "test_doctor_host_reports_runtime_and_capabilities"
+  run_selected_test test_host_address_reads_container_1_1_gateway "test_host_address_reads_container_1_1_gateway"
+  run_selected_test test_host_address_supports_custom_network_subnet_fallback "test_host_address_supports_custom_network_subnet_fallback"
+  run_selected_test test_configure_container_host_alias_replaces_stale_entry "test_configure_container_host_alias_replaces_stale_entry"
+  run_selected_test test_remove_legacy_codex_files_preserves_image_metadata "test_remove_legacy_codex_files_preserves_image_metadata"
+  run_selected_test test_run_container_refreshes_host_alias_before_exec "test_run_container_refreshes_host_alias_before_exec"
+  run_selected_test test_start_and_restart_refresh_host_alias "test_start_and_restart_refresh_host_alias"
   run_selected_test test_rescue_help_reports_backup_image_options "test_rescue_help_reports_backup_image_options"
   run_selected_test test_run_model_wires_selected_model "test_run_model_wires_selected_model"
   run_selected_test test_build_help_reports_primary_base_images "test_build_help_reports_primary_base_images"
@@ -9501,6 +9829,8 @@ main() {
   run_selected_test test_build_cmd_rebuilds_and_snapshots_local_dependencies "test_build_cmd_rebuilds_and_snapshots_local_dependencies"
   run_selected_test test_build_cmd_snapshots_existing_image_when_timestamp_missing "test_build_cmd_snapshots_existing_image_when_timestamp_missing"
   run_selected_test test_build_cmd_skips_existing_image_when_timestamp_matches "test_build_cmd_skips_existing_image_when_timestamp_matches"
+  run_selected_test test_build_cmd_recognizes_container_1_image_snapshot_schema "test_build_cmd_recognizes_container_1_image_snapshot_schema"
+  run_selected_test test_container_lookup_uses_quiet_exact_ids "test_container_lookup_uses_quiet_exact_ids"
   run_selected_test test_run_cmd_runtime_selection_does_not_auto_install_for_new_container "test_run_cmd_runtime_selection_does_not_auto_install_for_new_container"
   run_selected_test test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container "test_run_cmd_runtime_selection_does_not_auto_install_for_existing_container"
   run_selected_test test_build_cmd_warns_for_legacy_office_image "test_build_cmd_warns_for_legacy_office_image"

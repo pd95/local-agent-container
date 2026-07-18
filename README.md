@@ -5,6 +5,9 @@
 This repository packages a practical local setup for running agent CLIs on Apple
 Silicon Macs with Apple’s `container` tool.
 
+Run `agentctl --version` to inspect the checked-out release. Published versions
+and the release process are documented in [docs/releases.md](docs/releases.md).
+
 The main entry point is `agentctl`, which manages:
 - curated images such as `agent-plain`, `agent-python`, and `agent-swift`
 - runtime selection (`codex`, `claude`, and more over time)
@@ -67,7 +70,7 @@ container system start
 
 Before your first local run, make sure containers can reach Ollama. The short
 version is:
-- many setups use `192.168.64.1:11434` as the host-visible Ollama address
+- agentctl maps `host.container.internal` to the current Apple container gateway
 - default Ollama only listens on `localhost`
 - you may need to expose or proxy Ollama onto the container-visible host address
 
@@ -77,9 +80,9 @@ For isolated Ollama listeners or non-default ports, pass the container-reachable
 base URL explicitly:
 
 ```bash
-OLLAMA_HOST=http://192.168.64.1:11439 agentctl run ...
+OLLAMA_HOST=http://host.container.internal:11439 agentctl run ...
 # or
-agentctl run -c ollama_host=http://192.168.64.1:11439 ...
+agentctl run -c ollama_host=http://host.container.internal:11439 ...
 ```
 
 ## Workspace model
@@ -234,12 +237,15 @@ curated image. More on that in [docs/bootstrap.md](docs/bootstrap.md).
 
 Host integration and shell unit tests are documented in [TESTING.md](TESTING.md).
 
-Fast checks:
+Fast checks (the host runner defaults to its smoke tier):
 
 ```bash
 bash tests/run-unit-tests.sh
 bash tests/run-tests.sh
 ```
+
+Use `bash tests/run-tests.sh --tier full` for release and runtime-upgrade
+validation.
 
 ## Documentation
 
