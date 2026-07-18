@@ -416,6 +416,100 @@ test_upgrade_no_backup_preserves_state() {
   assert_contains "runtime-state-ok"
 }
 
+test_upgrade_repeats_tagged_apk_reinstall_instructions() {
+  begin_test "upgrade repeats complete tagged APK reinstall instructions"
+  local name
+  local workdir
+  local reinstall_command
+  local main_repository
+  local community_repository
+  local main_restore_fragment
+  local community_restore_fragment
+  local preflight_output
+  local reminder_output
+
+  name="$(unique_name upgrade-tagged-apk)"
+  workdir="$(new_workdir)"
+  register_container_cleanup "$name"
+  reinstall_command="agentctl su-exec --name $name apk add --no-cache nano@agentctlmain tree@agentctlcommunity"
+
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd true
+  assert_status 0
+
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+
+  # Give packages from main and community one distinct repository tag each.
+  run_capture "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
+set -e
+main_repository="$(sed -n "/\/main$/ { p; q; }" /etc/apk/repositories)"
+community_repository="$(sed -n "/\/community$/ { p; q; }" /etc/apk/repositories)"
+[ -n "$main_repository" ] || {
+  printf "agent-plain has no APK main repository\n" >&2
+  exit 1
+}
+[ -n "$community_repository" ] || {
+  printf "agent-plain has no APK community repository\n" >&2
+  exit 1
+}
+! apk info -e nano || {
+  printf "nano is already part of agent-plain; choose another main package fixture\n" >&2
+  exit 1
+}
+! apk info -e tree || {
+  printf "tree is already part of agent-plain; choose another community package fixture\n" >&2
+  exit 1
+}
+printf "@agentctlmain %s\n" "$main_repository" >>/etc/apk/repositories
+printf "@agentctlcommunity %s\n" "$community_repository" >>/etc/apk/repositories
+apk update
+apk add --no-cache nano@agentctlmain tree@agentctlcommunity
+apk info -e nano
+apk info -e tree
+printf "AGENTCTL_MAIN_REPOSITORY=%s\n" "$main_repository"
+printf "AGENTCTL_COMMUNITY_REPOSITORY=%s\n" "$community_repository"
+'
+  assert_status 0
+  main_repository="$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^AGENTCTL_MAIN_REPOSITORY=//p' | tail -n 1)"
+  community_repository="$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^AGENTCTL_COMMUNITY_REPOSITORY=//p' | tail -n 1)"
+  [ -n "$main_repository" ] || fail "Could not capture the tagged APK main repository"
+  [ -n "$community_repository" ] || fail "Could not capture the tagged APK community repository"
+  main_restore_fragment="grep -Fxq '\\''@agentctlmain $main_repository'\\'' /etc/apk/repositories"
+  community_restore_fragment="grep -Fxq '\\''@agentctlcommunity $community_repository'\\'' /etc/apk/repositories"
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --image agent-plain --no-backup
+  assert_status 0
+  assert_contains "Upgrade complete: $name (backup skipped)"
+  assert_contains "Reminder: reinstall top-level packages removed by the upgrade if you still need them:"
+
+  preflight_output="$(printf '%s\n' "$RUN_OUTPUT" | sed '/^Reminder: reinstall top-level packages removed by the upgrade if you still need them:$/,$d')"
+  reminder_output="$(printf '%s\n' "$RUN_OUTPUT" | sed -n '/^Reminder: reinstall top-level packages removed by the upgrade if you still need them:$/,$p')"
+
+  printf '%s\n' "$preflight_output" | grep -Fq "Restore APK repository tag(s) before reinstalling tagged packages:" \
+    || fail "Expected tagged APK repository instructions during upgrade preflight"
+  printf '%s\n' "$reminder_output" | grep -Fq "Restore APK repository tag(s) before reinstalling tagged packages:" \
+    || fail "Expected tagged APK repository instructions in the final reminder"
+  printf '%s\n' "$preflight_output" | grep -Fq "$main_restore_fragment" \
+    || fail "Expected the exact APK main repository restore command during upgrade preflight"
+  printf '%s\n' "$preflight_output" | grep -Fq "$community_restore_fragment" \
+    || fail "Expected the exact APK community repository restore command during upgrade preflight"
+  printf '%s\n' "$reminder_output" | grep -Fq "$main_restore_fragment" \
+    || fail "Expected the exact APK main repository restore command in the final reminder"
+  printf '%s\n' "$reminder_output" | grep -Fq "$community_restore_fragment" \
+    || fail "Expected the exact APK community repository restore command in the final reminder"
+  printf '%s\n' "$preflight_output" | grep -Fq "agentctl su-exec --name $name apk update" \
+    || fail "Expected apk update during upgrade preflight"
+  printf '%s\n' "$reminder_output" | grep -Fq "agentctl su-exec --name $name apk update" \
+    || fail "Expected apk update in the final reminder"
+  printf '%s\n' "$preflight_output" | grep -Fq "$reinstall_command" \
+    || fail "Expected the tagged APK reinstall command during upgrade preflight"
+  printf '%s\n' "$reminder_output" | grep -Fq "$reinstall_command" \
+    || fail "Expected the tagged APK reinstall command in the final reminder"
+
+  run_capture "$CONTAINER_CMD" exec "$name" sh -lc '! apk info -e nano && ! apk info -e tree'
+  assert_status 0
+}
+
 test_upgrade_with_backup_creates_recovery_image() {
   begin_test "upgrade creates a backup image by default"
   local name
@@ -884,6 +978,7 @@ main() {
   run_selected_test test_named_run_persists_until_rm "named run persists until explicit removal" smoke
   run_selected_test test_build_rebuild_stops_buildkit "build --rebuild stops buildkit after a successful build" full
   run_selected_test test_upgrade_no_backup_preserves_state "upgrade --no-backup preserves state without creating backup images" full
+  run_selected_test test_upgrade_repeats_tagged_apk_reinstall_instructions "upgrade repeats complete tagged APK reinstall instructions" full
   run_selected_test test_upgrade_with_backup_creates_recovery_image "upgrade creates a backup image by default" full
   run_selected_test test_upgrade_backup_restores_home_and_boots_rescue_image "upgrade backup restores home state and creates a bootable full-rootfs rescue image" full
   run_selected_test test_upgrade_preflight_failure_keeps_container "upgrade preflight failure leaves the original container intact" full

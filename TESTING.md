@@ -22,6 +22,8 @@ dependencies:
 - backup-enabled `refresh` requires a container runtime with `export --output`
 - `refresh --no-backup` preserves user state without creating a backup image
 - default `refresh` creates a recovery backup image
+- `upgrade` repeats repository restoration, `apk update`, and reinstall commands for
+  packages installed through multiple tagged APK repositories
 - `refresh` accepts explicit `--cpu` and `--mem` overrides when recreating a container
 - refresh preflight failures do not remove the original container
 - `run --reset-config` restores image-owned config, model metadata, and `AGENTS.md`
@@ -49,6 +51,15 @@ caches stay under `/opt/agentctl` while user state remains under `/home/coder`:
 
 ```bash
 bash tests/run-integration-tests.sh --filter tool-home
+```
+
+The tagged-package upgrade regression creates an `agent-plain` container, installs
+`nano` and `tree` through two tagged aliases of its real APK repositories, performs a
+real no-backup upgrade, and verifies that the complete repository and package commands
+appear both during preflight and in the final reminder:
+
+```bash
+bash tests/run-integration-tests.sh --tier full --filter tagged-apk
 ```
 
 This test requires macOS with Apple's `container` CLI. It uses `agentctl run --cmd true`

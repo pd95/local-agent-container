@@ -284,7 +284,13 @@ begin_test() {
 test_matches_filter() {
   local name="$1"
   local description="$2"
-  local normalized_filter="${TEST_FILTER// /_}"
+  local normalized_filter="${TEST_FILTER//-/_}"
+  local normalized_name="${name//-/_}"
+  local normalized_description="${description//-/_}"
+
+  normalized_filter="${normalized_filter// /_}"
+  normalized_name="${normalized_name// /_}"
+  normalized_description="${normalized_description// /_}"
 
   if [ -z "$TEST_FILTER" ]; then
     return 0
@@ -292,6 +298,8 @@ test_matches_filter() {
 
   case "$name"$'\n'"$description" in
     *"$TEST_FILTER"*) return 0 ;;
+  esac
+  case "$normalized_name"$'\n'"$normalized_description" in
     *"$normalized_filter"*) return 0 ;;
     *) return 1 ;;
   esac
@@ -300,7 +308,13 @@ test_matches_filter() {
 test_matches_start_from() {
   local name="$1"
   local description="$2"
-  local normalized_start_from="${TEST_START_FROM// /_}"
+  local normalized_start_from="${TEST_START_FROM//-/_}"
+  local normalized_name="${name//-/_}"
+  local normalized_description="${description//-/_}"
+
+  normalized_start_from="${normalized_start_from// /_}"
+  normalized_name="${normalized_name// /_}"
+  normalized_description="${normalized_description// /_}"
 
   if [ -z "$TEST_START_FROM" ]; then
     return 0
@@ -314,6 +328,8 @@ test_matches_start_from() {
       TEST_START_ACTIVE=1
       return 0
       ;;
+  esac
+  case "$normalized_name"$'\n'"$normalized_description" in
     *"$normalized_start_from"*)
       TEST_START_ACTIVE=1
       return 0

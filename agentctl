@@ -5017,6 +5017,61 @@ print_upgrade_package_reinstall_line() {
 }${line}"
 }
 
+print_apk_repository_restore_instructions() {
+  local packages_json="$1"
+  local current_repositories_json="$2"
+  local target_repositories_json="$3"
+  local target_name="$4"
+  local missing_tags_json='[]'
+  local repository_lines_json='[]'
+  local resolved_tags_json='[]'
+  local unresolved_tags_json='[]'
+  local default_repository_lines_json='[]'
+  local repository_line=""
+  local quoted_repository_line=""
+  local shell_repository_line=""
+  local reminder_line=""
+
+  missing_tags_json="$(
+    json_string_array_difference \
+      "$(apk_package_tags_json "$packages_json")" \
+      "$(apk_repository_tags_json "$target_repositories_json")"
+  )"
+  [ "$(printf '%s' "$missing_tags_json" | jq -r 'length' 2>/dev/null || printf '0\n')" -gt 0 ] || return 0
+
+  repository_lines_json="$(apk_repository_lines_for_tags_json "$current_repositories_json" "$missing_tags_json")"
+  resolved_tags_json="$(apk_repository_tags_json "$repository_lines_json")"
+  unresolved_tags_json="$(json_string_array_difference "$missing_tags_json" "$resolved_tags_json")"
+  default_repository_lines_json="$(apk_default_repository_lines_for_tags_json "$unresolved_tags_json")"
+  repository_lines_json="$(jq -cn \
+    --argjson current "$repository_lines_json" \
+    --argjson defaults "$default_repository_lines_json" \
+    '$current + $defaults | unique | sort')"
+  resolved_tags_json="$(apk_repository_tags_json "$repository_lines_json")"
+  unresolved_tags_json="$(json_string_array_difference "$missing_tags_json" "$resolved_tags_json")"
+
+  if [ "$(printf '%s' "$repository_lines_json" | jq -r 'length' 2>/dev/null || printf '0\n')" -gt 0 ]; then
+    print_upgrade_package_reinstall_line "Restore APK repository tag(s) before reinstalling tagged packages:"
+    while IFS= read -r repository_line; do
+      [ -n "$repository_line" ] || continue
+      quoted_repository_line="$(printf '%s' "$repository_line" | jq -Rr '@sh')"
+      shell_repository_line="$(printf 'grep -Fxq %s /etc/apk/repositories || printf "%%s\\\\n" %s >> /etc/apk/repositories' "$quoted_repository_line" "$quoted_repository_line" | jq -Rr '@sh')"
+      reminder_line="$(printf '  %s su-exec --name %s sh -lc %s' \
+        "$CLI_NAME" \
+        "$target_name" \
+        "$shell_repository_line")"
+      print_upgrade_package_reinstall_line "$reminder_line"
+    done < <(printf '%s' "$repository_lines_json" | jq -r '.[]' 2>/dev/null || true)
+    reminder_line="  ${CLI_NAME} su-exec --name ${target_name} apk update"
+    print_upgrade_package_reinstall_line "$reminder_line"
+  fi
+
+  if [ "$(printf '%s' "$unresolved_tags_json" | jq -r 'length' 2>/dev/null || printf '0\n')" -gt 0 ]; then
+    warn "Tagged APK package reinstall needs missing repository tag(s), but no repository URL is available:"
+    printf '%s' "$unresolved_tags_json" | jq -r '.[] | "  - @" + .' >&2
+  fi
+}
+
 warn_upgrade_package_loss() {
   local name="$1"
   local current_image="$2"
@@ -5055,13 +5110,6 @@ warn_upgrade_package_loss() {
   local reinstall_label="To reinstall after upgrade:"
   local requested_package_count=0
   local requested_package_data_available=0
-  local missing_apk_repository_tags_json='[]'
-  local missing_apk_repository_lines_json='[]'
-  local missing_apk_repository_tag_count=0
-  local missing_apk_repository_line_count=0
-  local repository_line=""
-  local quoted_repository_line=""
-  local shell_repository_line=""
   local reminder_line=""
   local lost_count=""
 
@@ -5137,6 +5185,11 @@ warn_upgrade_package_loss() {
                 "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')")"
               print_upgrade_package_reinstall_line "$reminder_line"
             elif [ "$target_package_manager" = "apk" ]; then
+              print_apk_repository_restore_instructions \
+                "$removed_baseline_requested_packages_json" \
+                "$current_apk_repositories_json" \
+                "$target_apk_repositories_json" \
+                "$target_name"
               reminder_line="$(printf '  %s su-exec --name %s apk add --no-cache %s' \
                 "$CLI_NAME" \
                 "$target_name" \
@@ -5206,38 +5259,11 @@ warn_upgrade_package_loss() {
       fi
       printf '%s\n' "$reinstall_label" >&2
       if [ "$reinstall_package_manager" = "apk" ]; then
-        missing_apk_repository_tags_json="$(
-          json_string_array_difference \
-            "$(apk_package_tags_json "$reinstall_packages_json")" \
-            "$(apk_repository_tags_json "$target_apk_repositories_json")"
-        )"
-        missing_apk_repository_tag_count="$(printf '%s' "$missing_apk_repository_tags_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
-        if [ "$missing_apk_repository_tag_count" -gt 0 ]; then
-          missing_apk_repository_lines_json="$(apk_repository_lines_for_tags_json "$current_apk_repositories_json" "$missing_apk_repository_tags_json")"
-          missing_apk_repository_line_count="$(printf '%s' "$missing_apk_repository_lines_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
-          if [ "$missing_apk_repository_line_count" -eq 0 ]; then
-            missing_apk_repository_lines_json="$(apk_default_repository_lines_for_tags_json "$missing_apk_repository_tags_json")"
-            missing_apk_repository_line_count="$(printf '%s' "$missing_apk_repository_lines_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
-          fi
-          if [ "$missing_apk_repository_line_count" -gt 0 ]; then
-            print_upgrade_package_reinstall_line "Restore APK repository tag(s) before reinstalling tagged packages:"
-            while IFS= read -r repository_line; do
-              [ -n "$repository_line" ] || continue
-              quoted_repository_line="$(printf '%s' "$repository_line" | jq -Rr '@sh')"
-              shell_repository_line="$(printf 'grep -Fxq %s /etc/apk/repositories || printf "%%s\\\\n" %s >> /etc/apk/repositories' "$quoted_repository_line" "$quoted_repository_line" | jq -Rr '@sh')"
-              reminder_line="$(printf '  %s su-exec --name %s sh -lc %s' \
-                "$CLI_NAME" \
-                "$target_name" \
-                "$shell_repository_line")"
-              print_upgrade_package_reinstall_line "$reminder_line"
-            done < <(printf '%s' "$missing_apk_repository_lines_json" | jq -r '.[]' 2>/dev/null || true)
-            reminder_line="  ${CLI_NAME} su-exec --name ${target_name} apk update"
-            print_upgrade_package_reinstall_line "$reminder_line"
-          else
-            warn "Tagged APK package reinstall needs missing repository tag(s), but the original repository URL was not available:"
-            printf '%s' "$missing_apk_repository_tags_json" | jq -r '.[] | "  - @" + .' >&2
-          fi
-        fi
+        print_apk_repository_restore_instructions \
+          "$reinstall_packages_json" \
+          "$current_apk_repositories_json" \
+          "$target_apk_repositories_json" \
+          "$target_name"
       fi
       if [ "$reinstall_package_manager" = "apt-get" ]; then
         reminder_line="  ${CLI_NAME} su-exec --name ${target_name} apt-get update"
