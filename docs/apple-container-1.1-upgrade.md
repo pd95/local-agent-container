@@ -103,7 +103,7 @@ command -v -a container \
 sw_vers \
   | tee /tmp/agentctl-container-upgrade/macos-before.txt
 
-bash tests/run-tests.sh \
+bash tests/run-tests.sh --tier full \
   2>&1 | tee /tmp/agentctl-container-upgrade/integration-0.12.3.log
 ```
 
@@ -219,6 +219,16 @@ command -v -a container \
 
 Keep `/tmp/agentctl-container-upgrade` until compatibility verification is
 complete so the old and new output shapes can be compared.
+
+Run the complete unit and host suites before declaring 1.1 compatible. The host
+runner defaults to only its smoke tier, so `--tier full` is required here:
+
+```zsh
+bash tests/run-unit-tests.sh \
+  2>&1 | tee /tmp/agentctl-container-upgrade/unit-1.1.0.log
+bash tests/run-tests.sh --tier full \
+  2>&1 | tee /tmp/agentctl-container-upgrade/integration-1.1.0-full.log
+```
 
 ## Rollback
 

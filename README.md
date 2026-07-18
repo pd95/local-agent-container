@@ -234,12 +234,15 @@ curated image. More on that in [docs/bootstrap.md](docs/bootstrap.md).
 
 Host integration and shell unit tests are documented in [TESTING.md](TESTING.md).
 
-Fast checks:
+Fast checks (the host runner defaults to its smoke tier):
 
 ```bash
 bash tests/run-unit-tests.sh
 bash tests/run-tests.sh
 ```
+
+Use `bash tests/run-tests.sh --tier full` for release and runtime-upgrade
+validation.
 
 ## Documentation
 

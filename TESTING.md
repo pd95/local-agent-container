@@ -27,10 +27,19 @@ dependencies:
 - `run --reset-config` restores image-owned config, model metadata, and `AGENTS.md`
 - `refresh --overwrite-config` restores image-owned config, model metadata, and `AGENTS.md`
 
-Run the suite from the repository root on the host:
+The default tier is an eight-test smoke suite for quick lifecycle feedback:
 
 ```bash
 bash tests/run-tests.sh
+```
+
+Before a release, runtime upgrade, or compatibility sign-off, run the full
+20-test host suite. The full tier includes the smoke tests plus build cleanup,
+upgrade/backup/rescue, package manifests, feature installation, and Alpine and
+Debian bootstrap coverage:
+
+```bash
+bash tests/run-tests.sh --tier full
 ```
 
 Focused integration filters are available for narrower validation. The tool-home smoke
@@ -59,7 +68,8 @@ bash tests/run-integration-tests.sh --filter tool-home
 You can point the harness at another `agentctl` binary or container runtime command:
 
 ```bash
-AGENTCTL=/path/to/agentctl CONTAINER_CMD=container bash tests/run-tests.sh
+AGENTCTL=/path/to/agentctl CONTAINER_CMD=container \
+  bash tests/run-tests.sh --tier full
 ```
 
 ## Automated shell unit tests
