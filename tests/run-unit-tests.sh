@@ -753,6 +753,56 @@ test_build_cmd_passes_runtime_list_build_args() {
   printf '%s\n' "$build_call" | grep -Eq -- '--build-arg BUILD_TIME=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' || fail "Expected shared build time build arg, got: $build_call"
 }
 
+test_build_cmd_expands_all_registered_runtimes() {
+  begin_test "build_cmd expands all registered runtimes"
+
+  load_agentctl_functions
+
+  local build_call=""
+
+  require_container() { return 0; }
+  image_exists() { return 1; }
+  stop_buildkit_container() { :; }
+  mock_container() {
+    if [ "$1" = "build" ]; then
+      build_call="$(printf '%s\n' "$*")"
+    fi
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture build_cmd --image agent-plain --runtimes all
+  assert_status 0
+  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_RUNTIMES=codex,claude,opencode,pi,qwen' \
+    || fail "Expected every registered runtime in the build arg, got: $build_call"
+  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_DEFAULT_RUNTIME=codex' \
+    || fail "Expected the normal default runtime to remain codex, got: $build_call"
+}
+
+test_build_cmd_all_rejects_manifest_filename_id_mismatch() {
+  begin_test "build_cmd all rejects runtime manifest filename and id mismatch"
+
+  local temp_dir
+  local unit_script
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-runtime-manifest.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  unit_script="$temp_dir/check.sh"
+  mkdir -p "$temp_dir/runtimes.d"
+  printf '%s\n' '{"id":"different"}' >"$temp_dir/runtimes.d/example.json"
+
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$AGENTCTL_IMPL"
+SCRIPT_DIR="$temp_dir"
+build_cmd --image agent-plain --runtimes all
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 1
+  assert_contains "Runtime manifest filename must match id 'different'"
+}
+
 test_build_cmd_uses_first_runtime_as_default_when_unspecified() {
   begin_test "build_cmd uses the first runtime as default when unspecified"
 
@@ -10048,6 +10098,8 @@ main() {
   run_selected_test test_run_model_wires_selected_model "test_run_model_wires_selected_model"
   run_selected_test test_build_help_reports_primary_base_images "test_build_help_reports_primary_base_images"
   run_selected_test test_build_cmd_passes_runtime_list_build_args "test_build_cmd_passes_runtime_list_build_args"
+  run_selected_test test_build_cmd_expands_all_registered_runtimes "test_build_cmd_expands_all_registered_runtimes"
+  run_selected_test test_build_cmd_all_rejects_manifest_filename_id_mismatch "test_build_cmd_all_rejects_manifest_filename_id_mismatch"
   run_selected_test test_build_cmd_uses_first_runtime_as_default_when_unspecified "test_build_cmd_uses_first_runtime_as_default_when_unspecified"
   run_selected_test test_build_cmd_default_runtime_alone_installs_only_that_runtime "test_build_cmd_default_runtime_alone_installs_only_that_runtime"
   run_selected_test test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden "test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden"

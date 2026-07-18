@@ -37,12 +37,16 @@ You can choose which runtimes are built into an image:
 
 ```bash
 agentctl build --runtimes codex,claude --default-runtime claude
+# Or install every runtime currently registered with agentctl:
+agentctl build --runtimes all --default-runtime codex
 ```
 
 Rules:
 
 - if `--default-runtime` is omitted, the first runtime in `--runtimes` becomes
   the default
+- `--runtimes all` expands to every manifest in `runtimes.d`, keeping `codex`
+  first as the default unless `--default-runtime` is supplied
 - `--default-runtime <name>` still works by itself for the single-runtime case
 
 Image builds use the copied in-image `agent.sh runtime install ...` flow, so

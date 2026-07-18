@@ -77,6 +77,8 @@ Images can preinstall multiple runtimes:
 
 ```bash
 agentctl build --runtimes codex,claude,opencode,qwen,pi --default-runtime opencode
+# Equivalent registry-driven installation of every available runtime:
+agentctl build --runtimes all --default-runtime opencode
 ```
 
 That image starts with OpenCode as the default runtime, but you can later switch

@@ -772,7 +772,7 @@ Usage: $CLI_NAME build [--image NAME] [--runtimes NAME[,NAME...]] [--default-run
 
 Options:
   --image NAME       Local image name to build (for example: agent-plain, agent-python, agent-swift, agent-my-team)
-  --runtimes LIST    Comma-separated runtimes to preinstall in the image (default: $DEFAULT_RUNTIME)
+  --runtimes LIST    Comma-separated runtimes, or all, to preinstall in the image (default: $DEFAULT_RUNTIME)
   --default-runtime  Runtime to install as the image default (default: $DEFAULT_RUNTIME)
   --rebuild          Rebuild images even if they already exist (disables build cache only; does not refresh FROM tags)
   --snapshot         Add a fresh UTC timestamp tag for existing images without rebuilding
@@ -1538,10 +1538,26 @@ build_cmd() {
   normalize_build_runtime_csv() {
     local raw="$1"
     local entry=""
+    local manifest=""
+    local registered_runtime=""
     local normalized=""
     local first=""
     local duplicate_guard=$'\n'
     local IFS=','
+
+    if [ "$raw" = "all" ]; then
+      raw="$DEFAULT_RUNTIME"
+      for manifest in "$SCRIPT_DIR"/runtimes.d/*.json; do
+        [ -e "$manifest" ] || continue
+        command -v jq >/dev/null 2>&1 || die "jq is required to expand --runtimes all"
+        registered_runtime="$(jq -er '.id | strings | select(length > 0)' "$manifest" 2>/dev/null)" \
+          || die "Invalid runtime id in manifest: $manifest"
+        [ "$(basename "$manifest" .json)" = "$registered_runtime" ] \
+          || die "Runtime manifest filename must match id '$registered_runtime': $manifest"
+        [ "$registered_runtime" = "$DEFAULT_RUNTIME" ] && continue
+        raw="${raw},${registered_runtime}"
+      done
+    fi
     read -r -a build_runtimes <<<"$raw"
 
     for entry in "${build_runtimes[@]}"; do
