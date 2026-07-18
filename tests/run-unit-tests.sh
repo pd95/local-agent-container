@@ -572,14 +572,91 @@ test_run_container_refreshes_host_alias_before_exec() {
   container_running() { return 0; }
   validate_mount_mode() { :; }
   configure_container_host_alias() { configured_name="$1"; }
+  warn_if_container_agentctl_versions_differ() { :; }
   CONTAINER_CMD=container
   container() {
     [ "$1" = "exec" ] || fail "Expected agent exec, got: $*"
   }
 
-  run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 true
+  assert_status 0
   [ "$configured_name" = "unit-test-container" ] \
     || fail "Expected host alias refresh before exec, got: $configured_name"
+  unset -f container
+}
+
+test_container_agentctl_version_warning_distinguishes_image_and_tooling() {
+  begin_test "container version warning distinguishes image and refreshed tooling"
+
+  load_agentctl_functions
+
+  local current_version
+  current_version="$(cat "$TEST_ROOT/VERSION")"
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      *tooling-version*) printf '%s\n' 0.2.0 ;;
+      *image-version*) printf '%s\n' 0.1.0 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  run_capture warn_if_container_agentctl_versions_differ unit-test-container
+  assert_status 0
+  assert_not_contains "uses agentctl tooling"
+  assert_contains "was built with agentctl 0.1.0"
+  assert_contains "Consider rebuilding and upgrading its image"
+
+  container() {
+    case "$*" in
+      *tooling-version*|*image-version*) printf '%s\n' __missing__ ;;
+      *) return 1 ;;
+    esac
+  }
+  run_capture warn_if_container_agentctl_versions_differ unit-test-container
+  assert_contains "predates agentctl version tracking"
+  assert_contains "has no image build version"
+
+  container() {
+    case "$*" in
+      *tooling-version*) printf '%s\n' 0.1.0 ;;
+      *image-version*) printf '%s\n' "$current_version" ;;
+      *) return 1 ;;
+    esac
+  }
+  run_capture warn_if_container_agentctl_versions_differ unit-test-container
+  assert_contains "uses agentctl tooling 0.1.0"
+  assert_contains "refresh --name unit-test-container"
+  unset -f container
+}
+
+test_new_container_launch_checks_agentctl_versions() {
+  begin_test "new container launch checks image and tooling versions"
+
+  load_agentctl_functions
+
+  local checked_name=""
+  container_exists() { return 1; }
+  container_running() { return 1; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  configure_container_host_alias() { :; }
+  warn_if_container_agentctl_versions_differ() { checked_name="$1"; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create|start|stop) return 0 ;;
+      exec) return 0 ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 true
+  assert_status 0
+  assert_contains "Creating container..."
+  assert_contains "Starting container: unit-test-container"
+  assert_contains "Stopping container: unit-test-container"
+  [ "$checked_name" = "unit-test-container" ] \
+    || fail "Expected version check on first launch, got: ${checked_name:-none}"
   unset -f container
 }
 
@@ -9964,6 +10041,8 @@ main() {
   run_selected_test test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure "test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure"
   run_selected_test test_runtime_default_files_apply_local_overrides "test_runtime_default_files_apply_local_overrides"
   run_selected_test test_run_container_refreshes_host_alias_before_exec "test_run_container_refreshes_host_alias_before_exec"
+  run_selected_test test_container_agentctl_version_warning_distinguishes_image_and_tooling "test_container_agentctl_version_warning_distinguishes_image_and_tooling"
+  run_selected_test test_new_container_launch_checks_agentctl_versions "test_new_container_launch_checks_agentctl_versions"
   run_selected_test test_start_and_restart_refresh_host_alias "test_start_and_restart_refresh_host_alias"
   run_selected_test test_rescue_help_reports_backup_image_options "test_rescue_help_reports_backup_image_options"
   run_selected_test test_run_model_wires_selected_model "test_run_model_wires_selected_model"

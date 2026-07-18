@@ -747,7 +747,7 @@ Run "$CLI_NAME <command> --help" for command-specific options.
 EOF
 }
 
-version_cmd() {
+agentctl_release_version() {
   local version_file="$SCRIPT_DIR/VERSION"
   local version=""
 
@@ -756,6 +756,13 @@ version_cmd() {
   printf '%s\n' "$version" \
     | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' \
     || die "Invalid agentctl VERSION: ${version:-empty}"
+  printf '%s\n' "$version"
+}
+
+version_cmd() {
+  local version=""
+
+  version="$(agentctl_release_version)"
   printf '%s %s\n' "$CLI_NAME" "$version"
 }
 
@@ -5222,6 +5229,48 @@ display_upgrade_memory_limit() {
   display_memory_limit "$1"
 }
 
+warn_if_container_agentctl_versions_differ() {
+  local name="$1"
+  local current_version=""
+  local tooling_version=""
+  local image_version=""
+
+  current_version="$(agentctl_release_version)"
+  if ! tooling_version="$("$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    if [ -f /etc/agentctl/tooling-version ]; then
+      cat /etc/agentctl/tooling-version
+    else
+      printf "%s\n" __missing__
+    fi
+  ' 2>/dev/null)"; then
+    return 0
+  fi
+  if ! image_version="$("$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    if [ -f /etc/agentctl/image-version ]; then
+      cat /etc/agentctl/image-version
+    else
+      printf "%s\n" __missing__
+    fi
+  ' 2>/dev/null)"; then
+    image_version=""
+  fi
+
+  if [ "$tooling_version" = "__missing__" ]; then
+    warn "Container $name predates agentctl version tracking; run '$CLI_NAME refresh --name $name'"
+  elif [ -z "$tooling_version" ]; then
+    warn "Container $name has an empty agentctl tooling version; run '$CLI_NAME refresh --name $name'"
+  elif [ "$tooling_version" != "$current_version" ]; then
+    warn "Container $name uses agentctl tooling $tooling_version; host tooling is $current_version. Run '$CLI_NAME refresh --name $name'"
+  fi
+  if [ "$image_version" = "__missing__" ]; then
+    warn "Container $name has no image build version; consider rebuilding and upgrading it"
+  elif [ -z "$image_version" ]; then
+    warn "Container $name has an empty image build version; consider rebuilding and upgrading it"
+  elif [ -n "$image_version" ] && [ "$image_version" != "$current_version" ]; then
+    warn "Container $name was built with agentctl $image_version; host tooling is $current_version. Consider rebuilding and upgrading its image"
+  fi
+}
+
 run_container() {
   local name="$1"
   local image="$2"
@@ -5323,6 +5372,7 @@ run_container() {
   fi
 
   configure_container_host_alias "$actual_name"
+  warn_if_container_agentctl_versions_differ "$actual_name"
 
   if [ "$reset_config" -eq 1 ]; then
     local reset_runtime="${RUN_SELECTED_RUNTIME:-}"

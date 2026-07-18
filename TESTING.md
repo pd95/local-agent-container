@@ -176,14 +176,19 @@ agentctl run --image agent-swift --temp --workdir testing/agent-swift --cmd bash
 agentctl run --image agent-office --temp --workdir testing/agent-office --cmd bash -lc 'test -f /etc/agentctl/image.md && sed -n "1,20p" /etc/agentctl/image.md'
 ```
 
-Also verify the image-owned config, default profile files, and model metadata are present
-and match the default user copies inside the image:
+Also verify the image-owned config, default profile files, model metadata, and
+version provenance are present and match the default user copies inside the
+image. No build scaffolding files should remain:
 
 ```bash
 agentctl run --image agent-plain --temp --workdir testing/agent-plain --cmd bash -lc 'test -f /etc/agentctl/codex/config.toml && test -f /etc/agentctl/codex/gpt-oss.config.toml && test -f /etc/agentctl/codex/local_models.json && diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json'
 agentctl run --image agent-python --temp --workdir testing/agent-python --cmd bash -lc 'test -f /etc/agentctl/codex/config.toml && test -f /etc/agentctl/codex/gpt-oss.config.toml && test -f /etc/agentctl/codex/local_models.json && diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json'
 agentctl run --image agent-swift --temp --workdir testing/agent-swift --cmd bash -lc 'test -f /etc/agentctl/codex/config.toml && test -f /etc/agentctl/codex/gpt-oss.config.toml && test -f /etc/agentctl/codex/local_models.json && diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json'
 agentctl run --image agent-office --temp --workdir testing/agent-office --cmd bash -lc 'test -f /etc/agentctl/codex/config.toml && test -f /etc/agentctl/codex/gpt-oss.config.toml && test -f /etc/agentctl/codex/local_models.json && diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json'
+```
+
+```bash
+agentctl run --image agent-plain --temp --workdir testing/agent-plain --cmd sh -lc 'test -f /etc/agentctl/claude/settings.json && test -f /etc/agentctl/image-version && test -f /etc/agentctl/tooling-version && test "$(cat /etc/agentctl/image-version)" = "$(cat /etc/agentctl/tooling-version)" && ! find /etc/agentctl /home/coder/.codex -name .gitkeep -print | grep -q .'
 ```
 
 Also verify global AGENTS guidance points at the image metadata file:
