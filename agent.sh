@@ -519,7 +519,7 @@ Tried:
 - Configured Ollama host: $api_url
 
 Use a URL reachable from inside the container, for example:
-  OLLAMA_HOST=http://192.168.64.1:11439"
+  OLLAMA_HOST=http://host.container.internal:11439"
   fi
 
   gateway="$(ollama_detect_gateway)"

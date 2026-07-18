@@ -19,7 +19,7 @@
   "launch_configs": {
     "ollama_host": {
       "type": "string",
-      "description": "Container-reachable Ollama base URL for local mode, for example http://192.168.64.1:11439"
+      "description": "Container-reachable Ollama base URL for local mode, for example http://host.container.internal:11439"
     },
     "profile": {
       "type": "string",

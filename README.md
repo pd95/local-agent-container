@@ -67,7 +67,7 @@ container system start
 
 Before your first local run, make sure containers can reach Ollama. The short
 version is:
-- many setups use `192.168.64.1:11434` as the host-visible Ollama address
+- agentctl maps `host.container.internal` to the current Apple container gateway
 - default Ollama only listens on `localhost`
 - you may need to expose or proxy Ollama onto the container-visible host address
 
@@ -77,9 +77,9 @@ For isolated Ollama listeners or non-default ports, pass the container-reachable
 base URL explicitly:
 
 ```bash
-OLLAMA_HOST=http://192.168.64.1:11439 agentctl run ...
+OLLAMA_HOST=http://host.container.internal:11439 agentctl run ...
 # or
-agentctl run -c ollama_host=http://192.168.64.1:11439 ...
+agentctl run -c ollama_host=http://host.container.internal:11439 ...
 ```
 
 ## Workspace model

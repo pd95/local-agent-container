@@ -67,9 +67,12 @@ After upgrading this host, the default container network moved from
 `192.168.64.1` are therefore stale.
 
 `agent.sh` already detects the current default gateway from `/proc/net/route`
-when neither `OLLAMA_HOST` nor runtime config `ollama_host` is supplied. The
-remaining seed configuration, documentation, examples, and Xcode relay defaults
-must stop treating `192.168.64.1` as stable.
+when neither `OLLAMA_HOST` nor runtime config `ollama_host` is supplied. On the
+host, `agentctl host-address` reads the authoritative gateway from `container
+network inspect default`; `--network NAME` supports a non-default network.
+Agentctl writes that gateway to each managed container's `/etc/hosts` as
+`host.container.internal` on start and before exec. The Xcode MCP shim advertises
+the stable hostname rather than a fixed address.
 
 Apple container 1.1 also documents a named host-service route using
 `host.container.internal`, created with `container system dns create

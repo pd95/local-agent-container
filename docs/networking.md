@@ -18,11 +18,12 @@ If you just want local mode to work with the least amount of debugging:
 > prefer one of the more controlled [options below](#options) instead.
 
 1. In the Ollama app, enable **Expose Ollama to the network**.
-2. In a macOS host terminal, verify that the container-visible host address can
-   reach Ollama:
+2. With an agent container running, verify that its stable host alias can reach
+   Ollama:
 
    ```bash
-   curl -fsS http://192.168.64.1:11434/api/version
+   agentctl exec --no-tty -- curl -fsS \
+     http://host.container.internal:11434/api/version
    ```
 
 3. If that prints a small JSON response, try:
@@ -41,11 +42,12 @@ The agentctl-managed local runtime setup expects local model traffic to go to a
 host-visible Ollama listener, typically:
 
 ```text
-http://192.168.64.1:11434
+http://host.container.internal:11434
 ```
 
-On many Apple container setups, `192.168.64.1` is the host-visible address from
-inside the container. The actual gateway can differ.
+Agentctl refreshes this name in the managed container's `/etc/hosts` using the
+current gateway reported by Apple container. The underlying subnet may change
+without requiring Codex or MCP configuration edits.
 
 Ollama itself usually listens only on:
 - `http://localhost:11434`
@@ -57,8 +59,8 @@ For an isolated Ollama server or a non-default port, pass the base URL that is
 reachable from inside the container:
 
 ```bash
-OLLAMA_HOST=http://192.168.64.1:11439 agentctl run ...
-agentctl run -c ollama_host=http://192.168.64.1:11439 ...
+OLLAMA_HOST=http://host.container.internal:11439 agentctl run ...
+agentctl run -c ollama_host=http://host.container.internal:11439 ...
 ```
 
 The `-c ollama_host=...` value takes precedence over `OLLAMA_HOST`. Use the
@@ -67,11 +69,11 @@ container-reachable address, not the macOS listener value such as
 
 ## Quick verification
 
-If `192.168.64.1` is your container-visible host address, run this on the
-macOS host:
+With the container running, run this on the macOS host:
 
 ```bash
-curl -fsS http://192.168.64.1:11434/api/version
+agentctl exec --no-tty -- curl -fsS \
+  http://host.container.internal:11434/api/version
 ```
 
 If that fails, fix networking before expecting local runtime launches to work.
@@ -105,7 +107,8 @@ with that exposure.
 ### Option 2: run a second Ollama listener on the host-visible address
 
 ```bash
-OLLAMA_HOST=192.168.64.1 ollama serve
+AGENTCTL_HOST_ADDRESS="$(agentctl host-address)"
+OLLAMA_HOST="${AGENTCTL_HOST_ADDRESS}:11434" ollama serve
 ```
 
 Run that on the macOS host.
@@ -118,7 +121,8 @@ container is already running.
 #### 3.1 `socat`
 
 ```bash
-socat TCP-LISTEN:11434,fork,bind=192.168.64.1 TCP:127.0.0.1:11434
+AGENTCTL_HOST_ADDRESS="$(agentctl host-address)"
+socat TCP-LISTEN:11434,fork,bind="$AGENTCTL_HOST_ADDRESS" TCP:127.0.0.1:11434
 ```
 
 Install with:

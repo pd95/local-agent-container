@@ -96,6 +96,7 @@ run_agent_sh_capture_env() {
     "HOME=$temp_home/home"
     "XDG_CONFIG_HOME=$temp_home/config"
     "PATH=/usr/bin:/bin"
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools"
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d"
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes"
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d"
@@ -303,6 +304,136 @@ test_doctor_host_reports_runtime_and_capabilities() {
   assert_contains "container machine        yes"
   CONTAINER_CMD=container
   unset -f command
+}
+
+test_host_address_reads_container_1_1_gateway() {
+  begin_test "host-address reads the Apple container 1.1 network gateway"
+
+  load_codexctl_functions
+
+  local output
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "--version") return 0 ;;
+      "network inspect default")
+        printf '%s\n' '[{"id":"default","configuration":{},"status":{"ipv4Subnet":"192.168.65.0/24","ipv4Gateway":"192.168.65.1"}}]'
+        ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  output="$(host_address_cmd)"
+  [ "$output" = "192.168.65.1" ] || fail "Expected 192.168.65.1, got: $output"
+  unset -f container
+}
+
+test_host_address_supports_custom_network_subnet_fallback() {
+  begin_test "host-address supports custom networks and subnet fallback"
+
+  load_codexctl_functions
+
+  local output
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "--version") return 0 ;;
+      "network inspect mcp")
+        printf '%s\n' '{"id":"mcp","status":{"ipv4Subnet":"10.42.7.0/24"}}'
+        ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  output="$(host_address_cmd --network mcp)"
+  [ "$output" = "10.42.7.1" ] || fail "Expected 10.42.7.1, got: $output"
+  unset -f container
+}
+
+test_configure_container_host_alias_replaces_stale_entry() {
+  begin_test "container host alias replaces a stale gateway entry"
+
+  load_codexctl_functions
+
+  local temp_dir
+  local hosts_file
+  local update_script=""
+  local update_address=""
+  local update_hostname=""
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-host-alias.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  hosts_file="$temp_dir/hosts"
+  printf '%s\n' \
+    '127.0.0.1 localhost' \
+    '192.168.64.1 host.container.internal old-alias' \
+    '10.0.0.2 unrelated.internal' >"$hosts_file"
+
+  container_network_host_address() { printf '%s\n' 192.168.65.1; }
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = "exec" ] || fail "Expected container exec, got: $*"
+    [ "$2" = "--user" ] && [ "$3" = "root" ] || fail "Expected root exec, got: $*"
+    [ "$4" = "unit-test-container" ] || fail "Expected target container, got: $*"
+    update_script="$7"
+    update_address="$9"
+    update_hostname="${10}"
+  }
+
+  configure_container_host_alias unit-test-container
+  sh -c "$update_script" sh "$update_address" "$update_hostname" "$hosts_file"
+
+  awk '$1 == "192.168.65.1" && $2 == "host.container.internal" { found = 1 } END { exit !found }' "$hosts_file" \
+    || fail "Expected refreshed host alias: $(cat "$hosts_file")"
+  if grep -Fq '192.168.64.1' "$hosts_file"; then
+    fail "Did not expect stale host gateway: $(cat "$hosts_file")"
+  fi
+  grep -Fqx '10.0.0.2 unrelated.internal' "$hosts_file" \
+    || fail "Expected unrelated host entry to remain"
+  unset -f container
+}
+
+test_run_container_refreshes_host_alias_before_exec() {
+  begin_test "run_container refreshes the host alias before agent exec"
+
+  load_codexctl_functions
+
+  local configured_name=""
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { return 0; }
+  validate_mount_mode() { :; }
+  configure_container_host_alias() { configured_name="$1"; }
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = "exec" ] || fail "Expected agent exec, got: $*"
+  }
+
+  run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 true
+  [ "$configured_name" = "unit-test-container" ] \
+    || fail "Expected host alias refresh before exec, got: $configured_name"
+  unset -f container
+}
+
+test_start_and_restart_refresh_host_alias() {
+  begin_test "start and restart refresh the container host alias"
+
+  load_codexctl_functions
+
+  local action_log=""
+  local alias_log=""
+  require_container() { :; }
+  configure_container_host_alias() { alias_log="${alias_log}$1"$'\n'; }
+  CONTAINER_CMD=container
+  container() { action_log="${action_log}$1:$2"$'\n'; }
+
+  simple_name_cmd start --name unit-test-container
+  simple_name_cmd restart --name unit-test-container
+
+  [ "${action_log%$'\n'}" = $'start:unit-test-container\nrestart:unit-test-container' ] \
+    || fail "Expected start and restart actions, got: $action_log"
+  [ "${alias_log%$'\n'}" = $'unit-test-container\nunit-test-container' ] \
+    || fail "Expected alias refresh after both actions, got: $alias_log"
+  unset -f container
 }
 
 test_rescue_help_reports_backup_image_options() {
@@ -1132,6 +1263,7 @@ require_container() { return 0; }
 container_exists() { [ "\$1" = "unit-test-container" ]; }
 container_running() { [ "\$1" = "unit-test-container" ]; }
 validate_mount_mode() { :; }
+configure_container_host_alias() { :; }
 pre_reads_stdin() {
   local line=""
   if IFS= read -r line; then
@@ -5361,6 +5493,7 @@ test_agent_sh_state_export_includes_known_user_state() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5406,6 +5539,7 @@ test_agent_sh_state_export_uses_installed_runtime_hooks() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5451,6 +5585,7 @@ test_agent_sh_opencode_state_export_uses_runtime_hooks() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5489,6 +5624,7 @@ test_agent_sh_qwen_state_export_uses_runtime_hooks() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5527,6 +5663,7 @@ test_agent_sh_pi_state_export_uses_runtime_hooks() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5691,6 +5828,7 @@ test_agent_sh_state_import_restores_known_user_state() {
     "HOME=$source_home/home" \
     "XDG_CONFIG_HOME=$source_home/home/.config" \
     "PATH=/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$source_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5701,6 +5839,7 @@ test_agent_sh_state_import_restores_known_user_state() {
     "HOME=$target_home/home" \
     "XDG_CONFIG_HOME=$target_home/home/.config" \
     "PATH=/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$target_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5741,6 +5880,7 @@ test_agent_sh_state_import_uses_installed_runtime_hooks() {
     "HOME=$source_home/home" \
     "XDG_CONFIG_HOME=$source_home/home/.config" \
     "PATH=/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$source_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5756,6 +5896,7 @@ test_agent_sh_state_import_uses_installed_runtime_hooks() {
     "HOME=$target_home/home" \
     "XDG_CONFIG_HOME=$target_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$target_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5795,6 +5936,7 @@ test_agent_sh_state_import_preserves_image_owned_codex_packages() {
     "HOME=$target_home/home" \
     "XDG_CONFIG_HOME=$target_home/home/.config" \
     "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$target_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -5818,6 +5960,7 @@ test_agent_sh_state_import_with_empty_stdin_preserves_existing_state() {
     "HOME=$temp_home/home" \
     "XDG_CONFIG_HOME=$temp_home/home/.config" \
     "PATH=/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
     "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
@@ -7122,6 +7265,11 @@ test_run_rejects_resource_flags_for_existing_container() {
   cat >"$fake_container" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [ "$*" = "ls -a --quiet" ]; then
+  printf '%s\n' unit-test-container
+  exit 0
+fi
 
 if [ "${1:-}" = "ls" ] && [ "${2:-}" = "-a" ]; then
   cat <<'OUT'
@@ -9441,6 +9589,7 @@ test_build_backup_image_uses_clean_context_for_exported_rootfs() {
   local build_context=""
   local build_dockerfile=""
   local validated_image=""
+  local buildkit_stopped=0
 
   temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-backup-build.XXXXXX")"
   register_dir_cleanup "$temp_dir"
@@ -9467,6 +9616,7 @@ test_build_backup_image_uses_clean_context_for_exported_rootfs() {
         ;;
     esac
   }
+  stop_buildkit_container() { buildkit_stopped=1; }
   validate_backup_image() { validated_image="$1"; }
 
   build_backup_image_from_export agent-test-backup unit-test-container "$export_file" "$backup_root" "$backup_dockerfile"
@@ -9481,6 +9631,7 @@ test_build_backup_image_uses_clean_context_for_exported_rootfs() {
   grep -Fq 'ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' "$backup_dockerfile" || fail "Expected backup Dockerfile to set PATH"
   grep -Fq 'ADD rootfs.tar /' "$backup_dockerfile" || fail "Expected backup Dockerfile to add tarred rootfs"
   [ "$validated_image" = "agent-test-backup" ] || fail "Expected backup image validation, got: $validated_image"
+  [ "$buildkit_stopped" -eq 1 ] || fail "Expected backup build to stop BuildKit"
 }
 
 test_build_backup_image_preserves_flat_export_tar() {
@@ -9517,6 +9668,7 @@ test_build_backup_image_preserves_flat_export_tar() {
         ;;
     esac
   }
+  stop_buildkit_container() { :; }
   validate_backup_image() { :; }
 
   build_backup_image_from_export agent-test-backup unit-test-container "$export_file" "$backup_root" "$backup_dockerfile"
@@ -9611,6 +9763,11 @@ main() {
   run_selected_test test_run_cmd_wires_home_mount "test_run_cmd_wires_home_mount"
   run_selected_test test_doctor_help_reports_fix_option "test_doctor_help_reports_fix_option"
   run_selected_test test_doctor_host_reports_runtime_and_capabilities "test_doctor_host_reports_runtime_and_capabilities"
+  run_selected_test test_host_address_reads_container_1_1_gateway "test_host_address_reads_container_1_1_gateway"
+  run_selected_test test_host_address_supports_custom_network_subnet_fallback "test_host_address_supports_custom_network_subnet_fallback"
+  run_selected_test test_configure_container_host_alias_replaces_stale_entry "test_configure_container_host_alias_replaces_stale_entry"
+  run_selected_test test_run_container_refreshes_host_alias_before_exec "test_run_container_refreshes_host_alias_before_exec"
+  run_selected_test test_start_and_restart_refresh_host_alias "test_start_and_restart_refresh_host_alias"
   run_selected_test test_rescue_help_reports_backup_image_options "test_rescue_help_reports_backup_image_options"
   run_selected_test test_run_model_wires_selected_model "test_run_model_wires_selected_model"
   run_selected_test test_build_help_reports_primary_base_images "test_build_help_reports_primary_base_images"

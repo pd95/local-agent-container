@@ -43,8 +43,8 @@ npx -y @agentclientprotocol/claude-agent-acp
 - Node.js available on the host
 - an `agentctl` image such as `agent-plain`, `agent-python`, or `agent-swift`
 - Codex auth stored through `agentctl auth --runtime codex` for the Codex path
-- for Xcode MCP bridging, the container must be able to reach the host at
-  `192.168.64.1`
+- for Xcode MCP bridging, the container must be able to reach services bound
+  on the current Apple container network gateway
 
 Claude additionally needs one of:
 
@@ -221,5 +221,15 @@ If a container was created with the wrong mounted home, use a new salt:
 AGENTCTL_XCODE_CONTAINER_SALT=assistant-home-v3
 ```
 
-If MCP startup fails with `127.0.0.1`, make sure the relay advertises a host
-address reachable from the container. The default is `192.168.64.1`.
+Agentctl refreshes `host.container.internal` in each managed container's
+`/etc/hosts` file whenever it starts or enters the container. The Xcode shim
+advertises this stable name to MCP relays. You can inspect its current address:
+
+```sh
+./agentctl host-address
+```
+
+For a non-default network, use `./agentctl host-address --network NAME`. Set
+`MCP_RELAY_ADVERTISE_HOST` only when the bridge must advertise a deliberate
+override. `MCP_RELAY_HOST` controls the local bind address and defaults to
+`0.0.0.0`; it is distinct from the address advertised to containers.
