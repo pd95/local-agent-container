@@ -8571,7 +8571,14 @@ test_upgrade_reinstall_command_restores_missing_apk_repository_tags() {
 
   CLI_NAME=agentctl
 
-  run_capture warn_upgrade_package_loss \
+  warn_with_final_package_reminder() {
+    local upgrade_package_reinstall_commands=""
+
+    warn_upgrade_package_loss "$@"
+    printf 'Final reminder:\n%s\n' "$upgrade_package_reinstall_commands" >&2
+  }
+
+  run_capture warn_with_final_package_reminder \
     unit-test-container \
     agent-plain \
     agent-python \
@@ -8587,6 +8594,15 @@ test_upgrade_reinstall_command_restores_missing_apk_repository_tags() {
   assert_contains "agentctl su-exec --name unit-test-container sh -lc 'grep -Fxq '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' /etc/apk/repositories || printf \"%s\\\\n\" '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' >> /etc/apk/repositories'"
   assert_contains "agentctl su-exec --name unit-test-container apk update"
   assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache go@edgecommunity golangci-lint@edgecommunity zstd"
+  assert_contains "Final reminder:"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "Restore APK repository tag(s) before reinstalling tagged packages:")" -eq 2 ] \
+    || fail "Expected APK repository restore heading before and after upgrade"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "agentctl su-exec --name unit-test-container sh -lc")" -eq 2 ] \
+    || fail "Expected APK repository restore command before and after upgrade"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "agentctl su-exec --name unit-test-container apk update")" -eq 2 ] \
+    || fail "Expected apk update before and after upgrade"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "agentctl su-exec --name unit-test-container apk add --no-cache go@edgecommunity golangci-lint@edgecommunity zstd")" -eq 2 ] \
+    || fail "Expected APK reinstall command before and after upgrade"
 }
 
 test_upgrade_reinstall_command_suggests_default_apk_edge_tags() {

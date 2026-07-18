@@ -1135,13 +1135,15 @@ images_print_metadata() {
         then [$target]
         else [$target, $target + ":latest"]
         end;
+      def round_one_decimal:
+        (. * 10 + 0.5 | floor) / 10;
       def human_size:
-        if . >= 1073741824 then ((. / 1073741824 * 10 | round) / 10 | tostring) + " GiB"
-        elif . >= 1048576 then ((. / 1048576 * 10 | round) / 10 | tostring) + " MiB"
-        elif . >= 1024 then ((. / 1024 * 10 | round) / 10 | tostring) + " KiB"
+        if . >= 1073741824 then (. / 1073741824 | round_one_decimal | tostring) + " GiB"
+        elif . >= 1048576 then (. / 1048576 | round_one_decimal | tostring) + " MiB"
+        elif . >= 1024 then (. / 1024 | round_one_decimal | tostring) + " KiB"
         else tostring + " B"
         end;
-      if type != "array" then error("invalid image list") else . end as $images
+      (if type != "array" then error("invalid image list") else . end) as $images
       | ($targets | split("\n") | map(select(length > 0)))[] as $target
       | (target_refs($target)) as $candidate_refs
       | ([$images[] | select(type == "object") | select(ref as $ref | $candidate_refs | index($ref))][0] // {}) as $image
@@ -1150,14 +1152,18 @@ images_print_metadata() {
       | ($image.variants // []) as $variants
       | (($configuration.creationDate // $configuration.created // $variants[0].config.created // "unknown")
           | if . == "unknown" then . else sub("\\.[0-9]+Z$"; "Z") | sub("T"; " ") end) as $created
-      | ([$variants[]? | .size | numbers] | add // ($descriptor.size | numbers?) // null) as $size
+      | ([$variants[]? | .size | select(type == "number")] | add) as $variant_size
+      | (if $variant_size != null then $variant_size
+         elif ($descriptor.size | type) == "number" then $descriptor.size
+         else null
+         end) as $size
       | ([$variants[]? | .platform? // {}
             | ((.os // "unknown") + "/" + (.architecture // "unknown") + (if .variant then "/" + .variant else "" end))]
           | unique | if length == 0 then ["unknown"] else . end | join(",")) as $platform
       | (($descriptor.digest // $image.id // "unknown")
           | if startswith("sha256:") then .[7:19] else .[0:12] end) as $image_id
       | [$target, $created, (if $size == null then "unknown" else ($size | human_size) end), $platform, $image_id] | @tsv
-    ' 2>/dev/null)" || return 1
+    ')" || return 1
 
   printf '%s\n' "$rows" | awk -F '\t' '
     BEGIN {
@@ -1264,7 +1270,7 @@ images_list_cmd() {
       printf '%s\n' "$sorted_refs"
       return 0
     fi
-    if ! images_print_metadata "$sorted_refs" "$images_json"; then
+    if ! images_print_metadata "$sorted_refs" "$images_json" 2>/dev/null; then
       warn "Unable to parse image metadata; showing image refs only"
       printf '%s\n' "$sorted_refs"
     fi
@@ -5003,6 +5009,14 @@ persist_container_system_manifest_baseline_from_live_state() {
   persist_container_system_manifest_baseline "$name" "$manifest" "live-state" "$image_ref"
 }
 
+print_upgrade_package_reinstall_line() {
+  local line="$1"
+
+  printf '%s\n' "$line" >&2
+  upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
+}${line}"
+}
+
 warn_upgrade_package_loss() {
   local name="$1"
   local current_image="$2"
@@ -5048,6 +5062,7 @@ warn_upgrade_package_loss() {
   local repository_line=""
   local quoted_repository_line=""
   local shell_repository_line=""
+  local reminder_line=""
   local lost_count=""
 
   if [ -z "$current_manifest" ] && ! current_manifest="$(container_system_manifest_json "$name")"; then
@@ -5114,21 +5129,19 @@ warn_upgrade_package_loss() {
           if [ "$removed_baseline_requested_package_count" -gt 0 ]; then
             printf 'If you still need them, reinstall top-level packages after upgrade:\n' >&2
             if [ "$target_package_manager" = "dpkg" ]; then
-              printf '  %s su-exec --name %s apt-get update\n' "$CLI_NAME" "$target_name" >&2
-              printf '  %s su-exec --name %s apt-get install -y %s\n' \
+              reminder_line="  ${CLI_NAME} su-exec --name ${target_name} apt-get update"
+              print_upgrade_package_reinstall_line "$reminder_line"
+              reminder_line="$(printf '  %s su-exec --name %s apt-get install -y %s' \
                 "$CLI_NAME" \
                 "$target_name" \
-                "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')" >&2
-              upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
-}  ${CLI_NAME} su-exec --name ${target_name} apt-get update
-  ${CLI_NAME} su-exec --name ${target_name} apt-get install -y $(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')"
+                "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')")"
+              print_upgrade_package_reinstall_line "$reminder_line"
             elif [ "$target_package_manager" = "apk" ]; then
-              printf '  %s su-exec --name %s apk add --no-cache %s\n' \
+              reminder_line="$(printf '  %s su-exec --name %s apk add --no-cache %s' \
                 "$CLI_NAME" \
                 "$target_name" \
-                "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')" >&2
-              upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
-}  ${CLI_NAME} su-exec --name ${target_name} apk add --no-cache $(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')"
+                "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')")"
+              print_upgrade_package_reinstall_line "$reminder_line"
             fi
           fi
         fi
@@ -5207,17 +5220,19 @@ warn_upgrade_package_loss() {
             missing_apk_repository_line_count="$(printf '%s' "$missing_apk_repository_lines_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
           fi
           if [ "$missing_apk_repository_line_count" -gt 0 ]; then
-            printf 'Restore APK repository tag(s) before reinstalling tagged packages:\n' >&2
+            print_upgrade_package_reinstall_line "Restore APK repository tag(s) before reinstalling tagged packages:"
             while IFS= read -r repository_line; do
               [ -n "$repository_line" ] || continue
               quoted_repository_line="$(printf '%s' "$repository_line" | jq -Rr '@sh')"
               shell_repository_line="$(printf 'grep -Fxq %s /etc/apk/repositories || printf "%%s\\\\n" %s >> /etc/apk/repositories' "$quoted_repository_line" "$quoted_repository_line" | jq -Rr '@sh')"
-              printf '  %s su-exec --name %s sh -lc %s\n' \
+              reminder_line="$(printf '  %s su-exec --name %s sh -lc %s' \
                 "$CLI_NAME" \
                 "$target_name" \
-                "$shell_repository_line" >&2
+                "$shell_repository_line")"
+              print_upgrade_package_reinstall_line "$reminder_line"
             done < <(printf '%s' "$missing_apk_repository_lines_json" | jq -r '.[]' 2>/dev/null || true)
-            printf '  %s su-exec --name %s apk update\n' "$CLI_NAME" "$target_name" >&2
+            reminder_line="  ${CLI_NAME} su-exec --name ${target_name} apk update"
+            print_upgrade_package_reinstall_line "$reminder_line"
           else
             warn "Tagged APK package reinstall needs missing repository tag(s), but the original repository URL was not available:"
             printf '%s' "$missing_apk_repository_tags_json" | jq -r '.[] | "  - @" + .' >&2
@@ -5225,17 +5240,15 @@ warn_upgrade_package_loss() {
         fi
       fi
       if [ "$reinstall_package_manager" = "apt-get" ]; then
-        printf '  %s su-exec --name %s apt-get update\n' "$CLI_NAME" "$target_name" >&2
-        upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
-}  ${CLI_NAME} su-exec --name ${target_name} apt-get update"
+        reminder_line="  ${CLI_NAME} su-exec --name ${target_name} apt-get update"
+        print_upgrade_package_reinstall_line "$reminder_line"
       fi
-      printf '  %s su-exec --name %s %s %s\n' \
+      reminder_line="$(printf '  %s su-exec --name %s %s %s' \
         "$CLI_NAME" \
         "$target_name" \
         "$reinstall_command" \
-        "$(printf '%s' "$reinstall_packages_json" | jq -r 'join(" ")')" >&2
-      upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
-}  ${CLI_NAME} su-exec --name ${target_name} ${reinstall_command} $(printf '%s' "$reinstall_packages_json" | jq -r 'join(" ")')"
+        "$(printf '%s' "$reinstall_packages_json" | jq -r 'join(" ")')")"
+      print_upgrade_package_reinstall_line "$reminder_line"
     fi
   fi
 }
