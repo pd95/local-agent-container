@@ -1,6 +1,6 @@
 # Local agent container on your Mac
 
-> **Run agent CLIs locally on macOS, powered by Ollama**
+> **Run agent CLIs locally on macOS, with optional Ollama integration**
 
 This repository packages a practical local setup for running agent CLIs on Apple
 Silicon Macs with Apple’s `container` tool.
@@ -18,9 +18,14 @@ The main entry point is `agentctl`, which manages:
 ## Prerequisites
 
 You need:
-- a Mac with Apple Silicon
-- Ollama installed
-- Apple’s `container` CLI installed
+- an Apple Silicon Mac running macOS 26
+- Apple’s `container` CLI 1.1 or newer
+- the system Bash and Apple-provided `jq` (jq 1.6 or newer; macOS 26
+  provides `jq 1.7.1-apple`)
+
+This baseline is Homebrew-free and does not require host-side Python, Node.js,
+or another package manager. Ollama is only required for local-model workflows;
+online runtime workflows do not require it.
 
 Recommended memory:
 - for local-model workflows, plan for at least 32 GB RAM
@@ -33,8 +38,8 @@ Official releases:
 
 ## Preliminary setup
 
-After installing Ollama and `container`, clone this repository and open a
-Terminal in the repository root.
+After installing `container` (and Ollama if you plan to use local models), clone
+this repository and open a Terminal in the repository root.
 
 Then make `agentctl` available on your `PATH`. The easiest option on macOS is
 usually a symlink into `/usr/local/bin`:
