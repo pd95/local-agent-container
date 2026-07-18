@@ -661,7 +661,7 @@ test_container_agentctl_version_warning_distinguishes_image_and_tooling() {
   CONTAINER_CMD=container
   container() {
     case "$*" in
-      *tooling-version*) printf '%s\n' 0.2.0 ;;
+      *tooling-version*) printf '%s\n' "$current_version" ;;
       *image-version*) printf '%s\n' 0.1.0 ;;
       *) return 1 ;;
     esac
@@ -2751,23 +2751,47 @@ test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state() {
   local fake_bin
   local tools_home
   local state_dir
+  local image_version_file
+  local tooling_version_file
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   tools_home="$temp_home/tools"
   fake_bin="$(make_fake_runtime_bin "$temp_home" codex)"
   make_fake_runtime_bin "$temp_home" claude >/dev/null
   state_dir="$temp_home/state"
+  image_version_file="$temp_home/image-version"
+  tooling_version_file="$temp_home/tooling-version"
   mkdir -p "$state_dir/office" "$temp_home/config/agentctl"
   printf '%s\n' installed >"$state_dir/office/install-complete"
   printf '%s\n' claude >"$temp_home/config/agentctl/preferred-runtime"
+  printf '%s\n' 0.2.0 >"$image_version_file"
+  printf '%s\n' 0.2.1 >"$tooling_version_file"
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_TOOLS_HOME="$tools_home" \
     AGENTCTL_FEATURE_STATE_DIR="$state_dir" \
+    AGENTCTL_IMAGE_VERSION_FILE="$image_version_file" \
+    AGENTCTL_TOOLING_VERSION_FILE="$tooling_version_file" \
     -- system manifest
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er --arg tools "$tools_home" '.installed_runtimes == ["claude","codex"] and .installed_features == ["office"] and .default_runtime == "codex" and .preferred_runtime == "claude" and .tools_home == $tools and .tools_bin_dir == ($tools + "/bin")' >/dev/null || fail "Expected richer system manifest JSON, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er --arg tools "$tools_home" '.installed_runtimes == ["claude","codex"] and .installed_features == ["office"] and .default_runtime == "codex" and .preferred_runtime == "claude" and .tools_home == $tools and .tools_bin_dir == ($tools + "/bin") and .image_version == "0.2.0" and .tooling_version == "0.2.1"' >/dev/null || fail "Expected richer system manifest JSON, got: $RUN_OUTPUT"
+}
+
+test_agent_sh_system_manifest_reports_unknown_version_markers() {
+  begin_test "agent.sh system manifest reports unknown missing version markers"
+
+  local temp_home
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+
+  run_agent_sh_capture_env "$temp_home" \
+    AGENTCTL_IMAGE_VERSION_FILE="$temp_home/missing-image-version" \
+    AGENTCTL_TOOLING_VERSION_FILE="$temp_home/missing-tooling-version" \
+    -- system manifest
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -er '.image_version == "unknown" and .tooling_version == "unknown"' >/dev/null \
+    || fail "Expected unknown version markers, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_system_manifest_reports_apk_requested_packages() {
@@ -10242,6 +10266,7 @@ main() {
   run_selected_test test_agent_sh_qwen_runtime_info_reports_local_only_metadata "test_agent_sh_qwen_runtime_info_reports_local_only_metadata"
   run_selected_test test_agent_sh_pi_runtime_info_reports_local_only_metadata "test_agent_sh_pi_runtime_info_reports_local_only_metadata"
   run_selected_test test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state "test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state"
+  run_selected_test test_agent_sh_system_manifest_reports_unknown_version_markers "test_agent_sh_system_manifest_reports_unknown_version_markers"
   run_selected_test test_agent_sh_system_manifest_reports_apk_requested_packages "test_agent_sh_system_manifest_reports_apk_requested_packages"
   run_selected_test test_agent_sh_system_manifest_reports_dpkg_requested_packages "test_agent_sh_system_manifest_reports_dpkg_requested_packages"
   run_selected_test test_agent_sh_claude_runtime_install_runs_native_installer "test_agent_sh_claude_runtime_install_runs_native_installer"

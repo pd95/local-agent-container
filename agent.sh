@@ -685,9 +685,11 @@ json_feature_info() {
 }
 
 json_system_manifest() {
-  local package_manager packages_json requested_packages_json apk_repositories_json runtimes_json features_json default_runtime preferred_runtime
+  local package_manager packages_json requested_packages_json apk_repositories_json runtimes_json features_json default_runtime preferred_runtime image_version tooling_version
   local apk_world_file="${AGENTCTL_APK_WORLD_FILE:-/etc/apk/world}"
   local apk_repositories_file="${AGENTCTL_APK_REPOSITORIES_FILE:-/etc/apk/repositories}"
+  local image_version_file="${AGENTCTL_IMAGE_VERSION_FILE:-/etc/agentctl/image-version}"
+  local tooling_version_file="${AGENTCTL_TOOLING_VERSION_FILE:-/etc/agentctl/tooling-version}"
 
   if command -v apk >/dev/null 2>&1; then
     package_manager=apk
@@ -721,6 +723,14 @@ json_system_manifest() {
   features_json="$(feature_ids_installed | jq -R . | jq -s .)"
   default_runtime="$(runtime_default)"
   preferred_runtime="$(runtime_preferred)"
+  if [ -f "$image_version_file" ]; then
+    image_version="$(tr -d '[:space:]' <"$image_version_file")"
+  fi
+  if [ -f "$tooling_version_file" ]; then
+    tooling_version="$(tr -d '[:space:]' <"$tooling_version_file")"
+  fi
+  image_version="${image_version:-unknown}"
+  tooling_version="${tooling_version:-unknown}"
 
   jq -n \
     --arg package_manager "$package_manager" \
@@ -733,6 +743,8 @@ json_system_manifest() {
     --argjson installed_features "$features_json" \
     --arg default_runtime "$default_runtime" \
     --arg preferred_runtime "$preferred_runtime" \
+    --arg image_version "$image_version" \
+    --arg tooling_version "$tooling_version" \
     '{
       package_manager: $package_manager,
       packages: $packages,
@@ -743,7 +755,9 @@ json_system_manifest() {
       installed_runtimes: $installed_runtimes,
       installed_features: $installed_features,
       default_runtime: $default_runtime,
-      preferred_runtime: $preferred_runtime
+      preferred_runtime: $preferred_runtime,
+      image_version: $image_version,
+      tooling_version: $tooling_version
     }'
 }
 

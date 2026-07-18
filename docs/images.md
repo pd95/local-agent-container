@@ -254,6 +254,10 @@ The curated images carry image-owned defaults used by `refresh`,
 - `/etc/agentctl/tooling-version`
 - `/etc/agentctl/claude/settings.json`
 
+`agent.sh system manifest` (and therefore `agentctl system-manifest`) exposes
+the two version markers as `image_version` and `tooling_version`. Images that
+predate version tracking report `unknown`.
+
 The global `AGENTS.md` guidance inside the image points at the image-owned
 metadata file instead of storing mutable user state inside `~/.codex`.
 
