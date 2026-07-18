@@ -4993,11 +4993,16 @@ warn_upgrade_package_loss() {
                 "$CLI_NAME" \
                 "$target_name" \
                 "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')" >&2
+              upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
+}  ${CLI_NAME} su-exec --name ${target_name} apt-get update
+  ${CLI_NAME} su-exec --name ${target_name} apt-get install -y $(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')"
             elif [ "$target_package_manager" = "apk" ]; then
               printf '  %s su-exec --name %s apk add --no-cache %s\n' \
                 "$CLI_NAME" \
                 "$target_name" \
                 "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')" >&2
+              upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
+}  ${CLI_NAME} su-exec --name ${target_name} apk add --no-cache $(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')"
             fi
           fi
         fi
@@ -5085,12 +5090,16 @@ warn_upgrade_package_loss() {
       fi
       if [ "$reinstall_package_manager" = "apt-get" ]; then
         printf '  %s su-exec --name %s apt-get update\n' "$CLI_NAME" "$target_name" >&2
+        upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
+}  ${CLI_NAME} su-exec --name ${target_name} apt-get update"
       fi
       printf '  %s su-exec --name %s %s %s\n' \
         "$CLI_NAME" \
         "$target_name" \
         "$reinstall_command" \
         "$(printf '%s' "$reinstall_packages_json" | jq -r 'join(" ")')" >&2
+      upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
+}  ${CLI_NAME} su-exec --name ${target_name} ${reinstall_command} $(printf '%s' "$reinstall_packages_json" | jq -r 'join(" ")')"
     fi
   fi
 }
@@ -5733,6 +5742,7 @@ upgrade_cmd() {
   local preflight_source_manifest=""
   local preflight_target_manifest=""
   local inspect_info=""
+  local upgrade_package_reinstall_commands=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -5940,9 +5950,11 @@ upgrade_cmd() {
   esac
 
   if [ "$used_export_for_config_backup" -eq 1 ]; then
+    echo >&2
     echo "Backing up user state from exported filesystem: $name" >&2
   else
     repair_state_permissions_for_upgrade "$name"
+    echo >&2
     echo "Backing up user state from $name" >&2
     backup_codex_config "$name" "$state_backup_file"
   fi
@@ -5953,6 +5965,7 @@ upgrade_cmd() {
   fi
 
   if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ]; then
+    echo >&2
     if [ "$used_export_for_config_backup" -eq 0 ]; then
       echo "Exporting container state to image: $backup_image" >&2
       export_container_for_upgrade "$name" "$export_file" "$was_running"
@@ -5960,6 +5973,7 @@ upgrade_cmd() {
       echo "Reusing exported container state for backup image: $backup_image" >&2
     fi
     build_backup_image_from_export "$backup_image" "$name" "$export_file" "$backup_root" "$backup_dockerfile"
+    echo >&2
   elif [ "$copy_mode" -eq 0 ]; then
     echo "Skipping backup image export for $name" >&2
   fi
@@ -6028,6 +6042,10 @@ upgrade_cmd() {
     echo "Upgrade complete: $target_name (backup skipped)" >&2
   fi
   echo >&2
+  if [ -n "$upgrade_package_reinstall_commands" ]; then
+    echo "Reminder: reinstall top-level packages removed by the upgrade if you still need them:" >&2
+    printf '%s\n\n' "$upgrade_package_reinstall_commands" >&2
+  fi
   echo "If no valid AGENTS.md configuration already exists, reset it with: ${CLI_NAME} run --name $target_name --reset-config" >&2
   if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ]; then
     echo "If everything works as expected, remove the backup image with: ${CLI_NAME} images prune --backup --image $backup_image --keep 0" >&2

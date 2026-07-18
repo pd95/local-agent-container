@@ -7868,7 +7868,7 @@ test_upgrade_uses_explicit_resource_overrides() {
         rm_calls=$((rm_calls + 1))
         ;;
       export)
-        fail "export should not be called for --no-backup"
+        :
         ;;
       *)
         fail "Unexpected container invocation: $*"
@@ -7879,9 +7879,12 @@ test_upgrade_uses_explicit_resource_overrides() {
     printf 'codex\t%s\trw\t2\t4G\n' "$TEST_ROOT"
   }
 
-  run_capture upgrade_cmd --name unit-test-container --cpu 6 --mem 12G --no-backup
+  run_capture upgrade_cmd --name unit-test-container --cpu 6 --mem 12G
   assert_status 0
-  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  assert_contains "Upgrade complete: unit-test-container (backup image: unit-test-container-backup-20260406120000)"
+  assert_contains $'Starting container for state backup: unit-test-container\n\nBacking up user state from unit-test-container'
+  assert_contains $'Stopping container: unit-test-container\n\nExporting container state to image: unit-test-container-backup-20260406120000'
+  assert_contains $'Exporting container state to image: unit-test-container-backup-20260406120000\n\nRemoving container: unit-test-container'
   printf '%s\n' "$create_args" | grep -F -- "-c 6" >/dev/null || fail "Expected create args to include overridden cpu, got: $create_args"
   printf '%s\n' "$create_args" | grep -F -- "-m 12G" >/dev/null || fail "Expected create args to include overridden mem, got: $create_args"
   printf '%s\n' "$create_args" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected create args to include container name, got: $create_args"
@@ -8051,6 +8054,7 @@ test_upgrade_export_failure_restarts_running_source() {
   assert_contains "Backing up user state from unit-test-container"
   assert_contains "Stopping container: unit-test-container"
   assert_contains "Exporting container state to image: unit-test-container-backup-20260406120000"
+  assert_contains $'Stopping container: unit-test-container\n\nExporting container state to image: unit-test-container-backup-20260406120000'
   assert_contains "Restarting original container after failed export: unit-test-container"
   assert_contains "Failed to export container filesystem for backup image. The original container was not removed."
   assert_not_contains "Removing container: unit-test-container"
@@ -8352,7 +8356,7 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
   ensure_started_container_is_running() { return 0; }
   image_exists() {
     case "$1" in
-      agent-plain|agent-python) return 0 ;;
+      agent-plain|agent-swift) return 0 ;;
       *) return 1 ;;
     esac
   }
@@ -8362,7 +8366,7 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
   persist_container_system_manifest_baseline() { :; }
   persist_container_system_manifest_baseline_from_image() { :; }
   collect_upgrade_container_preflight() {
-    UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":["bash","git","curl","ripgrep"]}'
+    UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"dpkg","packages":["bash","git","curl","tree"]}'
     UPGRADE_PREFLIGHT_BASELINE_MANIFEST=''
     UPGRADE_PREFLIGHT_SOURCE_SUPPORTS_STATE_CONTRACT=1
   }
@@ -8398,13 +8402,13 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
       exec)
         case "$2" in
           unit-test-container)
-            printf '{"package_manager":"apk","packages":["bash","git","curl","ripgrep"]}\n'
+            printf '{"package_manager":"dpkg","packages":["bash","git","curl","tree"]}\n'
             ;;
           source-manifest)
-            printf '{"package_manager":"apk","packages":["bash","git"]}\n'
+            printf '{"package_manager":"dpkg","packages":["bash","git"]}\n'
             ;;
           target-manifest)
-            printf '{"package_manager":"apk","packages":["bash","git","curl","python3"]}\n'
+            printf '{"package_manager":"dpkg","packages":["bash","git","curl","python3"]}\n'
             ;;
           *)
             fail "Unexpected manifest exec target: $2"
@@ -8423,15 +8427,21 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
     printf 'agent-plain\t%s\trw\t2\t4G\n' "$TEST_ROOT"
   }
 
-  run_capture upgrade_cmd --name unit-test-container --image agent-python --no-backup
+  run_capture upgrade_cmd --name unit-test-container --image agent-swift --no-backup
   assert_status 0
-  assert_contains "Upgrade will remove 1 extra apk package(s) not present in agent-python:"
-  assert_contains "  - ripgrep"
+  assert_contains "Upgrade will remove 1 extra dpkg package(s) not present in agent-swift:"
+  assert_contains "  - tree"
   assert_contains "To reinstall after upgrade:"
-  assert_contains "su-exec --name unit-test-container apk add --no-cache ripgrep"
+  assert_contains "su-exec --name unit-test-container apt-get update"
+  assert_contains "su-exec --name unit-test-container apt-get install -y tree"
   assert_not_contains "  - curl"
   assert_not_contains "  - bash"
   assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  assert_contains "Reminder: reinstall top-level packages removed by the upgrade if you still need them:"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "su-exec --name unit-test-container apt-get update")" -eq 2 ] \
+    || fail "Expected apt-get update before and after upgrade"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "su-exec --name unit-test-container apt-get install -y tree")" -eq 2 ] \
+    || fail "Expected apt-get install before and after upgrade"
   printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
   [ "$start_calls" -eq 2 ] || fail "Expected 2 persisted start calls, got: $start_calls"
   [ "$stop_calls" -eq 2 ] || fail "Expected 2 persisted stop calls, got: $stop_calls"
