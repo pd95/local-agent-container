@@ -2498,6 +2498,93 @@ test_images_help_reports_subcommand_options() {
   assert_not_contains "Options for :"
 }
 
+test_images_print_sorted_keeps_compact_output() {
+  begin_test "raw images listing keeps compact output"
+
+  load_agentctl_functions
+
+  run_capture images_print_sorted $'agent-python:20260718-180539\nagent-plain:20260718-180539\nagent-project-backup-20260718174529\nagent-python\nagent-plain' 0 "" 0
+
+  assert_status 0
+  [ "$RUN_OUTPUT" = $'agent-plain\nagent-plain:20260718-180539\nagent-python\nagent-python:20260718-180539\nagent-project-backup-20260718174529' ] \
+    || fail "Expected compact image output, got: $RUN_OUTPUT"
+}
+
+test_images_print_metadata_uses_runtime_image_details() {
+  begin_test "images metadata uses runtime creation, size, platform, and digest details"
+
+  load_agentctl_functions
+
+  run_capture images_print_metadata $'agent-plain\nagent-plain:20260718-180539\nlocalhost:5000/team/image' '[
+    {"configuration":{"name":"agent-plain:latest","creationDate":"2026-07-18T18:05:54Z","descriptor":{"digest":"sha256:7726e80cafd612345678","size":374}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"size":179522222}]},
+    {"configuration":{"name":"docker.io/library/agent-plain:20260718-180539","creationDate":"2026-07-18T18:05:54Z","descriptor":{"digest":"sha256:7726e80cafd612345678","size":374}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"size":179522222}]},
+    {"configuration":{"name":"localhost:5000/team/image:latest","creationDate":"2026-07-18T19:00:00Z","descriptor":{"digest":"sha256:abcdef1234567890"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"}}]}
+  ]'
+
+  assert_status 0
+  assert_contains "IMAGE"
+  assert_contains "CREATED"
+  assert_contains "SIZE"
+  assert_contains "PLATFORM"
+  assert_contains "IMAGE ID"
+  assert_contains "agent-plain"
+  assert_contains "2026-07-18 18:05:54Z"
+  assert_contains "171.2 MiB"
+  assert_contains "linux/arm64"
+  assert_contains "7726e80cafd6"
+  assert_contains "localhost:5000/team/image"
+  assert_contains "2026-07-18 19:00:00Z"
+  printf '%s\n' "$RUN_OUTPUT" | grep -E '^localhost:5000/team/image +2026-07-18 19:00:00Z +unknown +linux/arm64 +abcdef123456$' >/dev/null \
+    || fail "Expected registry-port image metadata with unknown size, got: $RUN_OUTPUT"
+}
+
+test_images_list_defaults_to_metadata_and_supports_raw_output() {
+  begin_test "images list defaults to metadata and supports raw output"
+
+  load_agentctl_functions
+
+  require_container() { :; }
+  parse_image_list() {
+    printf '%s\n' agent-plain agent-plain:20260718-180539 agent-project-backup-20260718174529
+  }
+  image_list_json() {
+    printf '%s\n' '[
+      {"configuration":{"name":"agent-plain:latest","creationDate":"2026-07-18T18:05:54Z","descriptor":{"digest":"sha256:7726e80cafd612345678"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"size":179522222}]},
+      {"configuration":{"name":"agent-plain:20260718-180539","creationDate":"2026-07-18T18:05:54Z","descriptor":{"digest":"sha256:7726e80cafd612345678"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"size":179522222}]},
+      {"configuration":{"name":"agent-project-backup-20260718174529:latest","creationDate":"2026-07-18T17:47:51Z","descriptor":{"digest":"sha256:77ac1f1455a712345678"}},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"size":3139973763}]}
+    ]'
+  }
+
+  run_capture images_list_cmd
+  assert_status 0
+  assert_contains "CREATED"
+  assert_contains "171.2 MiB"
+  assert_contains "2.9 GiB"
+
+  image_list_json() { fail "raw image listing should not request JSON metadata"; }
+  run_capture images_list_cmd --raw
+  assert_status 0
+  assert_not_contains "CREATED"
+  assert_contains $'agent-plain\nagent-plain:20260718-180539\nagent-project-backup-20260718174529'
+}
+
+test_images_list_falls_back_to_refs_when_metadata_is_unavailable() {
+  begin_test "images list falls back to refs when metadata is unavailable"
+
+  load_agentctl_functions
+
+  require_container() { :; }
+  parse_image_list() { printf '%s\n' agent-plain agent-python; }
+  image_list_json() { printf '%s\n' 'not-json'; }
+
+  run_capture images_list_cmd
+  assert_status 0
+  assert_contains "Warning: Image metadata is unavailable; showing image refs only"
+  assert_contains $'agent-plain\nagent-python'
+  assert_not_contains "0 B"
+  assert_not_contains "CREATED"
+}
+
 test_rm_help_reports_force_option() {
   begin_test "rm help reports the force option"
 
@@ -10358,6 +10445,10 @@ main() {
   run_selected_test test_feature_help_reports_new_command "test_feature_help_reports_new_command"
   run_selected_test test_use_help_reports_new_command "test_use_help_reports_new_command"
   run_selected_test test_images_help_reports_subcommand_options "test_images_help_reports_subcommand_options"
+  run_selected_test test_images_print_sorted_keeps_compact_output "test_images_print_sorted_keeps_compact_output"
+  run_selected_test test_images_print_metadata_uses_runtime_image_details "test_images_print_metadata_uses_runtime_image_details"
+  run_selected_test test_images_list_defaults_to_metadata_and_supports_raw_output "test_images_list_defaults_to_metadata_and_supports_raw_output"
+  run_selected_test test_images_list_falls_back_to_refs_when_metadata_is_unavailable "test_images_list_falls_back_to_refs_when_metadata_is_unavailable"
   run_selected_test test_rm_help_reports_force_option "test_rm_help_reports_force_option"
   run_selected_test test_agent_sh_runtime_info_reports_registry_metadata "test_agent_sh_runtime_info_reports_registry_metadata"
   run_selected_test test_agent_sh_feature_list_reports_declared_features "test_agent_sh_feature_list_reports_declared_features"

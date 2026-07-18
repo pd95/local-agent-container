@@ -886,6 +886,7 @@ Options for images:
   --backup      Show only backup image refs
   --all         Include non-agent images
   --latest      Show only stable tags and newest timestamp tag per family
+  --raw         Print image refs only, without metadata
 
 Options for images prune:
   --keep N      Keep the newest N timestamp tags per family (default: 1)
@@ -1119,6 +1120,77 @@ images_print_sorted() {
   fi
 }
 
+images_print_metadata() {
+  local refs="$1"
+  local images_json="$2"
+  local rows=""
+
+  rows="$(printf '%s' "$images_json" | jq -r --arg targets "$refs" '
+      def norm:
+        if type == "string" then sub("^docker\\.io/library/"; "") else "" end;
+      def ref:
+        (.reference // .configuration.name // .configuration.reference // "") | norm;
+      def target_refs($target):
+        if ($target | contains("@")) or ($target | split("/")[-1] | contains(":"))
+        then [$target]
+        else [$target, $target + ":latest"]
+        end;
+      def human_size:
+        if . >= 1073741824 then ((. / 1073741824 * 10 | round) / 10 | tostring) + " GiB"
+        elif . >= 1048576 then ((. / 1048576 * 10 | round) / 10 | tostring) + " MiB"
+        elif . >= 1024 then ((. / 1024 * 10 | round) / 10 | tostring) + " KiB"
+        else tostring + " B"
+        end;
+      if type != "array" then error("invalid image list") else . end as $images
+      | ($targets | split("\n") | map(select(length > 0)))[] as $target
+      | (target_refs($target)) as $candidate_refs
+      | ([$images[] | select(type == "object") | select(ref as $ref | $candidate_refs | index($ref))][0] // {}) as $image
+      | ($image.configuration // $image) as $configuration
+      | ($configuration.descriptor // $image.descriptor // {}) as $descriptor
+      | ($image.variants // []) as $variants
+      | (($configuration.creationDate // $configuration.created // $variants[0].config.created // "unknown")
+          | if . == "unknown" then . else sub("\\.[0-9]+Z$"; "Z") | sub("T"; " ") end) as $created
+      | ([$variants[]? | .size | numbers] | add // ($descriptor.size | numbers?) // null) as $size
+      | ([$variants[]? | .platform? // {}
+            | ((.os // "unknown") + "/" + (.architecture // "unknown") + (if .variant then "/" + .variant else "" end))]
+          | unique | if length == 0 then ["unknown"] else . end | join(",")) as $platform
+      | (($descriptor.digest // $image.id // "unknown")
+          | if startswith("sha256:") then .[7:19] else .[0:12] end) as $image_id
+      | [$target, $created, (if $size == null then "unknown" else ($size | human_size) end), $platform, $image_id] | @tsv
+    ' 2>/dev/null)" || return 1
+
+  printf '%s\n' "$rows" | awk -F '\t' '
+    BEGIN {
+      image_width = length("IMAGE")
+      created_width = length("CREATED")
+      size_width = length("SIZE")
+      platform_width = length("PLATFORM")
+    }
+    {
+      image[NR] = $1
+      created[NR] = $2
+      size[NR] = $3
+      platform[NR] = $4
+      image_id[NR] = $5
+      if (length($1) > image_width) image_width = length($1)
+      if (length($2) > created_width) created_width = length($2)
+      if (length($3) > size_width) size_width = length($3)
+      if (length($4) > platform_width) platform_width = length($4)
+    }
+    END {
+      format = "%-" image_width "s  %-" created_width "s  %" size_width "s  %-" platform_width "s  %s\n"
+      printf format, "IMAGE", "CREATED", "SIZE", "PLATFORM", "IMAGE ID"
+      for (i = 1; i <= NR; i++) {
+        if (image[i] == "") {
+          print ""
+        } else {
+          printf format, image[i], created[i], size[i], platform[i], image_id[i]
+        }
+      }
+    }
+  '
+}
+
 remove_image_ref() {
   local image_ref="$1"
   if "$CONTAINER_CMD" image rm "$image_ref" >/dev/null 2>&1; then
@@ -1135,8 +1207,11 @@ images_list_cmd() {
   local backup=0
   local include_all=0
   local latest=0
+  local raw=0
   local refs=""
+  local images_json=""
   local filtered_refs=""
+  local sorted_refs=""
   local ref
 
   while [ $# -gt 0 ]; do
@@ -1145,6 +1220,7 @@ images_list_cmd() {
       --backup) backup=1; shift ;;
       --all) include_all=1; shift ;;
       --latest) latest=1; shift ;;
+      --raw) raw=1; shift ;;
       --help) usage_images; return 0 ;;
       *) die "Unknown option for images: $1" ;;
     esac
@@ -1175,10 +1251,24 @@ images_list_cmd() {
   [ -z "$filtered_refs" ] && return 0
 
   if [ "$latest" -eq 1 ]; then
-    images_print_latest "$filtered_refs" "$image" "$backup"
-    return 0
+    sorted_refs="$(images_print_latest "$filtered_refs" "$image" "$backup")"
+  else
+    sorted_refs="$(images_print_sorted "$filtered_refs" "$include_all" "$image" "$backup")"
   fi
-  images_print_sorted "$filtered_refs" "$include_all" "$image" "$backup"
+  if [ "$raw" -eq 1 ]; then
+    printf '%s\n' "$sorted_refs"
+  else
+    images_json="$(image_list_json)"
+    if ! printf '%s' "$images_json" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+      warn "Image metadata is unavailable; showing image refs only"
+      printf '%s\n' "$sorted_refs"
+      return 0
+    fi
+    if ! images_print_metadata "$sorted_refs" "$images_json"; then
+      warn "Unable to parse image metadata; showing image refs only"
+      printf '%s\n' "$sorted_refs"
+    fi
+  fi
 }
 
 images_prune_cmd() {
