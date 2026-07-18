@@ -231,6 +231,7 @@ build_backup_image_from_export() {
   local export_file="$3"
   local backup_root="$4"
   local backup_dockerfile="$5"
+  local restart_source_on_failure="${6:-0}"
   local backup_context="${backup_root}.context"
   local context_rootfs="$backup_context/rootfs"
   local context_dockerfile="$backup_context/Dockerfile"
@@ -247,7 +248,17 @@ ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ADD rootfs.tar /
 EOF
   cp "$context_dockerfile" "$backup_dockerfile"
-  "$CONTAINER_CMD" build -t "$backup_image" -f "$context_dockerfile" "$backup_context"
+  if ! "$CONTAINER_CMD" build -t "$backup_image" -f "$context_dockerfile" "$backup_context"; then
+    stop_buildkit_container
+    if [ "$restart_source_on_failure" -eq 1 ]; then
+      echo "Restarting original container after failed backup image build: $container_name" >&2
+      if ! "$CONTAINER_CMD" start "$container_name" >/dev/null 2>&1; then
+        warn "Failed to restart $container_name after backup image build failure; start it manually with: ${CLI_NAME} start --name $container_name"
+      fi
+    fi
+    report_backup_storage_diagnostics || true
+    die "Failed to build backup image $backup_image. The original container $container_name was not removed."
+  fi
   stop_buildkit_container
   validate_backup_image "$backup_image"
 }
@@ -737,13 +748,15 @@ Usage: $CLI_NAME doctor [options]
 Options:
   --name NAME  Container name (default: agent-<dir>)
   --fix        Repair detected user-state ownership and readability problems
-  --host       Check the host container CLI, service, and agentctl capabilities
+  --host       Check the host container CLI, service, capabilities, and runtime storage
 
 Doctor checks that the container can stay running for exec-based maintenance,
 checks known agentctl user-state paths in /home/coder, and verifies installed
 runtimes plus image-managed Codex local-mode config. With --fix, it repairs
 state permissions, reinstalls missing installable runtimes, restores missing
 Codex AGENTS.md, and resets broken Codex runtime config when needed.
+Host storage figures are global Apple container runtime accounting and do not
+measure free host disk space or predict the temporary space required by backup.
 EOF
 }
 
@@ -2018,6 +2031,7 @@ export_container_for_upgrade() {
     fi
   fi
 
+  report_backup_storage_diagnostics || true
   die "Failed to export container filesystem for backup image. The original container was not removed. This usually indicates a container runtime storage/export error; retry after checking the runtime, or use '${CLI_NAME} upgrade --name $name --new-name <new-name> --copy' to create an upgraded copy without a full backup export."
 }
 
@@ -3751,12 +3765,101 @@ container_command_available() {
     | grep -Eq "^[[:space:]]+${command_name}([,[:space:]]|$)"
 }
 
+container_system_df_supported() {
+  "$CONTAINER_CMD" system df --help 2>/dev/null | grep -Fq -- '--format'
+}
+
+container_storage_usage_json() {
+  local output=""
+
+  output="$("$CONTAINER_CMD" system df --format json 2>&1)" || {
+    printf '%s\n' "$output" >&2
+    return 1
+  }
+  printf '%s' "$output" | jq -ce '
+    def valid_usage:
+      type == "object"
+      and ([.total, .active, .sizeInBytes, .reclaimable]
+        | all(type == "number" and . >= 0 and floor == .));
+    if type == "object"
+      and (.images | valid_usage)
+      and (.containers | valid_usage)
+      and (.volumes | valid_usage)
+    then {
+      images: .images,
+      containers: .containers,
+      volumes: .volumes
+    }
+    else error("invalid container system df JSON")
+    end
+  '
+}
+
+format_storage_bytes() {
+  local bytes="$1"
+
+  awk -v bytes="$bytes" 'BEGIN {
+    split("B KiB MiB GiB TiB PiB", units, " ")
+    value = bytes + 0
+    unit = 1
+    while (value >= 1024 && unit < 6) {
+      value /= 1024
+      unit++
+    }
+    if (unit == 1) printf "%.0f %s", value, units[unit]
+    else if (value >= 10) printf "%.1f %s", value, units[unit]
+    else printf "%.2f %s", value, units[unit]
+  }'
+}
+
+print_container_storage_usage() {
+  local storage_json="$1"
+  local label=""
+  local total=""
+  local active=""
+  local size=""
+  local reclaimable=""
+
+  printf '  %-14s %7s %7s %12s %12s\n' Type Total Active Size Reclaimable
+  while IFS=$'\t' read -r label total active size reclaimable; do
+    [ -n "$label" ] || continue
+    printf '  %-14s %7s %7s %12s %12s\n' \
+      "$label" "$total" "$active" \
+      "$(format_storage_bytes "$size")" \
+      "$(format_storage_bytes "$reclaimable")"
+  done < <(printf '%s' "$storage_json" | jq -r '
+    [["Images", .images], ["Containers", .containers], ["Volumes", .volumes]][]
+    | [.[0], .[1].total, .[1].active, .[1].sizeInBytes, .[1].reclaimable]
+    | @tsv
+  ')
+}
+
+report_backup_storage_diagnostics() {
+  local storage_json=""
+
+  if ! container_system_df_supported; then
+    warn "Apple container storage diagnostics are unavailable; inspect the runtime and host free space before retrying"
+    return 0
+  fi
+  if ! storage_json="$(container_storage_usage_json 2>/dev/null)"; then
+    warn "Unable to read Apple container storage diagnostics; run: ${CLI_NAME} doctor --host"
+    return 0
+  fi
+
+  echo "Apple container runtime storage at backup failure:" >&2
+  print_container_storage_usage "$storage_json" >&2
+  echo "  Reclaimable is a runtime classification, not confirmation that data is safe to delete." >&2
+  echo "  Inspect with: ${CLI_NAME} doctor --host" >&2
+  echo "  Preview agent image cleanup with: ${CLI_NAME} images prune --dry-run" >&2
+}
+
 host_doctor() {
   local cli_path=""
   local cli_version=""
   local system_version=""
   local jq_path=""
   local detected_jq_version=""
+  local storage_json=""
   local status=0
 
   printf 'Host JSON processor\n'
@@ -3802,6 +3905,18 @@ host_doctor() {
   host_capability 'Unix socket publish' container_help_contains --publish-socket run
   host_capability 'shared memory size' container_help_contains --shm-size run
   host_capability 'container machine' container_command_available machine
+  host_capability 'storage accounting' container_system_df_supported
+
+  printf 'Container storage\n'
+  if ! container_system_df_supported; then
+    printf '  unavailable: container system df is not supported by this runtime\n'
+  elif storage_json="$(container_storage_usage_json 2>&1)"; then
+    print_container_storage_usage "$storage_json"
+    printf '  Note: values cover the global Apple container runtime. Reclaimable does not mean safe to delete; stopped containers and volumes may contain valuable state.\n'
+  else
+    printf '  unavailable: %s\n' "${storage_json:-invalid container system df response}"
+    status=1
+  fi
 
   return "$status"
 }
@@ -6310,7 +6425,7 @@ upgrade_cmd() {
     else
       echo "Reusing exported container state for backup image: $backup_image" >&2
     fi
-    build_backup_image_from_export "$backup_image" "$name" "$export_file" "$backup_root" "$backup_dockerfile"
+    build_backup_image_from_export "$backup_image" "$name" "$export_file" "$backup_root" "$backup_dockerfile" "$was_running"
     echo >&2
   elif [ "$copy_mode" -eq 0 ]; then
     echo "Skipping backup image export for $name" >&2

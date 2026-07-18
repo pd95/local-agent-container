@@ -293,6 +293,12 @@ test_doctor_host_reports_runtime_and_capabilities() {
       "system version --format json")
         printf '[{"name":"container-apiserver","version":"1.1.0"}]\n'
         ;;
+      "system df --help")
+        printf '%s\n' '  --format <format>'
+        ;;
+      "system df --format json")
+        printf '%s\n' '{"containers":{"active":1,"reclaimable":221802872832,"sizeInBytes":223992311808,"total":12},"images":{"active":4,"reclaimable":80104914944,"sizeInBytes":88524947456,"total":31},"volumes":{"active":0,"reclaimable":107920809984,"sizeInBytes":107920809984,"total":2}}'
+        ;;
       "list --help")
         printf '%s\n' '  --quiet' '  --format <format>'
         ;;
@@ -322,7 +328,100 @@ test_doctor_host_reports_runtime_and_capabilities() {
   assert_contains "container copy           yes"
   assert_contains "SSH agent forwarding     yes"
   assert_contains "container machine        yes"
+  assert_contains "storage accounting       yes"
+  assert_contains "Container storage"
+  assert_contains "Images              31       4"
+  assert_contains "Containers          12       1"
+  assert_contains "Reclaimable does not mean safe to delete"
   CONTAINER_CMD=container
+  unset -f command
+}
+
+test_storage_usage_parser_rejects_invalid_data_and_renders_valid_data() {
+  begin_test "storage diagnostics validate Apple container JSON and render stable rows"
+
+  load_agentctl_functions
+
+  mock_storage_container() {
+    printf '%s\n' '{"images":{"total":31,"active":4,"sizeInBytes":88524947456,"reclaimable":80104914944},"containers":{"total":12,"active":1,"sizeInBytes":223992311808,"reclaimable":221802872832},"volumes":{"total":2,"active":0,"sizeInBytes":107920809984,"reclaimable":107920809984}}'
+  }
+  CONTAINER_CMD=mock_storage_container
+
+  local storage_json=""
+  storage_json="$(container_storage_usage_json)"
+  run_capture print_container_storage_usage "$storage_json"
+  assert_status 0
+  assert_contains "Images              31       4"
+  assert_contains "82.4 GiB"
+  assert_contains "Containers          12       1"
+  assert_contains "Volumes              2       0"
+
+  mock_storage_container() {
+    printf '%s\n' '{"images":{"total":-1}}'
+  }
+  storage_parser_wrapper() { ( container_storage_usage_json ); }
+  run_capture storage_parser_wrapper
+  assert_status 5
+  assert_contains "invalid container system df JSON"
+}
+
+test_doctor_host_tolerates_unsupported_storage_accounting() {
+  begin_test "doctor --host treats unsupported storage accounting as informational"
+
+  load_agentctl_functions
+
+  command() {
+    if [ "$1" = "-v" ] && [ "$2" = "mock_container" ]; then
+      printf '/opt/homebrew/bin/container\n'
+      return 0
+    fi
+    builtin command "$@"
+  }
+  mock_container() {
+    case "$*" in
+      "--version") printf 'container CLI version 0.12.3\n' ;;
+      "system version --format json") printf '[]\n' ;;
+      *"--help") return 1 ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  CONTAINER_CMD=mock_container
+
+  run_capture doctor_cmd --host
+  assert_status 0
+  assert_contains "storage accounting       no"
+  assert_contains "unavailable: container system df is not supported"
+  unset -f command
+}
+
+test_doctor_host_rejects_malformed_supported_storage_data() {
+  begin_test "doctor --host fails when supported storage accounting returns malformed JSON"
+
+  load_agentctl_functions
+
+  command() {
+    if [ "$1" = "-v" ] && [ "$2" = "mock_container" ]; then
+      printf '/opt/homebrew/bin/container\n'
+      return 0
+    fi
+    builtin command "$@"
+  }
+  host_capability() { :; }
+  mock_container() {
+    case "$*" in
+      "--version") printf 'container CLI version 1.1.0\n' ;;
+      "system version --format json") printf '[]\n' ;;
+      "system df --help") printf '%s\n' '  --format <format>' ;;
+      "system df --format json") printf '%s\n' '{"images":{}}' ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  CONTAINER_CMD=mock_container
+
+  run_capture doctor_cmd --host
+  assert_status 1
+  assert_contains "Container storage"
+  assert_contains "invalid container system df JSON"
   unset -f command
 }
 
@@ -8238,6 +8337,7 @@ test_upgrade_export_failure_restarts_running_source() {
   }
   image_system_manifest_json() { return 1; }
   sanitize_image_name() { printf '%s\n' "$1"; }
+  report_backup_storage_diagnostics() { echo "storage diagnostic marker" >&2; return 1; }
   date() { printf '20260406120000\n'; }
   trap() { :; }
 
@@ -8282,6 +8382,7 @@ test_upgrade_export_failure_restarts_running_source() {
   assert_contains "Exporting container state to image: unit-test-container-backup-20260406120000"
   assert_contains $'Stopping container: unit-test-container\n\nExporting container state to image: unit-test-container-backup-20260406120000'
   assert_contains "Restarting original container after failed export: unit-test-container"
+  assert_contains "storage diagnostic marker"
   assert_contains "Failed to export container filesystem for backup image. The original container was not removed."
   assert_not_contains "Removing container: unit-test-container"
   assert_not_contains "Recreating container: unit-test-container"
@@ -10449,6 +10550,89 @@ test_build_backup_image_uses_clean_context_for_exported_rootfs() {
   [ "$buildkit_stopped" -eq 1 ] || fail "Expected backup build to stop BuildKit"
 }
 
+test_build_backup_image_failure_reports_storage_and_preserves_source() {
+  begin_test "backup image build failure reports storage without removing the source"
+
+  load_agentctl_functions
+
+  local temp_dir
+  local export_root
+  local export_file
+  local backup_root
+  local backup_dockerfile
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-backup-build-failure.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  export_root="$temp_dir/export-root"
+  export_file="$temp_dir/export.tar"
+  backup_root="$temp_dir/rootfs"
+  backup_dockerfile="$temp_dir/Dockerfile.backup"
+
+  mkdir -p "$export_root/home/coder" "$export_root/bin"
+  ln -s /bin/busybox "$export_root/bin/sh"
+  tar -C "$export_root" -cf "$export_file" .
+
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = "build" ] || fail "Unexpected container invocation: $*"
+    return 1
+  }
+  stop_buildkit_container() { :; }
+  report_backup_storage_diagnostics() { echo "storage diagnostic marker" >&2; return 1; }
+  validate_backup_image() { fail "Failed backup image must not be validated"; }
+  build_failure_wrapper() {
+    ( build_backup_image_from_export agent-test-backup unit-test-container "$export_file" "$backup_root" "$backup_dockerfile" )
+  }
+
+  run_capture build_failure_wrapper
+  assert_status 1
+  assert_contains "storage diagnostic marker"
+  assert_contains "Failed to build backup image agent-test-backup"
+  assert_contains "original container unit-test-container was not removed"
+  assert_not_contains "Restarting original container"
+}
+
+test_build_backup_image_failure_restarts_running_source() {
+  begin_test "backup image build failure restarts an originally running source"
+
+  load_agentctl_functions
+
+  local temp_dir
+  local export_root
+  local export_file
+  local backup_root
+  local backup_dockerfile
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-backup-build-restart.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  export_root="$temp_dir/export-root"
+  export_file="$temp_dir/export.tar"
+  backup_root="$temp_dir/rootfs"
+  backup_dockerfile="$temp_dir/Dockerfile.backup"
+
+  mkdir -p "$export_root/home/coder" "$export_root/bin"
+  ln -s /bin/busybox "$export_root/bin/sh"
+  tar -C "$export_root" -cf "$export_file" .
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      build) return 1 ;;
+      start) printf '%s\n' "$2" >"$temp_dir/start.log" ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  stop_buildkit_container() { :; }
+  report_backup_storage_diagnostics() { return 1; }
+  build_restart_failure_wrapper() {
+    ( build_backup_image_from_export agent-test-backup unit-test-container "$export_file" "$backup_root" "$backup_dockerfile" 1 )
+  }
+
+  run_capture build_restart_failure_wrapper
+  assert_status 1
+  assert_contains "Restarting original container after failed backup image build: unit-test-container"
+  assert_contains "Failed to build backup image agent-test-backup"
+  [ "$(cat "$temp_dir/start.log")" = "unit-test-container" ] || fail "Expected source container restart"
+}
+
 test_build_backup_image_preserves_flat_export_tar() {
   begin_test "build_backup_image_from_export preserves flat export tar as build input"
 
@@ -10579,6 +10763,9 @@ main() {
   run_selected_test test_doctor_help_reports_fix_option "test_doctor_help_reports_fix_option"
   run_selected_test test_agentctl_version_matches_version_file "test_agentctl_version_matches_version_file"
   run_selected_test test_doctor_host_reports_runtime_and_capabilities "test_doctor_host_reports_runtime_and_capabilities"
+  run_selected_test test_storage_usage_parser_rejects_invalid_data_and_renders_valid_data "test_storage_usage_parser_rejects_invalid_data_and_renders_valid_data"
+  run_selected_test test_doctor_host_tolerates_unsupported_storage_accounting "test_doctor_host_tolerates_unsupported_storage_accounting"
+  run_selected_test test_doctor_host_rejects_malformed_supported_storage_data "test_doctor_host_rejects_malformed_supported_storage_data"
   run_selected_test test_jq_dependency_version_checks "test_jq_dependency_version_checks"
   run_selected_test test_host_address_reads_container_1_1_gateway "test_host_address_reads_container_1_1_gateway"
   run_selected_test test_host_address_supports_custom_network_subnet_fallback "test_host_address_supports_custom_network_subnet_fallback"
@@ -10839,6 +11026,8 @@ main() {
   run_selected_test test_extract_container_export_rootfs_respects_oci_layer_order "test_extract_container_export_rootfs_respects_oci_layer_order"
   run_selected_test test_validate_backup_rootfs_accepts_shell_symlink "test_validate_backup_rootfs_accepts_shell_symlink"
   run_selected_test test_build_backup_image_uses_clean_context_for_exported_rootfs "test_build_backup_image_uses_clean_context_for_exported_rootfs"
+  run_selected_test test_build_backup_image_failure_reports_storage_and_preserves_source "test_build_backup_image_failure_reports_storage_and_preserves_source"
+  run_selected_test test_build_backup_image_failure_restarts_running_source "test_build_backup_image_failure_restarts_running_source"
   run_selected_test test_build_backup_image_preserves_flat_export_tar "test_build_backup_image_preserves_flat_export_tar"
   run_selected_test test_validate_backup_image_rejects_unbootable_backup "test_validate_backup_image_rejects_unbootable_backup"
   run_selected_test test_validate_backup_image_stops_validation_container_before_remove "test_validate_backup_image_stops_validation_container_before_remove"

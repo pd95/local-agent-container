@@ -57,7 +57,7 @@ The candidate tables use these labels:
 | Topic | Current status | Expected value | Likely effort | Suggested priority |
 |---|---|---:|---:|---:|
 | `--shm-size` | implemented | high for browsers and shared-memory workloads | complete | selected |
-| Storage and backup diagnostics | unused | high for full backup reliability | small-medium | high |
+| Storage and backup diagnostics | implemented | high for full backup reliability | complete | selected |
 | `container cp` transfer backend | detected | medium; simpler and less guest-tool dependent | medium | high |
 | OCI recovery-image export | unused | high for off-host disaster recovery | medium | high |
 | Effective runtime defaults in doctor | implicit only | medium; clearer resource behavior | small-medium | medium |
@@ -123,41 +123,30 @@ upgrade should retain current behavior rather than inventing one.
 Apple corrected `container system df` so that it counts content blobs and
 deduplicates shared storage. Earlier output could misstate actual usage.
 
-### Opportunity
+### Agentctl integration
 
-Full recovery-image creation is the most storage-intensive `agentctl`
-operation. Correct accounting could improve diagnostics before and after:
+`agentctl doctor --host` reports validated global image, container, and volume
+usage from `container system df --format json`. Backup export and image-build
+failures include the same best-effort summary and direct users to host doctor.
+Successful backup paths remain quiet.
 
-- container filesystem export
-- backup-image build
-- image pruning
-- refresh or upgrade with backups enabled
+The report explicitly treats Apple's reclaimable value as a runtime
+classification, not permission to delete data. Stopped containers and volumes
+may contain valuable mutable state, so diagnostics never trigger pruning.
 
-Possible additions:
-
-```bash
-agentctl doctor --host
-agentctl images df
-agentctl upgrade --dry-run
-```
-
-These could display structured `container system df` data and explain that a
-full export may temporarily require space for the container filesystem, export
-tar, BuildKit context, and resulting image layer.
-
-### Boundaries
+### Boundaries and verification
 
 `system df` does not report free host disk space or predict BuildKit's peak
 temporary use. It can support warnings and diagnosis, but not a reliable
 preflight guarantee.
 
-### Investigation before implementation
-
-- Capture 0.12.3 and 1.1 JSON shapes on the host.
-- Compare reported allocation with `df` on the host data volume.
-- Measure peak temporary space during a representative backup.
-- Decide whether a failed/unsupported `system df` is informational or fatal.
-- Avoid parsing human-readable tables.
+- The 1.1 JSON contract contains `images`, `containers`, and `volumes`, each
+  with `total`, `active`, `sizeInBytes`, and `reclaimable`.
+- Older runtimes without `system df` remain supported; host doctor reports the
+  capability as unavailable without failing.
+- A supported command that fails or returns malformed JSON makes host doctor
+  fail, while failure-path diagnostics never mask the original backup error.
+- Human-readable Apple tables are never parsed.
 
 ## Optional container-copy backend
 

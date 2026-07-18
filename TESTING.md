@@ -45,6 +45,17 @@ Debian bootstrap coverage:
 bash tests/run-tests.sh --tier full
 ```
 
+For a focused Apple container 1.1 storage-accounting smoke check, run:
+
+```bash
+agentctl doctor --host
+```
+
+Expected output includes a `Container storage` section with Images,
+Containers, and Volumes rows. Values are global runtime accounting;
+`Reclaimable` is not a statement that stopped containers or volumes are safe
+to delete.
+
 Focused integration filters are available for narrower validation. The tool-home smoke
 builds or requires `agent-plain`, creates a real container with host directories mounted
 over both `/workdir` and `/home/coder`, then verifies runtime launchers and package
