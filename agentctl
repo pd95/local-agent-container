@@ -80,6 +80,12 @@ require_container_backup_support() {
   fi
 }
 
+require_container_shm_size_support() {
+  if ! container_help_contains --shm-size create; then
+    die "Shared-memory sizing requires an Apple container runtime with 'container create --shm-size <size>' support"
+  fi
+}
+
 container_list_all() {
   "$CONTAINER_CMD" ls -a 2>/dev/null || true
 }
@@ -284,6 +290,23 @@ container_upgrade_info() {
        ($cpus | resource), ($memory | resource)] end
     | join("\t")
   ' 2>/dev/null || printf '\t\t\t\t\n'
+}
+
+container_shm_size() {
+  local name="$1"
+
+  "$CONTAINER_CMD" inspect "$name" 2>/dev/null | jq -Rrs '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then empty
+      else $parsed
+      | (if type == "array" then (.[0] // {}) elif type == "object" then . else {} end) as $data
+      | ($data.configuration // $data) as $config
+      | ($config.shmSize // $config.shmSizeInBytes // $config.resources.shmSize // $config.resources.shmSizeInBytes // $data.shmSize // $data.shmSizeInBytes // empty)
+      | if type == "number" and . > 0 then floor | tostring
+        elif type == "string" and length > 0 and . != "0" then .
+        else empty end
+      end
+  ' 2>/dev/null
 }
 
 validate_mount_mode() {
@@ -671,6 +694,7 @@ Options:
   --stdio         With --cmd, keep stdin open without a TTY for stdio protocols such as ACP or MCP
   --cpu NUM       CPU cores for container
   --mem SIZE      Memory limit (e.g. 8G)
+  --shm-size SIZE Size of /dev/shm (e.g. 512M, 1G; requires new container)
 EOF
 }
 
@@ -684,6 +708,7 @@ Options:
   --workdir PATH  Host directory to mount at /workdir when creating a container
   --cpu NUM       CPU cores for a newly created bootstrap container
   --mem SIZE      Memory limit for a newly created bootstrap container
+  --shm-size SIZE Size of /dev/shm for a newly created bootstrap container
 
 The current bootstrap slice supports Alpine and Debian/Ubuntu-based containers.
 It installs the current managed control surface into the container so that
@@ -780,6 +805,7 @@ Options:
   --workdir PATH      Host directory to mount at /workdir after recreation (default: preserve existing mount source)
   --cpu NUM           CPU cores for recreated container (default: preserve existing setting)
   --mem SIZE          Memory limit for recreated container (default: preserve existing setting)
+  --shm-size SIZE     Size of /dev/shm for recreated container (default: preserve explicit existing setting)
   --backup-image NAME Backup image name for container export (default: <new-name-or-name>-backup-<timestamp>)
   --no-backup         Skip container export backup image creation
   --dry-run           Show the planned upgrade actions without recreating the container
@@ -805,6 +831,7 @@ Options:
   --keep         Leave the rescue container running instead of removing it after exit
   --cpu NUM      CPU cores for the rescue container
   --mem SIZE     Memory limit for the rescue container
+  --shm-size SIZE  Size of /dev/shm for the rescue container
   --cmd ...      Run a custom command instead of an interactive /bin/sh shell
 
 Rescue runs a backup image directly without refresh, auth sync, runtime install,
@@ -3553,6 +3580,7 @@ bootstrap_cmd() {
   local workdir=""
   local cpu=""
   local mem=""
+  local shm_size=""
   local was_running=0
   local started_for_bootstrap=0
   local created_for_bootstrap=0
@@ -3565,6 +3593,7 @@ bootstrap_cmd() {
       --workdir) workdir="$2"; shift 2 ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
+      --shm-size) shm_size="$2"; shift 2 ;;
       --help) usage_bootstrap; return 0 ;;
       *) die "Unknown option for bootstrap: $1" ;;
     esac
@@ -3587,8 +3616,8 @@ bootstrap_cmd() {
   fi
 
   if container_exists "$name"; then
-    if [ -n "$image" ] || [ -n "$cpu" ] || [ -n "$mem" ]; then
-      die "--image, --cpu, and --mem only apply when bootstrap creates a new container"
+    if [ -n "$image" ] || [ -n "$cpu" ] || [ -n "$mem" ] || [ -n "$shm_size" ]; then
+      die "--image, --cpu, --mem, and --shm-size only apply when bootstrap creates a new container"
     fi
   else
     [ -n "$image" ] || die "Container not found: $name (pass --image to create and bootstrap a new container)"
@@ -3599,6 +3628,10 @@ bootstrap_cmd() {
     fi
     if [ -n "$mem" ]; then
       create_cmd+=(-m "$mem")
+    fi
+    if [ -n "$shm_size" ]; then
+      require_container_shm_size_support
+      create_cmd+=(--shm-size "$shm_size")
     fi
     create_cmd+=(
       --name "$name"
@@ -4137,6 +4170,105 @@ size_to_bytes() {
     return 0
   fi
   return 1
+}
+
+shared_memory_size_to_bytes() {
+  local value="$1"
+  local normalized=""
+  local number=""
+  local whole=""
+  local fraction=""
+  local fraction_digits=""
+  local fraction_scale=1
+  local fraction_bytes=0
+  local multiplier_quotient=0
+  local multiplier_remainder=0
+  local suffix=""
+  local multiplier=1
+  local max_value=9223372036854775807
+  local max_whole=""
+
+  [ -n "$value" ] || return 1
+  normalized="$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')"
+  if [[ "$normalized" =~ ^([0-9]+)(\.([0-9]+))?(B|K|KB|KIB|M|MB|MIB|G|GB|GIB|T|TB|TIB|P|PB|PIB)?$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    fraction="${BASH_REMATCH[3]}"
+    suffix="${BASH_REMATCH[4]}"
+  else
+    return 1
+  fi
+
+  while [ "${number#0}" != "$number" ]; do
+    number="${number#0}"
+  done
+  [ -n "$number" ] || number=0
+  [ "${#number}" -le 19 ] || return 1
+
+  case "$suffix" in
+    ""|B) multiplier=1 ;;
+    K|KB|KIB) multiplier=1024 ;;
+    M|MB|MIB) multiplier=1048576 ;;
+    G|GB|GIB) multiplier=1073741824 ;;
+    T|TB|TIB) multiplier=1099511627776 ;;
+    P|PB|PIB) multiplier=1125899906842624 ;;
+    *) return 1 ;;
+  esac
+
+  max_whole="$((max_value / multiplier))"
+  [ "${#number}" -lt "${#max_whole}" ] \
+    || { [ "${#number}" -eq "${#max_whole}" ] && [[ "$number" < "$max_whole" || "$number" = "$max_whole" ]]; } \
+    || return 1
+  whole=$((10#$number))
+  whole=$((whole * multiplier))
+
+  if [ -n "$fraction" ]; then
+    while [ "${fraction%0}" != "$fraction" ]; do
+      fraction="${fraction%0}"
+    done
+    if [ -n "$fraction" ]; then
+      [ "${#fraction}" -le 9 ] || return 1
+      fraction_digits="${#fraction}"
+      while [ "$fraction_digits" -gt 0 ]; do
+        fraction_scale=$((fraction_scale * 10))
+        fraction_digits=$((fraction_digits - 1))
+      done
+      fraction=$((10#$fraction))
+      multiplier_quotient=$((multiplier / fraction_scale))
+      multiplier_remainder=$((multiplier % fraction_scale))
+      fraction_bytes=$((multiplier_quotient * fraction + (multiplier_remainder * fraction) / fraction_scale))
+    fi
+  fi
+
+  [ "$whole" -le $((max_value - fraction_bytes)) ] || return 1
+  printf '%s\n' "$((whole + fraction_bytes))"
+}
+
+display_shared_memory_size() {
+  local value="$1"
+
+  if [ -z "$value" ] || [ "$value" = "0" ]; then
+    printf 'runtime default\n'
+    return 0
+  fi
+  display_memory_limit "$value"
+}
+
+validate_existing_container_shm_size() {
+  local name="$1"
+  local requested="$2"
+  local requested_bytes=""
+  local current_bytes=""
+
+  [ -n "$requested" ] || return 0
+  requested_bytes="$(shared_memory_size_to_bytes "$requested" 2>/dev/null || true)"
+  [ -n "$requested_bytes" ] \
+    || die "Unable to compare --shm-size '$requested' with existing container $name; use a size such as 512M, 1.5G, or 2GiB"
+  current_bytes="$(container_shm_size "$name")"
+  [ -n "$current_bytes" ] \
+    || die "Unable to determine the shared-memory size of existing container $name; omit --shm-size or recreate it with ${CLI_NAME} upgrade --name $name --shm-size $requested"
+  if [ "$requested_bytes" != "$current_bytes" ]; then
+    die "Container $name uses /dev/shm size $(display_shared_memory_size "$current_bytes"), not $requested. Recreate it with: ${CLI_NAME} upgrade --name $name --shm-size $requested"
+  fi
 }
 
 runtime_install_memory_pressure_limit() {
@@ -5291,12 +5423,14 @@ print_upgrade_dry_run_summary() {
   local target_cpu="$9"
   local current_mem="${10}"
   local target_mem="${11}"
-  local was_running="${12}"
-  local backup_mode="${13}"
-  local no_backup="${14}"
-  local backup_image="${15}"
-  local overwrite_config="${16}"
-  local copy_mode="${17:-0}"
+  local current_shm_size="${12}"
+  local target_shm_size="${13}"
+  local was_running="${14}"
+  local backup_mode="${15}"
+  local no_backup="${16}"
+  local backup_image="${17}"
+  local overwrite_config="${18}"
+  local copy_mode="${19:-0}"
   local state_label=""
   local mount_label=""
   local config_label=""
@@ -5306,6 +5440,8 @@ print_upgrade_dry_run_summary() {
   local target_image_display=""
   local current_mem_display=""
   local target_mem_display=""
+  local current_shm_display=""
+  local target_shm_display=""
 
   if [ "$was_running" -eq 1 ]; then
     state_label="running"
@@ -5350,6 +5486,8 @@ print_upgrade_dry_run_summary() {
   target_image_display="$(display_upgrade_image_ref "$target_image")"
   current_mem_display="$(display_upgrade_memory_limit "$current_mem")"
   target_mem_display="$(display_upgrade_memory_limit "$target_mem")"
+  current_shm_display="$(display_shared_memory_size "$current_shm_size")"
+  target_shm_display="$(display_shared_memory_size "$target_shm_size")"
 
   echo "Dry run: upgrade plan for $name -> $target_name" >&2
   echo "  Source image: $source_image_display" >&2
@@ -5359,6 +5497,7 @@ print_upgrade_dry_run_summary() {
   echo "  Mount mode: $mount_label" >&2
   echo "  CPU: ${current_cpu:-unlimited} -> ${target_cpu:-unlimited}" >&2
   echo "  Memory: $current_mem_display -> $target_mem_display" >&2
+  echo "  Shared memory: $current_shm_display -> $target_shm_display" >&2
   echo "  Current state: $state_label" >&2
   echo "  Config backup: $config_label" >&2
   echo "  Backup image: $backup_label" >&2
@@ -5447,7 +5586,8 @@ run_container() {
   local post_exec="${11}"
   local reset_config="${12}"
   local stdio="${13}"
-  shift 13
+  local shm_size="${14}"
+  shift 14
   local cmd=("$@")
   local exit_code=0
   local started=0
@@ -5475,6 +5615,7 @@ run_container() {
   # Lifecycle: create if missing, start if needed, pre_exec, exec, stop, remove if temp.
   if [ -n "$actual_name" ] && container_exists "$actual_name"; then
     validate_mount_mode "$actual_name" "$read_only"
+    validate_existing_container_shm_size "$actual_name" "$shm_size"
   fi
   if [ -n "$actual_name" ] && container_running "$actual_name"; then
     already_running=1
@@ -5494,6 +5635,10 @@ run_container() {
       fi
       if [ -n "$mem" ]; then
         create_cmd+=(-m "$mem")
+      fi
+      if [ -n "$shm_size" ]; then
+        require_container_shm_size_support
+        create_cmd+=(--shm-size "$shm_size")
       fi
       if [ -n "$actual_name" ]; then
         create_cmd+=(--name "$actual_name")
@@ -5595,7 +5740,8 @@ run_mode() {
   local runtime_config_json="${14}"
   local model_override="${15}"
   local stdio="${16}"
-  shift 16
+  local shm_size="${17}"
+  shift 17
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
@@ -5631,7 +5777,7 @@ run_mode() {
     shell=0
   fi
 
-  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "$stdio" "${cmd[@]}"
+  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "$stdio" "$shm_size" "${cmd[@]}"
 }
 
 RUN_SELECTED_RUNTIME=""
@@ -5740,6 +5886,7 @@ run_cmd() {
   local read_only=0
   local cpu=""
   local mem=""
+  local shm_size=""
   local home_mount=""
   local workdir=""
   local stdio=0
@@ -5769,6 +5916,7 @@ run_cmd() {
       --cmd) shift; cmd_override_set=1; cmd_override=("$@"); break ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
+      --shm-size) shm_size="$2"; shift 2 ;;
       --help) usage_run; return 0 ;;
       *) die "Unknown option for run: $1" ;;
     esac
@@ -5823,6 +5971,9 @@ run_cmd() {
   if [ "$temp" -eq 0 ] && [ -n "$name" ] && container_exists "$name" && { [ -n "$cpu" ] || [ -n "$mem" ]; }; then
     die "--cpu and --mem only apply when creating a new container. Use ${CLI_NAME} upgrade --name $name${image:+ --image $image}${cpu:+ --cpu $cpu}${mem:+ --mem $mem} to recreate the container with updated resources"
   fi
+  if [ -n "$shm_size" ]; then
+    require_container_shm_size_support
+  fi
   if [ "$temp" -eq 0 ] && [ -n "$name" ] && container_exists "$name" && [ -n "$home_mount" ]; then
     die "--home only applies when creating a new container"
   fi
@@ -5852,7 +6003,7 @@ run_cmd() {
     RUN_UPDATE_CODEX=1
   fi
 
-  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" "$stdio" ${cmd_override[@]+"${cmd_override[@]}"}
+  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" "$stdio" "$shm_size" ${cmd_override[@]+"${cmd_override[@]}"}
 }
 
 auth_cmd() {
@@ -5893,6 +6044,7 @@ upgrade_cmd() {
   local workdir_override=""
   local cpu=""
   local mem=""
+  local shm_size=""
   local backup_image=""
   local no_backup=0
   local dry_run=0
@@ -5903,6 +6055,7 @@ upgrade_cmd() {
   local mount_mode=""
   local current_cpu=""
   local current_mem=""
+  local current_shm_size=""
   local read_only=0
   local was_running=0
   local started_for_backup=0
@@ -5928,6 +6081,7 @@ upgrade_cmd() {
       --workdir) workdir_override="$2"; shift 2 ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
+      --shm-size) shm_size="$2"; shift 2 ;;
       --backup-image) backup_image="$2"; shift 2 ;;
       --no-backup) no_backup=1; shift ;;
       --dry-run) dry_run=1; shift ;;
@@ -5937,6 +6091,9 @@ upgrade_cmd() {
     esac
   done
 
+  if [ -n "$shm_size" ] && ! shared_memory_size_to_bytes "$shm_size" >/dev/null 2>&1; then
+    die "Invalid --shm-size: $shm_size (use a size such as 512M, 1.5G, or 2GiB)"
+  fi
   require_container
 
   if [ -z "$name" ]; then
@@ -5971,6 +6128,7 @@ upgrade_cmd() {
 
   inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
   IFS=$'\t' read -r current_image current_workdir mount_mode current_cpu current_mem <<<"$inspect_info"
+  current_shm_size="$(container_shm_size "$name")"
   [ -n "$current_image" ] || die "Unable to determine image for $name"
   [ -n "$current_workdir" ] || die "Unable to determine /workdir mount source for $name"
 
@@ -5991,6 +6149,10 @@ upgrade_cmd() {
   fi
   [ -n "$cpu" ] || cpu="$current_cpu"
   [ -n "$mem" ] || mem="$current_mem"
+  [ -n "$shm_size" ] || shm_size="$current_shm_size"
+  if [ -n "$shm_size" ]; then
+    require_container_shm_size_support
+  fi
   image_exists "$image" || die "Image not found: $image"
   if [ -z "$workdir_override" ]; then
     [ -e "$workdir" ] || die "Preserved /workdir source does not exist: $workdir"
@@ -6040,7 +6202,7 @@ upgrade_cmd() {
   if [ "$dry_run" -eq 1 ]; then
     print_upgrade_dry_run_summary \
       "$name" "$target_name" "$current_image" "$image" "$current_workdir" "$workdir" \
-      "$mount_mode" "$current_cpu" "$cpu" "$current_mem" "$mem" "$was_running" \
+      "$mount_mode" "$current_cpu" "$cpu" "$current_mem" "$mem" "$current_shm_size" "$shm_size" "$was_running" \
       "$backup_mode" "$no_backup" "$backup_image" "$overwrite_config" "$copy_mode"
     return 0
   fi
@@ -6168,6 +6330,9 @@ upgrade_cmd() {
   if [ -n "$mem" ]; then
     create_cmd+=(-m "$mem")
   fi
+  if [ -n "$shm_size" ]; then
+    create_cmd+=(--shm-size "$shm_size")
+  fi
   local mount_opts="type=bind,src=$workdir,dst=/workdir"
   if [ "$read_only" -eq 1 ]; then
     mount_opts="${mount_opts},readonly"
@@ -6234,6 +6399,7 @@ rescue_cmd() {
   local keep=0
   local cpu=""
   local mem=""
+  local shm_size=""
   local created=0
   local started=0
   local exit_code=0
@@ -6268,6 +6434,7 @@ rescue_cmd() {
       --keep) keep=1; shift ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
+      --shm-size) shm_size="$2"; shift 2 ;;
       --cmd) shift; cmd_override_set=1; cmd=("$@"); break ;;
       --help) usage_rescue; return 0 ;;
       --*) die "Unknown option for rescue: $1" ;;
@@ -6284,6 +6451,9 @@ rescue_cmd() {
 
   require_container
   [ -n "$image" ] || die "--image is required for rescue"
+  if [ -n "$shm_size" ]; then
+    require_container_shm_size_support
+  fi
   if [ "$cmd_override_set" -eq 1 ] && [ "${#cmd[@]}" -eq 0 ]; then
     die "Missing command after --cmd"
   fi
@@ -6314,6 +6484,9 @@ rescue_cmd() {
   fi
   if [ -n "$mem" ]; then
     create_cmd+=(-m "$mem")
+  fi
+  if [ -n "$shm_size" ]; then
+    create_cmd+=(--shm-size "$shm_size")
   fi
   create_cmd+=(--name "$name" "$image" /bin/sh -c 'sleep infinity')
 

@@ -91,6 +91,30 @@ If you need a heavier direct container:
 container run -it -c 6 -m 8G --name "agent-$(basename "$PWD")" --mount type=bind,src="$(pwd)",dst=/workdir agent-plain
 ```
 
+For browser automation, databases, or other workloads that use shared memory
+heavily, size the container's `/dev/shm` filesystem when it is created:
+
+```bash
+agentctl run --mem 8G --shm-size 1G
+```
+
+Playwright and Chromium test suites are common reasons to increase this from the
+runtime default. The capacity is not reserved eagerly, but data actually stored
+in `/dev/shm` contributes to container memory pressure. This is a targeted
+compatibility setting, not a general performance switch.
+
+Shared-memory size is fixed at container creation. Recreate an existing
+container while preserving its state and explicit shared-memory setting with:
+
+```bash
+agentctl upgrade --name my-agent --shm-size 2G
+```
+
+`upgrade` preserves an explicit existing value when no override is supplied.
+`bootstrap` and `rescue` also accept `--shm-size` when they create containers.
+The option requires an Apple container runtime that supports
+`container create --shm-size`.
+
 ## Manual provider-backed Codex flow
 
 If you want a fully manual isolated Codex login flow:

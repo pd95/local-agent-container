@@ -19,6 +19,7 @@ dependencies:
 - named `run` keeps the container until explicit removal
 - `build --rebuild` stops the temporary `buildkit` support container after a successful build
 - `run` rejects `--cpu` and `--mem` for existing named containers
+- `run --shm-size` reuses an existing container only when the requested size matches
 - backup-enabled `refresh` requires a container runtime with `export --output`
 - `refresh --no-backup` preserves user state without creating a backup image
 - default `refresh` creates a recovery backup image
@@ -238,6 +239,24 @@ agentctl run --name agent-refresh-resources --image agent-plain --workdir testin
 agentctl refresh --name agent-refresh-resources --cpu 4 --mem 8G --no-backup
 agentctl rm --name agent-refresh-resources
 ```
+
+Shared-memory sizing requires Apple container 1.1 or newer. Verify creation,
+matching reuse, conflicting reuse, and upgrade preservation with a disposable
+container:
+
+```bash
+agentctl run --name agent-shm-smoke --image agent-plain --workdir testing/agent-plain --shm-size 1G --cmd sh -lc 'df -h /dev/shm && mount | grep /dev/shm'
+agentctl run --name agent-shm-smoke --image agent-plain --workdir testing/agent-plain --shm-size 1024MiB --cmd true
+agentctl run --name agent-shm-smoke --image agent-plain --workdir testing/agent-plain --shm-size 2G --cmd true
+agentctl upgrade --name agent-shm-smoke --no-backup --dry-run
+agentctl upgrade --name agent-shm-smoke --no-backup --shm-size 2G
+agentctl run --name agent-shm-smoke --image agent-plain --workdir testing/agent-plain --cmd sh -lc 'df -h /dev/shm && mount | grep /dev/shm'
+agentctl rm --name agent-shm-smoke
+```
+
+The matching `1024MiB` reuse should succeed, the conflicting `2G` reuse should
+fail with upgrade guidance, the dry run should report `1G -> 1G`, and the final
+container should report approximately 2 GiB for `/dev/shm`.
 
 Expected output includes:
 

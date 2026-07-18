@@ -206,6 +206,7 @@ test_run_help_reports_runtime_options() {
   assert_contains "--model NAME    Override the launch model for the selected runtime"
   assert_contains "--online        Use the runtime's online/provider-backed mode"
   assert_contains "--stdio         With --cmd, keep stdin open without a TTY"
+  assert_contains "--shm-size SIZE Size of /dev/shm"
 }
 
 test_exec_help_reports_stdio_option() {
@@ -433,6 +434,95 @@ test_inspect_json_helpers_handle_schema_shapes_and_invalid_input() {
   [ "$(printf '%s' '' | container_upgrade_info)" = $'\t\t\t\t' ] || fail "Expected empty inspect tuple"
 }
 
+test_shared_memory_size_helpers_normalize_and_compare_values() {
+  begin_test "shared-memory helpers normalize documented units and compare existing containers"
+
+  load_agentctl_functions
+
+  [ "$(shared_memory_size_to_bytes 1G)" = "1073741824" ] || fail "Expected 1G normalization"
+  [ "$(shared_memory_size_to_bytes 1024MiB)" = "1073741824" ] || fail "Expected MiB normalization"
+  [ "$(shared_memory_size_to_bytes 2gib)" = "2147483648" ] || fail "Expected case-insensitive GiB normalization"
+  [ "$(shared_memory_size_to_bytes 1GB)" = "1073741824" ] || fail "Expected Apple-compatible GB normalization"
+  [ "$(shared_memory_size_to_bytes 1.5G)" = "1610612736" ] || fail "Expected fractional G normalization"
+  [ "$(shared_memory_size_to_bytes 0.25GiB)" = "268435456" ] || fail "Expected fractional GiB normalization"
+  [ "$(shared_memory_size_to_bytes 1PiB)" = "1125899906842624" ] || fail "Expected PiB normalization"
+  [ "$(shared_memory_size_to_bytes 1.000000000G)" = "1073741824" ] || fail "Expected trailing fractional zeroes to normalize"
+  if shared_memory_size_to_bytes 1.0000000001G >/dev/null 2>&1; then
+    fail "Did not expect excessive fractional precision to normalize"
+  fi
+  if shared_memory_size_to_bytes 99999999999999999999P >/dev/null 2>&1; then
+    fail "Did not expect overflowing shared-memory sizes to normalize"
+  fi
+
+  container_shm_size() { printf '1073741824\n'; }
+  run_capture validate_existing_container_shm_size unit-test-container 1024MiB
+  assert_status 0
+  container_shm_size() { printf '1610612736\n'; }
+  run_capture validate_existing_container_shm_size unit-test-container 1.5G
+  assert_status 0
+  container_shm_size() { printf '1073741824\n'; }
+  validate_shm_wrapper() { ( validate_existing_container_shm_size "$@" ); }
+  run_capture validate_shm_wrapper unit-test-container 2G
+  assert_status 1
+  assert_contains "uses /dev/shm size 1G, not 2G"
+  assert_contains "upgrade --name unit-test-container --shm-size 2G"
+}
+
+test_container_shm_size_reads_apple_container_inspect_shape() {
+  begin_test "shared-memory inspect helper reads Apple container 1.1 configuration"
+
+  load_agentctl_functions
+  mock_container() {
+    printf '%s\n' '[{"configuration":{"shmSize":536870912}}]'
+  }
+  CONTAINER_CMD=mock_container
+
+  [ "$(container_shm_size unit-test-container)" = "536870912" ] \
+    || fail "Expected shared-memory byte count from inspect"
+}
+
+test_shared_memory_support_check_fails_before_use() {
+  begin_test "shared-memory support check rejects older Apple container runtimes"
+
+  load_agentctl_functions
+  container_help_contains() { return 1; }
+  require_shm_wrapper() { ( require_container_shm_size_support ); }
+
+  run_capture require_shm_wrapper
+  assert_status 1
+  assert_contains "Shared-memory sizing requires an Apple container runtime"
+}
+
+test_run_container_passes_shared_memory_size_to_create() {
+  begin_test "run_container passes shared-memory size to container create"
+
+  load_agentctl_functions
+
+  local create_log=""
+  container_exists() { return 1; }
+  container_running() { return 1; }
+  require_container_shm_size_support() { return 0; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  configure_container_host_alias() { :; }
+  warn_if_container_agentctl_versions_differ() { :; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create)
+        shift
+        create_log="$(printf '%s ' "$@")"
+        ;;
+      start|stop|exec) ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 1GiB true
+  assert_status 0
+  printf '%s\n' "$create_log" | grep -Fq -- "--shm-size 1GiB" \
+    || fail "Expected shared-memory create flag, got: $create_log"
+}
+
 test_configure_container_host_alias_replaces_stale_entry() {
   begin_test "container host alias replaces a stale gateway entry"
 
@@ -644,7 +734,7 @@ test_run_container_refreshes_host_alias_before_exec() {
     [ "$1" = "exec" ] || fail "Expected agent exec, got: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" true
   assert_status 0
   [ "$configured_name" = "unit-test-container" ] \
     || fail "Expected host alias refresh before exec, got: $configured_name"
@@ -716,7 +806,7 @@ test_new_container_launch_checks_agentctl_versions() {
     esac
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" true
   assert_status 0
   assert_contains "Creating container..."
   assert_contains "Starting container: unit-test-container"
@@ -756,6 +846,7 @@ test_rescue_help_reports_backup_image_options() {
   assert_contains "Usage: agentctl rescue --image IMAGE"
   assert_contains "--keep"
   assert_contains "--cmd ..."
+  assert_contains "--shm-size SIZE"
   assert_contains "backup image"
 }
 
@@ -1647,7 +1738,7 @@ container() {
       ;;
   esac
 }
-printf 'protocol-input\n' | run_container unit-test-container agent-python 0 0 "" "" 0 "$TEST_ROOT" "" pre_reads_stdin "" 0 1 cat
+printf 'protocol-input\n' | run_container unit-test-container agent-python 0 0 "" "" 0 "$TEST_ROOT" "" pre_reads_stdin "" 0 1 "" cat
 EOF
   chmod +x "$unit_script"
 
@@ -1809,7 +1900,7 @@ test_run_container_reset_config_uses_runtime_helper() {
     fail "Unexpected agent.sh invocation: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:codex' || fail "Expected runtime reset-config helper call, got: $helper_log"
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:codex' || fail "Expected preferred runtime to be preserved, got: $helper_log"
@@ -1847,7 +1938,7 @@ test_run_container_reset_config_uses_selected_runtime() {
     fail "Did not expect preferred runtime lookup when selected runtime is set: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:opencode' || fail "Expected selected runtime reset-config helper call, got: $helper_log"
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:opencode' || fail "Expected selected runtime to be preserved, got: $helper_log"
@@ -1889,7 +1980,7 @@ test_run_container_reset_config_preserves_preferred_runtime() {
     fail "Unexpected agent.sh invocation: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:reset:opencode' || fail "Expected preferred runtime reset-config helper call, got: $helper_log"
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:opencode' || fail "Expected preferred runtime to be restored after reset, got: $helper_log"
@@ -2268,6 +2359,7 @@ test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
   expected_workdir="$(CDPATH= cd -- "$workdir" && pwd)"
 
   require_container() { return 0; }
+  require_container_shm_size_support() { return 0; }
   container_exists() { return 1; }
   container_running() { return 1; }
   persist_container_system_manifest_baseline_from_live_state() { :; }
@@ -2305,7 +2397,7 @@ test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
     esac
   }
 
-  run_capture bootstrap_cmd --name unit-bootstrap-container --image docker.io/library/alpine:latest --workdir "$workdir" --cpu 2 --mem 3G
+  run_capture bootstrap_cmd --name unit-bootstrap-container --image docker.io/library/alpine:latest --workdir "$workdir" --cpu 2 --mem 3G --shm-size 1G
   assert_status 0
   assert_contains "Bootstrap container ready: unit-bootstrap-container"
   assert_contains "Bootstrap complete: unit-bootstrap-container"
@@ -2316,6 +2408,7 @@ test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
   printf '%s\n' "$create_log" | grep -Fq -- "src=$expected_workdir" || fail "Expected create mount to include source workdir"
   printf '%s\n' "$create_log" | grep -Fq -- "dst=/workdir" || fail "Expected create mount to target /workdir"
   printf '%s\n' "$create_log" | grep -Fq -- "-c 2 -m 3G" || fail "Expected create to include cpu/mem settings"
+  printf '%s\n' "$create_log" | grep -Fq -- "--shm-size 1G" || fail "Expected create to include shared-memory size"
   printf '%s\n' "$create_log" | grep -Fq -- "docker.io/library/alpine:latest sh -c sleep infinity" || fail "Expected create to use requested image"
   printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
 }
@@ -2476,6 +2569,7 @@ test_bootstrap_help_reports_new_command() {
   assert_status 0
   assert_contains "Usage: agentctl bootstrap [options]"
   assert_contains "--image IMAGE   Create the container from IMAGE first if it does not exist"
+  assert_contains "--shm-size SIZE Size of /dev/shm"
   assert_contains "supports Alpine and Debian/Ubuntu-based containers"
 }
 
@@ -7543,6 +7637,7 @@ test_rescue_runs_command_in_temporary_backup_container() {
   local rm_calls=0
 
   require_container() { return 0; }
+  require_container_shm_size_support() { return 0; }
   image_exists() { [ "$1" = "agent-project-backup-20260516113757" ]; }
   container_exists() { return 1; }
   CONTAINER_CMD=container
@@ -7571,11 +7666,12 @@ test_rescue_runs_command_in_temporary_backup_container() {
     esac
   }
 
-  run_capture rescue_cmd --image agent-project-backup-20260516113757 --name unit-rescue --cmd /bin/sh -lc 'cat /etc/agentctl/smoke-marker'
+  run_capture rescue_cmd --image agent-project-backup-20260516113757 --name unit-rescue --shm-size 768M --cmd /bin/sh -lc 'cat /etc/agentctl/smoke-marker'
   assert_status 0
   printf '%s\n' "$create_log" | grep -Fq -- "--name unit-rescue" || fail "Expected named rescue container create, got: $create_log"
   printf '%s\n' "$create_log" | grep -Fq -- "agent-project-backup-20260516113757" || fail "Expected backup image in create call, got: $create_log"
   printf '%s\n' "$create_log" | grep -Fq -- "/bin/sh" || fail "Expected sleep wrapper shell in create call, got: $create_log"
+  printf '%s\n' "$create_log" | grep -Fq -- "--shm-size 768M" || fail "Expected shared-memory size in rescue create, got: $create_log"
   printf '%s\n' "$exec_log" | grep -Fq -- "exec" || fail "Expected rescue exec call, got: $exec_log"
   if printf '%s\n' "$exec_log" | grep -Fq -- "-it"; then
     fail "Did not expect non-interactive rescue command to force -it: $exec_log"
@@ -7929,7 +8025,7 @@ EOF
 }
 
 test_upgrade_uses_explicit_resource_overrides() {
-  begin_test "upgrade prefers explicit --cpu/--mem over inspected values"
+  begin_test "upgrade prefers explicit CPU, memory, and shared-memory overrides"
 
   load_agentctl_functions
 
@@ -7941,6 +8037,8 @@ test_upgrade_uses_explicit_resource_overrides() {
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
   require_container_backup_support() { return 0; }
+  require_container_shm_size_support() { return 0; }
+  container_shm_size() { printf '1073741824\n'; }
   container_supports_state_contract() { return 0; }
   container_exists() { [ "$1" = "unit-test-container" ]; }
   container_running() { return 1; }
@@ -7993,7 +8091,7 @@ test_upgrade_uses_explicit_resource_overrides() {
     printf 'codex\t%s\trw\t2\t4G\n' "$TEST_ROOT"
   }
 
-  run_capture upgrade_cmd --name unit-test-container --cpu 6 --mem 12G
+  run_capture upgrade_cmd --name unit-test-container --cpu 6 --mem 12G --shm-size 2GiB
   assert_status 0
   assert_contains "Upgrade complete: unit-test-container (backup image: unit-test-container-backup-20260406120000)"
   assert_contains $'Starting container for state backup: unit-test-container\n\nBacking up user state from unit-test-container'
@@ -8001,10 +8099,24 @@ test_upgrade_uses_explicit_resource_overrides() {
   assert_contains $'Exporting container state to image: unit-test-container-backup-20260406120000\n\nRemoving container: unit-test-container'
   printf '%s\n' "$create_args" | grep -F -- "-c 6" >/dev/null || fail "Expected create args to include overridden cpu, got: $create_args"
   printf '%s\n' "$create_args" | grep -F -- "-m 12G" >/dev/null || fail "Expected create args to include overridden mem, got: $create_args"
+  printf '%s\n' "$create_args" | grep -F -- "--shm-size 2GiB" >/dev/null || fail "Expected create args to include overridden shared-memory size, got: $create_args"
   printf '%s\n' "$create_args" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected create args to include container name, got: $create_args"
   [ "$start_calls" -eq 2 ] || fail "Expected 2 start calls, got: $start_calls"
   [ "$stop_calls" -eq 2 ] || fail "Expected 2 stop calls, got: $stop_calls"
   [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
+}
+
+test_upgrade_rejects_invalid_shared_memory_before_container_access() {
+  begin_test "upgrade rejects invalid shared-memory size before container access"
+
+  load_agentctl_functions
+
+  require_container() { fail "Invalid shared-memory size reached require_container"; }
+  upgrade_invalid_wrapper() { ( upgrade_cmd "$@" ); }
+
+  run_capture upgrade_invalid_wrapper --name unit-test-container --no-backup --shm-size garbage
+  assert_status 1
+  assert_contains "Invalid --shm-size: garbage"
 }
 
 test_upgrade_can_rename_container_during_recreation() {
@@ -8306,6 +8418,8 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
   require_container_backup_support() { return 0; }
+  require_container_shm_size_support() { return 0; }
+  container_shm_size() { printf '1073741824\n'; }
   container_exists() {
     case "$1" in
       unit-test-container) return 0 ;;
@@ -8364,6 +8478,7 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
   assert_contains "  Mount mode: read-only"
   assert_contains "  CPU: 2 -> 2"
   assert_contains "  Memory: 4G -> 4G"
+  assert_contains "  Shared memory: 1G -> 1G"
   assert_contains "  Config backup: export existing container filesystem and recover user state from it"
   assert_contains "  Backup image: renamed-container-backup-20260406120000"
   assert_contains "  Actions: remove unit-test-container and recreate it as renamed-container"
@@ -10469,6 +10584,10 @@ main() {
   run_selected_test test_host_address_supports_custom_network_subnet_fallback "test_host_address_supports_custom_network_subnet_fallback"
   run_selected_test test_host_address_handles_non_24_and_rejects_malformed_networks "test_host_address_handles_non_24_and_rejects_malformed_networks"
   run_selected_test test_inspect_json_helpers_handle_schema_shapes_and_invalid_input "test_inspect_json_helpers_handle_schema_shapes_and_invalid_input"
+  run_selected_test test_shared_memory_size_helpers_normalize_and_compare_values "test_shared_memory_size_helpers_normalize_and_compare_values"
+  run_selected_test test_container_shm_size_reads_apple_container_inspect_shape "test_container_shm_size_reads_apple_container_inspect_shape"
+  run_selected_test test_shared_memory_support_check_fails_before_use "test_shared_memory_support_check_fails_before_use"
+  run_selected_test test_run_container_passes_shared_memory_size_to_create "test_run_container_passes_shared_memory_size_to_create"
   run_selected_test test_configure_container_host_alias_replaces_stale_entry "test_configure_container_host_alias_replaces_stale_entry"
   run_selected_test test_migrate_legacy_runtime_config_files "test_migrate_legacy_runtime_config_files"
   run_selected_test test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure "test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure"
@@ -10673,6 +10792,7 @@ main() {
   run_selected_test test_run_rejects_resource_flags_for_existing_container "test_run_rejects_resource_flags_for_existing_container"
   run_selected_test test_upgrade_rejects_no_backup_for_legacy_source "test_upgrade_rejects_no_backup_for_legacy_source"
   run_selected_test test_upgrade_uses_explicit_resource_overrides "test_upgrade_uses_explicit_resource_overrides"
+  run_selected_test test_upgrade_rejects_invalid_shared_memory_before_container_access "test_upgrade_rejects_invalid_shared_memory_before_container_access"
   run_selected_test test_upgrade_can_rename_container_during_recreation "test_upgrade_can_rename_container_during_recreation"
   run_selected_test test_upgrade_export_failure_restarts_running_source "test_upgrade_export_failure_restarts_running_source"
   run_selected_test test_upgrade_copy_keeps_running_source_container "test_upgrade_copy_keeps_running_source_container"
