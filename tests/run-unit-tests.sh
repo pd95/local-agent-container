@@ -579,12 +579,12 @@ test_build_cmd_recognizes_container_1_image_snapshot_schema() {
         cat <<'EOF'
 [
   {
-    "configuration":{"name":"agent-plain:latest"},
-    "variants":[{"descriptor":{"digest":"sha256:plain-latest"},"platform":{"architecture":"arm64","os":"linux"}}]
+    "configuration":{"name":"agent-plain:latest","descriptor":{"digest":"sha256:plain-latest"}},
+    "variants":[{"digest":"sha256:plain-variant","platform":{"architecture":"arm64","os":"linux"}}]
   },
   {
-    "configuration":{"name":"docker.io/library/agent-plain:20260718-120000"},
-    "variants":[{"descriptor":{"digest":"sha256:plain-latest"},"platform":{"architecture":"arm64","os":"linux"}}]
+    "configuration":{"name":"docker.io/library/agent-plain:20260718-120000","descriptor":{"digest":"sha256:plain-latest"}},
+    "variants":[{"digest":"sha256:plain-variant","platform":{"architecture":"arm64","os":"linux"}}]
   }
 ]
 EOF
@@ -6966,25 +6966,21 @@ test_ls_reports_matching_snapshot_ref_by_default() {
   CONTAINER_CMD=container
   container() {
     case "$*" in
-      "ls -a")
-        cat <<'EOF'
-ID                               IMAGE                                                OS     ARCH   STATE    ADDR              CPUS  MEMORY   STARTED
-converter                        docker.io/library/debian:latest                      linux  amd64  stopped                    4     1024 MB
-agent-local-agent-container      agent-python:latest                                  linux  arm64  running  192.168.64.253/24  4     4096 MB  2026-06-07T15:03:00Z
-EOF
+      "ls -a --quiet")
+        printf '%s\n' agent-local-agent-container
         ;;
       "image ls --format json")
         cat <<'EOF'
 [
-  {"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"agent-python:latest"},
-  {"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"docker.io/library/agent-python:20260607-150156"},
-  {"descriptor":{"digest":"sha256:other"},"reference":"agent-python:20260607-144649"}
+  {"configuration":{"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"name":"agent-python:latest"},"variants":[]},
+  {"configuration":{"descriptor":{"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"name":"docker.io/library/agent-python:20260607-150156"},"variants":[]},
+  {"configuration":{"descriptor":{"digest":"sha256:other"},"name":"agent-python:20260607-144649"},"variants":[]}
 ]
 EOF
         ;;
       "inspect agent-local-agent-container")
         cat <<'EOF'
-[{"configuration":{"mounts":[{"source":"/Users/philipp/Developer/local-agent-container","options":[],"destination":"/workdir","type":{"virtiofs":{}}}],"resources":{"memoryInBytes":4294967296,"cpus":4},"image":{"descriptor":{"annotations":{"org.opencontainers.image.created":"2026-06-07T15:02:18Z"},"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"agent-python:latest"}},"status":"running"}]
+[{"configuration":{"mounts":[{"source":"/Users/philipp/Developer/local-agent-container","options":[],"destination":"/workdir","type":{"virtiofs":{}}}],"resources":{"memoryInBytes":4294967296,"cpus":4},"image":{"descriptor":{"annotations":{"org.opencontainers.image.created":"2026-06-07T15:02:18Z"},"digest":"sha256:4924ec2b2c5a647919c4d8b8c0846b169a5447b3d57722ec9b0094ed79fa7640"},"reference":"agent-python:latest"}},"status":{"state":"running","networks":[]}}]
 EOF
         ;;
       *)
@@ -7014,11 +7010,8 @@ test_ls_reports_unknown_snapshot_when_timestamp_missing() {
   CONTAINER_CMD=container
   container() {
     case "$*" in
-      "ls -a")
-        cat <<'EOF'
-ID                          IMAGE                OS     ARCH   STATE
-agent-local-agent-container agent-python:latest  linux  arm64  running
-EOF
+      "ls -a --quiet")
+        printf '%s\n' agent-local-agent-container
         ;;
       "image ls --format json")
         cat <<'EOF'
@@ -7054,11 +7047,8 @@ test_ls_keeps_row_when_inspect_fails() {
   CONTAINER_CMD=container
   container() {
     case "$*" in
-      "ls -a")
-        cat <<'EOF'
-ID                          IMAGE                OS     ARCH   STATE
-agent-local-agent-container agent-python:latest  linux  arm64  running
-EOF
+      "ls -a --quiet")
+        printf '%s\n' agent-local-agent-container
         ;;
       "image ls --format json")
         printf '[]\n'

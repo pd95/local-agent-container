@@ -60,6 +60,23 @@ Then:
 5. Fix regressions and repeat the affected checks.
 6. Implement selected 1.1 features only after the compatibility suite passes.
 
+### Discovered network migration issue
+
+After upgrading this host, the default container network moved from
+`192.168.64.0/24` to `192.168.65.0/24`. Existing literal references to
+`192.168.64.1` are therefore stale.
+
+`agent.sh` already detects the current default gateway from `/proc/net/route`
+when neither `OLLAMA_HOST` nor runtime config `ollama_host` is supplied. The
+remaining seed configuration, documentation, examples, and Xcode relay defaults
+must stop treating `192.168.64.1` as stable.
+
+Apple container 1.1 also documents a named host-service route using
+`host.container.internal`, created with `container system dns create
+--localhost`. That mechanism requires elevated host setup, disables Private
+Relay, and its packet-filter rule is removed on restart. Evaluate it as an
+explicit opt-in rather than silently configuring it from `agentctl`.
+
 ## Host baseline commands for 0.12.3
 
 Run these on the macOS host, not inside an agent container:
@@ -231,3 +248,5 @@ use `brew uninstall container` before restoring the Apple package.
 - Stdio ACP/MCP behavior remains byte-clean on stdout.
 - README and testing documentation state the supported macOS and runtime
   versions and provide installation guidance.
+- Default local-model and relay paths do not assume a fixed `192.168.64.1`
+  gateway; stable host DNS setup is documented as an explicit alternative.

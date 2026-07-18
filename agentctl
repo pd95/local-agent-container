@@ -429,7 +429,8 @@ def entry_ref(entry):
 
 def entry_digests(entry):
     digests = set()
-    descriptor = entry.get("descriptor") or {}
+    configuration = entry.get("configuration") or {}
+    descriptor = entry.get("descriptor") or configuration.get("descriptor") or {}
     digest = descriptor.get("digest")
     if isinstance(digest, str) and digest:
         digests.add(digest)
@@ -437,7 +438,7 @@ def entry_digests(entry):
         if not isinstance(variant, dict):
             continue
         descriptor = variant.get("descriptor") or {}
-        digest = descriptor.get("digest")
+        digest = descriptor.get("digest") or variant.get("digest")
         if isinstance(digest, str) and digest:
             digests.add(digest)
     return digests
@@ -6013,17 +6014,25 @@ ls_raw_cmd() {
 }
 
 managed_container_names() {
-  container_list_all | awk '
-    NR == 1 { next }
-    {
-      image = $2
-      sub(/^.*\//, "", image)
-      sub(/[:@].*$/, "", image)
-      if (image ~ /^(agent|codex)([[:alnum:]_.-]*|$)/) {
-        print $1
-      }
-    }
-  '
+  local name=""
+  local image=""
+  local family=""
+
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    image="$(container_image_name "$name")"
+    family="${image##*/}"
+    family="${family%%:*}"
+    family="${family%%@*}"
+    case "$family" in
+      agent*|codex*) printf '%s\n' "$name" ;;
+      "")
+        case "$name" in
+          agent*|codex*) printf '%s\n' "$name" ;;
+        esac
+        ;;
+    esac
+  done < <(container_list_all_ids)
 }
 
 ls_details_row() {
@@ -6118,6 +6127,8 @@ ref = normalize_ref(image.get("reference") or "")
 digest = descriptor.get("digest") or ""
 created = annotations.get("org.opencontainers.image.created") or ""
 status = data.get("status") or "unknown"
+if isinstance(status, dict):
+    status = status.get("state") or "unknown"
 workdir = "unknown"
 mount_mode = "unknown"
 for mount in mounts:
@@ -6136,10 +6147,17 @@ current_family = family_for_ref(ref)
 for entry in images:
     if not isinstance(entry, dict):
         continue
-    entry_digest = ((entry.get("descriptor") or {}).get("digest") or "")
+    entry_config = entry.get("configuration") or {}
+    entry_descriptor = entry.get("descriptor") or entry_config.get("descriptor") or {}
+    entry_digest = entry_descriptor.get("digest") or ""
     if entry_digest != digest:
         continue
-    entry_ref = normalize_ref(entry.get("reference") or "")
+    entry_ref = normalize_ref(
+        entry.get("reference")
+        or entry_config.get("name")
+        or entry_config.get("reference")
+        or ""
+    )
     if not entry_ref:
         continue
     matching_refs.append(entry_ref)
