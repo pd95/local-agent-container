@@ -5,9 +5,14 @@ This guide is the longer version of the top-level README quick start.
 ## Prerequisites
 
 You need:
-- Apple Silicon
-- Ollama installed
-- Apple's `container` CLI installed
+- an Apple Silicon Mac running macOS 26
+- Apple's `container` CLI 1.1 or newer
+- the system Bash and Apple-provided `jq` (jq 1.6 or newer; macOS 26
+  provides `jq 1.7.1-apple`)
+
+No Homebrew installation, host Python, host Node.js, or other package manager is
+required. Install Ollama only when using local-model workflows; online runtime
+workflows do not require it.
 
 Recommended memory:
 - for local-model workflows, plan for at least 32 GB RAM
@@ -38,7 +43,7 @@ ln -sf "$PWD/agentctl" "$HOME/bin/agentctl"
 export PATH="$HOME/bin:$PATH"
 ```
 
-Then run:
+For local-model workflows, install Ollama and then run:
 
 ```bash
 ollama pull gpt-oss:20b
