@@ -2,7 +2,7 @@
   "id": "opencode",
   "command": "opencode",
   "install_method": "npm-prefix",
-  "default_config_dir": "/etc/opencodectl",
+  "default_config_dir": "/etc/agentctl/opencode",
   "capabilities": {
     "install": true,
     "update": true,

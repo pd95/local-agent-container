@@ -409,20 +409,32 @@ test_configure_container_host_alias_replaces_stale_entry() {
   unset -f container
 }
 
-test_remove_legacy_codex_files_preserves_image_metadata() {
-  begin_test "legacy Codex defaults migrate into the agentctl layout"
+test_migrate_legacy_runtime_config_files() {
+  begin_test "legacy runtime defaults migrate into the agentctl layout"
 
   load_agentctl_functions
 
   local temp_root
+  local fake_bin
   local migration_script=""
   temp_root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-legacy-codex.XXXXXX")"
   register_dir_cleanup "$temp_root"
-  mkdir -p "$temp_root/etc/codexctl" "$temp_root/etc/agentctl" "$temp_root/home/coder/.codex"
+  mkdir -p "$temp_root/etc/codexctl" "$temp_root/etc/claudectl" \
+    "$temp_root/etc/opencodectl" "$temp_root/etc/qwenctl" "$temp_root/etc/pictl" \
+    "$temp_root/etc/agentctl/codex" "$temp_root/home/coder/.codex"
   printf '%s\n' legacy-image >"$temp_root/etc/codexctl/image.md"
+  printf '%s\n' legacy-codex-config >"$temp_root/etc/codexctl/config.toml"
+  printf '%s\n' custom-unknown >"$temp_root/etc/codexctl/custom.txt"
+  printf '%s\n' canonical-codex-config >"$temp_root/etc/agentctl/codex/config.toml"
   printf '%s\n' legacy-config >"$temp_root/etc/agentctl/config.toml"
   ln -s "$temp_root/etc/codexctl/image.md" "$temp_root/etc/agentctl/image.md"
   ln -s /etc/codexctl/image.md "$temp_root/home/coder/.codex/AGENTS.md"
+  printf '%s\n' claude-default >"$temp_root/etc/claudectl/settings.json"
+  mkdir -p "$temp_root/etc/agentctl/claude"
+  printf '%s\n' canonical-claude >"$temp_root/etc/agentctl/claude/settings.json"
+  printf '%s\n' opencode-default >"$temp_root/etc/opencodectl/config.json"
+  printf '%s\n' qwen-default >"$temp_root/etc/qwenctl/settings.json"
+  printf '%s\n' pi-default >"$temp_root/etc/pictl/config.json"
 
   CONTAINER_CMD=container
   container() {
@@ -430,16 +442,123 @@ test_remove_legacy_codex_files_preserves_image_metadata() {
     migration_script="$7"
   }
 
-  remove_legacy_codex_files unit-test-container
-  sh -c "$migration_script" sh "$temp_root"
+  migrate_legacy_runtime_config_files unit-test-container
+  run_capture sh -c "$migration_script" sh "$temp_root"
+  assert_status 0
+  assert_contains "preserved legacy Codex defaults at /etc/agentctl/migration-backups/codexctl"
+  assert_contains "preserved conflicting legacy defaults at /etc/agentctl/migration-backups/claudectl"
 
   [ ! -e "$temp_root/etc/codexctl" ] || fail "Expected legacy /etc/codexctl to be removed"
+  [ "$(cat "$temp_root/etc/agentctl/codex/config.toml")" = "canonical-codex-config" ] \
+    || fail "Expected canonical Codex config to win migration conflicts"
+  [ "$(cat "$temp_root/etc/agentctl/migration-backups/codexctl/config.toml")" = "legacy-codex-config" ] \
+    || fail "Expected conflicting legacy Codex config to be preserved"
+  [ "$(cat "$temp_root/etc/agentctl/migration-backups/codexctl/custom.txt")" = "custom-unknown" ] \
+    || fail "Expected unknown legacy Codex files to be preserved"
   [ ! -e "$temp_root/etc/agentctl/config.toml" ] || fail "Expected misplaced generic Codex config to be removed"
   [ ! -L "$temp_root/etc/agentctl/image.md" ] || fail "Expected image metadata symlink to become a regular file"
   [ "$(cat "$temp_root/etc/agentctl/image.md")" = "legacy-image" ] || fail "Expected image metadata to survive migration"
   [ "$(readlink "$temp_root/home/coder/.codex/AGENTS.md")" = "/etc/agentctl/image.md" ] \
     || fail "Expected legacy AGENTS.md symlink to use the agentctl image path"
+  [ "$(cat "$temp_root/etc/agentctl/claude/settings.json")" = "canonical-claude" ] \
+    || fail "Expected canonical Claude defaults to win migration conflicts"
+  [ "$(cat "$temp_root/etc/agentctl/migration-backups/claudectl/settings.json")" = "claude-default" ] \
+    || fail "Expected conflicting legacy Claude defaults to be preserved in a backup"
+  [ "$(cat "$temp_root/etc/agentctl/opencode/config.json")" = "opencode-default" ] \
+    || fail "Expected OpenCode defaults to migrate"
+  [ "$(cat "$temp_root/etc/agentctl/qwen/settings.json")" = "qwen-default" ] \
+    || fail "Expected Qwen defaults to migrate"
+  [ "$(cat "$temp_root/etc/agentctl/pi/config.json")" = "pi-default" ] \
+    || fail "Expected Pi defaults to migrate"
+  for legacy_dir in claudectl opencodectl qwenctl pictl; do
+    [ ! -e "$temp_root/etc/$legacy_dir" ] || fail "Expected legacy /etc/$legacy_dir to be removed"
+  done
   unset -f container
+}
+
+test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure() {
+  begin_test "legacy runtime migration preserves source after copy failure"
+
+  load_agentctl_functions
+
+  local temp_root
+  local migration_script=""
+  temp_root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-legacy-failure.XXXXXX")"
+  register_dir_cleanup "$temp_root"
+  fake_bin="$temp_root/bin"
+  mkdir -p "$fake_bin" "$temp_root/etc/opencodectl" "$temp_root/etc/agentctl/opencode" "$temp_root/home/coder/.codex"
+  printf '%s\n' irreplaceable >"$temp_root/etc/opencodectl/config.json"
+  printf '%s\n' canonical >"$temp_root/etc/agentctl/opencode/config.json"
+  cat >"$fake_bin/cp" <<'EOF'
+#!/bin/sh
+exit 73
+EOF
+  chmod +x "$fake_bin/cp"
+
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = "exec" ] || fail "Expected container exec, got: $*"
+    migration_script="$7"
+  }
+
+  migrate_legacy_runtime_config_files unit-test-container
+  run_capture env PATH="$fake_bin:/usr/bin:/bin" sh -c "$migration_script" sh "$temp_root"
+  [ "$RUN_STATUS" -ne 0 ] || fail "Expected migration copy failure"
+  [ -e "$temp_root/etc/opencodectl/config.json" ] \
+    || fail "Expected legacy source to remain after copy failure"
+  [ "$(cat "$temp_root/etc/agentctl/opencode/config.json")" = "canonical" ] \
+    || fail "Expected canonical target to remain intact after copy failure"
+  unset -f container
+}
+
+test_runtime_default_files_apply_local_overrides() {
+  begin_test "runtime defaults apply ignored host-local overrides"
+
+  load_agentctl_functions
+
+  local temp_dir
+  local refresh_log=""
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-local-defaults.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  DEFAULTS_DIR="$temp_dir/defaults"
+  LOCAL_DEFAULTS_DIR="$temp_dir/defaults.local"
+  mkdir -p "$DEFAULTS_DIR/codex" "$DEFAULTS_DIR/claude" \
+    "$DEFAULTS_DIR/opencode" "$DEFAULTS_DIR/qwen" "$DEFAULTS_DIR/pi" \
+    "$LOCAL_DEFAULTS_DIR/codex" "$LOCAL_DEFAULTS_DIR/claude" \
+    "$LOCAL_DEFAULTS_DIR/opencode" "$LOCAL_DEFAULTS_DIR/qwen" "$LOCAL_DEFAULTS_DIR/pi"
+  printf '%s\n' baseline >"$DEFAULTS_DIR/codex/config.toml"
+  printf '%s\n' profile >"$DEFAULTS_DIR/codex/base.config.toml"
+  printf '%s\n' models >"$DEFAULTS_DIR/codex/local_models.json"
+  printf '%s\n' local >"$LOCAL_DEFAULTS_DIR/codex/config.toml"
+  printf '%s\n' custom-profile >"$LOCAL_DEFAULTS_DIR/codex/custom.config.toml"
+  printf '%s\n' baseline-claude >"$DEFAULTS_DIR/claude/settings.json"
+  printf '%s\n' local-claude >"$LOCAL_DEFAULTS_DIR/claude/settings.json"
+  printf '%s\n' local-opencode >"$LOCAL_DEFAULTS_DIR/opencode/opencode.json"
+  printf '%s\n' local-qwen >"$LOCAL_DEFAULTS_DIR/qwen/settings.json"
+  printf '%s\n' local-pi >"$LOCAL_DEFAULTS_DIR/pi/models.json"
+
+  refresh_container_file() {
+    refresh_log="${refresh_log}$2 -> $3\n"
+  }
+
+  refresh_codex_config_files unit-test-container /etc/agentctl/codex root:root
+  refresh_optional_runtime_default_files unit-test-container
+
+  printf '%b' "$refresh_log" | grep -Fq "$DEFAULTS_DIR/codex/config.toml -> /etc/agentctl/codex/config.toml" \
+    || fail "Expected tracked Codex baseline to be refreshed"
+  printf '%b' "$refresh_log" | grep -Fq "$LOCAL_DEFAULTS_DIR/codex/config.toml -> /etc/agentctl/codex/config.toml" \
+    || fail "Expected local Codex config to override the baseline"
+  printf '%b' "$refresh_log" | grep -Fq "$LOCAL_DEFAULTS_DIR/codex/custom.config.toml -> /etc/agentctl/codex/custom.config.toml" \
+    || fail "Expected additional local Codex profiles to be refreshed"
+  [ "$(runtime_default_file claude settings.json)" = "$LOCAL_DEFAULTS_DIR/claude/settings.json" ] \
+    || fail "Expected local Claude settings to override the baseline"
+  printf '%b' "$refresh_log" | grep -Fq "$LOCAL_DEFAULTS_DIR/opencode/opencode.json -> /etc/agentctl/opencode/opencode.json" \
+    || fail "Expected local OpenCode defaults to be refreshed"
+  printf '%b' "$refresh_log" | grep -Fq "$LOCAL_DEFAULTS_DIR/qwen/settings.json -> /etc/agentctl/qwen/settings.json" \
+    || fail "Expected local Qwen defaults to be refreshed"
+  printf '%b' "$refresh_log" | grep -Fq "$LOCAL_DEFAULTS_DIR/pi/models.json -> /etc/agentctl/pi/models.json" \
+    || fail "Expected local Pi defaults to be refreshed"
+  unset -f refresh_container_file
 }
 
 test_run_container_refreshes_host_alias_before_exec() {
@@ -453,14 +572,91 @@ test_run_container_refreshes_host_alias_before_exec() {
   container_running() { return 0; }
   validate_mount_mode() { :; }
   configure_container_host_alias() { configured_name="$1"; }
+  warn_if_container_agentctl_versions_differ() { :; }
   CONTAINER_CMD=container
   container() {
     [ "$1" = "exec" ] || fail "Expected agent exec, got: $*"
   }
 
-  run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 true
+  assert_status 0
   [ "$configured_name" = "unit-test-container" ] \
     || fail "Expected host alias refresh before exec, got: $configured_name"
+  unset -f container
+}
+
+test_container_agentctl_version_warning_distinguishes_image_and_tooling() {
+  begin_test "container version warning distinguishes image and refreshed tooling"
+
+  load_agentctl_functions
+
+  local current_version
+  current_version="$(cat "$TEST_ROOT/VERSION")"
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      *tooling-version*) printf '%s\n' 0.2.0 ;;
+      *image-version*) printf '%s\n' 0.1.0 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  run_capture warn_if_container_agentctl_versions_differ unit-test-container
+  assert_status 0
+  assert_not_contains "uses agentctl tooling"
+  assert_contains "was built with agentctl 0.1.0"
+  assert_contains "Consider rebuilding and upgrading its image"
+
+  container() {
+    case "$*" in
+      *tooling-version*|*image-version*) printf '%s\n' __missing__ ;;
+      *) return 1 ;;
+    esac
+  }
+  run_capture warn_if_container_agentctl_versions_differ unit-test-container
+  assert_contains "predates agentctl version tracking"
+  assert_contains "has no image build version"
+
+  container() {
+    case "$*" in
+      *tooling-version*) printf '%s\n' 0.1.0 ;;
+      *image-version*) printf '%s\n' "$current_version" ;;
+      *) return 1 ;;
+    esac
+  }
+  run_capture warn_if_container_agentctl_versions_differ unit-test-container
+  assert_contains "uses agentctl tooling 0.1.0"
+  assert_contains "refresh --name unit-test-container"
+  unset -f container
+}
+
+test_new_container_launch_checks_agentctl_versions() {
+  begin_test "new container launch checks image and tooling versions"
+
+  load_agentctl_functions
+
+  local checked_name=""
+  container_exists() { return 1; }
+  container_running() { return 1; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  configure_container_host_alias() { :; }
+  warn_if_container_agentctl_versions_differ() { checked_name="$1"; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create|start|stop) return 0 ;;
+      exec) return 0 ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 true
+  assert_status 0
+  assert_contains "Creating container..."
+  assert_contains "Starting container: unit-test-container"
+  assert_contains "Stopping container: unit-test-container"
+  [ "$checked_name" = "unit-test-container" ] \
+    || fail "Expected version check on first launch, got: ${checked_name:-none}"
   unset -f container
 }
 
@@ -555,6 +751,56 @@ test_build_cmd_passes_runtime_list_build_args() {
   printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_RUNTIMES=codex,claude' || fail "Expected build arg for runtime list, got: $build_call"
   printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_DEFAULT_RUNTIME=claude' || fail "Expected build arg for default runtime, got: $build_call"
   printf '%s\n' "$build_call" | grep -Eq -- '--build-arg BUILD_TIME=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z' || fail "Expected shared build time build arg, got: $build_call"
+}
+
+test_build_cmd_expands_all_registered_runtimes() {
+  begin_test "build_cmd expands all registered runtimes"
+
+  load_agentctl_functions
+
+  local build_call=""
+
+  require_container() { return 0; }
+  image_exists() { return 1; }
+  stop_buildkit_container() { :; }
+  mock_container() {
+    if [ "$1" = "build" ]; then
+      build_call="$(printf '%s\n' "$*")"
+    fi
+  }
+  CONTAINER_CMD="mock_container"
+
+  run_capture build_cmd --image agent-plain --runtimes all
+  assert_status 0
+  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_RUNTIMES=codex,claude,opencode,pi,qwen' \
+    || fail "Expected every registered runtime in the build arg, got: $build_call"
+  printf '%s\n' "$build_call" | grep -Fq -- '--build-arg AGENT_DEFAULT_RUNTIME=codex' \
+    || fail "Expected the normal default runtime to remain codex, got: $build_call"
+}
+
+test_build_cmd_all_rejects_manifest_filename_id_mismatch() {
+  begin_test "build_cmd all rejects runtime manifest filename and id mismatch"
+
+  local temp_dir
+  local unit_script
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-runtime-manifest.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  unit_script="$temp_dir/check.sh"
+  mkdir -p "$temp_dir/runtimes.d"
+  printf '%s\n' '{"id":"different"}' >"$temp_dir/runtimes.d/example.json"
+
+  cat >"$unit_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+source "$AGENTCTL_IMPL"
+SCRIPT_DIR="$temp_dir"
+build_cmd --image agent-plain --runtimes all
+EOF
+  chmod +x "$unit_script"
+
+  run_capture bash "$unit_script"
+  assert_status 1
+  assert_contains "Runtime manifest filename must match id 'different'"
 }
 
 test_build_cmd_uses_first_runtime_as_default_when_unspecified() {
@@ -2393,7 +2639,7 @@ test_agent_sh_claude_runtime_info_reports_skeleton_metadata() {
 
   run_agent_sh_capture "$temp_home" runtime info claude
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "claude" and .installed == false and .install_method == "native-installer" and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.local_mode == true and .capabilities.online_mode == true and (.auth_formats | index("claude_ai_oauth_json") != null) and (.commands | index("runtime install claude") != null) and (.commands | index("auth login claude") != null)' >/dev/null || fail "Expected runtime info JSON for claude runtime, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "claude" and .installed == false and .install_method == "native-installer" and .default_config_dir == "/etc/agentctl/claude" and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == true and .capabilities.auth_read == true and .capabilities.auth_write == true and .capabilities.local_mode == true and .capabilities.online_mode == true and (.auth_formats | index("claude_ai_oauth_json") != null) and (.commands | index("runtime install claude") != null) and (.commands | index("auth login claude") != null)' >/dev/null || fail "Expected runtime info JSON for claude runtime, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_opencode_runtime_info_reports_local_only_metadata() {
@@ -2405,7 +2651,7 @@ test_agent_sh_opencode_runtime_info_reports_local_only_metadata() {
 
   run_agent_sh_capture "$temp_home" runtime info opencode
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "opencode" and .installed == false and .install_method == "npm-prefix" and .default_config_dir == "/etc/opencodectl" and .auth_formats == [] and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == false and .capabilities.auth_read == false and .capabilities.auth_write == false and .capabilities.local_mode == true and .capabilities.online_mode == false and (.commands | index("runtime install opencode") != null)' >/dev/null || fail "Expected runtime info JSON for opencode runtime, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "opencode" and .installed == false and .install_method == "npm-prefix" and .default_config_dir == "/etc/agentctl/opencode" and .auth_formats == [] and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == false and .capabilities.auth_read == false and .capabilities.auth_write == false and .capabilities.local_mode == true and .capabilities.online_mode == false and (.commands | index("runtime install opencode") != null)' >/dev/null || fail "Expected runtime info JSON for opencode runtime, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_qwen_runtime_info_reports_local_only_metadata() {
@@ -2417,7 +2663,7 @@ test_agent_sh_qwen_runtime_info_reports_local_only_metadata() {
 
   run_agent_sh_capture "$temp_home" runtime info qwen
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "qwen" and .installed == false and .install_method == "npm-prefix" and .default_config_dir == "/etc/qwenctl" and .auth_formats == [] and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == false and .capabilities.auth_read == false and .capabilities.auth_write == false and .capabilities.local_mode == true and .capabilities.online_mode == false and (.commands | index("runtime install qwen") != null)' >/dev/null || fail "Expected runtime info JSON for qwen runtime, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "qwen" and .installed == false and .install_method == "npm-prefix" and .default_config_dir == "/etc/agentctl/qwen" and .auth_formats == [] and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == false and .capabilities.auth_read == false and .capabilities.auth_write == false and .capabilities.local_mode == true and .capabilities.online_mode == false and (.commands | index("runtime install qwen") != null)' >/dev/null || fail "Expected runtime info JSON for qwen runtime, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_pi_runtime_info_reports_local_only_metadata() {
@@ -2429,7 +2675,7 @@ test_agent_sh_pi_runtime_info_reports_local_only_metadata() {
 
   run_agent_sh_capture "$temp_home" runtime info pi
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "pi" and .installed == false and .install_method == "npm-prefix" and .default_config_dir == "/etc/pictl" and .auth_formats == [] and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == false and .capabilities.auth_read == false and .capabilities.auth_write == false and .capabilities.local_mode == true and .capabilities.online_mode == false and (.commands | index("runtime install pi") != null)' >/dev/null || fail "Expected runtime info JSON for pi runtime, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "pi" and .installed == false and .install_method == "npm-prefix" and .default_config_dir == "/etc/agentctl/pi" and .auth_formats == [] and .capabilities.install == true and .capabilities.update == true and .capabilities.reset_config == true and .capabilities.auth_login == false and .capabilities.auth_read == false and .capabilities.auth_write == false and .capabilities.local_mode == true and .capabilities.online_mode == false and (.commands | index("runtime install pi") != null)' >/dev/null || fail "Expected runtime info JSON for pi runtime, got: $RUN_OUTPUT"
 }
 
 test_agent_sh_system_manifest_includes_runtime_feature_and_preference_state() {
@@ -4708,13 +4954,20 @@ test_agent_sh_opencode_run_uses_local_ollama_defaults() {
   local fake_bin
   local run_log
   local config_file
+  local registry_dir
+  local default_dir
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$temp_home/bin"
   run_log="$temp_home/opencode-run.log"
   config_file="$temp_home/home/.config/opencode/opencode.json"
-  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  registry_dir="$temp_home/runtimes.d"
+  default_dir="$temp_home/default-opencode"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl" "$registry_dir" "$default_dir"
   printf '%s\n' opencode >"$temp_home/config/agentctl/preferred-runtime"
+  jq --arg config_dir "$default_dir" '.default_config_dir = $config_dir' \
+    "$TEST_ROOT/runtimes.d/opencode.json" >"$registry_dir/opencode.json"
+  printf '%s\n' '{"seeded":true,"model":"ollama/gpt-oss:20b","provider":{"ollama":{}}}' >"$default_dir/opencode.json"
 
   cat >"$fake_bin/opencode" <<EOF
 #!/bin/sh
@@ -4737,11 +4990,12 @@ EOF
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$registry_dir" \
     AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
     -- run
   assert_status 0
   grep -Fq 'ARGS=--model ollama/gpt-oss:20b' "$run_log" || fail "Expected OpenCode run to inject the default local model"
-  jq -er '.provider.ollama.options.baseURL == "http://192.168.0.1:11434/v1" and .provider.ollama.models["gpt-oss:20b"].name == "gpt-oss:20b (local)"' "$config_file" >/dev/null || fail "Expected OpenCode run to write default Ollama config"
+  jq -er '.seeded == true' "$config_file" >/dev/null || fail "Expected OpenCode run to seed image-owned defaults"
 }
 
 test_agent_sh_opencode_run_uses_model_override() {
@@ -4833,13 +5087,20 @@ test_agent_sh_qwen_run_uses_local_ollama_defaults() {
   local fake_bin
   local run_log
   local settings_file
+  local registry_dir
+  local default_dir
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$temp_home/bin"
   run_log="$temp_home/qwen-run.log"
   settings_file="$temp_home/home/.qwen/settings.json"
-  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  registry_dir="$temp_home/runtimes.d"
+  default_dir="$temp_home/default-qwen"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl" "$registry_dir" "$default_dir"
   printf '%s\n' qwen >"$temp_home/config/agentctl/preferred-runtime"
+  jq --arg config_dir "$default_dir" '.default_config_dir = $config_dir' \
+    "$TEST_ROOT/runtimes.d/qwen.json" >"$registry_dir/qwen.json"
+  printf '%s\n' '{"seeded":true}' >"$default_dir/settings.json"
 
   cat >"$fake_bin/qwen" <<EOF
 #!/bin/sh
@@ -4862,6 +5123,7 @@ EOF
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$registry_dir" \
     AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
     -- run
   assert_status 0
@@ -4869,7 +5131,7 @@ EOF
   grep -Fq 'OLLAMA_API_KEY=ollama' "$run_log" || fail "Expected Qwen run to provide dummy Ollama API key"
   grep -Fq 'OPENAI_BASE_URL=http://192.168.0.1:11434/v1' "$run_log" || fail "Expected Qwen run to provide OpenAI-compatible Ollama base URL"
   grep -Fq 'OPENAI_MODEL=gpt-oss:20b' "$run_log" || fail "Expected Qwen run to provide OpenAI model env"
-  jq -er '.model.name == "gpt-oss:20b" and .modelProviders.openai.models[0].baseUrl == "http://192.168.0.1:11434/v1" and .privacy.usageStatisticsEnabled == false' "$settings_file" >/dev/null || fail "Expected Qwen run to write default Ollama config"
+  jq -er '.seeded == true and .model.name == "gpt-oss:20b" and .modelProviders.openai.models[0].baseUrl == "http://192.168.0.1:11434/v1" and .privacy.usageStatisticsEnabled == false' "$settings_file" >/dev/null || fail "Expected Qwen run to seed defaults and merge Ollama config"
 }
 
 test_agent_sh_qwen_run_uses_model_override() {
@@ -5076,13 +5338,20 @@ test_agent_sh_pi_run_uses_local_ollama_defaults() {
   local fake_bin
   local run_log
   local models_file
+  local registry_dir
+  local default_dir
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
   fake_bin="$temp_home/bin"
   run_log="$temp_home/pi-run.log"
   models_file="$temp_home/home/.pi/agent/models.json"
-  mkdir -p "$fake_bin" "$temp_home/config/agentctl"
+  registry_dir="$temp_home/runtimes.d"
+  default_dir="$temp_home/default-pi"
+  mkdir -p "$fake_bin" "$temp_home/config/agentctl" "$registry_dir" "$default_dir"
   printf '%s\n' pi >"$temp_home/config/agentctl/preferred-runtime"
+  jq --arg config_dir "$default_dir" '.default_config_dir = $config_dir' \
+    "$TEST_ROOT/runtimes.d/pi.json" >"$registry_dir/pi.json"
+  printf '%s\n' '{"seeded":true}' >"$default_dir/models.json"
 
   cat >"$fake_bin/pi" <<EOF
 #!/bin/sh
@@ -5105,6 +5374,7 @@ EOF
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$registry_dir" \
     AGENTCTL_OLLAMA_ROUTE_FILE="$temp_home/proc-net-route" \
     -- run
   assert_status 0
@@ -5112,7 +5382,7 @@ EOF
   grep -Fq 'PI_TELEMETRY=0' "$run_log" || fail "Expected Pi telemetry to be disabled"
   grep -Fq 'PI_OFFLINE=1' "$run_log" || fail "Expected Pi offline mode to disable startup network operations"
   grep -Fq 'PI_SKIP_VERSION_CHECK=1' "$run_log" || fail "Expected Pi version checks to be disabled"
-  jq -er '.providers.ollama.baseUrl == "http://192.168.0.1:11434/v1" and .providers.ollama.models[0].id == "gpt-oss:20b"' "$models_file" >/dev/null || fail "Expected Pi run to write default Ollama config"
+  jq -er '.seeded == true and .providers.ollama.baseUrl == "http://192.168.0.1:11434/v1" and .providers.ollama.models[0].id == "gpt-oss:20b"' "$models_file" >/dev/null || fail "Expected Pi run to seed defaults and merge Ollama config"
 }
 
 test_agent_sh_pi_run_uses_model_override() {
@@ -8946,6 +9216,7 @@ test_refresh_updates_managed_files_without_recreate() {
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
   printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/codex/config.toml" || fail "Expected refresh to update /etc/agentctl/codex/config.toml"
   printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/codex/gpt-oss.config.toml" || fail "Expected refresh to update /etc/agentctl/codex/gpt-oss.config.toml"
+  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/tooling-version" || fail "Expected refresh to update the agentctl tooling version marker"
   printf '%s\n' "$exec_log" | grep -Fq "/etc/codexctl" || fail "Expected refresh to remove legacy Codex defaults"
   printf '%s\n' "$exec_log" | grep -Fq "/usr/local/bin/agent.sh" || fail "Expected refresh to update agent.sh"
   printf '%s\n' "$exec_log" | grep -Fq "/usr/local/lib/agentctl/runtimes" || fail "Expected refresh to update runtime adapters"
@@ -9816,13 +10087,19 @@ main() {
   run_selected_test test_host_address_reads_container_1_1_gateway "test_host_address_reads_container_1_1_gateway"
   run_selected_test test_host_address_supports_custom_network_subnet_fallback "test_host_address_supports_custom_network_subnet_fallback"
   run_selected_test test_configure_container_host_alias_replaces_stale_entry "test_configure_container_host_alias_replaces_stale_entry"
-  run_selected_test test_remove_legacy_codex_files_preserves_image_metadata "test_remove_legacy_codex_files_preserves_image_metadata"
+  run_selected_test test_migrate_legacy_runtime_config_files "test_migrate_legacy_runtime_config_files"
+  run_selected_test test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure "test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure"
+  run_selected_test test_runtime_default_files_apply_local_overrides "test_runtime_default_files_apply_local_overrides"
   run_selected_test test_run_container_refreshes_host_alias_before_exec "test_run_container_refreshes_host_alias_before_exec"
+  run_selected_test test_container_agentctl_version_warning_distinguishes_image_and_tooling "test_container_agentctl_version_warning_distinguishes_image_and_tooling"
+  run_selected_test test_new_container_launch_checks_agentctl_versions "test_new_container_launch_checks_agentctl_versions"
   run_selected_test test_start_and_restart_refresh_host_alias "test_start_and_restart_refresh_host_alias"
   run_selected_test test_rescue_help_reports_backup_image_options "test_rescue_help_reports_backup_image_options"
   run_selected_test test_run_model_wires_selected_model "test_run_model_wires_selected_model"
   run_selected_test test_build_help_reports_primary_base_images "test_build_help_reports_primary_base_images"
   run_selected_test test_build_cmd_passes_runtime_list_build_args "test_build_cmd_passes_runtime_list_build_args"
+  run_selected_test test_build_cmd_expands_all_registered_runtimes "test_build_cmd_expands_all_registered_runtimes"
+  run_selected_test test_build_cmd_all_rejects_manifest_filename_id_mismatch "test_build_cmd_all_rejects_manifest_filename_id_mismatch"
   run_selected_test test_build_cmd_uses_first_runtime_as_default_when_unspecified "test_build_cmd_uses_first_runtime_as_default_when_unspecified"
   run_selected_test test_build_cmd_default_runtime_alone_installs_only_that_runtime "test_build_cmd_default_runtime_alone_installs_only_that_runtime"
   run_selected_test test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden "test_build_cmd_rebuilds_existing_image_when_runtime_selection_is_overridden"

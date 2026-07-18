@@ -128,8 +128,14 @@ pi_ensure_models_file() {
   local ollama_base_url="$1"
   local model="$2"
   local models_file=""
+  local default_file=""
 
   models_file="$(pi_models_file)"
+  default_file="$(runtime_default_config_dir pi)/models.json"
+  if [ ! -f "$models_file" ] && [ -f "$default_file" ]; then
+    mkdir -p "$(dirname "$models_file")"
+    cp "$default_file" "$models_file"
+  fi
   if [ -f "$models_file" ]; then
     pi_merge_models "$models_file" "$ollama_base_url" "$model"
   else

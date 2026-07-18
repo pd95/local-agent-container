@@ -2,7 +2,7 @@
   "id": "qwen",
   "command": "qwen",
   "install_method": "npm-prefix",
-  "default_config_dir": "/etc/qwenctl",
+  "default_config_dir": "/etc/agentctl/qwen",
   "capabilities": {
     "install": true,
     "update": true,

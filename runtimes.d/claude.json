@@ -2,7 +2,7 @@
   "id": "claude",
   "command": "claude",
   "install_method": "native-installer",
-  "default_config_dir": "/etc/claudectl",
+  "default_config_dir": "/etc/agentctl/claude",
   "capabilities": {
     "install": true,
     "update": true,

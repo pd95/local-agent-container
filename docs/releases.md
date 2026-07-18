@@ -7,10 +7,23 @@ truth for `agentctl --version`.
 ## 0.2 migration notes
 
 Version 0.2 removes the deprecated `codexctl` wrapper. Use `agentctl` directly.
-Codex image defaults move from `/etc/codexctl` to `/etc/agentctl/codex`, while
-shared image guidance lives at `/etc/agentctl/image.md`. `agentctl refresh`
-migrates existing managed containers, preserves their image guidance, and
-removes the old managed paths.
+Image-owned runtime defaults now live below `/etc/agentctl`: `codex`, `claude`,
+`opencode`, `qwen`, and `pi`. Shared image guidance lives at
+`/etc/agentctl/image.md`. `agentctl refresh` migrates defaults from the legacy
+`/etc/codexctl`, `/etc/claudectl`, `/etc/opencodectl`, `/etc/qwenctl`, and
+`/etc/pictl` directories, preserves image guidance, and removes the old managed
+paths. When both layouts contain the same file, the legacy file is migrated
+before repository-owned defaults are refreshed.
+
+Curated images record immutable build provenance in
+`/etc/agentctl/image-version`. The current managed helper version lives in
+`/etc/agentctl/tooling-version` and is updated by `agentctl refresh`. A missing
+marker identifies an image or container made before this metadata was
+introduced.
+
+Host-side runtime defaults move into tracked `defaults/<runtime>/` directories.
+Ignored `defaults.local/<runtime>/` files can override them for local builds and
+refreshes without changing tracked project files.
 
 ## Release checklist
 

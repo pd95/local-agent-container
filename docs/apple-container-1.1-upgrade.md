@@ -231,9 +231,10 @@ bash tests/run-tests.sh --tier full \
 ```
 
 After updating an existing managed container to agentctl 0.2, run `agentctl
-refresh --name NAME` once. Refresh migrates image-owned Codex defaults from the
-removed `/etc/codexctl` layout to `/etc/agentctl/codex` and repairs the image
-guidance link without changing user-owned Codex configuration.
+refresh --name NAME` once. Refresh migrates image-owned runtime defaults from
+the former runtime-specific `/etc/*ctl` directories into
+`/etc/agentctl/<runtime>` and repairs the image guidance link without changing
+user-owned runtime configuration.
 
 ## Rollback
 

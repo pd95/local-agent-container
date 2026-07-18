@@ -558,6 +558,24 @@ test_run_reset_config_restores_image_defaults() {
   assert_contains "reset-config-ok"
 }
 
+test_image_contains_runtime_defaults_and_version_markers() {
+  begin_test "image contains normalized defaults and separate version markers"
+  local workdir
+
+  workdir="$(new_workdir)"
+  run_capture "$AGENTCTL" run --image agent-plain --temp --workdir "$workdir" --cmd sh -lc '
+    test -f /etc/agentctl/codex/config.toml
+    test -f /etc/agentctl/claude/settings.json
+    test -f /etc/agentctl/image-version
+    test -f /etc/agentctl/tooling-version
+    test "$(cat /etc/agentctl/image-version)" = "$(cat /etc/agentctl/tooling-version)"
+    ! find /etc/agentctl /home/coder/.codex -name .gitkeep -print | grep -q .
+    echo runtime-defaults-and-versions-ok
+  '
+  assert_status 0
+  assert_contains "runtime-defaults-and-versions-ok"
+}
+
 test_upgrade_overwrite_config_restores_image_defaults() {
   begin_test "upgrade --overwrite-config restores config, models, and AGENTS symlink"
   local name
@@ -870,6 +888,7 @@ main() {
   run_selected_test test_upgrade_backup_restores_home_and_boots_rescue_image "upgrade backup restores home state and creates a bootable full-rootfs rescue image" full
   run_selected_test test_upgrade_preflight_failure_keeps_container "upgrade preflight failure leaves the original container intact" full
   run_selected_test test_run_reset_config_restores_image_defaults "run --reset-config restores config, models, and AGENTS symlink" smoke
+  run_selected_test test_image_contains_runtime_defaults_and_version_markers "image contains normalized defaults and separate version markers" smoke
   run_selected_test test_upgrade_overwrite_config_restores_image_defaults "upgrade --overwrite-config restores config, models, and AGENTS symlink" full
   run_selected_test test_system_manifest_requested_packages_on_agent_plain_apk "system manifest reports requested apk packages on agent-plain" full
   run_selected_test test_system_manifest_requested_packages_on_agent_swift_dpkg "system manifest reports requested dpkg packages on agent-swift" full

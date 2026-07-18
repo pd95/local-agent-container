@@ -30,6 +30,8 @@ SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
 CLI_NAME="${AGENTCTL_NAME:-$(basename -- "$SCRIPT_PATH")}"
 KEYCHAIN_SCRIPT="$SCRIPT_DIR/agentctl-keychain.sh"
+DEFAULTS_DIR="$SCRIPT_DIR/defaults"
+LOCAL_DEFAULTS_DIR="$SCRIPT_DIR/defaults.local"
 
 die() {
   echo "Error: $*" >&2
@@ -745,7 +747,7 @@ Run "$CLI_NAME <command> --help" for command-specific options.
 EOF
 }
 
-version_cmd() {
+agentctl_release_version() {
   local version_file="$SCRIPT_DIR/VERSION"
   local version=""
 
@@ -754,6 +756,13 @@ version_cmd() {
   printf '%s\n' "$version" \
     | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' \
     || die "Invalid agentctl VERSION: ${version:-empty}"
+  printf '%s\n' "$version"
+}
+
+version_cmd() {
+  local version=""
+
+  version="$(agentctl_release_version)"
   printf '%s %s\n' "$CLI_NAME" "$version"
 }
 
@@ -763,7 +772,7 @@ Usage: $CLI_NAME build [--image NAME] [--runtimes NAME[,NAME...]] [--default-run
 
 Options:
   --image NAME       Local image name to build (for example: agent-plain, agent-python, agent-swift, agent-my-team)
-  --runtimes LIST    Comma-separated runtimes to preinstall in the image (default: $DEFAULT_RUNTIME)
+  --runtimes LIST    Comma-separated runtimes, or all, to preinstall in the image (default: $DEFAULT_RUNTIME)
   --default-runtime  Runtime to install as the image default (default: $DEFAULT_RUNTIME)
   --rebuild          Rebuild images even if they already exist (disables build cache only; does not refresh FROM tags)
   --snapshot         Add a fresh UTC timestamp tag for existing images without rebuilding
@@ -1529,10 +1538,26 @@ build_cmd() {
   normalize_build_runtime_csv() {
     local raw="$1"
     local entry=""
+    local manifest=""
+    local registered_runtime=""
     local normalized=""
     local first=""
     local duplicate_guard=$'\n'
     local IFS=','
+
+    if [ "$raw" = "all" ]; then
+      raw="$DEFAULT_RUNTIME"
+      for manifest in "$SCRIPT_DIR"/runtimes.d/*.json; do
+        [ -e "$manifest" ] || continue
+        command -v jq >/dev/null 2>&1 || die "jq is required to expand --runtimes all"
+        registered_runtime="$(jq -er '.id | strings | select(length > 0)' "$manifest" 2>/dev/null)" \
+          || die "Invalid runtime id in manifest: $manifest"
+        [ "$(basename "$manifest" .json)" = "$registered_runtime" ] \
+          || die "Runtime manifest filename must match id '$registered_runtime': $manifest"
+        [ "$registered_runtime" = "$DEFAULT_RUNTIME" ] && continue
+        raw="${raw},${registered_runtime}"
+      done
+    fi
     read -r -a build_runtimes <<<"$raw"
 
     for entry in "${build_runtimes[@]}"; do
@@ -1883,9 +1908,11 @@ run_auth_flow() {
 
   "$CONTAINER_CMD" start "$auth_name" >/dev/null
   refresh_container_file "$auth_name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
-  remove_legacy_codex_files "$auth_name"
+  migrate_legacy_runtime_config_files "$auth_name"
+  refresh_container_file "$auth_name" "$SCRIPT_DIR/VERSION" "/etc/agentctl/tooling-version" "root:root" "644"
   refresh_codex_config_files "$auth_name" "/etc/agentctl/codex" "root:root"
-  refresh_container_file "$auth_name" "$SCRIPT_DIR/claude-settings.json" "/etc/claudectl/settings.json" "root:root" "644"
+  refresh_container_file "$auth_name" "$(runtime_default_file claude settings.json)" "/etc/agentctl/claude/settings.json" "root:root" "644"
+  refresh_optional_runtime_default_files "$auth_name"
   refresh_container_file "$auth_name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
   refresh_container_tree "$auth_name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
   refresh_container_tree "$auth_name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
@@ -3156,29 +3183,145 @@ refresh_codex_config_files() {
   local name="$1"
   local target_dir="$2"
   local owner="$3"
+  local source_dir=""
   local profile_config=""
 
-  refresh_container_file "$name" "$SCRIPT_DIR/config.toml" "$target_dir/config.toml" "$owner" "644"
-  for profile_config in "$SCRIPT_DIR"/*.config.toml; do
-    [ -e "$profile_config" ] || continue
-    refresh_container_file "$name" "$profile_config" "$target_dir/$(basename "$profile_config")" "$owner" "644"
+  for source_dir in "$DEFAULTS_DIR/codex" "$LOCAL_DEFAULTS_DIR/codex"; do
+    [ -d "$source_dir" ] || continue
+    if [ -f "$source_dir/config.toml" ]; then
+      refresh_container_file "$name" "$source_dir/config.toml" "$target_dir/config.toml" "$owner" "644"
+    fi
+    for profile_config in "$source_dir"/*.config.toml; do
+      [ -e "$profile_config" ] || continue
+      refresh_container_file "$name" "$profile_config" "$target_dir/$(basename "$profile_config")" "$owner" "644"
+    done
+    if [ -f "$source_dir/local_models.json" ]; then
+      refresh_container_file "$name" "$source_dir/local_models.json" "$target_dir/local_models.json" "$owner" "644"
+    fi
   done
-  refresh_container_file "$name" "$SCRIPT_DIR/local_models.json" "$target_dir/local_models.json" "$owner" "644"
 }
 
-remove_legacy_codex_files() {
+runtime_default_file() {
+  local runtime="$1"
+  local relative_path="$2"
+  local local_file="$LOCAL_DEFAULTS_DIR/$runtime/$relative_path"
+  local baseline_file="$DEFAULTS_DIR/$runtime/$relative_path"
+
+  if [ -f "$local_file" ]; then
+    printf '%s\n' "$local_file"
+  else
+    printf '%s\n' "$baseline_file"
+  fi
+}
+
+refresh_optional_runtime_default_file() {
+  local name="$1"
+  local runtime="$2"
+  local relative_path="$3"
+  local source_file=""
+
+  source_file="$(runtime_default_file "$runtime" "$relative_path")"
+  [ -f "$source_file" ] || return 0
+  refresh_container_file "$name" "$source_file" "/etc/agentctl/$runtime/$relative_path" "root:root" "644"
+}
+
+refresh_optional_runtime_default_files() {
+  local name="$1"
+
+  refresh_optional_runtime_default_file "$name" opencode opencode.json
+  refresh_optional_runtime_default_file "$name" qwen settings.json
+  refresh_optional_runtime_default_file "$name" pi models.json
+}
+
+migrate_legacy_runtime_config_files() {
   local name="$1"
 
   "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    set -e
     root="${1:-}"
     legacy_dir="$root/etc/codexctl"
     agent_dir="$root/etc/agentctl"
     agents_file="$root/home/coder/.codex/AGENTS.md"
     image_copy="/tmp/agentctl-image.md.$$"
+    migration_stage=""
+    migration_dirs=""
+    migration_files=""
+    cleanup_migration() {
+      rm -f "$image_copy"
+      [ -z "$migration_dirs" ] || rm -f "$migration_dirs"
+      [ -z "$migration_files" ] || rm -f "$migration_files"
+      [ -z "$migration_stage" ] || rm -rf "$migration_stage"
+    }
+    trap cleanup_migration EXIT HUP INT TERM
+    migrate_config_dir() {
+      source_dir="$1"
+      target_dir="$2"
+      [ -d "$source_dir" ] || return 0
+      migration_stage="$agent_dir/.migration-stage.$$"
+      migration_dirs="$agent_dir/.migration-dirs.$$"
+      migration_files="$agent_dir/.migration-files.$$"
+      rm -rf "$migration_stage"
+      mkdir -p "$migration_stage" "$target_dir"
+      cp -Rp "$source_dir"/. "$migration_stage"/
+      find "$migration_stage" -type d -print >"$migration_dirs"
+      while IFS= read -r staged_dir; do
+        relative_dir="${staged_dir#"$migration_stage"}"
+        [ -n "$relative_dir" ] || continue
+        mkdir -p "$target_dir$relative_dir"
+      done <"$migration_dirs"
+      find "$migration_stage" ! -type d -print >"$migration_files"
+      conflicts=0
+      while IFS= read -r staged_file; do
+        relative_file="${staged_file#"$migration_stage"}"
+        target_file="$target_dir$relative_file"
+        if [ -e "$target_file" ] || [ -L "$target_file" ]; then
+          conflicts=1
+          continue
+        fi
+        mkdir -p "$(dirname "$target_file")"
+        cp -Rp "$staged_file" "$target_file"
+      done <"$migration_files"
+      rm -rf "$migration_stage"
+      rm -f "$migration_dirs" "$migration_files"
+      migration_stage=""
+      migration_dirs=""
+      migration_files=""
+      if [ "$conflicts" -eq 1 ]; then
+        backup_dir="$agent_dir/migration-backups/$(basename "$source_dir")"
+        if [ -e "$backup_dir" ]; then
+          backup_dir="${backup_dir}.$$"
+        fi
+        mkdir -p "$(dirname "$backup_dir")"
+        mv "$source_dir" "$backup_dir"
+        echo "Warning: preserved conflicting legacy defaults at ${backup_dir#"$root"}" >&2
+      else
+        rm -rf "$source_dir"
+      fi
+    }
+    migrate_codex_dir() {
+      source_dir="$1"
+      target_dir="$agent_dir/codex"
+      [ -d "$source_dir" ] || return 0
+      mkdir -p "$target_dir"
+      for source_file in "$source_dir/config.toml" "$source_dir"/*.config.toml "$source_dir/local_models.json"; do
+        [ -f "$source_file" ] || continue
+        target_file="$target_dir/$(basename "$source_file")"
+        if [ ! -e "$target_file" ] && [ ! -L "$target_file" ]; then
+          cp -p "$source_file" "$target_file"
+        fi
+      done
+      backup_dir="$agent_dir/migration-backups/codexctl"
+      if [ -e "$backup_dir" ]; then
+        backup_dir="${backup_dir}.$$"
+      fi
+      mkdir -p "$(dirname "$backup_dir")"
+      mv "$source_dir" "$backup_dir"
+      echo "Warning: preserved legacy Codex defaults at ${backup_dir#"$root"}" >&2
+    }
     if [ -f "$agent_dir/image.md" ]; then
       cp -L "$agent_dir/image.md" "$image_copy"
     fi
-    rm -rf "$legacy_dir"
+    migrate_codex_dir "$legacy_dir"
     rm -f "$agent_dir/config.toml" "$agent_dir"/*.config.toml "$agent_dir/local_models.json"
     if [ -f "$image_copy" ]; then
       rm -f "$agent_dir/image.md"
@@ -3188,6 +3331,10 @@ remove_legacy_codex_files() {
     if [ -L "$agents_file" ] && [ "$(readlink "$agents_file")" = "/etc/codexctl/image.md" ]; then
       ln -sf /etc/agentctl/image.md "$agents_file"
     fi
+    migrate_config_dir "$root/etc/claudectl" "$agent_dir/claude"
+    migrate_config_dir "$root/etc/opencodectl" "$agent_dir/opencode"
+    migrate_config_dir "$root/etc/qwenctl" "$agent_dir/qwen"
+    migrate_config_dir "$root/etc/pictl" "$agent_dir/pi"
   '
 }
 
@@ -3267,16 +3414,19 @@ EOF
     if ! id -u coder >/dev/null 2>&1; then
       adduser -S -G coder -h /home/coder -s /bin/bash coder >/dev/null
     fi
-    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/agentctl/codex /etc/claudectl /var/lib/agentctl /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude
-    rm -rf /etc/codexctl
+    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/agentctl/codex /etc/agentctl/claude /var/lib/agentctl /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude
     chown -R coder:coder /home/coder /opt/agentctl
     chown coder:coder /workdir >/dev/null 2>&1 || true
   '
 
+  migrate_legacy_runtime_config_files "$name"
   refresh_container_file "$name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
+  refresh_container_file "$name" "$SCRIPT_DIR/VERSION" "/etc/agentctl/tooling-version" "root:root" "644"
+  refresh_container_file "$name" "$SCRIPT_DIR/VERSION" "/etc/agentctl/image-version" "root:root" "644"
   refresh_codex_config_files "$name" "/home/coder/.codex" "coder:coder"
   refresh_codex_config_files "$name" "/etc/agentctl/codex" "root:root"
-  refresh_container_file "$name" "$SCRIPT_DIR/claude-settings.json" "/etc/claudectl/settings.json" "root:root" "644"
+  refresh_container_file "$name" "$(runtime_default_file claude settings.json)" "/etc/agentctl/claude/settings.json" "root:root" "644"
+  refresh_optional_runtime_default_files "$name"
   refresh_container_file "$name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
@@ -3335,16 +3485,19 @@ EOF
     if ! id -u coder >/dev/null 2>&1; then
       useradd -m -g coder -d /home/coder -s /bin/bash coder
     fi
-    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/agentctl/codex /etc/claudectl /var/lib/agentctl /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude
-    rm -rf /etc/codexctl
+    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/agentctl/codex /etc/agentctl/claude /var/lib/agentctl /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude
     chown -R coder:coder /home/coder /opt/agentctl
     chown coder:coder /workdir >/dev/null 2>&1 || true
   '
 
+  migrate_legacy_runtime_config_files "$name"
   refresh_container_file "$name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
+  refresh_container_file "$name" "$SCRIPT_DIR/VERSION" "/etc/agentctl/tooling-version" "root:root" "644"
+  refresh_container_file "$name" "$SCRIPT_DIR/VERSION" "/etc/agentctl/image-version" "root:root" "644"
   refresh_codex_config_files "$name" "/home/coder/.codex" "coder:coder"
   refresh_codex_config_files "$name" "/etc/agentctl/codex" "root:root"
-  refresh_container_file "$name" "$SCRIPT_DIR/claude-settings.json" "/etc/claudectl/settings.json" "root:root" "644"
+  refresh_container_file "$name" "$(runtime_default_file claude settings.json)" "/etc/agentctl/claude/settings.json" "root:root" "644"
+  refresh_optional_runtime_default_files "$name"
   refresh_container_file "$name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
@@ -3488,9 +3641,11 @@ refresh_cmd() {
   fi
 
   refresh_container_file "$name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
-  remove_legacy_codex_files "$name"
+  migrate_legacy_runtime_config_files "$name"
+  refresh_container_file "$name" "$SCRIPT_DIR/VERSION" "/etc/agentctl/tooling-version" "root:root" "644"
   refresh_codex_config_files "$name" "/etc/agentctl/codex" "root:root"
-  refresh_container_file "$name" "$SCRIPT_DIR/claude-settings.json" "/etc/claudectl/settings.json" "root:root" "644"
+  refresh_container_file "$name" "$(runtime_default_file claude settings.json)" "/etc/agentctl/claude/settings.json" "root:root" "644"
+  refresh_optional_runtime_default_files "$name"
   refresh_container_file "$name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
@@ -5090,6 +5245,48 @@ display_upgrade_memory_limit() {
   display_memory_limit "$1"
 }
 
+warn_if_container_agentctl_versions_differ() {
+  local name="$1"
+  local current_version=""
+  local tooling_version=""
+  local image_version=""
+
+  current_version="$(agentctl_release_version)"
+  if ! tooling_version="$("$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    if [ -f /etc/agentctl/tooling-version ]; then
+      cat /etc/agentctl/tooling-version
+    else
+      printf "%s\n" __missing__
+    fi
+  ' 2>/dev/null)"; then
+    return 0
+  fi
+  if ! image_version="$("$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    if [ -f /etc/agentctl/image-version ]; then
+      cat /etc/agentctl/image-version
+    else
+      printf "%s\n" __missing__
+    fi
+  ' 2>/dev/null)"; then
+    image_version=""
+  fi
+
+  if [ "$tooling_version" = "__missing__" ]; then
+    warn "Container $name predates agentctl version tracking; run '$CLI_NAME refresh --name $name'"
+  elif [ -z "$tooling_version" ]; then
+    warn "Container $name has an empty agentctl tooling version; run '$CLI_NAME refresh --name $name'"
+  elif [ "$tooling_version" != "$current_version" ]; then
+    warn "Container $name uses agentctl tooling $tooling_version; host tooling is $current_version. Run '$CLI_NAME refresh --name $name'"
+  fi
+  if [ "$image_version" = "__missing__" ]; then
+    warn "Container $name has no image build version; consider rebuilding and upgrading it"
+  elif [ -z "$image_version" ]; then
+    warn "Container $name has an empty image build version; consider rebuilding and upgrading it"
+  elif [ -n "$image_version" ] && [ "$image_version" != "$current_version" ]; then
+    warn "Container $name was built with agentctl $image_version; host tooling is $current_version. Consider rebuilding and upgrading its image"
+  fi
+}
+
 run_container() {
   local name="$1"
   local image="$2"
@@ -5191,6 +5388,7 @@ run_container() {
   fi
 
   configure_container_host_alias "$actual_name"
+  warn_if_container_agentctl_versions_differ "$actual_name"
 
   if [ "$reset_config" -eq 1 ]; then
     local reset_runtime="${RUN_SELECTED_RUNTIME:-}"

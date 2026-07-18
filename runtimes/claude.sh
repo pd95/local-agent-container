@@ -11,8 +11,8 @@ claude_command_path() {
 claude_write_default_settings() {
   local target_file="$1"
 
-  if [ -f /etc/claudectl/settings.json ]; then
-    cp /etc/claudectl/settings.json "$target_file"
+  if [ -f /etc/agentctl/claude/settings.json ]; then
+    cp /etc/agentctl/claude/settings.json "$target_file"
     return 0
   fi
   cat >"$target_file" <<'EOF'

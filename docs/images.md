@@ -37,12 +37,16 @@ You can choose which runtimes are built into an image:
 
 ```bash
 agentctl build --runtimes codex,claude --default-runtime claude
+# Or install every runtime currently registered with agentctl:
+agentctl build --runtimes all --default-runtime codex
 ```
 
 Rules:
 
 - if `--default-runtime` is omitted, the first runtime in `--runtimes` becomes
   the default
+- `--runtimes all` expands to every manifest in `runtimes.d`, keeping `codex`
+  first as the default unless `--default-runtime` is supplied
 - `--default-runtime <name>` still works by itself for the single-runtime case
 
 Image builds use the copied in-image `agent.sh runtime install ...` flow, so
@@ -246,10 +250,51 @@ The curated images carry image-owned defaults used by `refresh`,
 - `/etc/agentctl/codex/config.toml`
 - `/etc/agentctl/codex/local_models.json`
 - `/etc/agentctl/image.md`
-- `/etc/claudectl/settings.json`
+- `/etc/agentctl/image-version`
+- `/etc/agentctl/tooling-version`
+- `/etc/agentctl/claude/settings.json`
 
 The global `AGENTS.md` guidance inside the image points at the image-owned
 metadata file instead of storing mutable user state inside `~/.codex`.
+
+Host-side baselines use the same runtime grouping:
+
+- `defaults/codex/`
+- `defaults/claude/`
+- `defaults/opencode/`
+- `defaults/qwen/`
+- `defaults/pi/`
+
+These files are tracked and provide working starting points. Personal defaults
+belong in the ignored `defaults.local/<runtime>/` overlay. A file there replaces
+the tracked file with the same name during image builds and `agentctl refresh`.
+For example:
+
+```bash
+cp defaults/codex/config.toml defaults.local/codex/config.toml
+# Edit defaults.local/codex/config.toml, then rebuild the desired images.
+agentctl build
+```
+
+Additional Codex `*.config.toml` profiles placed in
+`defaults.local/codex/` are included as image defaults. Avoid putting auth
+tokens or other secrets in either defaults directory: image layers and
+container defaults are not secret storage.
+
+OpenCode, Qwen Code, and Pi normally generate their Ollama provider settings at
+runtime because the endpoint and selected model can vary. Their tracked folders
+are therefore intentionally empty. Optional local defaults use these filenames:
+
+- `defaults.local/opencode/opencode.json`
+- `defaults.local/qwen/settings.json`
+- `defaults.local/pi/models.json`
+
+Builds place supplied files in the matching `/etc/agentctl/<runtime>` directory;
+refresh deploys them to existing containers. Qwen Code and Pi merge their
+launch-time model and endpoint into user configuration. OpenCode uses an
+existing configuration unchanged, so a local OpenCode default should use a
+portable endpoint such as `http://host.container.internal:11434/v1` unless a
+fixed endpoint is intentional.
 
 ## Related docs
 
