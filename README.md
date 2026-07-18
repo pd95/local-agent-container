@@ -5,6 +5,9 @@
 This repository packages a practical local setup for running agent CLIs on Apple
 Silicon Macs with Apple’s `container` tool.
 
+Run `agentctl --version` to inspect the checked-out release. Published versions
+and the release process are documented in [docs/releases.md](docs/releases.md).
+
 The main entry point is `agentctl`, which manages:
 - curated images such as `agent-plain`, `agent-python`, and `agent-swift`
 - runtime selection (`codex`, `claude`, and more over time)

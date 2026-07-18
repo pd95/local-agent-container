@@ -2,7 +2,7 @@
   "id": "codex",
   "command": "codex",
   "install_method": "standalone-installer",
-  "default_config_dir": "/etc/codexctl",
+  "default_config_dir": "/etc/agentctl/codex",
   "capabilities": {
     "install": true,
     "update": true,

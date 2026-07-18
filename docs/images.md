@@ -243,9 +243,9 @@ agentctl images rm --image agent-custom --dry-run
 The curated images carry image-owned defaults used by `refresh`,
 `reset-config`, and runtime adapters, including:
 
-- `/etc/codexctl/config.toml`
-- `/etc/codexctl/local_models.json`
-- `/etc/codexctl/image.md`
+- `/etc/agentctl/codex/config.toml`
+- `/etc/agentctl/codex/local_models.json`
+- `/etc/agentctl/image.md`
 - `/etc/claudectl/settings.json`
 
 The global `AGENTS.md` guidance inside the image points at the image-owned

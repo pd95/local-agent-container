@@ -718,6 +718,7 @@ usage() {
 Usage: $CLI_NAME <command> [options]
 
 Commands:
+  version    Print the agentctl release version
   build      Build agent images
   run        Create/start a container for the current directory
   bootstrap  Bootstrap agentctl into an existing compatible container
@@ -742,6 +743,18 @@ Commands:
 
 Run "$CLI_NAME <command> --help" for command-specific options.
 EOF
+}
+
+version_cmd() {
+  local version_file="$SCRIPT_DIR/VERSION"
+  local version=""
+
+  [ -f "$version_file" ] || die "Missing agentctl VERSION file: $version_file"
+  IFS= read -r version <"$version_file" || true
+  printf '%s\n' "$version" \
+    | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' \
+    || die "Invalid agentctl VERSION: ${version:-empty}"
+  printf '%s %s\n' "$CLI_NAME" "$version"
 }
 
 usage_build() {
@@ -1870,8 +1883,8 @@ run_auth_flow() {
 
   "$CONTAINER_CMD" start "$auth_name" >/dev/null
   refresh_container_file "$auth_name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
-  refresh_codex_config_files "$auth_name" "/etc/agentctl" "root:root"
-  refresh_codex_config_files "$auth_name" "/etc/codexctl" "root:root"
+  remove_legacy_codex_files "$auth_name"
+  refresh_codex_config_files "$auth_name" "/etc/agentctl/codex" "root:root"
   refresh_container_file "$auth_name" "$SCRIPT_DIR/claude-settings.json" "/etc/claudectl/settings.json" "root:root" "644"
   refresh_container_file "$auth_name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
   refresh_container_tree "$auth_name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
@@ -2377,7 +2390,7 @@ doctor_fix_missing_codex_agents() {
 
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
 mkdir -p /home/coder/.codex
-ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
+ln -sf /etc/agentctl/image.md /home/coder/.codex/AGENTS.md
 chown -h coder:coder /home/coder/.codex/AGENTS.md
 '
 }
@@ -3153,6 +3166,31 @@ refresh_codex_config_files() {
   refresh_container_file "$name" "$SCRIPT_DIR/local_models.json" "$target_dir/local_models.json" "$owner" "644"
 }
 
+remove_legacy_codex_files() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    root="${1:-}"
+    legacy_dir="$root/etc/codexctl"
+    agent_dir="$root/etc/agentctl"
+    agents_file="$root/home/coder/.codex/AGENTS.md"
+    image_copy="/tmp/agentctl-image.md.$$"
+    if [ -f "$agent_dir/image.md" ]; then
+      cp -L "$agent_dir/image.md" "$image_copy"
+    fi
+    rm -rf "$legacy_dir"
+    rm -f "$agent_dir/config.toml" "$agent_dir"/*.config.toml "$agent_dir/local_models.json"
+    if [ -f "$image_copy" ]; then
+      rm -f "$agent_dir/image.md"
+      cp "$image_copy" "$agent_dir/image.md"
+      rm -f "$image_copy"
+    fi
+    if [ -L "$agents_file" ] && [ "$(readlink "$agents_file")" = "/etc/codexctl/image.md" ]; then
+      ln -sf /etc/agentctl/image.md "$agents_file"
+    fi
+  '
+}
+
 write_container_file_content() {
   local name="$1"
   local target="$2"
@@ -3229,28 +3267,27 @@ EOF
     if ! id -u coder >/dev/null 2>&1; then
       adduser -S -G coder -h /home/coder -s /bin/bash coder >/dev/null
     fi
-    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/codexctl /etc/claudectl /etc/agentctl /var/lib/agentctl /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude
+    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/agentctl/codex /etc/claudectl /var/lib/agentctl /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude
+    rm -rf /etc/codexctl
     chown -R coder:coder /home/coder /opt/agentctl
     chown coder:coder /workdir >/dev/null 2>&1 || true
   '
 
   refresh_container_file "$name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
   refresh_codex_config_files "$name" "/home/coder/.codex" "coder:coder"
-  refresh_codex_config_files "$name" "/etc/agentctl" "root:root"
-  refresh_codex_config_files "$name" "/etc/codexctl" "root:root"
+  refresh_codex_config_files "$name" "/etc/agentctl/codex" "root:root"
   refresh_container_file "$name" "$SCRIPT_DIR/claude-settings.json" "/etc/claudectl/settings.json" "root:root" "644"
   refresh_container_file "$name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/features" "/usr/local/lib/agentctl/features" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/features.d" "/etc/agentctl/features.d" "root:root" "644" "755"
-  refresh_container_file "$name" "$image_md_file" "/etc/codexctl/image.md" "root:root" "644"
   refresh_container_file "$name" "$image_md_file" "/etc/agentctl/image.md" "root:root" "644"
   persist_container_system_manifest_baseline_from_live_state "$name" "bootstrapped-container"
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
     set -e
     printf "%s\n" codex >/etc/agentctl/preferred-runtime
-    ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
+    ln -sf /etc/agentctl/image.md /home/coder/.codex/AGENTS.md
     chown -h coder:coder /home/coder/.codex/AGENTS.md
     cat >/etc/agentctl/bootstrap.json <<JSON
 {"schema_version":1,"bootstrapped":true,"bootstrap_package_manager":"apk","bootstrap_mode":"in-place"}
@@ -3298,28 +3335,27 @@ EOF
     if ! id -u coder >/dev/null 2>&1; then
       useradd -m -g coder -d /home/coder -s /bin/bash coder
     fi
-    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/codexctl /etc/claudectl /etc/agentctl /var/lib/agentctl /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude
+    mkdir -p /home/coder/.codex /home/coder/.local/bin /workdir /etc/agentctl/codex /etc/claudectl /var/lib/agentctl /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude
+    rm -rf /etc/codexctl
     chown -R coder:coder /home/coder /opt/agentctl
     chown coder:coder /workdir >/dev/null 2>&1 || true
   '
 
   refresh_container_file "$name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
   refresh_codex_config_files "$name" "/home/coder/.codex" "coder:coder"
-  refresh_codex_config_files "$name" "/etc/agentctl" "root:root"
-  refresh_codex_config_files "$name" "/etc/codexctl" "root:root"
+  refresh_codex_config_files "$name" "/etc/agentctl/codex" "root:root"
   refresh_container_file "$name" "$SCRIPT_DIR/claude-settings.json" "/etc/claudectl/settings.json" "root:root" "644"
   refresh_container_file "$name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/features" "/usr/local/lib/agentctl/features" "root:root" "644" "755"
   refresh_container_tree "$name" "$SCRIPT_DIR/features.d" "/etc/agentctl/features.d" "root:root" "644" "755"
-  refresh_container_file "$name" "$image_md_file" "/etc/codexctl/image.md" "root:root" "644"
   refresh_container_file "$name" "$image_md_file" "/etc/agentctl/image.md" "root:root" "644"
   persist_container_system_manifest_baseline_from_live_state "$name" "bootstrapped-container"
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
     set -e
     printf "%s\n" codex >/etc/agentctl/preferred-runtime
-    ln -sf /etc/codexctl/image.md /home/coder/.codex/AGENTS.md
+    ln -sf /etc/agentctl/image.md /home/coder/.codex/AGENTS.md
     chown -h coder:coder /home/coder/.codex/AGENTS.md
     cat >/etc/agentctl/bootstrap.json <<JSON
 {"schema_version":1,"bootstrapped":true,"bootstrap_package_manager":"apt-get","bootstrap_mode":"in-place"}
@@ -3452,8 +3488,8 @@ refresh_cmd() {
   fi
 
   refresh_container_file "$name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
-  refresh_codex_config_files "$name" "/etc/agentctl" "root:root"
-  refresh_codex_config_files "$name" "/etc/codexctl" "root:root"
+  remove_legacy_codex_files "$name"
+  refresh_codex_config_files "$name" "/etc/agentctl/codex" "root:root"
   refresh_container_file "$name" "$SCRIPT_DIR/claude-settings.json" "/etc/claudectl/settings.json" "root:root" "644"
   refresh_container_file "$name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
   refresh_container_tree "$name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
@@ -5727,7 +5763,7 @@ upgrade_cmd() {
           echo "Stopping container: $name" >&2
           "$CONTAINER_CMD" stop "$name" >/dev/null || true
         fi
-        die "Container has ~/.codex/AGENTS.md as a regular file. Re-run with --overwrite-config to replace ~/.codex/config.toml, default ~/.codex/*.config.toml profiles, and ~/.codex/local_models.json and recreate ~/.codex/AGENTS.md as a symlink to /etc/codexctl/image.md. If no valid AGENTS.md configuration already exists, use ${CLI_NAME} run --name $name --reset-config"
+        die "Container has ~/.codex/AGENTS.md as a regular file. Re-run with --overwrite-config to replace ~/.codex/config.toml, default ~/.codex/*.config.toml profiles, and ~/.codex/local_models.json and recreate ~/.codex/AGENTS.md as a symlink to /etc/agentctl/image.md. If no valid AGENTS.md configuration already exists, use ${CLI_NAME} run --name $name --reset-config"
       fi
       echo "Warning: replacing regular ~/.codex/AGENTS.md, ~/.codex/config.toml, default ~/.codex/*.config.toml profiles, and ~/.codex/local_models.json in $name due to --overwrite-config" >&2
       ;;
@@ -5737,7 +5773,7 @@ upgrade_cmd() {
           echo "Stopping container: $name" >&2
           "$CONTAINER_CMD" stop "$name" >/dev/null || true
         fi
-        die "Container has ~/.codex/AGENTS.md in a non-symlink form. Re-run with --overwrite-config to recreate it as a symlink to /etc/codexctl/image.md. If no valid AGENTS.md configuration already exists, use ${CLI_NAME} run --name $name --reset-config"
+        die "Container has ~/.codex/AGENTS.md in a non-symlink form. Re-run with --overwrite-config to recreate it as a symlink to /etc/agentctl/image.md. If no valid AGENTS.md configuration already exists, use ${CLI_NAME} run --name $name --reset-config"
       fi
       echo "Warning: replacing non-standard ~/.codex/AGENTS.md in $name due to --overwrite-config" >&2
       ;;
@@ -6365,6 +6401,7 @@ ls_details_cmd() {
 
 cmd="${1:-}"
 case "$cmd" in
+  --version|-V|version) shift; version_cmd "$@" ;;
   build) shift; build_cmd "$@" ;;
   run) shift; run_cmd "$@" ;;
   bootstrap) shift; bootstrap_cmd "$@" ;;

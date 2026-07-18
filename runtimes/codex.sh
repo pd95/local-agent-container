@@ -202,8 +202,8 @@ codex_ensure_config_file() {
     codex_copy_missing_default_profile_configs
     return 0
   fi
-  if [ -f /etc/codexctl/config.toml ]; then
-    cp /etc/codexctl/config.toml "$config_file"
+  if [ -f /etc/agentctl/codex/config.toml ]; then
+    cp /etc/agentctl/codex/config.toml "$config_file"
     codex_copy_missing_default_profile_configs
     return 0
   fi
@@ -214,8 +214,8 @@ codex_copy_missing_default_profile_configs() {
   local profile_config=""
   local target=""
 
-  [ -d /etc/codexctl ] || return 0
-  for profile_config in /etc/codexctl/*.config.toml; do
+  [ -d /etc/agentctl/codex ] || return 0
+  for profile_config in /etc/agentctl/codex/*.config.toml; do
     [ -e "$profile_config" ] || continue
     target="$(codex_home_dir)/$(basename "$profile_config")"
     [ -f "$target" ] && continue
@@ -823,7 +823,7 @@ agent_runtime_reset_config() {
   else
     rm -f "$codex_dir/local_models.json"
   fi
-  ln -sf "$config_dir/image.md" "$codex_dir/AGENTS.md"
+  ln -sf /etc/agentctl/image.md "$codex_dir/AGENTS.md"
   rm -f "$USER_RUNTIME_FILE"
 }
 

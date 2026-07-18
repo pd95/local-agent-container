@@ -4,7 +4,6 @@ set -euo pipefail
 TEST_ROOT="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 AGENTCTL="${AGENTCTL:-$TEST_ROOT/agentctl}"
 AGENTCTL_IMPL="${AGENTCTL_IMPL:-$TEST_ROOT/agentctl}"
-CODEXCTL="${CODEXCTL:-$AGENTCTL_IMPL}"
 CONTAINER_CMD="${CONTAINER_CMD:-container}"
 TEST_FILTER="${TEST_FILTER:-}"
 TEST_START_FROM="${TEST_START_FROM:-}"
@@ -49,7 +48,7 @@ unique_name() {
 
 new_workdir() {
   local dir
-  dir="$(mktemp -d "${TMPDIR:-/tmp}/codexctl-test.XXXXXX")"
+  dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-test.XXXXXX")"
   register_dir_cleanup "$dir"
   printf '%s\n' "$dir"
 }
@@ -159,7 +158,7 @@ list_backup_images() {
 
 run_capture() {
   local log_file
-  log_file="$(mktemp "${TMPDIR:-/tmp}/codexctl-test-log.XXXXXX")"
+  log_file="$(mktemp "${TMPDIR:-/tmp}/agentctl-test-log.XXXXXX")"
   if "$@" >"$log_file" 2>&1; then
     RUN_STATUS=0
   else

@@ -170,20 +170,20 @@ agentctl run --image agent-office --temp --workdir testing/agent-office --cmd ba
 Also verify the image metadata file is present and readable:
 
 ```bash
-agentctl run --image agent-plain --temp --workdir testing/agent-plain --cmd bash -lc 'test -f /etc/codexctl/image.md && sed -n "1,20p" /etc/codexctl/image.md'
-agentctl run --image agent-python --temp --workdir testing/agent-python --cmd bash -lc 'test -f /etc/codexctl/image.md && sed -n "1,20p" /etc/codexctl/image.md'
-agentctl run --image agent-swift --temp --workdir testing/agent-swift --cmd bash -lc 'test -f /etc/codexctl/image.md && sed -n "1,20p" /etc/codexctl/image.md'
-agentctl run --image agent-office --temp --workdir testing/agent-office --cmd bash -lc 'test -f /etc/codexctl/image.md && sed -n "1,20p" /etc/codexctl/image.md'
+agentctl run --image agent-plain --temp --workdir testing/agent-plain --cmd bash -lc 'test -f /etc/agentctl/image.md && sed -n "1,20p" /etc/agentctl/image.md'
+agentctl run --image agent-python --temp --workdir testing/agent-python --cmd bash -lc 'test -f /etc/agentctl/image.md && sed -n "1,20p" /etc/agentctl/image.md'
+agentctl run --image agent-swift --temp --workdir testing/agent-swift --cmd bash -lc 'test -f /etc/agentctl/image.md && sed -n "1,20p" /etc/agentctl/image.md'
+agentctl run --image agent-office --temp --workdir testing/agent-office --cmd bash -lc 'test -f /etc/agentctl/image.md && sed -n "1,20p" /etc/agentctl/image.md'
 ```
 
 Also verify the image-owned config, default profile files, and model metadata are present
 and match the default user copies inside the image:
 
 ```bash
-agentctl run --image agent-plain --temp --workdir testing/agent-plain --cmd bash -lc 'test -f /etc/codexctl/config.toml && test -f /etc/codexctl/gpt-oss.config.toml && test -f /etc/codexctl/local_models.json && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json'
-agentctl run --image agent-python --temp --workdir testing/agent-python --cmd bash -lc 'test -f /etc/codexctl/config.toml && test -f /etc/codexctl/gpt-oss.config.toml && test -f /etc/codexctl/local_models.json && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json'
-agentctl run --image agent-swift --temp --workdir testing/agent-swift --cmd bash -lc 'test -f /etc/codexctl/config.toml && test -f /etc/codexctl/gpt-oss.config.toml && test -f /etc/codexctl/local_models.json && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json'
-agentctl run --image agent-office --temp --workdir testing/agent-office --cmd bash -lc 'test -f /etc/codexctl/config.toml && test -f /etc/codexctl/gpt-oss.config.toml && test -f /etc/codexctl/local_models.json && diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json'
+agentctl run --image agent-plain --temp --workdir testing/agent-plain --cmd bash -lc 'test -f /etc/agentctl/codex/config.toml && test -f /etc/agentctl/codex/gpt-oss.config.toml && test -f /etc/agentctl/codex/local_models.json && diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json'
+agentctl run --image agent-python --temp --workdir testing/agent-python --cmd bash -lc 'test -f /etc/agentctl/codex/config.toml && test -f /etc/agentctl/codex/gpt-oss.config.toml && test -f /etc/agentctl/codex/local_models.json && diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json'
+agentctl run --image agent-swift --temp --workdir testing/agent-swift --cmd bash -lc 'test -f /etc/agentctl/codex/config.toml && test -f /etc/agentctl/codex/gpt-oss.config.toml && test -f /etc/agentctl/codex/local_models.json && diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json'
+agentctl run --image agent-office --temp --workdir testing/agent-office --cmd bash -lc 'test -f /etc/agentctl/codex/config.toml && test -f /etc/agentctl/codex/gpt-oss.config.toml && test -f /etc/agentctl/codex/local_models.json && diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json'
 ```
 
 Also verify global AGENTS guidance points at the image metadata file:
@@ -305,14 +305,14 @@ Expected output includes:
 
 - `Error: Container has ~/.codex/AGENTS.md as a regular file. Re-run with --overwrite-config`
 - `If no valid AGENTS.md configuration already exists, use agentctl run --name agent-refresh-agents-test --reset-config`
-- `/etc/codexctl/image.md`
+- `/etc/agentctl/image.md`
 
 `run --reset-config` should restore config, default profile files, and local model
 metadata from the image before launching the container session:
 
 ```bash
 agentctl run --name agent-run-reset-config --image agent-plain --workdir testing/agent-plain --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# legacy-config\n" >/home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json'
-agentctl run --name agent-run-reset-config --image agent-plain --workdir testing/agent-plain --reset-config --cmd bash -lc 'if diff -q /etc/codexctl/config.toml /home/coder/.codex/config.toml && diff -q /etc/codexctl/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/codexctl/local_models.json /home/coder/.codex/local_models.json && grep -q "trust_level = \"trusted\"" /home/coder/.codex/config.toml; then echo reset-config-ok; else exit 1; fi'
+agentctl run --name agent-run-reset-config --image agent-plain --workdir testing/agent-plain --reset-config --cmd bash -lc 'if diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json && grep -q "trust_level = \"trusted\"" /home/coder/.codex/config.toml; then echo reset-config-ok; else exit 1; fi'
 ```
 
 Expected output after the reset run should include:
@@ -321,14 +321,14 @@ Expected output after the reset run should include:
 
 `--overwrite-config` now sources from the upgraded image's immutable config, default
 profile files, and local model metadata; verify it by changing user config, removing
-user metadata, refreshing, and checking that restored files match `/etc/codexctl/`:
+user metadata, refreshing, and checking that restored files match `/etc/agentctl/codex/`:
 
 ```bash
 agentctl run --name agent-refresh-overwrite-config-test --image agent-plain --workdir testing/agent-plain --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# PRE-OVERWRITE\n[ollama]\nhost = \"http://127.0.0.1:11434\"\n" > /home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json'
 agentctl refresh --name agent-refresh-overwrite-config-test --no-backup
-agentctl run --name agent-refresh-overwrite-config-test --image agent-plain --workdir testing/agent-plain --cmd bash -lc 'cp /etc/codexctl/config.toml /tmp/image-config.toml && cp /home/coder/.codex/config.toml /tmp/container-config.toml && sha256sum /tmp/image-config.toml /tmp/container-config.toml && test ! -f /home/coder/.codex/local_models.json'
+agentctl run --name agent-refresh-overwrite-config-test --image agent-plain --workdir testing/agent-plain --cmd bash -lc 'cp /etc/agentctl/codex/config.toml /tmp/image-config.toml && cp /home/coder/.codex/config.toml /tmp/container-config.toml && sha256sum /tmp/image-config.toml /tmp/container-config.toml && test ! -f /home/coder/.codex/local_models.json'
 agentctl refresh --name agent-refresh-overwrite-config-test --overwrite-config --no-backup
-agentctl run --name agent-refresh-overwrite-config-test --image agent-plain --workdir testing/agent-plain --cmd bash -lc 'cp /etc/codexctl/config.toml /tmp/image-config.toml && cp /home/coder/.codex/config.toml /tmp/container-config.toml && cp /etc/codexctl/local_models.json /tmp/image-models.json && cp /home/coder/.codex/local_models.json /tmp/container-models.json && diff -q /tmp/image-config.toml /tmp/container-config.toml && diff -q /etc/codexctl/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /tmp/image-models.json /tmp/container-models.json && grep -q "trust_level = \"trusted\"" /home/coder/.codex/config.toml'
+agentctl run --name agent-refresh-overwrite-config-test --image agent-plain --workdir testing/agent-plain --cmd bash -lc 'cp /etc/agentctl/codex/config.toml /tmp/image-config.toml && cp /home/coder/.codex/config.toml /tmp/container-config.toml && cp /etc/agentctl/codex/local_models.json /tmp/image-models.json && cp /home/coder/.codex/local_models.json /tmp/container-models.json && diff -q /tmp/image-config.toml /tmp/container-config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /tmp/image-models.json /tmp/container-models.json && grep -q "trust_level = \"trusted\"" /home/coder/.codex/config.toml'
 agentctl rm --name agent-refresh-overwrite-config-test
 ```
 

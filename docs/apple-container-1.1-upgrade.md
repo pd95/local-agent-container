@@ -230,6 +230,11 @@ bash tests/run-tests.sh --tier full \
   2>&1 | tee /tmp/agentctl-container-upgrade/integration-1.1.0-full.log
 ```
 
+After updating an existing managed container to agentctl 0.2, run `agentctl
+refresh --name NAME` once. Refresh migrates image-owned Codex defaults from the
+removed `/etc/codexctl` layout to `/etc/agentctl/codex` and repairs the image
+guidance link without changing user-owned Codex configuration.
+
 ## Rollback
 
 If 1.1.0 cannot start the service or breaks critical existing containers, use
