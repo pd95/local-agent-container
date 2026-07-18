@@ -314,6 +314,8 @@ test_doctor_host_reports_runtime_and_capabilities() {
   run_capture doctor_cmd --host
   assert_status 0
   assert_contains "/opt/homebrew/bin/container"
+  assert_contains "Host JSON processor"
+  assert_contains "supported                yes"
   assert_contains "container CLI version 1.1.0"
   assert_contains '"container-apiserver"'
   assert_contains "container copy           yes"
@@ -321,6 +323,31 @@ test_doctor_host_reports_runtime_and_capabilities() {
   assert_contains "container machine        yes"
   CONTAINER_CMD=container
   unset -f command
+}
+
+test_jq_dependency_version_checks() {
+  begin_test "host jq dependency rejects missing and unsupported versions"
+
+  load_agentctl_functions
+  jq_version_supported "1.6"
+  jq_version_supported "1.7.1-apple"
+  ! jq_version_supported "1.5"
+  ! jq_version_supported "not-a-version"
+
+  command() {
+    if [ "$1" = "-v" ] && [ "$2" = "jq" ]; then return 1; fi
+    builtin command "$@"
+  }
+  require_jq_wrapper() { ( require_jq ); }
+  run_capture require_jq_wrapper
+  assert_status 1
+  assert_contains "Missing 'jq' command"
+  unset -f command
+
+  jq_version() { printf '1.5\n'; }
+  run_capture require_jq_wrapper
+  assert_status 1
+  assert_contains "Unsupported jq version: 1.5"
 }
 
 test_host_address_reads_container_1_1_gateway() {
@@ -365,6 +392,45 @@ test_host_address_supports_custom_network_subnet_fallback() {
   output="$(host_address_cmd --network mcp)"
   [ "$output" = "10.42.7.1" ] || fail "Expected 10.42.7.1, got: $output"
   unset -f container
+}
+
+test_host_address_handles_non_24_and_rejects_malformed_networks() {
+  begin_test "host-address calculates non-/24 networks and rejects malformed input"
+
+  load_agentctl_functions
+  require_container() { return 0; }
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "network inspect broad") printf '%s\n' '{"status":{"ipv4Subnet":"10.42.7.99/20"}}' ;;
+      "network inspect malformed") printf '%s\n' '{"status":{"ipv4Subnet":"10.42.7.0/not-a-prefix"}}' ;;
+      "network inspect empty") printf '%s\n' 'not-json' ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  [ "$(host_address_cmd --network broad)" = "10.42.0.1" ] || fail "Expected /20 network host address"
+  host_address_wrapper() { ( host_address_cmd "$@" ); }
+  run_capture host_address_wrapper --network malformed
+  assert_status 1
+  assert_contains "no usable IPv4 gateway"
+  run_capture host_address_wrapper --network empty
+  assert_status 1
+  assert_contains "no usable IPv4 gateway"
+  unset -f container
+}
+
+test_inspect_json_helpers_handle_schema_shapes_and_invalid_input() {
+  begin_test "inspect JSON helpers handle objects, arrays, and invalid input"
+
+  load_agentctl_functions
+  [ "$(printf '%s' '{"configuration":{"mounts":[{"destination":"/workdir","options":"ro"}]}}' | container_mount_mode)" = "ro" ] \
+    || fail "Expected object inspect mount mode"
+  [ "$(printf '%s' '[{"mounts":[{"dst":"/workdir","options":[]}]}]' | container_mount_mode)" = "rw" ] \
+    || fail "Expected array inspect mount mode"
+  [ "$(printf '%s' 'not-json' | container_mount_mode)" = "unknown" ] || fail "Expected invalid inspect fallback"
+  [ "$(printf '%s' '[{"configuration":{"image":{"name":"agent-plain:latest"},"resources":{"cpus":2,"memoryInBytes":4294967296},"mounts":[{"target":"/workdir","src":"/tmp/work","options":["readonly"]}]}}]' | container_upgrade_info)" = $'agent-plain:latest\t/tmp/work\tro\t2\t4294967296' ] \
+    || fail "Expected upgrade inspect tuple"
+  [ "$(printf '%s' '' | container_upgrade_info)" = $'\t\t\t\t' ] || fail "Expected empty inspect tuple"
 }
 
 test_configure_container_host_alias_replaces_stale_entry() {
@@ -6835,18 +6901,22 @@ test_auth_info_from_json_parses_claude_oauth_payload() {
   begin_test "auth_info_from_json parses claude oauth payloads"
 
   load_agentctl_functions
-  python_exec() {
-    jq -r '
-      . as $payload
-      | ($payload.claudeAiOauth.refreshToken // "") as $token
-      | ($payload.claudeAiOauth.expiresAt // "") as $expires_at
-      | "\($token)\t\($expires_at)"
-    '
-  }
-
   RUN_OUTPUT="$(printf '%s' '{"claudeAiOauth":{"refreshToken":"claude-refresh","expiresAt":1776462236852}}' | auth_info_from_json)"
   RUN_STATUS=0
   [ "$RUN_OUTPUT" = $'claude-refresh\t1776462236852' ] || fail "Expected Claude auth info tuple, got: $RUN_OUTPUT"
+}
+
+test_auth_info_from_json_preserves_escaped_tokens_and_normalizes_timestamps() {
+  begin_test "auth JSON parsing preserves escaped tokens and normalizes timestamp types"
+
+  load_agentctl_functions
+  [ "$(printf '%s' '{"tokens":{"refresh_token":"quote\" slash\\ tab\t"},"last_refresh":"stamp"}' | auth_info_from_json)" = $'quote" slash\\ tab\t\tstamp' ] \
+    || fail "Expected escaped token characters to survive jq parsing"
+  [ "$(printf '%s' '{"claudeAiOauth":{"refreshToken":"token","expiresAt":"123"}}' | auth_info_from_json)" = $'token\t0000000000123' ] \
+    || fail "Expected string expiresAt normalization"
+  [ "$(printf '%s' '{"refresh_token":"legacy","last_refresh":"2026-01-01"' | auth_info_from_json)" = $'legacy\t2026-01-01' ] \
+    || fail "Expected malformed legacy payload fallback"
+  [ "$(printf '%s' '' | auth_info_from_json)" = $'\t' ] || fail "Expected empty auth tuple"
 }
 
 test_run_auth_flow_uses_agent_sh_auth_contract() {
@@ -10084,8 +10154,11 @@ main() {
   run_selected_test test_doctor_help_reports_fix_option "test_doctor_help_reports_fix_option"
   run_selected_test test_agentctl_version_matches_version_file "test_agentctl_version_matches_version_file"
   run_selected_test test_doctor_host_reports_runtime_and_capabilities "test_doctor_host_reports_runtime_and_capabilities"
+  run_selected_test test_jq_dependency_version_checks "test_jq_dependency_version_checks"
   run_selected_test test_host_address_reads_container_1_1_gateway "test_host_address_reads_container_1_1_gateway"
   run_selected_test test_host_address_supports_custom_network_subnet_fallback "test_host_address_supports_custom_network_subnet_fallback"
+  run_selected_test test_host_address_handles_non_24_and_rejects_malformed_networks "test_host_address_handles_non_24_and_rejects_malformed_networks"
+  run_selected_test test_inspect_json_helpers_handle_schema_shapes_and_invalid_input "test_inspect_json_helpers_handle_schema_shapes_and_invalid_input"
   run_selected_test test_configure_container_host_alias_replaces_stale_entry "test_configure_container_host_alias_replaces_stale_entry"
   run_selected_test test_migrate_legacy_runtime_config_files "test_migrate_legacy_runtime_config_files"
   run_selected_test test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure "test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure"
@@ -10264,6 +10337,7 @@ main() {
   run_selected_test test_sync_runtime_auth_to_container_rejects_inconclusive_conflict "test_sync_runtime_auth_to_container_rejects_inconclusive_conflict"
   run_selected_test test_sync_runtime_auth_from_container_uses_runtime_parameters "test_sync_runtime_auth_from_container_uses_runtime_parameters"
   run_selected_test test_auth_info_from_json_parses_claude_oauth_payload "test_auth_info_from_json_parses_claude_oauth_payload"
+  run_selected_test test_auth_info_from_json_preserves_escaped_tokens_and_normalizes_timestamps "test_auth_info_from_json_preserves_escaped_tokens_and_normalizes_timestamps"
   run_selected_test test_run_auth_flow_uses_agent_sh_auth_contract "test_run_auth_flow_uses_agent_sh_auth_contract"
   run_selected_test test_run_auth_flow_skips_keychain_write_when_auth_unchanged "test_run_auth_flow_skips_keychain_write_when_auth_unchanged"
   run_selected_test test_run_auth_flow_rejects_runtime_without_host_auth_support "test_run_auth_flow_rejects_runtime_without_host_auth_support"

@@ -43,31 +43,41 @@ warn() {
 }
 
 require_container() {
+  require_jq
   command -v "$CONTAINER_CMD" >/dev/null 2>&1 || die "Missing '$CONTAINER_CMD' command"
+}
+
+JQ_MIN_VERSION="1.6"
+
+jq_version() {
+  jq --version 2>/dev/null | sed 's/^jq-//'
+}
+
+jq_version_supported() {
+  local version="${1%%-*}"
+  local major="${version%%.*}"
+  local minor="${version#*.}"
+
+  minor="${minor%%.*}"
+  case "$major.$minor" in
+    *[!0-9.]*|.*|*.) return 1 ;;
+  esac
+  [ "$major" -gt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -ge 6 ]; }
+}
+
+require_jq() {
+  local version=""
+
+  command -v jq >/dev/null 2>&1 || die "Missing 'jq' command (jq $JQ_MIN_VERSION or newer is required)"
+  version="$(jq_version)"
+  jq_version_supported "$version" \
+    || die "Unsupported jq version: ${version:-unknown} (jq $JQ_MIN_VERSION or newer is required)"
 }
 
 require_container_backup_support() {
   if ! "$CONTAINER_CMD" export --help 2>/dev/null | grep -Fq -- '--output'; then
     die "Upgrade backups require a container runtime with 'container export --output <path>' support"
   fi
-}
-
-python_exec() {
-  local python_cmd=""
-  local script="$1"
-  shift
-  if command -v python3 >/dev/null 2>&1; then
-    python_cmd="python3"
-  elif command -v python >/dev/null 2>&1; then
-    python_cmd="python"
-  else
-    die "Missing python (python3 or python)"
-  fi
-  "$python_cmd" -c "$script" "$@"
-}
-
-python_available() {
-  command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1
 }
 
 container_list_all() {
@@ -237,135 +247,43 @@ EOF
 }
 
 container_mount_mode() {
-  local script
-  script="$(cat <<'PY'
-import json
-import sys
-
-try:
-    data = json.loads(sys.stdin.read())
-except Exception:
-    print("unknown")
-    sys.exit(0)
-
-if isinstance(data, list) and data:
-    data = data[0]
-
-config = data.get("configuration") or data
-mounts = config.get("mounts") or []
-
-mode = "unknown"
-for mount in mounts:
-    target = mount.get("destination") or mount.get("dst") or ""
-    if target != "/workdir":
-        continue
-    opts = mount.get("options") or []
-    if isinstance(opts, str):
-        opts = [opts]
-    mode = "ro" if "ro" in opts else "rw"
-    break
-
-print(mode)
-PY
-)"
-  python_exec "$script" || echo "unknown"
+  jq -Rrs '
+    (try fromjson catch {})
+    | (if type == "array" then (.[0] // {}) elif type == "object" then . else {} end)
+    | (.configuration // .) as $config
+    | [($config.mounts // [])[]
+        | select((.destination // .dst // "") == "/workdir")][0] as $mount
+    | if $mount == null then "unknown"
+      elif (($mount.options // []) | if type == "string" then [.] else . end | index("ro")) != null then "ro"
+      else "rw" end
+  ' 2>/dev/null || printf 'unknown\n'
 }
 
 container_upgrade_info() {
-  local script
-  script="$(cat <<'PY'
-import json
-import sys
-
-def lookup(data, *paths):
-    for path in paths:
-        cur = data
-        ok = True
-        for part in path:
-            if isinstance(cur, dict) and part in cur:
-                cur = cur[part]
-            else:
-                ok = False
-                break
-        if ok and cur not in (None, ""):
-            return cur
-    return ""
-
-def string_value(value):
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        for key in ("name", "reference", "image", "imageName", "id"):
-            inner = value.get(key)
-            if isinstance(inner, str) and inner:
-                return inner
-    return ""
-
-def resource_value(value):
-    if value in (None, "", 0, "0"):
-        return ""
-    if isinstance(value, (int, float)):
-        if int(value) <= 0:
-            return ""
-        return str(int(value))
-    if isinstance(value, str):
-        return value
-    return ""
-
-try:
-    data = json.loads(sys.stdin.read())
-except Exception:
-    print("\t\t\t\t")
-    sys.exit(0)
-
-if isinstance(data, list) and data:
-    data = data[0]
-
-config = data.get("configuration") or data
-mounts = config.get("mounts") or []
-
-image = string_value(
-    lookup(data, ("image", "name"))
-    or lookup(config, ("image", "name"))
-    or lookup(data, ("image",))
-    or lookup(config, ("image",))
-    or lookup(data, ("imageReference",))
-    or lookup(config, ("imageReference",))
-)
-workdir = ""
-mount_mode = "unknown"
-for mount in mounts:
-    target = mount.get("destination") or mount.get("dst") or mount.get("target") or ""
-    if target != "/workdir":
-        continue
-    workdir = mount.get("source") or mount.get("src") or ""
-    opts = mount.get("options") or []
-    if isinstance(opts, str):
-        opts = [opts]
-    mount_mode = "ro" if "ro" in opts or "readonly" in opts else "rw"
-    break
-
-cpus = (
-    lookup(config, ("cpus",))
-    or lookup(config, ("resources", "cpus"))
-    or lookup(data, ("cpus",))
-    or lookup(data, ("resources", "cpus"))
-)
-memory = (
-    lookup(config, ("memory",))
-    or lookup(config, ("memoryInBytes",))
-    or lookup(config, ("resources", "memory"))
-    or lookup(config, ("resources", "memoryInBytes"))
-    or lookup(data, ("memory",))
-    or lookup(data, ("memoryInBytes",))
-    or lookup(data, ("resources", "memory"))
-    or lookup(data, ("resources", "memoryInBytes"))
-)
-
-print(f"{image}\t{workdir}\t{mount_mode}\t{resource_value(cpus)}\t{resource_value(memory)}")
-PY
-)"
-  python_exec "$script" || echo -e "\t\t\t\t"
+  jq -Rrs '
+    def first: if type == "array" then (.[0] // {}) elif type == "object" then . else {} end;
+    def text:
+      if type == "string" then .
+      elif type == "object" then (.name // .reference // .image // .imageName // .id // "")
+      else "" end;
+    def resource:
+      if . == null or . == "" or . == 0 or . == "0" then ""
+      elif type == "number" then if . > 0 then floor | tostring else "" end
+      elif type == "string" then . else "" end;
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then ["", "", "", "", ""]
+      else $parsed | first as $data
+    | ($data.configuration // $data) as $config
+    | [($config.mounts // [])[] | select((.destination // .dst // .target // "") == "/workdir")][0] as $mount
+    | (($data.image.name // $config.image.name // $data.image // $config.image // $data.imageReference // $config.imageReference // "") | text) as $image
+    | ($config.cpus // $config.resources.cpus // $data.cpus // $data.resources.cpus // null) as $cpus
+    | ($config.memory // $config.memoryInBytes // $config.resources.memory // $config.resources.memoryInBytes // $data.memory // $data.memoryInBytes // $data.resources.memory // $data.resources.memoryInBytes // null) as $memory
+    | [$image,
+       ($mount.source // $mount.src // ""),
+       (if $mount == null then "unknown" elif (($mount.options // []) | if type == "string" then [.] else . end | any(. == "ro" or . == "readonly")) then "ro" else "rw" end),
+       ($cpus | resource), ($memory | resource)] end
+    | join("\t")
+  ' 2>/dev/null || printf '\t\t\t\t\n'
 }
 
 validate_mount_mode() {
@@ -401,88 +319,23 @@ image_list_json() {
 image_matching_timestamp_ref() {
   local image="$1"
   local images_json
-  local script
-
-  python_available || return 2
   images_json="$(image_list_json)"
-  script="$(cat <<'PY'
-import json
-import re
-import sys
-
-target = sys.argv[1]
-if ":" not in target:
-    target_latest = f"{target}:latest"
-else:
-    target_latest = target
-target_family = target_latest.rsplit(":", 1)[0]
-
-def normalize_ref(ref):
-    if not isinstance(ref, str):
-        return ""
-    return re.sub(r"^docker\.io/library/", "", ref)
-
-def entry_ref(entry):
-    configuration = entry.get("configuration") or {}
-    return normalize_ref(
-        entry.get("reference")
-        or configuration.get("name")
-        or configuration.get("reference")
-        or ""
-    )
-
-def entry_digests(entry):
-    digests = set()
-    configuration = entry.get("configuration") or {}
-    descriptor = entry.get("descriptor") or configuration.get("descriptor") or {}
-    digest = descriptor.get("digest")
-    if isinstance(digest, str) and digest:
-        digests.add(digest)
-    for variant in entry.get("variants") or []:
-        if not isinstance(variant, dict):
-            continue
-        descriptor = variant.get("descriptor") or {}
-        digest = descriptor.get("digest") or variant.get("digest")
-        if isinstance(digest, str) and digest:
-            digests.add(digest)
-    return digests
-
-try:
-    images = json.loads(sys.stdin.read())
-    if not isinstance(images, list):
-        images = []
-except Exception:
-    images = []
-
-target_digests = set()
-for entry in images:
-    if not isinstance(entry, dict):
-        continue
-    ref = entry_ref(entry)
-    if ref in (target, target_latest):
-        target_digests = entry_digests(entry)
-        break
-
-if not target_digests:
-    sys.exit(2)
-
-matches = []
-for entry in images:
-    if not isinstance(entry, dict):
-        continue
-    if not target_digests.intersection(entry_digests(entry)):
-        continue
-    ref = entry_ref(entry)
-    if ref.rsplit(":", 1)[0] != target_family:
-        continue
-    if re.search(r":[0-9]{8}-[0-9]{6}$", ref):
-        matches.append(ref)
-
-if matches:
-    print(sorted(matches)[-1])
-PY
-)"
-  printf '%s' "$images_json" | python_exec "$script" "$image"
+  printf '%s' "$images_json" | jq -er --arg target "$image" '
+    def norm: if type == "string" then sub("^docker\\.io/library/"; "") else "" end;
+    def ref: (.reference // .configuration.name // .configuration.reference // "") | norm;
+    def digests: [(.descriptor.digest // .configuration.descriptor.digest // empty), ((.variants // [])[] | .descriptor.digest // .digest // empty)] | unique;
+    if type != "array" then error("invalid image list") else . end
+    | (if ($target | contains(":")) then $target else $target + ":latest" end) as $latest
+    | ($latest | rtrimstr(":" + (split(":")[-1]))) as $family
+    | ([.[] | select(type == "object") | select((ref == $target) or (ref == $latest)) | digests][0] // []) as $target_digests
+    | if ($target_digests | length) == 0 then error("missing target digest") else . end
+    | [.[] | select(type == "object")
+        | select(((digests - $target_digests) | length) < (digests | length))
+        | ref
+        | select(test(":[0-9]{8}-[0-9]{6}$"))
+        | select((rtrimstr(":" + (split(":")[-1]))) == $family)]
+    | sort | last // empty
+  '
 }
 
 image_exists() {
@@ -1803,13 +1656,11 @@ build_cmd() {
         "$CONTAINER_CMD" image tag "$name" "$versioned_name"
         return 0
       fi
-      if python_available; then
-        existing_snapshot="$(image_matching_timestamp_ref "$name" 2>/dev/null || true)"
-        if [ -z "$existing_snapshot" ]; then
-          echo "Snapshotting missing image tag: $name, $versioned_name"
-          "$CONTAINER_CMD" image tag "$name" "$versioned_name"
-          return 0
-        fi
+      existing_snapshot="$(image_matching_timestamp_ref "$name" 2>/dev/null || true)"
+      if [ -z "$existing_snapshot" ]; then
+        echo "Snapshotting missing image tag: $name, $versioned_name"
+        "$CONTAINER_CMD" image tag "$name" "$versioned_name"
+        return 0
       fi
       echo "Image already exists: $name (use --rebuild to rebuild)"
       return 0
@@ -2766,57 +2617,47 @@ run_keychain_for_runtime() {
 }
 
 auth_info_from_json() {
-  local script
-  script="$(cat <<'PY'
-import json
-import re
-import sys
+  local raw=""
+  local parsed=""
 
-raw = sys.stdin.buffer.read()
+  raw="$(cat)"
+  if parsed="$(printf '%s' "$raw" | jq -er '
+    def digits: type == "string" and test("^[0-9]+$");
+    (.refresh_token // .tokens.refresh_token // .claudeAiOauth.refreshToken // "") as $token
+    | (.last_refresh // .claudeAiOauth.expiresAt // "") as $refresh
+    | (if ($refresh | type) == "number" then ($refresh | floor | tostring | ("0000000000000" + .)[-13:])
+       elif ($refresh | digits) then ("0000000000000" + $refresh)[-13:]
+       else $refresh end) as $normalized_refresh
+    | "\($token)\t\($normalized_refresh)"
+  ' 2>/dev/null)"; then
+    printf '%s\n' "$parsed"
+    return 0
+  fi
 
-def extract_from_json(payload):
-    token = payload.get("refresh_token", "")
-    if not token:
-        tokens = payload.get("tokens", {})
-        if isinstance(tokens, dict):
-            token = tokens.get("refresh_token", "")
-    if not token:
-        claude = payload.get("claudeAiOauth", {})
-        if isinstance(claude, dict):
-            token = claude.get("refreshToken", "")
-    last_refresh = payload.get("last_refresh", "")
-    if not last_refresh:
-        claude = payload.get("claudeAiOauth", {})
-        if isinstance(claude, dict):
-            expires_at = claude.get("expiresAt", "")
-            if isinstance(expires_at, int):
-                last_refresh = f"{expires_at:013d}"
-            elif isinstance(expires_at, str) and expires_at.isdigit():
-                last_refresh = expires_at.zfill(13)
-    return token, last_refresh
-
-try:
-    data = json.loads(raw.decode("utf-8"))
-    token, last_refresh = extract_from_json(data)
-    print(f"{token}\t{last_refresh}")
-except Exception:
-    text = raw.decode("utf-8", "ignore")
-    token_match = re.search(r'"refresh_token"\s*:\s*"([^"]+)"', text)
-    if not token_match:
-        token_match = re.search(r'"refreshToken"\s*:\s*"([^"]+)"', text)
-    refresh_match = re.search(r'"last_refresh"\s*:\s*"([^"]+)"', text)
-    if not refresh_match:
-        refresh_match = re.search(r'"expiresAt"\s*:\s*([0-9]+)', text)
-    token = token_match.group(1) if token_match else ""
-    if refresh_match:
-        raw_refresh = refresh_match.group(1)
-        last_refresh = raw_refresh.zfill(13) if raw_refresh.isdigit() else raw_refresh
-    else:
-        last_refresh = ""
-    print(f"{token}\t{last_refresh}")
-PY
-)"
-  python_exec "$script"
+  # Preserve the legacy best-effort recovery for truncated credential payloads.
+  printf '%s\n' "$raw" | awk '
+    function field(name, numeric, pattern, value) {
+      if (numeric) pattern = "\"" name "\"[[:space:]]*:[[:space:]]*[0-9]+"
+      else pattern = "\"" name "\"[[:space:]]*:[[:space:]]*\"[^\"]+\""
+      if (match($0, pattern)) {
+        value = substr($0, RSTART, RLENGTH)
+        sub(/^[^:]*:[[:space:]]*\"?/, "", value)
+        sub(/\"$/, "", value)
+        return value
+      }
+      return ""
+    }
+    { text = text $0 "\n" }
+    END {
+      $0 = text
+      token = field("refresh_token", 0)
+      if (token == "") token = field("refreshToken", 0)
+      refresh = field("last_refresh", 0)
+      if (refresh == "") refresh = field("expiresAt", 1)
+      if (refresh ~ /^[0-9]+$/) while (length(refresh) < 13) refresh = "0" refresh
+      printf "%s\t%s\n", token, refresh
+    }
+  '
 }
 
 keychain_auth_info() {
@@ -3692,9 +3533,29 @@ host_doctor() {
   local cli_path=""
   local cli_version=""
   local system_version=""
+  local jq_path=""
+  local detected_jq_version=""
   local status=0
 
-  require_container
+  printf 'Host JSON processor\n'
+  if jq_path="$(command -v jq 2>/dev/null)"; then
+    detected_jq_version="$(jq_version)"
+    printf '  %-24s %s\n' path "$jq_path"
+    printf '  %-24s %s\n' version "${detected_jq_version:-unknown}"
+    if jq_version_supported "$detected_jq_version"; then
+      printf '  %-24s %s\n' supported yes
+    else
+      printf '  %-24s %s\n' supported no
+      status=1
+    fi
+  else
+    printf '  %-24s %s\n' path missing
+    printf '  %-24s %s\n' version unknown
+    printf '  %-24s %s\n' supported no
+    status=1
+  fi
+
+  command -v "$CONTAINER_CMD" >/dev/null 2>&1 || die "Missing '$CONTAINER_CMD' command"
   cli_path="$(command -v "$CONTAINER_CMD")"
   cli_version="$("$CONTAINER_CMD" --version 2>&1)" || status=1
 
@@ -3726,45 +3587,45 @@ host_doctor() {
 container_network_host_address() {
   local network="$1"
   local inspect_json=""
-  local script=""
+  local gateway=""
+  local subnet=""
 
   require_container
   inspect_json="$("$CONTAINER_CMD" network inspect "$network" 2>/dev/null)" \
     || die "Unable to inspect container network: $network"
-  script="$(cat <<'PY'
-import ipaddress
-import json
-import sys
+  gateway="$(printf '%s' "$inspect_json" | jq -er '
+    (if type == "array" then (.[0] // {}) elif type == "object" then . else {} end)
+    | .status.ipv4Gateway // .status.gateway // empty
+    | strings | select(length > 0)
+  ' 2>/dev/null || true)"
+  if [ -n "$gateway" ]; then
+    printf '%s\n' "$gateway"
+    return 0
+  fi
 
-try:
-    data = json.loads(sys.stdin.read())
-except Exception:
-    sys.exit(1)
-
-if isinstance(data, list):
-    data = data[0] if data else {}
-if not isinstance(data, dict):
-    sys.exit(1)
-
-status = data.get("status") or {}
-gateway = status.get("ipv4Gateway") or status.get("gateway") or ""
-if gateway:
-    print(gateway)
-    sys.exit(0)
-
-subnet = status.get("ipv4Subnet") or ""
-if subnet:
-    try:
-        network = ipaddress.ip_network(subnet, strict=False)
-        print(network.network_address + 1)
-        sys.exit(0)
-    except Exception:
-        pass
-sys.exit(1)
-PY
-)"
-  printf '%s' "$inspect_json" | python_exec "$script" \
-    || die "Container network has no usable IPv4 gateway: $network"
+  subnet="$(printf '%s' "$inspect_json" | jq -er '
+    (if type == "array" then (.[0] // {}) elif type == "object" then . else {} end)
+    | .status.ipv4Subnet // empty | strings | select(length > 0)
+  ' 2>/dev/null || true)"
+  printf '%s\n' "$subnet" | awk -F '[./]' '
+    NF == 5 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/ && $5 ~ /^[0-9]+$/ {
+      for (i = 1; i <= 4; i++) if ($i < 0 || $i > 255) exit 1
+      prefix = $5 + 0
+      if (prefix < 0 || prefix > 32) exit 1
+      address = ((($1 * 256) + $2) * 256 + $3) * 256 + $4
+      host_size = 2 ^ (32 - prefix)
+      network = int(address / host_size) * host_size
+      candidate = network + 1
+      if (candidate > 4294967295) exit 1
+      o4 = candidate % 256; candidate = int(candidate / 256)
+      o3 = candidate % 256; candidate = int(candidate / 256)
+      o2 = candidate % 256; candidate = int(candidate / 256)
+      o1 = candidate % 256
+      printf "%d.%d.%d.%d\n", o1, o2, o3, o4
+      found = 1
+    }
+    END { if (!found) exit 1 }
+  ' || die "Container network has no usable IPv4 gateway: $network"
 }
 
 host_address_cmd() {
@@ -6387,187 +6248,67 @@ ls_details_row() {
   local name="$1"
   local images_json_file="$2"
   local inspect_json="${3:-}"
-  local script
 
-  script="$(cat <<'PY'
-import json
-import re
-import sys
-
-name = sys.argv[1]
-images_json_file = sys.argv[2]
-inspect_raw = sys.stdin.read()
-
-def normalize_ref(ref):
-    if not isinstance(ref, str):
-        return ""
-    return re.sub(r"^docker\.io/library/", "", ref)
-
-def family_for_ref(ref):
-    ref = normalize_ref(ref)
-    if ":" in ref:
-        return ref.rsplit(":", 1)[0]
-    return ref
-
-def value_or_unknown(value):
-    if value is None or value == "":
-        return "unknown"
-    return str(value)
-
-def resource_value(value):
-    if value in (None, "", 0, "0"):
-        return "unlimited"
-    if isinstance(value, (int, float)):
-        if int(value) <= 0:
-            return "unlimited"
-        return str(int(value))
-    return str(value)
-
-def memory_value(value):
-    if value in (None, "", 0, "0"):
-        return "unlimited"
-    try:
-        size = int(value)
-    except Exception:
-        return str(value)
-    if size <= 0:
-        return "unlimited"
-    units = [("T", 1024 ** 4), ("G", 1024 ** 3), ("M", 1024 ** 2), ("K", 1024)]
-    for suffix, factor in units:
-        if size % factor == 0 and size >= factor:
-            return f"{size // factor}{suffix}"
-    return str(size)
-
-def first_json_object(raw):
-    data = json.loads(raw)
-    if isinstance(data, list):
-        if data:
-            return data[0]
-        return {}
-    if isinstance(data, dict):
-        return data
-    return {}
-
-try:
-    with open(images_json_file, "r", encoding="utf-8") as handle:
-        images = json.load(handle)
-        if not isinstance(images, list):
-            images = []
-except Exception:
-    images = []
-
-try:
-    data = first_json_object(inspect_raw)
-except Exception:
-    data = {}
-
-if isinstance(data, dict):
-    config = data.get("configuration") or data
-else:
-    config = {}
-image = config.get("image") or {}
-descriptor = image.get("descriptor") or {}
-annotations = descriptor.get("annotations") or {}
-resources = config.get("resources") or {}
-mounts = config.get("mounts") or []
-
-ref = normalize_ref(image.get("reference") or "")
-digest = descriptor.get("digest") or ""
-created = annotations.get("org.opencontainers.image.created") or ""
-status = data.get("status") or "unknown"
-if isinstance(status, dict):
-    status = status.get("state") or "unknown"
-workdir = "unknown"
-mount_mode = "unknown"
-for mount in mounts:
-    if mount.get("destination") != "/workdir":
-        continue
-    workdir = mount.get("source") or "unknown"
-    options = mount.get("options") or []
-    if isinstance(options, str):
-        options = [options]
-    mount_mode = "ro" if "ro" in options else "rw"
-    break
-
-matching_refs = []
-timestamp_refs = []
-current_family = family_for_ref(ref)
-for entry in images:
-    if not isinstance(entry, dict):
-        continue
-    entry_config = entry.get("configuration") or {}
-    entry_descriptor = entry.get("descriptor") or entry_config.get("descriptor") or {}
-    entry_digest = entry_descriptor.get("digest") or ""
-    if entry_digest != digest:
-        continue
-    entry_ref = normalize_ref(
-        entry.get("reference")
-        or entry_config.get("name")
-        or entry_config.get("reference")
-        or ""
-    )
-    if not entry_ref:
-        continue
-    matching_refs.append(entry_ref)
-    if re.search(r":[0-9]{8}-[0-9]{6}$", entry_ref):
-        timestamp_refs.append(entry_ref)
-
-same_family_timestamps = [candidate for candidate in timestamp_refs if family_for_ref(candidate) == current_family]
-snapshot = "unknown"
-if same_family_timestamps:
-    snapshot = sorted(same_family_timestamps)[-1]
-elif timestamp_refs:
-    snapshot = sorted(timestamp_refs)[-1]
-
-digest_display = digest
-if digest_display.startswith("sha256:") and len(digest_display) > len("sha256:") + 12:
-    digest_display = digest_display[:len("sha256:") + 12]
-
-row = [
-    name,
-    value_or_unknown(status),
-    value_or_unknown(ref),
-    value_or_unknown(snapshot),
-    value_or_unknown(digest_display),
-    value_or_unknown(workdir),
-    value_or_unknown(mount_mode),
-    resource_value(resources.get("cpus")),
-    memory_value(resources.get("memoryInBytes")),
-    value_or_unknown(created),
-]
-print("\t".join(row))
-PY
-)"
-
-  python_exec "$script" "$name" "$images_json_file" <<<"$inspect_json"
+  jq -rn --arg name "$name" --arg inspect "$inspect_json" --slurpfile images "$images_json_file" '
+    def norm: if type == "string" then sub("^docker\\.io/library/"; "") else "" end;
+    def family: norm | if contains(":") then rtrimstr(":" + (split(":")[-1])) else . end;
+    def unknown: if . == null or . == "" then "unknown" else tostring end;
+    def resource: if . == null or . == "" or . == 0 or . == "0" then "unlimited" elif type == "number" and . <= 0 then "unlimited" elif type == "number" then floor | tostring else tostring end;
+    def memory:
+      if . == null or . == "" or . == 0 or . == "0" then "unlimited"
+      elif (type == "number" or (type == "string" and test("^[0-9]+$"))) then
+        tonumber as $n | if $n <= 0 then "unlimited"
+        elif $n >= 1099511627776 and ($n % 1099511627776) == 0 then "\($n / 1099511627776)T"
+        elif $n >= 1073741824 and ($n % 1073741824) == 0 then "\($n / 1073741824)G"
+        elif $n >= 1048576 and ($n % 1048576) == 0 then "\($n / 1048576)M"
+        elif $n >= 1024 and ($n % 1024) == 0 then "\($n / 1024)K"
+        else $n | tostring end
+      else tostring end;
+    (try ($inspect | fromjson) catch {})
+    | (if type == "array" then (.[0] // {}) elif type == "object" then . else {} end) as $data
+    | ($data.configuration // $data) as $config
+    | ($config.image // {}) as $image
+    | ($image.descriptor // {}) as $descriptor
+    | ($config.resources // {}) as $resources
+    | [($config.mounts // [])[] | select((.destination // "") == "/workdir")][0] as $mount
+    | (($image.reference // "") | norm) as $ref
+    | ($descriptor.digest // "") as $digest
+    | (($images[0] // []) | if type == "array" then . else [] end) as $image_entries
+    | [$image_entries[] | select(type == "object")
+       | (.descriptor.digest // .configuration.descriptor.digest // "") as $entry_digest
+       | select($digest != "" and $entry_digest == $digest)
+       | (.reference // .configuration.name // .configuration.reference // "") | norm
+       | select(test(":[0-9]{8}-[0-9]{6}$"))] as $timestamps
+    | ([$timestamps[] | select((family) == ($ref | family))] | sort | last // ($timestamps | sort | last) // "unknown") as $snapshot
+    | ($data.status // "unknown" | if type == "object" then (.state // "unknown") else . end) as $status
+    | [$name, ($status | unknown), ($ref | unknown), $snapshot,
+       (($digest | if startswith("sha256:") and length > 19 then .[0:19] else . end) | unknown),
+       (($mount.source // "unknown") | unknown),
+       (if $mount == null then "unknown" elif (($mount.options // []) | if type == "string" then [.] else . end | index("ro")) != null then "ro" else "rw" end),
+       ($resources.cpus | resource), ($resources.memoryInBytes | memory),
+       (($descriptor.annotations["org.opencontainers.image.created"] // "unknown") | unknown)]
+    | join("\t")
+  '
 }
 
 format_tsv_table() {
-  local script
-
-  script="$(cat <<'PY'
-import sys
-
-rows = [line.rstrip("\n").split("\t") for line in sys.stdin if line.rstrip("\n")]
-if not rows:
-    sys.exit(0)
-
-widths = [0] * max(len(row) for row in rows)
-for row in rows:
-    for index, cell in enumerate(row):
-        widths[index] = max(widths[index], len(cell))
-
-for row in rows:
-    padded = []
-    for index, cell in enumerate(row):
-        if index == len(row) - 1:
-            padded.append(cell)
-        else:
-            padded.append(cell.ljust(widths[index]))
-    print("  ".join(padded).rstrip())
-PY
-)"
-  python_exec "$script"
+  awk -F '\t' '
+    function padded(value, target) {
+      while (length(value) < target) value = value " "
+      return value
+    }
+    { rows[NR] = $0; if (NF > columns) columns = NF; for (i = 1; i <= NF; i++) if (length($i) > width[i]) width[i] = length($i) }
+    END {
+      for (row = 1; row <= NR; row++) {
+        count = split(rows[row], cell, "\t")
+        for (i = 1; i <= count; i++) {
+          if (i < count) printf "%s  ", padded(cell[i], width[i])
+          else printf "%s", cell[i]
+        }
+        printf "\n"
+      }
+    }
+  '
 }
 
 ls_details_cmd() {
@@ -6576,12 +6317,6 @@ ls_details_cmd() {
   local name
   local inspect_json
   local rows
-
-  if ! python_available; then
-    warn "Python is required for detailed ls output; falling back to --raw"
-    ls_raw_cmd
-    return 0
-  fi
 
   images_json="$(image_list_json)"
   images_json_file="$(mktemp "${TMPDIR:-/tmp}/agentctl-images.XXXXXX")"
