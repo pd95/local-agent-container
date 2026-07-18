@@ -58,7 +58,7 @@ The candidate tables use these labels:
 |---|---|---:|---:|---:|
 | `--shm-size` | implemented | high for browsers and shared-memory workloads | complete | selected |
 | Storage and backup diagnostics | implemented | high for full backup reliability | complete | selected |
-| `container cp` transfer backend | detected | medium; simpler and less guest-tool dependent | medium | high |
+| `container cp` transfer backend | implemented | medium; simpler and less guest-tool dependent | complete | selected |
 | OCI recovery-image export | unused | high for off-host disaster recovery | medium | high |
 | Effective runtime defaults in doctor | implicit only | medium; clearer resource behavior | small-medium | medium |
 | Custom and host-only networks | partial network awareness | medium-high for isolation | medium-large | medium |
@@ -167,25 +167,44 @@ Limitations:
 
 ### Current agentctl state
 
-`doctor --host` detects the command, but normal operations still use:
+`doctor --host` detects the command. Managed host-to-container file and tree
+refreshes now select `container copy` automatically when the runtime supports
+the full command. Capability detection is cached so a refresh or bootstrap does
+not repeatedly invoke help.
 
-- `container exec -i ... cat` for individual files
-- host `tar` piped to guest `tar` for directory trees
-- guest `tar` streamed to the host for selective state backups
+Older runtimes retain the existing transports. Host source paths containing
+`:` also retain them because Apple's endpoint parser cannot represent those
+paths safely. File or directory symlinks used as the source root are streamed
+so refresh preserves the legacy behavior of installing the referenced content
+rather than a managed-target symlink.
 
-### Candidate design
+The following flows deliberately remain streaming-based:
 
-Introduce a small transfer abstraction with capability-based selection:
+- generated content and authentication payload writes that require stdin
+- selective user-state import/export and backup, which require filtering or
+  directly produce an archive
+- stopped-container and recovery-image export
+- permission and other stdin-driven scripts
+
+### Implemented design
+
+The stable managed refresh helpers select their transport internally:
 
 ```text
 host file/tree -> running container
-├── container cp supported: copy, then normalize ownership and modes
-└── otherwise: retain the current cat/tar stream
+├── copy supported and source root representable: container copy
+└── otherwise: retained stdin/tar stream
+    -> unique sibling stage
+    -> validate type and normalize ownership/modes
+    -> backup old target, activate stage, remove backup
+    -> restore backup if activation fails
 ```
 
-Good first users are managed host-to-container files and trees. Selective state
-backup should retain tar initially because it already supports exclusions and
-creates the final archive without a staging tree.
+Copy failures are reported directly rather than retried through another
+backend. Partial stages are cleaned without touching the previous target.
+Managed directory trees are exact mirrors, so activation removes stale or
+locally modified files. Recursive normalization preserves symlinks within a
+tree without dereferencing them.
 
 ### Expected benefit
 
@@ -194,17 +213,16 @@ utilities. It is not yet established that `cp` is faster. Directory copying may
 still use archive-like transport internally, and copying state out before
 packing it can add host I/O.
 
-### Investigation before implementation
+### Remaining investigation
 
 - Benchmark current streaming and `container cp` for small files, many small
   files, and a large directory.
 - Verify symlink, hardlink, timestamp, sparse-file, and extended-attribute
   behavior.
-- Verify destination semantics for existing directories and trailing slashes.
-- Verify failures are atomic enough for managed configuration updates.
-- Test spaces, colons, relative paths, and non-ASCII host paths.
-- Determine which owner/mode corrections remain necessary.
-- Preserve regression coverage for stdin-dependent `container exec -i` calls.
+- Run focused Apple container 1.1 host tests that inspect copied content,
+  ownership, modes, nested symlinks, and stale-file removal.
+- Benchmarking is informational; this implementation does not promise backup
+  acceleration because backup paths do not use `container copy`.
 
 ## Portable OCI recovery-image export
 

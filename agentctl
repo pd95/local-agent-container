@@ -11,6 +11,7 @@ CONTAINER_HOST_NAME="host.container.internal"
 CLAUDE_MIN_INSTALL_MEM="4G"
 SYSTEM_BASELINE_MANIFEST_FILE="/etc/agentctl/system-manifest.json"
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --no-new-privs --)
+CONTAINER_COPY_SUPPORT=""
 
 resolve_script_path() {
   local path="$1"
@@ -3235,19 +3236,107 @@ resolve_auth_image_for_container() {
   printf '%s\n' "$image"
 }
 
+container_copy_supported() {
+  if [ -z "$CONTAINER_COPY_SUPPORT" ]; then
+    if "$CONTAINER_CMD" copy --help >/dev/null 2>&1; then
+      CONTAINER_COPY_SUPPORT="yes"
+    else
+      CONTAINER_COPY_SUPPORT="no"
+    fi
+  fi
+  [ "$CONTAINER_COPY_SUPPORT" = "yes" ]
+}
+
+container_refresh_stage_path() {
+  local name="$1"
+  local target="$2"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    set -e
+    target="$1"
+    parent=${target%/*}
+    [ "$parent" != "$target" ] || parent=.
+    mkdir -p "$parent"
+    candidate="$target.agentctl-stage.$$"
+    suffix=0
+    while [ -e "$candidate" ] || [ -L "$candidate" ]; do
+      suffix=$((suffix + 1))
+      candidate="$target.agentctl-stage.$$.${suffix}"
+    done
+    printf "%s\n" "$candidate"
+  ' sh "$target"
+}
+
+cleanup_container_refresh_stage() {
+  local name="$1"
+  local stage="$2"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'rm -rf -- "$1"' sh "$stage" >/dev/null 2>&1 || true
+}
+
+activate_container_refresh_stage() {
+  local name="$1"
+  local stage="$2"
+  local target="$3"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    stage="$1"
+    target="$2"
+    backup="$target.agentctl-backup.$$"
+    suffix=0
+    while [ -e "$backup" ] || [ -L "$backup" ]; do
+      suffix=$((suffix + 1))
+      backup="$target.agentctl-backup.$$.${suffix}"
+    done
+    had_target=0
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      mv -- "$target" "$backup" || exit 1
+      had_target=1
+    fi
+    if ! mv -- "$stage" "$target"; then
+      if [ "$had_target" -eq 1 ]; then
+        mv -- "$backup" "$target" || {
+          echo "Error: failed to restore managed target after activation failure: $target" >&2
+          exit 1
+        }
+      fi
+      exit 1
+    fi
+    if [ "$had_target" -eq 1 ] && ! rm -rf -- "$backup"; then
+      echo "Warning: installed managed target but could not remove backup: $backup" >&2
+    fi
+  ' sh "$stage" "$target"
+}
+
 refresh_container_file() {
   local name="$1"
   local source="$2"
   local target="$3"
   local owner="${4:-root:root}"
   local mode="${5:-644}"
-  local dir
+  local stage
 
   [ -f "$source" ] || die "Refresh source not found: $source"
-  dir="$(dirname "$target")"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "mkdir -p '$dir'"
-  "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc "cat > '$target'" <"$source"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "chmod $mode '$target' && chown $owner '$target'"
+  stage="$(container_refresh_stage_path "$name" "$target")" || die "Failed to prepare refresh staging path for $target"
+  if container_copy_supported && [[ "$source" != *:* ]] && [ ! -L "$source" ]; then
+    if ! "$CONTAINER_CMD" copy "$source" "$name:$stage" >/dev/null; then
+      cleanup_container_refresh_stage "$name" "$stage"
+      die "Failed to copy refresh source into $name: $source"
+    fi
+  elif ! "$CONTAINER_CMD" exec -i -u 0 "$name" sh -c 'cat > "$1"' sh "$stage" <"$source"; then
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to stream refresh source into $name: $source"
+  fi
+  if ! "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    [ -f "$2" ] && [ ! -L "$2" ] && chmod "$1" "$2" && chown "$3" "$2"
+  ' sh "$mode" "$stage" "$owner"; then
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to normalize refreshed file: $target"
+  fi
+  activate_container_refresh_stage "$name" "$stage" "$target" || {
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to activate refreshed file: $target"
+  }
 }
 
 refresh_codex_config_files() {
@@ -3444,11 +3533,38 @@ refresh_container_tree() {
   local owner="${4:-root:root}"
   local file_mode="${5:-644}"
   local dir_mode="${6:-755}"
+  local stage
 
   [ -d "$source" ] || die "Refresh source directory not found: $source"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "mkdir -p '$target'"
-  tar_create_tree_stream "$source" | "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc "tar -xf - -C '$target'"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "chown -R $owner '$target' && find '$target' -type d -exec chmod $dir_mode {} + && find '$target' -type f -exec chmod $file_mode {} +"
+  stage="$(container_refresh_stage_path "$name" "$target")" || die "Failed to prepare refresh staging path for $target"
+  if container_copy_supported && [[ "$source" != *:* ]] && [ ! -L "$source" ]; then
+    if ! "$CONTAINER_CMD" copy "$source" "$name:$stage" >/dev/null; then
+      cleanup_container_refresh_stage "$name" "$stage"
+      die "Failed to copy refresh tree into $name: $source"
+    fi
+  else
+    if ! "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'mkdir "$1"' sh "$stage"; then
+      cleanup_container_refresh_stage "$name" "$stage"
+      die "Failed to create refresh tree staging directory: $target"
+    fi
+    if ! tar_create_tree_stream "$source" | "$CONTAINER_CMD" exec -i -u 0 "$name" sh -c 'tar -xf - -C "$1"' sh "$stage"; then
+      cleanup_container_refresh_stage "$name" "$stage"
+      die "Failed to stream refresh tree into $name: $source"
+    fi
+  fi
+  if ! "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    [ -d "$2" ] && [ ! -L "$2" ] &&
+      chown -h -R "$1" "$2" &&
+      find "$2" -type d -exec chmod "$3" {} + &&
+      find "$2" -type f -exec chmod "$4" {} +
+  ' sh "$owner" "$stage" "$dir_mode" "$file_mode"; then
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to normalize refreshed tree: $target"
+  fi
+  activate_container_refresh_stage "$name" "$stage" "$target" || {
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to activate refreshed tree: $target"
+  }
 }
 
 bootstrap_container_alpine() {
