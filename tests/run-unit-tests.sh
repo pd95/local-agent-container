@@ -6938,6 +6938,34 @@ test_auth_info_from_json_preserves_escaped_tokens_and_normalizes_timestamps() {
     || fail "Expected escaped token characters to survive jq parsing"
   [ "$(printf '%s' '{"claudeAiOauth":{"refreshToken":"token","expiresAt":"123"}}' | auth_info_from_json)" = $'token\t0000000000123' ] \
     || fail "Expected string expiresAt normalization"
+  [ "$(printf '%s' '{"claudeAiOauth":{"refreshToken":"token","expiresAt":123456789012345}}' | auth_info_from_json)" = $'token\t123456789012345' ] \
+    || fail "Expected long numeric expiresAt values to remain intact"
+  [ "$(printf '%s' '{"claudeAiOauth":{"refreshToken":"token","expiresAt":12345678901234567}}' | auth_info_from_json)" = $'token\t12345678901234567' ] \
+    || fail "Expected numeric expiresAt values above jq integer precision to remain intact"
+  [ "$(printf '%s' '{"claudeAiOauth":{"refreshToken":"token","expiresAt":"123456789012345"}}' | auth_info_from_json)" = $'token\t123456789012345' ] \
+    || fail "Expected long string expiresAt values to remain intact"
+  [ "$(printf '%s' '{"refresh_token":"token","last_refresh":123}' | auth_info_from_json)" = $'token\t123' ] \
+    || fail "Expected top-level numeric last_refresh to remain unpadded"
+  [ "$(printf '%s' '{"last_refresh":0,"claudeAiOauth":{"refreshToken":"token","expiresAt":123}}' | auth_info_from_json)" = $'token\t0000000000123' ] \
+    || fail "Expected zero last_refresh to fall back to Claude expiresAt"
+  [ "$(printf '%s' '{"last_refresh":false,"claudeAiOauth":{"refreshToken":"token","expiresAt":"456"}}' | auth_info_from_json)" = $'token\t0000000000456' ] \
+    || fail "Expected false last_refresh to fall back to Claude expiresAt"
+  [ "$(printf '%s' '{"metadata":{"expiresAt":999},"claudeAiOauth":{"refreshToken":"token","expiresAt":12345678901234567}}' | auth_info_from_json)" = $'token\t12345678901234567' ] \
+    || fail "Expected unrelated expiresAt fields to be ignored"
+  [ "$(printf '%s' '{"note":"misleading \\\"expiresAt\\\": 888","claudeAiOauth":{"refreshToken":"token","expiresAt":12345678901234567}}' | auth_info_from_json)" = $'token\t12345678901234567' ] \
+    || fail "Expected expiresAt-like string content to be ignored"
+  [ "$(printf '%s' '{"refresh_token":"__agentctl_json_number__:secret","last_refresh":"__agentctl_json_number__:stamp"}' | auth_info_from_json)" = $'__agentctl_json_number__:secret\t__agentctl_json_number__:stamp' ] \
+    || fail "Expected number-marker-like strings to remain intact"
+  [ "$(printf '%s' '{"claudeAiOauth":{"refreshToken":"token","expiresAt":"__agentctl_json_number__:123"}}' | auth_info_from_json)" = $'token\t__agentctl_json_number__:123' ] \
+    || fail "Expected number-marker-like string expiresAt to remain intact"
+  [ "$(printf '%s' '{"claudeAiOauth":{"refreshToken":"token","expiresAt":-1}}' | auth_info_from_json)" = $'token\t-000000000001' ] \
+    || fail "Expected negative integer expiresAt formatting to match Python"
+  [ "$(printf '%s' '{"claudeAiOauth":{"refreshToken":"token","expiresAt":1.5}}' | auth_info_from_json)" = $'token\t' ] \
+    || fail "Expected non-integer numeric expiresAt to remain ignored"
+  [ "$(printf '%s' '{"refresh_token":"","tokens":{"refresh_token":"fallback-token"}}' | auth_info_from_json)" = $'fallback-token\t' ] \
+    || fail "Expected falsey top-level tokens to use the nested fallback"
+  [ "$(printf '%s' '{"refresh_token":0,"tokens":{"refresh_token":false},"claudeAiOauth":{"refreshToken":"claude-token","expiresAt":true}}' | auth_info_from_json)" = $'claude-token\t0000000000001' ] \
+    || fail "Expected Python-compatible falsey token fallback and boolean expiresAt handling"
   [ "$(printf '%s' '{"refresh_token":"legacy","last_refresh":"2026-01-01"' | auth_info_from_json)" = $'legacy\t2026-01-01' ] \
     || fail "Expected malformed legacy payload fallback"
   [ "$(printf '%s' '' | auth_info_from_json)" = $'\t' ] || fail "Expected empty auth tuple"
@@ -7623,6 +7651,30 @@ test_ls_keeps_row_when_inspect_fails() {
   run_capture ls_cmd
   assert_status 0
   assert_matches '^agent-local-agent-container[[:space:]]+unknown[[:space:]]+unknown[[:space:]]+unknown[[:space:]]+unknown[[:space:]]+unknown[[:space:]]+unknown[[:space:]]+unlimited[[:space:]]+unlimited[[:space:]]+unknown$'
+}
+
+test_ls_handles_malformed_image_list_json() {
+  begin_test "ls handles malformed image-list JSON"
+
+  load_agentctl_functions
+
+  require_container() { return 0; }
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "ls -a --quiet") printf '%s\n' agent-local-agent-container ;;
+      "image ls --format json") printf '%s\n' not-json ;;
+      "inspect agent-local-agent-container")
+        printf '%s\n' '[{"configuration":{"mounts":[],"resources":{},"image":{"descriptor":{"digest":"sha256:abc"},"reference":"agent-plain:latest"}},"status":"running"}]'
+        ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture ls_cmd
+  assert_status 0
+  assert_matches '^agent-local-agent-container[[:space:]]+running[[:space:]]+agent-plain:latest[[:space:]]+unknown[[:space:]]+sha256:abc'
+  unset -f container
 }
 
 test_upgrade_backup_support_check() {
@@ -10377,6 +10429,7 @@ main() {
   run_selected_test test_ls_reports_matching_snapshot_ref_by_default "test_ls_reports_matching_snapshot_ref_by_default"
   run_selected_test test_ls_reports_unknown_snapshot_when_timestamp_missing "test_ls_reports_unknown_snapshot_when_timestamp_missing"
   run_selected_test test_ls_keeps_row_when_inspect_fails "test_ls_keeps_row_when_inspect_fails"
+  run_selected_test test_ls_handles_malformed_image_list_json "test_ls_handles_malformed_image_list_json"
   run_selected_test test_upgrade_backup_support_check "test_upgrade_backup_support_check"
   run_selected_test test_run_rejects_resource_flags_for_existing_container "test_run_rejects_resource_flags_for_existing_container"
   run_selected_test test_upgrade_rejects_no_backup_for_legacy_source "test_upgrade_rejects_no_backup_for_legacy_source"
