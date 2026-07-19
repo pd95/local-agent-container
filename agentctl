@@ -88,6 +88,20 @@ require_container_shm_size_support() {
   fi
 }
 
+require_container_ssh_support() {
+  container_help_contains --ssh create || die "Apple container does not support SSH agent forwarding (--ssh); upgrade the container CLI"
+}
+
+host_ssh_socket_available() {
+  [ -n "${SSH_AUTH_SOCK:-}" ] && [ "${SSH_AUTH_SOCK#/}" != "$SSH_AUTH_SOCK" ] && [ -S "$SSH_AUTH_SOCK" ]
+}
+
+require_host_ssh_socket() {
+  [ -n "${SSH_AUTH_SOCK:-}" ] || die "--ssh requires SSH_AUTH_SOCK to be set on the host"
+  [ "${SSH_AUTH_SOCK#/}" != "$SSH_AUTH_SOCK" ] || die "--ssh requires an absolute SSH_AUTH_SOCK path: $SSH_AUTH_SOCK"
+  [ -S "$SSH_AUTH_SOCK" ] || die "--ssh requires SSH_AUTH_SOCK to reference an existing Unix socket: $SSH_AUTH_SOCK"
+}
+
 container_list_all() {
   "$CONTAINER_CMD" ls -a 2>/dev/null || true
 }
@@ -153,32 +167,35 @@ extract_container_export_rootfs() {
   local manifest_digest=""
   local manifest_file=""
   local layer_file=""
+  local layer_digest=""
+  local layer_digests=""
   local extracted_layer=0
 
-  rm -rf "$rootfs_dir" "$staging_dir"
-  mkdir -p "$rootfs_dir" "$staging_dir"
-  tar -xf "$export_file" -C "$staging_dir"
+  rm -rf "$rootfs_dir" "$staging_dir" || return 1
+  mkdir -p "$rootfs_dir" "$staging_dir" || return 1
+  tar -xf "$export_file" -C "$staging_dir" || return 1
 
   if [ -f "$staging_dir/oci-layout" ] && [ -d "$staging_dir/blobs" ]; then
     [ -f "$staging_dir/index.json" ] || die "Container export did not contain an OCI index"
     manifest_digest="$(jq -er '.manifests[0].digest // empty' "$staging_dir/index.json")" || die "Container export did not contain an OCI manifest"
     manifest_file="$(oci_blob_path "$staging_dir" "$manifest_digest")" || die "Container export contained an invalid OCI manifest digest"
     [ -f "$manifest_file" ] || die "Container export referenced a missing OCI manifest blob"
-    while IFS= read -r layer_file; do
-      [ -n "$layer_file" ] || continue
+    layer_digests="$(jq -er '.layers | if type == "array" and length > 0 then .[].digest else error("missing layers") end' "$manifest_file")" \
+      || die "Container export did not contain valid OCI layer digests"
+    while IFS= read -r layer_digest; do
+      [ -n "$layer_digest" ] || continue
+      layer_file="$(oci_blob_path "$staging_dir" "$layer_digest")" || die "Container export contained an invalid OCI layer digest"
       [ -f "$layer_file" ] || die "Container export referenced a missing OCI layer blob"
-      tar -xf "$layer_file" -C "$rootfs_dir"
+      tar -xf "$layer_file" -C "$rootfs_dir" || return 1
       extracted_layer=1
-    done <<EOF_LAYERS
-$(jq -er '.layers[].digest' "$manifest_file" | while IFS= read -r layer_digest; do oci_blob_path "$staging_dir" "$layer_digest"; done)
-EOF_LAYERS
-    rm -rf "$staging_dir"
+    done <<<"$layer_digests"
+    rm -rf "$staging_dir" || return 1
     [ "$extracted_layer" -eq 1 ] || die "Container export did not contain any extractable filesystem layers"
     return 0
   fi
 
-  tar -C "$staging_dir" -cf - . | tar -C "$rootfs_dir" -xf -
-  rm -rf "$staging_dir"
+  tar -C "$staging_dir" -cf - . | tar -C "$rootfs_dir" -xf - || return 1
+  rm -rf "$staging_dir" || return 1
 }
 
 container_export_is_oci_layout() {
@@ -320,6 +337,51 @@ container_shm_size() {
         else empty end
       end
   ' 2>/dev/null
+}
+
+container_ssh_enabled() {
+  local name="$1"
+
+  "$CONTAINER_CMD" inspect "$name" 2>/dev/null | jq -Rrs '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then error("invalid container inspect JSON")
+      elif ($parsed | type) == "array" then ($parsed[0] // {})
+      elif ($parsed | type) == "object" then $parsed
+      else error("invalid container inspect JSON") end
+    | (.configuration // .) as $config
+    | ($config.ssh // false)
+    | if type == "boolean" then . else error("invalid SSH forwarding value") end
+  '
+}
+
+guest_ssh_socket_available() {
+  local name="$1"
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -c 'socket="${SSH_AUTH_SOCK:-/var/host-services/ssh-auth.sock}"; [ -S "$socket" ]' >/dev/null 2>&1
+}
+
+validate_existing_container_ssh() {
+  local name="$1"
+  local requested="$2"
+  local enabled=""
+
+  [ "$requested" -eq 1 ] || return 0
+  enabled="$(container_ssh_enabled "$name")" || die "Unable to determine SSH forwarding configuration for existing container: $name"
+  [ "$enabled" = "true" ] || die "Container $name was created without SSH forwarding. Recreate it with: ${CLI_NAME} upgrade --name $name --ssh"
+  if container_running "$name"; then
+    guest_ssh_socket_available "$name" || die "Container $name has SSH forwarding configured, but its guest agent socket is unavailable. Restart it from a shell with SSH_AUTH_SOCK set."
+  else
+    require_host_ssh_socket
+  fi
+}
+
+warn_if_ssh_forwarding_unavailable_on_start() {
+  local name="$1"
+  local enabled=""
+
+  enabled="$(container_ssh_enabled "$name" 2>/dev/null || true)"
+  if [ "$enabled" = "true" ] && ! host_ssh_socket_available; then
+    warn "Container $name has SSH forwarding enabled, but SSH_AUTH_SOCK is unavailable; the guest SSH agent socket will not be available after start"
+  fi
 }
 
 validate_mount_mode() {
@@ -658,12 +720,13 @@ version_cmd() {
 
 usage_build() {
   cat <<EOF
-Usage: $CLI_NAME build [--image NAME] [--runtimes NAME[,NAME...]] [--default-runtime NAME] [--rebuild] [--snapshot] [--pull-base] [--refresh-base]
+Usage: $CLI_NAME build [--image NAME] [--runtimes NAME[,NAME...]] [--default-runtime NAME] [--features NAME[,NAME...]|all] [--rebuild] [--snapshot] [--pull-base] [--refresh-base]
 
 Options:
   --image NAME       Local image name to build (for example: agent-plain, agent-python, agent-swift, agent-my-team)
   --runtimes LIST    Comma-separated runtimes, or all, to preinstall in the image (default: $DEFAULT_RUNTIME)
   --default-runtime  Runtime to install as the image default (default: $DEFAULT_RUNTIME)
+  --features LIST    Comma-separated features, or all, to preinstall (default: none)
   --rebuild          Rebuild images even if they already exist (disables build cache only; does not refresh FROM tags)
   --snapshot         Add a fresh UTC timestamp tag for existing images without rebuilding
   --pull-base     Pull the base image before building (preferred way to refresh remote FROM tags)
@@ -710,6 +773,7 @@ Options:
   --mem SIZE      Memory limit (e.g. 8G)
   --shm-size SIZE Size of /dev/shm (e.g. 512M, 1G; requires new container)
   --network NAME   Attach to a named network (repeatable; requires new container)
+  --ssh            Forward the host SSH agent and ensure SSH client tooling
 EOF
 }
 
@@ -725,6 +789,7 @@ Options:
   --mem SIZE      Memory limit for a newly created bootstrap container
   --shm-size SIZE Size of /dev/shm for a newly created bootstrap container
   --network NAME   Attach a newly created bootstrap container to a named network (repeatable)
+  --ssh            Forward the host SSH agent and install SSH client tooling
 
 The current bootstrap slice supports Alpine and Debian/Ubuntu-based containers.
 It installs the current managed control surface into the container so that
@@ -850,6 +915,8 @@ Options:
   --mem SIZE          Memory limit for recreated container (default: preserve existing setting)
   --shm-size SIZE     Size of /dev/shm for recreated container (default: preserve explicit existing setting)
   --network NAME      Replace preserved network attachments (repeatable)
+  --ssh               Enable SSH-agent forwarding and ensure SSH client tooling
+  --no-ssh            Disable preserved SSH-agent forwarding
   --backup-image NAME Backup image name for container export (default: <new-name-or-name>-backup-<timestamp>)
   --no-backup         Skip container export backup image creation
   --dry-run           Show the planned upgrade actions without recreating the container
@@ -1529,6 +1596,9 @@ build_cmd() {
   local runtimes_overridden=0
   local default_runtime="$DEFAULT_RUNTIME"
   local default_runtime_overridden=0
+  local features_csv=""
+  local features_overridden=0
+  local features_all=0
   local rebuild=0
   local snapshot=0
   local refresh_base=0
@@ -1542,6 +1612,7 @@ build_cmd() {
       --image) image="$2"; shift 2 ;;
       --runtimes) runtimes_csv="$2"; runtimes_overridden=1; shift 2 ;;
       --default-runtime) default_runtime="$2"; default_runtime_overridden=1; shift 2 ;;
+      --features) features_csv="$2"; features_overridden=1; shift 2 ;;
       --rebuild) rebuild=1; shift ;;
       --snapshot) snapshot=1; shift ;;
       --refresh-base) refresh_base=1; shift ;;
@@ -1604,6 +1675,42 @@ build_cmd() {
     printf '%s\t%s\n' "$normalized" "$first"
   }
 
+  normalize_build_feature_csv() {
+    local raw="$1"
+    local entry=""
+    local manifest=""
+    local registered_feature=""
+    local normalized=""
+    local duplicate_guard=$'\n'
+    local IFS=','
+
+    if [ "$raw" = "all" ]; then
+      raw=""
+      for manifest in "$SCRIPT_DIR"/features.d/*.json; do
+        [ -e "$manifest" ] || continue
+        registered_feature="$(jq -er '.id | strings | select(length > 0)' "$manifest" 2>/dev/null)" \
+          || die "Invalid feature id in manifest: $manifest"
+        [ "$(basename "$manifest" .json)" = "$registered_feature" ] \
+          || die "Feature manifest filename must match id '$registered_feature': $manifest"
+        raw="${raw}${raw:+,}${registered_feature}"
+      done
+    fi
+    read -r -a build_features <<<"$raw"
+    for entry in "${build_features[@]}"; do
+      entry="${entry#"${entry%%[![:space:]]*}"}"
+      entry="${entry%"${entry##*[![:space:]]}"}"
+      [ -n "$entry" ] || continue
+      [ -f "$SCRIPT_DIR/features.d/${entry}.json" ] || die "Unknown feature for build: $entry"
+      if printf '%s' "$duplicate_guard" | grep -Fqx -- "$entry"; then
+        continue
+      fi
+      duplicate_guard="${duplicate_guard}${entry}"$'\n'
+      normalized="${normalized}${normalized:+,}${entry}"
+    done
+    [ -n "$normalized" ] || die "No valid features provided for build"
+    printf '%s\n' "$normalized"
+  }
+
   if [ "$runtimes_overridden" -eq 0 ] && [ "$default_runtime_overridden" -eq 1 ]; then
     runtimes_csv="$default_runtime"
   fi
@@ -1620,6 +1727,11 @@ build_cmd() {
   fi
   if { [ "$default_runtime_overridden" -eq 1 ] || [ "$runtimes_overridden" -eq 1 ]; } && [ "$snapshot" -eq 1 ]; then
     die "--runtimes and --default-runtime cannot be combined with --snapshot"
+  fi
+  if [ "$features_overridden" -eq 1 ]; then
+    [ "$features_csv" != "all" ] || features_all=1
+    features_csv="$(normalize_build_feature_csv "$features_csv")" || return 1
+    [ "$snapshot" -eq 0 ] || die "--features cannot be combined with --snapshot"
   fi
 
   require_container
@@ -1755,6 +1867,7 @@ build_cmd() {
   local build_order_lines=""
   local build_seen_lines=""
   local build_visiting_lines=""
+  local requested_build_lines=""
 
   list_has_line() {
     local lines="$1"
@@ -1806,6 +1919,26 @@ build_cmd() {
     build_order_lines="${build_order_lines}${name}"$'\n'
   }
 
+  build_features_for_image() {
+    local image_name="$1"
+    local feature=""
+    local selected=""
+    local family="${image_name%%:*}"
+    local manifest=""
+
+    [ -n "$features_csv" ] || return 0
+    while IFS= read -r feature; do
+      [ -n "$feature" ] || continue
+      manifest="$SCRIPT_DIR/features.d/$feature.json"
+      if jq -e --arg family "$family" '((.supported_image_families // []) | index($family)) != null' "$manifest" >/dev/null 2>&1; then
+        selected="${selected}${selected:+,}${feature}"
+      elif [ -n "$image" ] && [ "$image_name" = "$image" ] && [ "$features_all" -eq 0 ]; then
+        die "Feature $feature is not supported by image $image_name"
+      fi
+    done < <(printf '%s\n' "$features_csv" | tr ',' '\n')
+    printf '%s\n' "$selected"
+  }
+
   build_one() {
     local name="$1"
     local file
@@ -1816,9 +1949,10 @@ build_cmd() {
     local versioned_name="${name}:${build_stamp}"
     local base=""
     local existing_snapshot=""
+    local image_features=""
     file="$(dockerfile_name_for_image "$name")"
     file_path="$SCRIPT_DIR/$file"
-    if [ "$rebuild" -eq 0 ] && [ "$default_runtime_overridden" -eq 0 ] && [ "$runtimes_overridden" -eq 0 ] && image_exists "$name"; then
+    if [ "$rebuild" -eq 0 ] && [ "$default_runtime_overridden" -eq 0 ] && [ "$runtimes_overridden" -eq 0 ] && [ "$features_overridden" -eq 0 ] && image_exists "$name"; then
       if [ "$snapshot" -eq 1 ]; then
         echo "Snapshotting existing image tags: $name, $versioned_name"
         "$CONTAINER_CMD" image tag "$name" "$versioned_name"
@@ -1850,7 +1984,10 @@ build_cmd() {
       fi
     fi
     echo "Building image tags: $name, $versioned_name"
-    build_args=(build -t "$name" -f "$file_path" --build-arg "AGENT_RUNTIMES=$runtimes_csv" --build-arg "AGENT_DEFAULT_RUNTIME=$default_runtime" --build-arg "BUILD_TIME=$build_time_utc")
+    if list_has_line "$requested_build_lines" "$name"; then
+      image_features="$(build_features_for_image "$name")" || return 1
+    fi
+    build_args=(build -t "$name" -f "$file_path" --build-arg "AGENT_RUNTIMES=$runtimes_csv" --build-arg "AGENT_DEFAULT_RUNTIME=$default_runtime" --build-arg "AGENT_FEATURES=$image_features" --build-arg "BUILD_TIME=$build_time_utc")
     if [ -n "$no_cache" ]; then
       build_args+=("$no_cache")
       build_args+=("$context")
@@ -1862,10 +1999,12 @@ build_cmd() {
   }
 
   if [ -n "$image" ]; then
+    requested_build_lines="${image}"$'\n'
     resolve_build_dependencies "$image"
   else
     while IFS= read -r local_image; do
       [ -z "$local_image" ] && continue
+      requested_build_lines="${requested_build_lines}${local_image}"$'\n'
       resolve_build_dependencies "$local_image"
     done <<< "$(list_local_build_images)"
   fi
@@ -1876,7 +2015,7 @@ build_cmd() {
 
   while IFS= read -r build_image; do
     [ -z "$build_image" ] && continue
-    build_one "$build_image"
+    build_one "$build_image" || return 1
   done <<< "$build_order_lines"
 
   stop_buildkit_container
@@ -3747,6 +3886,7 @@ bootstrap_cmd() {
   local started_for_bootstrap=0
   local created_for_bootstrap=0
   local package_manager=""
+  local ssh_requested=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3757,6 +3897,7 @@ bootstrap_cmd() {
       --mem) mem="$2"; shift 2 ;;
       --shm-size) shm_size="$2"; shift 2 ;;
       --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
+      --ssh) ssh_requested=1; shift ;;
       --help) usage_bootstrap; return 0 ;;
       *) die "Unknown option for bootstrap: $1" ;;
     esac
@@ -3785,10 +3926,16 @@ bootstrap_cmd() {
     if [ -n "$image" ] || [ -n "$cpu" ] || [ -n "$mem" ] || [ -n "$shm_size" ] || [ "${#networks[@]}" -gt 0 ]; then
       die "--image, --cpu, --mem, --shm-size, and --network only apply when bootstrap creates a new container"
     fi
+    validate_existing_container_ssh "$name" "$ssh_requested"
   else
     [ -n "$image" ] || die "Container not found: $name (pass --image to create and bootstrap a new container)"
     echo "Creating bootstrap container..." >&2
     local create_cmd=("$CONTAINER_CMD" create -t)
+    if [ "$ssh_requested" -eq 1 ]; then
+      require_container_ssh_support
+      require_host_ssh_socket
+      create_cmd+=(--ssh)
+    fi
     if [ -n "$cpu" ]; then
       create_cmd+=(-c "$cpu")
     fi
@@ -3836,6 +3983,10 @@ bootstrap_cmd() {
       die "Unsupported bootstrap container base for current bootstrap slice: $name (need Alpine/apk or Debian/Ubuntu apt-get)"
       ;;
   esac
+
+  if [ "$ssh_requested" -eq 1 ]; then
+    ensure_requested_feature_installed "$name" ssh
+  fi
 
   if [ "$started_for_bootstrap" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     "$CONTAINER_CMD" stop "$name" >/dev/null
@@ -4479,6 +4630,43 @@ configure_container_host_alias() {
     || die "Unable to configure $CONTAINER_HOST_NAME in container: $name"
 }
 
+doctor_ssh_status() {
+  local name="$1"
+  local relay=""
+  local feature_info=""
+  local client_installed=false
+  local status=0
+
+  relay="$(container_ssh_enabled "$name")" || {
+    printf '%s\n' "unable to inspect SSH forwarding configuration"
+    return 0
+  }
+  feature_info="$(run_agent_sh_in_container "$name" feature info ssh 2>/dev/null || true)"
+  if [ -n "$feature_info" ] && printf '%s' "$feature_info" | jq -e '.installed == true' >/dev/null 2>&1; then
+    client_installed=true
+  fi
+
+  if [ "$relay" = "true" ]; then
+    if guest_ssh_socket_available "$name"; then
+      printf '%s\n' "SSH agent relay is enabled and available"
+    else
+      printf '%s\n' "SSH agent relay is enabled but its guest socket is unavailable; restart from a shell with SSH_AUTH_SOCK set"
+      status=1
+    fi
+    if [ "$client_installed" = "true" ]; then
+      printf '%s\n' "SSH client feature is installed"
+    else
+      printf '%s\n' "SSH client feature is missing; run: ${CLI_NAME} feature install ssh --name $name"
+      status=1
+    fi
+  elif [ "$client_installed" = "true" ]; then
+    printf '%s\n' "SSH client feature is installed; agent forwarding is disabled (enable with: ${CLI_NAME} upgrade --name $name --ssh)"
+  else
+    printf '%s\n' "SSH agent forwarding and client feature are not configured"
+  fi
+  return "$status"
+}
+
 doctor_cmd() {
   local name=""
   local fix=0
@@ -4488,6 +4676,7 @@ doctor_cmd() {
   local permission_output=""
   local runtime_output=""
   local state_summary_output=""
+  local ssh_output=""
   local doctor_status=0
   local status=0
 
@@ -4580,6 +4769,15 @@ doctor_cmd() {
     echo "Doctor runtime state summary in $name:" >&2
     printf '%s\n' "$state_summary_output" | sed 's/^/  - /' >&2
   fi
+
+  if ssh_output="$(doctor_ssh_status "$name")"; then
+    echo "Doctor SSH state in $name:" >&2
+  else
+    doctor_status=$?
+    echo "Doctor found an SSH configuration problem in $name:" >&2
+    status="$doctor_status"
+  fi
+  [ -z "$ssh_output" ] || printf '%s\n' "$ssh_output" | sed 's/^/  - /' >&2
 
   if [ "$started_for_doctor" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     echo "Stopping container: $name" >&2
@@ -4937,6 +5135,21 @@ target_feature_installed() {
 
   feature_info="$(run_agent_sh_in_container "$name" feature info "$feature" 2>/dev/null)" || return 1
   printf '%s' "$feature_info" | jq -e '.installed == true' >/dev/null 2>&1
+}
+
+ensure_requested_feature_installed() {
+  local name="$1"
+  local feature="$2"
+
+  if target_feature_installed "$name" "$feature"; then
+    return 0
+  fi
+  if target_feature_installable "$name" "$feature"; then
+    echo "Installing requested feature in $name: $feature" >&2
+    run_agent_sh_in_container_root "$name" feature install "$feature" || die "Failed to install requested feature: $feature"
+    return 0
+  fi
+  die "Feature $feature is unavailable in $name. Run '${CLI_NAME} refresh --name $name' and retry."
 }
 
 ensure_target_feature_installed() {
@@ -6016,6 +6229,9 @@ print_upgrade_dry_run_summary() {
   local copy_mode="${19:-0}"
   local current_networks="${20:-default}"
   local target_networks="${21:-default}"
+  local current_ssh="${22:-false}"
+  local target_ssh="${23:-false}"
+  local ensure_ssh_feature="${24:-0}"
   local state_label=""
   local mount_label=""
   local config_label=""
@@ -6084,6 +6300,10 @@ print_upgrade_dry_run_summary() {
   echo "  Memory: $current_mem_display -> $target_mem_display" >&2
   echo "  Shared memory: $current_shm_display -> $target_shm_display" >&2
   echo "  Networks: ${current_networks:-default} -> ${target_networks:-default}" >&2
+  echo "  SSH forwarding: $([ "$current_ssh" = "true" ] && printf enabled || printf disabled) -> $([ "$target_ssh" = "true" ] && printf enabled || printf disabled)" >&2
+  if [ "$ensure_ssh_feature" -eq 1 ]; then
+    echo "  SSH client feature: ensure installed" >&2
+  fi
   echo "  Current state: $state_label" >&2
   echo "  Config backup: $config_label" >&2
   echo "  Backup image: $backup_label" >&2
@@ -6096,6 +6316,58 @@ print_upgrade_dry_run_summary() {
     echo "  Actions: remove $name and recreate it as $target_name" >&2
   fi
   echo "Dry run complete: no container changes applied" >&2
+}
+
+upgrade_should_ensure_ssh_feature() {
+  local target_ssh="$1"
+  local ssh_enable_requested="$2"
+  local source_manifest="${3:-}"
+
+  [ "$target_ssh" = "true" ] || return 1
+  [ "$ssh_enable_requested" -eq 0 ] || return 0
+  [ -n "$source_manifest" ] || return 1
+  printf '%s' "$source_manifest" | jq -e '((.installed_features // []) | index("ssh")) != null' >/dev/null 2>&1
+}
+
+exported_container_ssh_feature_installed() {
+  local name="$1"
+  local temp_dir=""
+  local export_file=""
+  local export_root=""
+  local status=1
+
+  temp_dir="$(mktemp -d)"
+  export_file="$temp_dir/container-export.tar"
+  export_root="$temp_dir/rootfs"
+  if ! "$CONTAINER_CMD" export "$name" --output "$export_file"; then
+    report_backup_storage_diagnostics || true
+    cleanup_temp_dir "$temp_dir"
+    return 2
+  fi
+  mkdir -p "$export_root"
+  if ! ( extract_container_export_rootfs "$export_file" "$export_root" ); then
+    cleanup_temp_dir "$temp_dir"
+    return 2
+  fi
+  if [ -f "$export_root/var/lib/agentctl/features/ssh/install-complete" ] \
+    && { [ -x "$export_root/usr/bin/ssh" ] || [ -x "$export_root/usr/local/bin/ssh" ]; }; then
+    status=0
+  fi
+  cleanup_temp_dir "$temp_dir"
+  return "$status"
+}
+
+upgrade_source_ssh_feature_installed() {
+  local name="$1"
+  local source_manifest="${2:-}"
+  local allow_export_fallback="${3:-0}"
+
+  if [ -n "$source_manifest" ]; then
+    printf '%s' "$source_manifest" | jq -e '((.installed_features // []) | index("ssh")) != null' >/dev/null 2>&1
+    return
+  fi
+  [ "$allow_export_fallback" -eq 1 ] || return 1
+  exported_container_ssh_feature_installed "$name"
 }
 
 display_upgrade_image_ref() {
@@ -6174,7 +6446,8 @@ run_container() {
   local stdio="${13}"
   local shm_size="${14}"
   local network_text="${15}"
-  shift 15
+  local ssh_requested="${16}"
+  shift 16
   local cmd=("$@")
   local exit_code=0
   local started=0
@@ -6204,6 +6477,7 @@ run_container() {
     validate_mount_mode "$actual_name" "$read_only"
     validate_existing_container_shm_size "$actual_name" "$shm_size"
     validate_existing_container_networks "$actual_name" "$network_text"
+    validate_existing_container_ssh "$actual_name" "$ssh_requested"
   fi
   if [ -n "$actual_name" ] && container_running "$actual_name"; then
     already_running=1
@@ -6216,6 +6490,10 @@ run_container() {
     fi
 
     if [ -z "$actual_name" ] || ! container_exists "$actual_name"; then
+      if [ "$ssh_requested" -eq 1 ]; then
+        require_container_ssh_support
+        require_host_ssh_socket
+      fi
       echo "Creating container..." >&2
       local create_cmd=("$CONTAINER_CMD" create -t)
       if [ -n "$cpu" ]; then
@@ -6232,6 +6510,7 @@ run_container() {
         [ -n "$network_name" ] || continue
         create_cmd+=(--network "$network_name")
       done < <(network_text_names "$network_text")
+      [ "$ssh_requested" -eq 0 ] || create_cmd+=(--ssh)
       if [ -n "$actual_name" ]; then
         create_cmd+=(--name "$actual_name")
       fi
@@ -6255,6 +6534,10 @@ run_container() {
         fi
       fi
       created=1
+    fi
+
+    if [ "$created" -eq 0 ] && [ "$ssh_requested" -eq 0 ]; then
+      warn_if_ssh_forwarding_unavailable_on_start "$actual_name"
     fi
 
     echo "Starting container: $actual_name" >&2
@@ -6334,7 +6617,8 @@ run_mode() {
   local stdio="${16}"
   local shm_size="${17}"
   local network_text="${18}"
-  shift 18
+  local ssh_requested="${19}"
+  shift 19
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
@@ -6361,7 +6645,7 @@ run_mode() {
       cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "$launch_env exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override" "$ollama_host")
     fi
   fi
-  if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ]; then
+  if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_ENSURE_SSH_FEATURE" -eq 1 ]; then
     pre_exec="run_pre_exec"
   fi
 
@@ -6370,7 +6654,7 @@ run_mode() {
     shell=0
   fi
 
-  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "$stdio" "$shm_size" "$network_text" "${cmd[@]}"
+  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "$stdio" "$shm_size" "$network_text" "$ssh_requested" "${cmd[@]}"
 }
 
 RUN_SELECTED_RUNTIME=""
@@ -6383,6 +6667,7 @@ RUN_UPDATE_CODEX=0
 RUN_EFFECTIVE_MODE="local"
 RUN_REQUESTED_IMAGE=""
 RUN_RUNTIME_CONFIG_JSON='{}'
+RUN_ENSURE_SSH_FEATURE=0
 
 run_post_exec() {
   local name="$1"
@@ -6409,6 +6694,10 @@ run_pre_exec() {
   local keychain_info=""
   local keychain_token=""
   local keychain_refresh=""
+
+  if [ "$RUN_ENSURE_SSH_FEATURE" -eq 1 ]; then
+    ensure_requested_feature_installed "$name" ssh
+  fi
 
   if [ "$RUN_UPDATE_CODEX" -eq 1 ]; then
     update_codex_pre_exec "$name"
@@ -6484,6 +6773,7 @@ run_cmd() {
   local home_mount=""
   local workdir=""
   local stdio=0
+  local ssh_requested=0
   local -a runtime_config_entries=()
   local -a networks=()
   local -a cmd_override=()
@@ -6513,6 +6803,7 @@ run_cmd() {
       --mem) mem="$2"; shift 2 ;;
       --shm-size) shm_size="$2"; shift 2 ;;
       --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
+      --ssh) ssh_requested=1; shift ;;
       --help) usage_run; return 0 ;;
       *) die "Unknown option for run: $1" ;;
     esac
@@ -6612,6 +6903,7 @@ run_cmd() {
   RUN_EFFECTIVE_MODE="local"
   RUN_REQUESTED_IMAGE="$image"
   RUN_RUNTIME_CONFIG_JSON="$runtime_config_json"
+  RUN_ENSURE_SSH_FEATURE="$ssh_requested"
   if [ "$online" -eq 1 ]; then
     RUN_EFFECTIVE_MODE="online"
     RUN_SYNC_RUNTIME_AUTH=1
@@ -6622,7 +6914,7 @@ run_cmd() {
     RUN_UPDATE_CODEX=1
   fi
 
-  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" "$stdio" "$shm_size" "$network_text" ${cmd_override[@]+"${cmd_override[@]}"}
+  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" "$stdio" "$shm_size" "$network_text" "$ssh_requested" ${cmd_override[@]+"${cmd_override[@]}"}
 }
 
 auth_cmd() {
@@ -6679,6 +6971,14 @@ upgrade_cmd() {
   local current_network_names=""
   local target_network_specs=""
   local target_network_names=""
+  local current_ssh="false"
+  local target_ssh="false"
+  local ssh_enable_requested=0
+  local ssh_disable_requested=0
+  local ensure_ssh_feature=0
+  local source_ssh_feature_installed=0
+  local ssh_feature_status=0
+  local allow_ssh_export_fallback=0
   local read_only=0
   local was_running=0
   local started_for_backup=0
@@ -6707,6 +7007,8 @@ upgrade_cmd() {
       --mem) mem="$2"; shift 2 ;;
       --shm-size) shm_size="$2"; shift 2 ;;
       --network) [ "$#" -ge 2 ] || die "Missing value for --network"; requested_networks+=("$2"); shift 2 ;;
+      --ssh) ssh_enable_requested=1; shift ;;
+      --no-ssh) ssh_disable_requested=1; shift ;;
       --backup-image) backup_image="$2"; shift 2 ;;
       --no-backup) no_backup=1; shift ;;
       --dry-run) dry_run=1; shift ;;
@@ -6719,6 +7021,7 @@ upgrade_cmd() {
   if [ -n "$shm_size" ] && ! shared_memory_size_to_bytes "$shm_size" >/dev/null 2>&1; then
     die "Invalid --shm-size: $shm_size (use a size such as 512M, 1.5G, or 2GiB)"
   fi
+  [ "$ssh_enable_requested" -eq 0 ] || [ "$ssh_disable_requested" -eq 0 ] || die "Cannot combine --ssh with --no-ssh"
   require_container
 
   if [ -z "$name" ]; then
@@ -6754,6 +7057,21 @@ upgrade_cmd() {
   inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
   IFS=$'\t' read -r current_image current_workdir mount_mode current_cpu current_mem <<<"$inspect_info"
   current_shm_size="$(container_shm_size "$name")"
+  current_ssh="$(container_ssh_enabled "$name")" || die "Unable to determine SSH forwarding configuration for $name"
+  target_ssh="$current_ssh"
+  if [ "$ssh_enable_requested" -eq 1 ]; then
+    target_ssh=true
+  elif [ "$ssh_disable_requested" -eq 1 ]; then
+    target_ssh=false
+  fi
+  if [ "$target_ssh" = "true" ]; then
+    require_container_ssh_support
+    if [ "$ssh_enable_requested" -eq 1 ]; then
+      require_host_ssh_socket
+    elif ! host_ssh_socket_available; then
+      warn "Preserving SSH forwarding for $name, but the current SSH_AUTH_SOCK is unavailable; forwarding will reconnect on a later start from a shell with SSH_AUTH_SOCK set"
+    fi
+  fi
   current_network_specs="$(container_network_specs "$name")" \
     || die "Unable to determine network attachments for $name; pass --network explicitly"
   current_network_names="$(printf '%s\n' "$current_network_specs" | sed '/^$/d; s/,.*//')"
@@ -6848,12 +7166,33 @@ upgrade_cmd() {
   if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ] && [ -z "$backup_image" ]; then
     backup_image="$(sanitize_image_name "${target_name}-backup-$(date -u +%Y%m%d%H%M%S)")"
   fi
+  if [ "$target_ssh" = "true" ] && [ "$ssh_enable_requested" -eq 0 ]; then
+    if [ "$was_running" -eq 0 ] && [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; then
+      allow_ssh_export_fallback=1
+    fi
+    if upgrade_source_ssh_feature_installed \
+      "$name" \
+      "$preflight_current_manifest" \
+      "$allow_ssh_export_fallback"; then
+      source_ssh_feature_installed=1
+    else
+      ssh_feature_status=$?
+      if [ "$ssh_feature_status" -gt 1 ]; then
+        die "Unable to determine whether stopped container $name has the SSH feature; refusing to recreate it while preserving SSH forwarding"
+      fi
+    fi
+  fi
+  if upgrade_should_ensure_ssh_feature "$target_ssh" "$ssh_enable_requested" "$preflight_current_manifest" \
+    || { [ "$target_ssh" = "true" ] && [ "$source_ssh_feature_installed" -eq 1 ]; }; then
+    ensure_ssh_feature=1
+  fi
   if [ "$dry_run" -eq 1 ]; then
     print_upgrade_dry_run_summary \
       "$name" "$target_name" "$current_image" "$image" "$current_workdir" "$workdir" \
       "$mount_mode" "$current_cpu" "$cpu" "$current_mem" "$mem" "$current_shm_size" "$shm_size" "$was_running" \
       "$backup_mode" "$no_backup" "$backup_image" "$overwrite_config" "$copy_mode" \
-      "$(printf '%s' "$current_network_names" | paste -sd, -)" "$(printf '%s' "$target_network_names" | paste -sd, -)"
+      "$(printf '%s' "$current_network_names" | paste -sd, -)" "$(printf '%s' "$target_network_names" | paste -sd, -)" \
+      "$current_ssh" "$target_ssh" "$ensure_ssh_feature"
     return 0
   fi
 
@@ -6988,6 +7327,7 @@ upgrade_cmd() {
     [ -n "$network_spec" ] || continue
     create_cmd+=(--network "$network_spec")
   done <<<"$target_network_specs"
+  [ "$target_ssh" = "false" ] || create_cmd+=(--ssh)
   local mount_opts="type=bind,src=$workdir,dst=/workdir"
   if [ "$read_only" -eq 1 ]; then
     mount_opts="${mount_opts},readonly"
@@ -7008,6 +7348,9 @@ upgrade_cmd() {
   fi
 
   reinstall_added_runtimes_and_features "$target_name" "$added_runtimes_json" "$added_features_json"
+  if [ "$ensure_ssh_feature" -eq 1 ]; then
+    ensure_requested_feature_installed "$target_name" ssh
+  fi
 
   echo "Restoring user state into $target_name" >&2
   restore_codex_config "$target_name" "$state_backup_file"
@@ -7295,11 +7638,13 @@ simple_name_cmd() {
 
   case "$action" in
     start)
+      warn_if_ssh_forwarding_unavailable_on_start "$name"
       "$CONTAINER_CMD" start "$name"
       configure_container_host_alias "$name"
       ;;
     stop) "$CONTAINER_CMD" stop "$name" ;;
     restart)
+      warn_if_ssh_forwarding_unavailable_on_start "$name"
       "$CONTAINER_CMD" restart "$name"
       configure_container_host_alias "$name"
       ;;

@@ -1,0 +1,31 @@
+{
+  "id": "ssh",
+  "display_name": "SSH Client Tooling",
+  "install_method": "apk-or-apt",
+  "description": "OpenSSH client commands for outbound SSH and optional Apple SSH-agent forwarding.",
+  "supported_image_families": [
+    "agent-plain",
+    "agent-python",
+    "agent-swift"
+  ],
+  "system_packages": {
+    "apk": [
+      "ca-certificates",
+      "openssh-client"
+    ],
+    "dpkg": [
+      "ca-certificates",
+      "openssh-client"
+    ]
+  },
+  "capabilities": {
+    "install": true,
+    "remove": false,
+    "update": false
+  },
+  "commands": [
+    "feature list",
+    "feature info ssh",
+    "feature install ssh"
+  ]
+}

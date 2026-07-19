@@ -62,7 +62,8 @@ The candidate tables use these labels:
 | OCI recovery-image export | unused | high for off-host disaster recovery | medium | high |
 | Effective runtime defaults in doctor | implicit only | medium; clearer resource behavior | small-medium | medium |
 | Custom and host-only networks | implemented and host-verified | medium-high for isolation | complete | selected |
-| SSH and socket forwarding | detected | medium for developer integrations | medium | medium |
+| SSH agent forwarding | implemented and host-verified | medium for developer integrations | complete | selected |
+| Arbitrary Unix-socket forwarding | detected | medium for MCP and developer integrations | medium | medium |
 | Builder DNS controls | unused | medium in VPN/private-network environments | medium | medium |
 | Pull concurrency and progress | unused | low-medium | small-medium | medium-low |
 | Stop-signal support | unused | low with the current keepalive process | medium | low-medium |
@@ -387,6 +388,10 @@ explain how to recreate it after a restart.
 
 ## SSH agent and Unix-socket forwarding
 
+Detailed behavior, host probe results, security constraints, MCP transport
+options, and proposed implementation phases are recorded in
+[SSH and Unix-socket forwarding research](ssh-socket-forwarding-research.md).
+
 ### Upstream capability and fix
 
 Apple 1.1 propagates host socket permissions into the guest so non-root users
@@ -395,29 +400,36 @@ published sockets, MCP connections, and developer-tool integrations.
 
 ### Current agentctl state
 
-Host doctor detects `--ssh` and `--publish-socket`, but `agentctl run` does not
-expose them generally.
+Host doctor detects `--ssh` and `--publish-socket`. SSH-agent forwarding is now
+an opt-in feature: `agentctl build --features ssh` installs the required SSH
+client, while `run --ssh` and `bootstrap --ssh` request forwarding and ensure
+that the selected image contains the feature. Upgrade preserves and reinstalls
+the feature when needed, accepts an explicit `--ssh`, and supports `--no-ssh`
+to disable forwarding. The complete SSH lifecycle is covered by a macOS host
+integration test.
+
+Arbitrary `--publish-socket` forwarding is detected but is not yet exposed by
+normal `agentctl` commands.
 
 ### Candidate interface
 
 ```bash
-agentctl run --ssh
 agentctl run --publish-socket HOST_PATH:CONTAINER_PATH
 ```
 
-Upgrade should preserve requested socket configuration where meaningful, but
-must distinguish ephemeral host paths such as a login-session SSH socket from
-stable configuration.
+Future socket forwarding should preserve requested configuration where
+meaningful while distinguishing ephemeral host paths from stable
+configuration.
 
 ### Investigation before implementation
 
-- Test access as `coder`, not only root.
-- Verify behavior after host logout/login changes `SSH_AUTH_SOCK`.
-- Decide whether `--ssh` should be opt-in per run or persisted in container
-  configuration.
+- Test arbitrary published-socket access as `coder`, not only root.
+- Verify behavior when an ephemeral host socket path changes.
 - Validate socket paths and avoid printing sensitive path or connection data.
-- Document the trust consequences of exposing a host agent or daemon socket to
-  code inside the container.
+- Define lifecycle, upgrade-preservation, and collision behavior for multiple
+  published sockets.
+- Document the trust consequences of exposing a host daemon socket to code
+  inside the container.
 
 ## Builder DNS controls
 

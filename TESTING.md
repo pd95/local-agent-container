@@ -58,6 +58,15 @@ and confirms upgrade preservation and attached-network deletion safety:
 bash tests/run-tests.sh --tier full --filter host-only
 ```
 
+The SSH forwarding test requires a working host `SSH_AUTH_SOCK`. It rebuilds
+`agent-plain` with the SSH feature preinstalled, verifies non-root agent access,
+checks upgrade preservation, and then disables the relay while retaining the
+client feature:
+
+```bash
+bash tests/run-tests.sh --tier full --filter ssh-forwarding
+```
+
 For a focused Apple container 1.1 storage-accounting smoke check, run:
 
 ```bash

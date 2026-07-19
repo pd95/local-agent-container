@@ -729,6 +729,79 @@ test_container_shm_size_reads_apple_container_inspect_shape() {
     || fail "Expected shared-memory byte count from inspect"
 }
 
+test_container_ssh_enabled_reads_inspect_shapes() {
+  begin_test "SSH forwarding inspect helper reads current and legacy shapes"
+
+  load_agentctl_functions
+  local inspect_json='{}'
+  CONTAINER_CMD=mock_container
+  mock_container() {
+    [ "$1" = "inspect" ] || fail "Unexpected container invocation: $*"
+    printf '%s\n' "$inspect_json"
+  }
+
+  inspect_json='[{"configuration":{"ssh":true}}]'
+  [ "$(container_ssh_enabled unit-test-container)" = "true" ] || fail "Expected configured SSH forwarding"
+  inspect_json='{"ssh":true}'
+  [ "$(container_ssh_enabled unit-test-container)" = "true" ] || fail "Expected legacy top-level SSH forwarding"
+  inspect_json='[{"configuration":{}}]'
+  [ "$(container_ssh_enabled unit-test-container)" = "false" ] || fail "Expected missing SSH field to default false"
+  inspect_json='[{"configuration":{"ssh":"yes"}}]'
+  if container_ssh_enabled unit-test-container >/dev/null 2>&1; then
+    fail "Expected malformed SSH value to fail"
+  fi
+}
+
+test_upgrade_ssh_feature_preservation_decision() {
+  begin_test "upgrade ensures SSH client when forwarding is requested or preserved"
+
+  load_agentctl_functions
+  local probe_base probe_dir
+  upgrade_should_ensure_ssh_feature true 1 '' \
+    || fail "Expected explicit --ssh to ensure the feature"
+  upgrade_should_ensure_ssh_feature true 0 '{"installed_features":["office","ssh"]}' \
+    || fail "Expected preserved forwarding to retain a source SSH feature"
+  if upgrade_should_ensure_ssh_feature true 0 '{"installed_features":["office"]}'; then
+    fail "Did not expect an absent source SSH feature to be installed implicitly"
+  fi
+  if upgrade_should_ensure_ssh_feature false 0 '{"installed_features":["ssh"]}'; then
+    fail "Did not expect --no-ssh to force SSH feature installation"
+  fi
+
+  probe_base="$(command mktemp -d "${TMPDIR:-/tmp}/agentctl-ssh-export-probe.XXXXXX")"
+  register_dir_cleanup "$probe_base"
+  probe_dir="$probe_base/probe"
+  mktemp() {
+    [ "$1" = "-d" ] || fail "Unexpected mktemp invocation: $*"
+    mkdir -p "$probe_dir"
+    printf '%s\n' "$probe_dir"
+  }
+  report_backup_storage_diagnostics() { :; }
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = "export" ] || fail "Unexpected container invocation: $*"
+    [ "$3" = "--output" ] || fail "Expected export output flag: $*"
+    printf '%s\n' 'not-a-tar-archive' >"$4"
+  }
+  if exported_container_ssh_feature_installed unit-test-container; then
+    fail "Expected malformed export inspection to fail"
+  else
+    [ "$?" -eq 2 ] || fail "Expected malformed export inspection status 2"
+  fi
+  [ ! -e "$probe_dir" ] || fail "Expected malformed-export probe directory cleanup"
+  unset -f mktemp container report_backup_storage_diagnostics
+
+  exported_container_ssh_feature_installed() { return 0; }
+  upgrade_source_ssh_feature_installed unit-test-container '' 1 \
+    || fail "Expected the stopped-export fallback to detect SSH"
+  if upgrade_source_ssh_feature_installed unit-test-container '' 0; then
+    fail "Did not expect export inspection outside the missing-workdir fallback"
+  fi
+  exported_container_ssh_feature_installed() { return 2; }
+  run_capture upgrade_source_ssh_feature_installed unit-test-container '' 1
+  assert_status 2
+}
+
 test_shared_memory_support_check_fails_before_use() {
   begin_test "shared-memory support check rejects older Apple container runtimes"
 
@@ -765,10 +838,36 @@ test_run_container_passes_shared_memory_size_to_create() {
     esac
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 1GiB "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 1GiB "" 0 true
   assert_status 0
   printf '%s\n' "$create_log" | grep -Fq -- "--shm-size 1GiB" \
     || fail "Expected shared-memory create flag, got: $create_log"
+}
+
+test_run_container_passes_ssh_to_create() {
+  begin_test "run_container passes SSH forwarding to container create"
+
+  load_agentctl_functions
+  local create_log=""
+  container_exists() { return 1; }
+  container_running() { return 1; }
+  require_container_ssh_support() { return 0; }
+  require_host_ssh_socket() { return 0; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  configure_container_host_alias() { :; }
+  warn_if_container_agentctl_versions_differ() { :; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create) shift; create_log="$(printf '%s ' "$@")" ;;
+      start|stop|exec) ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" 1 true
+  assert_status 0
+  printf '%s\n' "$create_log" | grep -Fq -- "--ssh" || fail "Expected SSH create flag, got: $create_log"
 }
 
 test_configure_container_host_alias_replaces_stale_entry() {
@@ -982,7 +1081,7 @@ test_run_container_refreshes_host_alias_before_exec() {
     [ "$1" = "exec" ] || fail "Expected agent exec, got: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" 0 true
   assert_status 0
   [ "$configured_name" = "unit-test-container" ] \
     || fail "Expected host alias refresh before exec, got: $configured_name"
@@ -1054,7 +1153,7 @@ test_new_container_launch_checks_agentctl_versions() {
     esac
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" 0 true
   assert_status 0
   assert_contains "Creating container..."
   assert_contains "Starting container: unit-test-container"
@@ -1128,10 +1227,51 @@ test_build_help_reports_primary_base_images() {
   assert_status 0
   assert_contains "--runtimes"
   assert_contains "--default-runtime"
+  assert_contains "--features"
   assert_contains "agent-plain"
   assert_contains "agent-python"
   assert_contains "agent-swift"
   assert_contains "agent-office remains available only as a legacy compatibility image"
+}
+
+test_build_cmd_passes_feature_list_only_to_requested_image() {
+  begin_test "build_cmd passes features only to the requested final image"
+
+  load_agentctl_functions
+  local build_calls=""
+  require_container() { return 0; }
+  image_exists() { return 1; }
+  stop_buildkit_container() { :; }
+  mock_container() {
+    if [ "$1" = "build" ]; then
+      build_calls="${build_calls}$*"$'\n'
+    fi
+  }
+  CONTAINER_CMD=mock_container
+
+  run_capture build_cmd --image agent-python --features ssh
+  assert_status 0
+  printf '%s\n' "$build_calls" | grep -F -- 'build -t agent-plain ' | grep -Fq -- '--build-arg AGENT_FEATURES=' \
+    || fail "Expected dependency build to receive an empty feature list: $build_calls"
+  printf '%s\n' "$build_calls" | grep -F -- 'build -t agent-plain ' | grep -Fqv -- '--build-arg AGENT_FEATURES=ssh' \
+    || fail "Did not expect SSH in the dependency image: $build_calls"
+  printf '%s\n' "$build_calls" | grep -F -- 'build -t agent-python ' | grep -Fq -- '--build-arg AGENT_FEATURES=ssh' \
+    || fail "Expected SSH in the requested image: $build_calls"
+}
+
+test_build_cmd_rejects_incompatible_feature() {
+  begin_test "build_cmd rejects features unsupported by the requested image"
+
+  load_agentctl_functions
+  require_container() { return 0; }
+  image_exists() { return 1; }
+  stop_buildkit_container() { :; }
+  mock_container() { :; }
+  CONTAINER_CMD=mock_container
+
+  run_capture build_cmd --image agent-plain --features office
+  assert_status 1
+  assert_contains "Feature office is not supported by image agent-plain"
 }
 
 test_build_cmd_passes_runtime_list_build_args() {
@@ -1990,7 +2130,7 @@ container() {
       ;;
   esac
 }
-printf 'protocol-input\n' | run_container unit-test-container agent-python 0 0 "" "" 0 "$TEST_ROOT" "" pre_reads_stdin "" 0 1 "" "" cat
+printf 'protocol-input\n' | run_container unit-test-container agent-python 0 0 "" "" 0 "$TEST_ROOT" "" pre_reads_stdin "" 0 1 "" "" 0 cat
 EOF
   chmod +x "$unit_script"
 
@@ -2153,7 +2293,7 @@ test_run_container_reset_config_uses_runtime_helper() {
     fail "Unexpected agent.sh invocation: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" "" 0 true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:codex' || fail "Expected runtime reset-config helper call, got: $helper_log"
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:codex' || fail "Expected preferred runtime to be preserved, got: $helper_log"
@@ -2192,7 +2332,7 @@ test_run_container_reset_config_uses_selected_runtime() {
     fail "Did not expect preferred runtime lookup when selected runtime is set: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" "" 0 true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:opencode' || fail "Expected selected runtime reset-config helper call, got: $helper_log"
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:opencode' || fail "Expected selected runtime to be preserved, got: $helper_log"
@@ -2235,7 +2375,7 @@ test_run_container_reset_config_preserves_preferred_runtime() {
     fail "Unexpected agent.sh invocation: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" "" 0 true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:reset:opencode' || fail "Expected preferred runtime reset-config helper call, got: $helper_log"
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:opencode' || fail "Expected preferred runtime to be restored after reset, got: $helper_log"
@@ -2782,25 +2922,25 @@ test_agentctl_wrapper_usage_banner() {
   assert_contains "Usage: agentctl <command> [options]"
 }
 
-test_host_test_filter_normalizes_hyphens_spaces_and_underscores() {
-  begin_test "host test filter normalizes hyphens, spaces, and underscores"
+test_host_test_filter_normalizes_case_hyphens_spaces_and_underscores() {
+  begin_test "host test filter normalizes case, hyphens, spaces, and underscores"
 
   local original_filter="$TEST_FILTER"
   local original_start_from="$TEST_START_FROM"
   local original_start_active="$TEST_START_ACTIVE"
 
-  TEST_FILTER="tagged-apk"
+  TEST_FILTER="TAGGED-APK"
   test_matches_filter \
     test_upgrade_repeats_tagged_apk_reinstall_instructions \
     "upgrade repeats complete tagged APK reinstall instructions" \
-    || fail "Expected a hyphenated filter to match underscore and space separators"
+    || fail "Expected a mixed-case hyphenated filter to match underscore and space separators"
 
-  TEST_START_FROM="tagged-apk"
+  TEST_START_FROM="Tagged-Apk"
   TEST_START_ACTIVE=0
   test_matches_start_from \
     test_upgrade_repeats_tagged_apk_reinstall_instructions \
     "upgrade repeats complete tagged APK reinstall instructions" \
-    || fail "Expected a hyphenated --from value to match underscore and space separators"
+    || fail "Expected a mixed-case hyphenated --from value to match underscore and space separators"
   [ "$TEST_START_ACTIVE" -eq 1 ] \
     || fail "Expected a matching --from value to activate subsequent tests"
 
@@ -3063,6 +3203,66 @@ EOF
   fi
   grep -Fq "npm install -g pptxgenjs" "$install_log" || fail "Expected office feature to install pptxgenjs"
   grep -Fq "pip install --no-cache-dir python-docx python-pptx xlrd pdfplumber" "$install_log" || fail "Expected office feature to install pip packages"
+}
+
+test_agent_sh_feature_install_ssh_supports_apk() {
+  begin_test "agent.sh feature install ssh supports Alpine apk"
+
+  local temp_home fake_bin state_dir install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-ssh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  state_dir="$temp_home/state"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin" "$state_dir"
+  cat >"$fake_bin/apk" <<EOF
+#!/bin/sh
+printf 'apk %s\n' "\$*" >>"$install_log"
+EOF
+  cat >"$fake_bin/ssh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/apk" "$fake_bin/ssh"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_FEATURE_SSH_SKIP_ROOT_CHECK=1 \
+    AGENTCTL_FEATURE_STATE_DIR="$state_dir" \
+    -- feature install ssh
+  assert_status 0
+  grep -Fq "apk add --no-cache ca-certificates openssh-client" "$install_log" || fail "Expected SSH apk packages"
+  [ -f "$state_dir/ssh/install-complete" ] || fail "Expected SSH feature marker"
+}
+
+test_agent_sh_feature_install_ssh_supports_apt() {
+  begin_test "agent.sh feature install ssh supports Debian apt-get"
+
+  local temp_home fake_bin state_dir install_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-ssh-apt-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  state_dir="$temp_home/state"
+  install_log="$temp_home/install.log"
+  mkdir -p "$fake_bin" "$state_dir"
+  cat >"$fake_bin/apt-get" <<EOF
+#!/bin/sh
+printf 'apt-get %s\n' "\$*" >>"$install_log"
+EOF
+  cat >"$fake_bin/ssh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/apt-get" "$fake_bin/ssh"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_FEATURE_SSH_SKIP_ROOT_CHECK=1 \
+    AGENTCTL_FEATURE_STATE_DIR="$state_dir" \
+    -- feature install ssh
+  assert_status 0
+  grep -Fq "apt-get update" "$install_log" || fail "Expected apt-get update"
+  grep -Fq "apt-get install -y --no-install-recommends ca-certificates openssh-client" "$install_log" || fail "Expected SSH apt packages"
 }
 
 test_agent_sh_feature_info_reports_installed_after_office_install() {
@@ -11334,8 +11534,11 @@ main() {
   run_selected_test test_inspect_json_helpers_handle_schema_shapes_and_invalid_input "test_inspect_json_helpers_handle_schema_shapes_and_invalid_input"
   run_selected_test test_shared_memory_size_helpers_normalize_and_compare_values "test_shared_memory_size_helpers_normalize_and_compare_values"
   run_selected_test test_container_shm_size_reads_apple_container_inspect_shape "test_container_shm_size_reads_apple_container_inspect_shape"
+  run_selected_test test_container_ssh_enabled_reads_inspect_shapes "test_container_ssh_enabled_reads_inspect_shapes"
+  run_selected_test test_upgrade_ssh_feature_preservation_decision "test_upgrade_ssh_feature_preservation_decision"
   run_selected_test test_shared_memory_support_check_fails_before_use "test_shared_memory_support_check_fails_before_use"
   run_selected_test test_run_container_passes_shared_memory_size_to_create "test_run_container_passes_shared_memory_size_to_create"
+  run_selected_test test_run_container_passes_ssh_to_create "test_run_container_passes_ssh_to_create"
   run_selected_test test_configure_container_host_alias_replaces_stale_entry "test_configure_container_host_alias_replaces_stale_entry"
   run_selected_test test_migrate_legacy_runtime_config_files "test_migrate_legacy_runtime_config_files"
   run_selected_test test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure "test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure"
@@ -11347,6 +11550,8 @@ main() {
   run_selected_test test_rescue_help_reports_backup_image_options "test_rescue_help_reports_backup_image_options"
   run_selected_test test_run_model_wires_selected_model "test_run_model_wires_selected_model"
   run_selected_test test_build_help_reports_primary_base_images "test_build_help_reports_primary_base_images"
+  run_selected_test test_build_cmd_passes_feature_list_only_to_requested_image "test_build_cmd_passes_feature_list_only_to_requested_image"
+  run_selected_test test_build_cmd_rejects_incompatible_feature "test_build_cmd_rejects_incompatible_feature"
   run_selected_test test_build_cmd_passes_runtime_list_build_args "test_build_cmd_passes_runtime_list_build_args"
   run_selected_test test_build_cmd_expands_all_registered_runtimes "test_build_cmd_expands_all_registered_runtimes"
   run_selected_test test_build_cmd_all_rejects_manifest_filename_id_mismatch "test_build_cmd_all_rejects_manifest_filename_id_mismatch"
@@ -11397,7 +11602,7 @@ main() {
   run_selected_test test_bootstrap_cmd_bootstraps_apt_container "test_bootstrap_cmd_bootstraps_apt_container"
   run_selected_test test_bootstrap_cmd_rejects_unsupported_base "test_bootstrap_cmd_rejects_unsupported_base"
   run_selected_test test_agentctl_wrapper_usage_banner "test_agentctl_wrapper_usage_banner"
-  run_selected_test test_host_test_filter_normalizes_hyphens_spaces_and_underscores "test_host_test_filter_normalizes_hyphens_spaces_and_underscores"
+  run_selected_test test_host_test_filter_normalizes_case_hyphens_spaces_and_underscores "test_host_test_filter_normalizes_case_hyphens_spaces_and_underscores"
   run_selected_test test_refresh_help_reports_new_command "test_refresh_help_reports_new_command"
   run_selected_test test_bootstrap_help_reports_new_command "test_bootstrap_help_reports_new_command"
   run_selected_test test_system_manifest_help_reports_new_command "test_system_manifest_help_reports_new_command"
@@ -11414,6 +11619,8 @@ main() {
   run_selected_test test_agent_sh_feature_list_reports_declared_features "test_agent_sh_feature_list_reports_declared_features"
   run_selected_test test_agent_sh_feature_info_reports_manifest_metadata "test_agent_sh_feature_info_reports_manifest_metadata"
   run_selected_test test_agent_sh_feature_install_office_creates_feature_state "test_agent_sh_feature_install_office_creates_feature_state"
+  run_selected_test test_agent_sh_feature_install_ssh_supports_apk "test_agent_sh_feature_install_ssh_supports_apk"
+  run_selected_test test_agent_sh_feature_install_ssh_supports_apt "test_agent_sh_feature_install_ssh_supports_apt"
   run_selected_test test_agent_sh_feature_info_reports_installed_after_office_install "test_agent_sh_feature_info_reports_installed_after_office_install"
   run_selected_test test_agent_sh_runtime_list_reports_installed_runtimes_only "test_agent_sh_runtime_list_reports_installed_runtimes_only"
   run_selected_test test_agent_sh_runtime_list_ignores_dangling_runtime_launcher "test_agent_sh_runtime_list_ignores_dangling_runtime_launcher"

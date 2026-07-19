@@ -856,6 +856,75 @@ test_feature_office_install_works_on_agent_python() {
   assert_status 0
 }
 
+test_ssh_feature_build_and_forwarding_lifecycle() {
+  begin_test "SSH forwarding feature preinstall survives upgrade and can be disabled"
+  local name workdir versioned_image
+
+  [ -n "${SSH_AUTH_SOCK:-}" ] || fail "SSH forwarding test requires SSH_AUTH_SOCK"
+  [ -S "$SSH_AUTH_SOCK" ] || fail "SSH forwarding test requires an existing SSH_AUTH_SOCK socket: $SSH_AUTH_SOCK"
+  name="$(unique_name ssh-forwarding)"
+  workdir="$(new_workdir)"
+  register_container_cleanup "$name"
+
+  run_capture "$AGENTCTL" build --image agent-plain --features ssh --rebuild
+  assert_status 0
+  versioned_image="$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^Building image tags: agent-plain, \(agent-plain:[^[:space:]]*\)$/\1/p' | tail -n 1)"
+  [ -n "$versioned_image" ] || fail "Could not parse versioned SSH build image from output: $RUN_OUTPUT"
+  register_image_cleanup "$versioned_image"
+
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --ssh --cmd true
+  assert_status 0
+  assert_not_contains "Installing requested feature"
+
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '(if type == "array" then .[0] else . end) | .configuration.ssh == true' >/dev/null \
+    || fail "Expected SSH forwarding in container inspect"
+
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '
+set -u
+command -v ssh >/dev/null
+command -v ssh-add >/dev/null
+test -S "${SSH_AUTH_SOCK:-/var/host-services/ssh-auth.sock}"
+output="$(ssh-add -l 2>&1)"
+status=$?
+[ "$status" -le 1 ]
+case "$output" in *"Could not open a connection"*) exit 1 ;; esac
+  '
+  assert_status 0
+
+  # Rebuild the target without preinstalled SSH to verify that a normal upgrade
+  # preserves the source feature instead of relying on the target image layer.
+  run_capture "$AGENTCTL" build --image agent-plain --rebuild
+  assert_status 0
+  versioned_image="$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^Building image tags: agent-plain, \(agent-plain:[^[:space:]]*\)$/\1/p' | tail -n 1)"
+  [ -n "$versioned_image" ] || fail "Could not parse versioned plain build image from output: $RUN_OUTPUT"
+  register_image_cleanup "$versioned_image"
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '(if type == "array" then .[0] else . end) | .configuration.ssh == true' >/dev/null \
+    || fail "Expected upgrade to preserve SSH forwarding"
+  run_capture "$AGENTCTL" feature --name "$name" info ssh
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.installed == true' >/dev/null \
+    || fail "Expected upgrade to reinstall the preserved SSH client feature"
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --no-ssh
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '(if type == "array" then .[0] else . end) | (.configuration.ssh // false) == false' >/dev/null \
+    || fail "Expected --no-ssh to disable forwarding"
+  run_capture "$AGENTCTL" feature --name "$name" info ssh
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.installed == true' >/dev/null || fail "Expected SSH client feature to remain installed"
+}
+
 test_bootstrap_works_on_existing_alpine_container() {
   begin_test "bootstrap works on an existing Alpine container"
   local name
@@ -1154,6 +1223,7 @@ main() {
   run_selected_test test_tool_home_smoke_codex_external_home "tool-home smoke keeps Codex tools outside mounted home" smoke
   run_selected_test test_tool_home_smoke_claude_external_home_when_installed "tool-home smoke keeps Claude tools outside mounted home when installed" smoke
   run_selected_test test_feature_office_install_works_on_agent_python "feature install office works on agent-python" full
+  run_selected_test test_ssh_feature_build_and_forwarding_lifecycle "SSH forwarding feature preinstall survives upgrade and can be disabled" full
   run_selected_test test_bootstrap_works_on_existing_alpine_container "bootstrap works on an existing Alpine container" full
   run_selected_test test_bootstrap_can_create_and_bootstrap_new_alpine_container "bootstrap can create and bootstrap a new Alpine container" full
   run_selected_test test_bootstrap_works_on_existing_debian_container "bootstrap works on an existing Debian container" full

@@ -188,6 +188,33 @@ agentctl runtime install claude
 agentctl runtime use claude
 ```
 
+Preinstall optional features while building an image:
+
+```bash
+# Features are opt-in; normal image builds remain lean.
+agentctl build --image agent-plain --features ssh
+agentctl build --image agent-python --features ssh,office
+```
+
+Use the macOS SSH agent from a container:
+
+```bash
+# Creates the relay and installs the SSH client feature if the image lacks it.
+agentctl run --ssh
+
+# Add forwarding to an existing container by recreating it safely.
+agentctl upgrade --name agent-my-project --ssh
+
+# Remove forwarding while retaining SSH client commands.
+agentctl upgrade --name agent-my-project --no-ssh
+```
+
+Forwarding grants code inside the container access to every identity offered by
+the host agent while the relay is available. It does not copy private keys, but
+container code can request signatures and authentication. Use it only with
+trusted images and projects. The `ssh` feature installs client tools only; it
+does not install an SSH server or weaken host-key checking.
+
 Run stdio-based protocol servers inside a container:
 
 ```bash

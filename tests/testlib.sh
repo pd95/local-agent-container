@@ -321,9 +321,16 @@ begin_test() {
 test_matches_filter() {
   local name="$1"
   local description="$2"
-  local normalized_filter="${TEST_FILTER//-/_}"
-  local normalized_name="${name//-/_}"
-  local normalized_description="${description//-/_}"
+  local normalized_filter=""
+  local normalized_name=""
+  local normalized_description=""
+
+  normalized_filter="$(printf '%s' "$TEST_FILTER" | tr '[:upper:]' '[:lower:]')"
+  normalized_name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  normalized_description="$(printf '%s' "$description" | tr '[:upper:]' '[:lower:]')"
+  normalized_filter="${normalized_filter//-/_}"
+  normalized_name="${normalized_name//-/_}"
+  normalized_description="${normalized_description//-/_}"
 
   normalized_filter="${normalized_filter// /_}"
   normalized_name="${normalized_name// /_}"
@@ -345,9 +352,16 @@ test_matches_filter() {
 test_matches_start_from() {
   local name="$1"
   local description="$2"
-  local normalized_start_from="${TEST_START_FROM//-/_}"
-  local normalized_name="${name//-/_}"
-  local normalized_description="${description//-/_}"
+  local normalized_start_from=""
+  local normalized_name=""
+  local normalized_description=""
+
+  normalized_start_from="$(printf '%s' "$TEST_START_FROM" | tr '[:upper:]' '[:lower:]')"
+  normalized_name="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+  normalized_description="$(printf '%s' "$description" | tr '[:upper:]' '[:lower:]')"
+  normalized_start_from="${normalized_start_from//-/_}"
+  normalized_name="${normalized_name//-/_}"
+  normalized_description="${normalized_description//-/_}"
 
   normalized_start_from="${normalized_start_from// /_}"
   normalized_name="${normalized_name// /_}"

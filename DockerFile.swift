@@ -3,6 +3,7 @@ FROM swift:latest
 
 ARG AGENT_RUNTIMES=codex
 ARG AGENT_DEFAULT_RUNTIME=codex
+ARG AGENT_FEATURES=""
 ARG BUILD_TIME=""
 
 # --- Core dev tooling (keep lean, no recommends) ---
@@ -80,6 +81,10 @@ RUN chmod 0755 /usr/local/bin/agent.sh \
  && find /usr/local/lib/agentctl/runtimes -type f -name '*.sh' -exec chmod 0644 {} + \
  && find /usr/local/lib/agentctl/features -type f -name '*.sh' -exec chmod 0644 {} + \
  && mkdir -p /etc/agentctl
+
+RUN if [ -n "$AGENT_FEATURES" ]; then \
+      AGENT_FEATURES="$AGENT_FEATURES" bash -lc 'set -euo pipefail; IFS="," read -r -a features <<<"$AGENT_FEATURES"; for feature in "${features[@]}"; do bash /usr/local/bin/agent.sh feature install "$feature"; done'; \
+    fi
 
 RUN mkdir -p /home/coder/.local/bin /home/coder/.swiftly \
  && chown -R coder:coder /home/coder/.local /home/coder/.swiftly
