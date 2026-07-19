@@ -13,6 +13,8 @@ CLAUDE_MIN_INSTALL_MEM="4G"
 SYSTEM_BASELINE_MANIFEST_FILE="/etc/agentctl/system-manifest.json"
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --no-new-privs --)
 CONTAINER_COPY_SUPPORT=""
+SOCKET_MOUNTS_TEXT=""
+SOCKET_PATH_MAX_BYTES=103
 
 resolve_script_path() {
   local path="$1"
@@ -293,6 +295,194 @@ container_mount_mode() {
       elif (($mount.options // []) | if type == "string" then [.] else . end | index("ro")) != null then "ro"
       else "rw" end
   ' 2>/dev/null || printf 'unknown\n'
+}
+
+container_extra_mounts() {
+  jq -Rrs '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then error("invalid container inspect JSON")
+      elif ($parsed | type) == "array" then ($parsed[0] // {})
+      elif ($parsed | type) == "object" then $parsed
+      else error("invalid container inspect JSON") end
+    | (.configuration // .) as $config
+    | ($config.mounts // [])[]
+    | [(.source // .src // .hostPath // ""),
+       (.destination // .dst // .target // .containerPath // "")]
+    | @tsv
+  '
+}
+
+validate_socket_path() {
+  local path="$1"
+  local label="$2"
+  local byte_count=""
+
+  [ -n "$path" ] || die "$label must not be empty"
+  [ "${path#/}" != "$path" ] || die "$label must be absolute: $path"
+  case "$path" in
+    *:*|*,*|*$'\n'*) die "$label contains a character unsupported by Apple container mount syntax: $path" ;;
+  esac
+  if printf '%s' "$path" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    die "$label contains a control character"
+  fi
+  byte_count="$(printf '%s' "$path" | LC_ALL=C wc -c | tr -d ' ')"
+  [ "$byte_count" -le "$SOCKET_PATH_MAX_BYTES" ] \
+    || die "$label exceeds the Unix-socket path limit ($SOCKET_PATH_MAX_BYTES bytes): $path"
+}
+
+validate_socket_destination() {
+  local destination="$1"
+  validate_socket_path "$destination" "Socket container path"
+  case "$destination" in
+    /workdir|/workdir/*|/home/coder|/home/coder/*|/var/host-services/ssh-auth.sock)
+      die "Socket container path is reserved by agentctl: $destination"
+      ;;
+  esac
+}
+
+validate_host_socket() {
+  local source="$1"
+  validate_socket_path "$source" "Host socket path"
+  [ ! -L "$source" ] || die "Host socket path must not be a symlink: $source"
+  [ -e "$source" ] || die "Host socket does not exist: $source"
+  [ -S "$source" ] || die "Host socket path is not a Unix socket: $source"
+}
+
+socket_mapping_destination() {
+  printf '%s\n' "${1#*$'\t'}"
+}
+
+socket_mapping_source() {
+  printf '%s\n' "${1%%$'\t'*}"
+}
+
+socket_text_has_destination() {
+  local mappings="$1"
+  local destination="$2"
+  local record=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    [ "$(socket_mapping_destination "$record")" != "$destination" ] || return 0
+  done <<<"$mappings"
+  return 1
+}
+
+parse_socket_mapping() {
+  local value="$1"
+  local source=""
+  local destination=""
+  case "$value" in
+    *:*) source="${value%%:*}"; destination="${value#*:}" ;;
+    *) die "Invalid --mount-socket value (expected HOST_PATH:CONTAINER_PATH): $value" ;;
+  esac
+  [ -n "$source" ] && [ -n "$destination" ] \
+    || die "Invalid --mount-socket value (expected HOST_PATH:CONTAINER_PATH): $value"
+  validate_host_socket "$source"
+  validate_socket_destination "$destination"
+  printf '%s\t%s\n' "$source" "$destination"
+}
+
+socket_unmount_record() {
+  local destination="$1"
+  validate_socket_destination "$destination"
+  printf '\t%s\n' "$destination"
+}
+
+validate_requested_socket_mappings() {
+  local mappings="$1"
+  local seen=""
+  local record=""
+  local destination=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    destination="$(socket_mapping_destination "$record")"
+    socket_text_has_destination "$seen" "$destination" \
+      && die "Duplicate socket container path: $destination"
+    seen="${seen}${seen:+$'\n'}${record}"
+  done <<<"$mappings"
+}
+
+container_socket_mounts() {
+  local name="$1"
+  local removals="${2:-}"
+  local mounts=""
+  local source=""
+  local destination=""
+  mounts="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_extra_mounts)" \
+    || die "Unable to inspect mounts for container: $name"
+  while IFS=$'\t' read -r source destination; do
+    [ -n "$source" ] && [ -n "$destination" ] || continue
+    case "$destination" in /workdir|/home/coder|/var/host-services/ssh-auth.sock) continue ;; esac
+    if socket_text_has_destination "$removals" "$destination"; then
+      continue
+    fi
+    if [ -L "$source" ] || [ ! -S "$source" ]; then
+      die "Cannot preserve extra mount $source -> $destination because its source cannot be proven to be a Unix socket; remove it with --unmount-socket $destination"
+    fi
+    validate_host_socket "$source"
+    validate_socket_destination "$destination"
+    printf '%s\t%s\n' "$source" "$destination"
+  done <<<"$mounts"
+}
+
+container_extra_mount_text() {
+  local name="$1"
+  local mounts=""
+  local source=""
+  local destination=""
+  mounts="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_extra_mounts)" \
+    || die "Unable to inspect mounts for container: $name"
+  while IFS=$'\t' read -r source destination; do
+    [ -n "$source" ] && [ -n "$destination" ] || continue
+    case "$destination" in /workdir|/home/coder|/var/host-services/ssh-auth.sock) continue ;; esac
+    printf '%s\t%s\n' "$source" "$destination"
+  done <<<"$mounts"
+}
+
+merge_socket_mappings() {
+  local preserved="$1"
+  local requested="$2"
+  local record=""
+  local destination=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    destination="$(socket_mapping_destination "$record")"
+    if ! socket_text_has_destination "$requested" "$destination"; then
+      printf '%s\n' "$record"
+    fi
+  done <<<"$preserved"
+  [ -z "$requested" ] || printf '%s\n' "$requested"
+}
+
+socket_volume_arguments() {
+  local mappings="$1"
+  local record=""
+  local source=""
+  local destination=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    source="$(socket_mapping_source "$record")"
+    destination="$(socket_mapping_destination "$record")"
+    printf '%s:%s\n' "$source" "$destination"
+  done <<<"$mappings"
+}
+
+normalize_socket_mappings() {
+  printf '%s\n' "$1" | sed '/^$/d' | LC_ALL=C sort
+}
+
+validate_existing_socket_mappings() {
+  local name="$1"
+  local requested="$2"
+  local current=""
+  current="$(container_socket_mounts "$name")"
+  [ "$(normalize_socket_mappings "$current")" = "$(normalize_socket_mappings "$requested")" ] \
+    || die "Container $name has different socket mappings. Recreate it with: ${CLI_NAME} upgrade --name $name"
+}
+
+validate_container_socket_sources() {
+  local name="$1"
+  container_socket_mounts "$name" >/dev/null
 }
 
 container_upgrade_info() {
@@ -756,6 +946,7 @@ Options:
   --image NAME    Image to use (default: agent-plain)
   --workdir PATH  Host directory to mount at /workdir (default: cwd)
   --home PATH     Host directory to mount at /home/coder (requires new container)
+  --mount-socket HOST_PATH:CONTAINER_PATH  Mount a host Unix socket (repeatable)
   --runtime NAME  Preferred runtime to launch in the container (e.g. codex, claude)
   --install-runtime  Install the selected runtime before launch
   -c, --config KEY=VALUE  Pass runtime-specific launch config (repeatable)
@@ -789,6 +980,7 @@ Options:
   --mem SIZE      Memory limit for a newly created bootstrap container
   --shm-size SIZE Size of /dev/shm for a newly created bootstrap container
   --network NAME   Attach a newly created bootstrap container to a named network (repeatable)
+  --mount-socket HOST_PATH:CONTAINER_PATH  Mount a host Unix socket (repeatable)
   --ssh            Forward the host SSH agent and install SSH client tooling
 
 The current bootstrap slice supports Alpine and Debian/Ubuntu-based containers.
@@ -915,6 +1107,8 @@ Options:
   --mem SIZE          Memory limit for recreated container (default: preserve existing setting)
   --shm-size SIZE     Size of /dev/shm for recreated container (default: preserve explicit existing setting)
   --network NAME      Replace preserved network attachments (repeatable)
+  --mount-socket HOST_PATH:CONTAINER_PATH  Add or replace a socket mapping (repeatable)
+  --unmount-socket CONTAINER_PATH  Remove a preserved socket mapping (repeatable)
   --ssh               Enable SSH-agent forwarding and ensure SSH client tooling
   --no-ssh            Disable preserved SSH-agent forwarding
   --backup-image NAME Backup image name for container export (default: <new-name-or-name>-backup-<timestamp>)
@@ -3887,10 +4081,12 @@ bootstrap_cmd() {
   local created_for_bootstrap=0
   local package_manager=""
   local ssh_requested=0
+  local socket_mappings=""
+  local mapping=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --name) name="$2"; shift 2 ;;
+      --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
       --image) image="$2"; shift 2 ;;
       --workdir) workdir="$2"; shift 2 ;;
       --cpu) cpu="$2"; shift 2 ;;
@@ -3898,12 +4094,19 @@ bootstrap_cmd() {
       --shm-size) shm_size="$2"; shift 2 ;;
       --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
       --ssh) ssh_requested=1; shift ;;
+      --mount-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --mount-socket"
+        mapping="$(parse_socket_mapping "$2")"
+        socket_mappings="${socket_mappings}${socket_mappings:+$'\n'}${mapping}"
+        shift 2
+        ;;
       --help) usage_bootstrap; return 0 ;;
       *) die "Unknown option for bootstrap: $1" ;;
     esac
   done
 
   require_container
+  validate_requested_socket_mappings "$socket_mappings"
   if [ "${#networks[@]}" -gt 0 ]; then
     validate_network_selection "${networks[@]}"
   fi
@@ -3927,6 +4130,7 @@ bootstrap_cmd() {
       die "--image, --cpu, --mem, --shm-size, and --network only apply when bootstrap creates a new container"
     fi
     validate_existing_container_ssh "$name" "$ssh_requested"
+    validate_existing_socket_mappings "$name" "$socket_mappings"
   else
     [ -n "$image" ] || die "Container not found: $name (pass --image to create and bootstrap a new container)"
     echo "Creating bootstrap container..." >&2
@@ -3955,8 +4159,12 @@ bootstrap_cmd() {
     create_cmd+=(
       --name "$name"
       --mount "type=bind,src=$workdir,dst=/workdir"
-      "$image" sh -c 'sleep infinity'
     )
+    while IFS= read -r mapping; do
+      [ -n "$mapping" ] || continue
+      create_cmd+=(--volume "$mapping")
+    done < <(socket_volume_arguments "$socket_mappings")
+    create_cmd+=("$image" sh -c 'sleep infinity')
     "${create_cmd[@]}"
     created_for_bootstrap=1
   fi
@@ -4667,6 +4875,33 @@ doctor_ssh_status() {
   return "$status"
 }
 
+doctor_socket_status() {
+  local name="$1"
+  local mounts=""
+  local source=""
+  local destination=""
+  local status=0
+
+  mounts="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_extra_mounts)" || {
+    printf '%s\n' "unable to inspect socket mappings"
+    return 0
+  }
+  while IFS=$'\t' read -r source destination; do
+    [ -n "$source" ] && [ -n "$destination" ] || continue
+    case "$destination" in /workdir|/home/coder|/var/host-services/ssh-auth.sock) continue ;; esac
+    printf '%s\n' "configured: $source -> $destination"
+    if [ -L "$source" ] || [ ! -S "$source" ]; then
+      printf '%s\n' "host source unavailable or not a Unix socket: $source"
+      status=1
+    elif container_running "$name" && ! "$CONTAINER_CMD" exec "$name" sh -c '[ -S "$1" ]' sh "$destination" >/dev/null 2>&1; then
+      printf '%s\n' "guest socket unavailable: $destination"
+      status=1
+    fi
+  done <<<"$mounts"
+  [ -n "$mounts" ] || printf '%s\n' "no host Unix-socket mappings configured"
+  return "$status"
+}
+
 doctor_cmd() {
   local name=""
   local fix=0
@@ -4677,6 +4912,7 @@ doctor_cmd() {
   local runtime_output=""
   local state_summary_output=""
   local ssh_output=""
+  local socket_output=""
   local doctor_status=0
   local status=0
 
@@ -4704,6 +4940,15 @@ doctor_cmd() {
   if ! container_exists "$name"; then
     die "Container not found: $name"
   fi
+
+  if socket_output="$(doctor_socket_status "$name")"; then
+    echo "Doctor socket mappings in $name:" >&2
+  else
+    doctor_status=$?
+    echo "Doctor found a socket-mapping problem in $name:" >&2
+    status="$doctor_status"
+  fi
+  [ -z "$socket_output" ] || printf '%s\n' "$socket_output" | sed 's/^/  - /' >&2
 
   if container_running "$name"; then
     was_running=1
@@ -6232,6 +6477,8 @@ print_upgrade_dry_run_summary() {
   local current_ssh="${22:-false}"
   local target_ssh="${23:-false}"
   local ensure_ssh_feature="${24:-0}"
+  local current_socket_mappings="${25:-}"
+  local target_socket_mappings="${26:-}"
   local state_label=""
   local mount_label=""
   local config_label=""
@@ -6301,6 +6548,18 @@ print_upgrade_dry_run_summary() {
   echo "  Shared memory: $current_shm_display -> $target_shm_display" >&2
   echo "  Networks: ${current_networks:-default} -> ${target_networks:-default}" >&2
   echo "  SSH forwarding: $([ "$current_ssh" = "true" ] && printf enabled || printf disabled) -> $([ "$target_ssh" = "true" ] && printf enabled || printf disabled)" >&2
+  echo "  Current socket mappings:" >&2
+  if [ -n "$current_socket_mappings" ]; then
+    printf '%s\n' "$current_socket_mappings" | sed $'s/\t/ -> /; s/^/    /' >&2
+  else
+    echo "    none" >&2
+  fi
+  echo "  Target socket mappings:" >&2
+  if [ -n "$target_socket_mappings" ]; then
+    printf '%s\n' "$target_socket_mappings" | sed $'s/\t/ -> /; s/^/    /' >&2
+  else
+    echo "    none" >&2
+  fi
   if [ "$ensure_ssh_feature" -eq 1 ]; then
     echo "  SSH client feature: ensure installed" >&2
   fi
@@ -6454,6 +6713,7 @@ run_container() {
   local already_running=0
   local created=0
   local actual_name="$name"
+  local socket_mount_arg=""
 
   # Execute command inside the container and preserve the exit code.
   run_exec() {
@@ -6478,6 +6738,7 @@ run_container() {
     validate_existing_container_shm_size "$actual_name" "$shm_size"
     validate_existing_container_networks "$actual_name" "$network_text"
     validate_existing_container_ssh "$actual_name" "$ssh_requested"
+    validate_existing_socket_mappings "$actual_name" "$SOCKET_MOUNTS_TEXT"
   fi
   if [ -n "$actual_name" ] && container_running "$actual_name"; then
     already_running=1
@@ -6522,6 +6783,10 @@ run_container() {
       if [ -n "$home_mount" ]; then
         create_cmd+=(--mount "type=bind,src=$home_mount,dst=/home/coder")
       fi
+      while IFS= read -r socket_mount_arg; do
+        [ -n "$socket_mount_arg" ] || continue
+        create_cmd+=(--volume "$socket_mount_arg")
+      done < <(socket_volume_arguments "$SOCKET_MOUNTS_TEXT")
       create_cmd+=("$image" sh -c 'sleep infinity')
       if [ -z "$actual_name" ]; then
         actual_name="$("${create_cmd[@]}")"
@@ -6538,6 +6803,9 @@ run_container() {
 
     if [ "$created" -eq 0 ] && [ "$ssh_requested" -eq 0 ]; then
       warn_if_ssh_forwarding_unavailable_on_start "$actual_name"
+    fi
+    if [ "$created" -eq 0 ]; then
+      validate_container_socket_sources "$actual_name"
     fi
 
     echo "Starting container: $actual_name" >&2
@@ -6774,6 +7042,8 @@ run_cmd() {
   local workdir=""
   local stdio=0
   local ssh_requested=0
+  local socket_mappings=""
+  local socket_mapping=""
   local -a runtime_config_entries=()
   local -a networks=()
   local -a cmd_override=()
@@ -6804,12 +7074,20 @@ run_cmd() {
       --shm-size) shm_size="$2"; shift 2 ;;
       --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
       --ssh) ssh_requested=1; shift ;;
+      --mount-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --mount-socket"
+        socket_mapping="$(parse_socket_mapping "$2")"
+        socket_mappings="${socket_mappings}${socket_mappings:+$'\n'}${socket_mapping}"
+        shift 2
+        ;;
       --help) usage_run; return 0 ;;
       *) die "Unknown option for run: $1" ;;
     esac
   done
 
   require_container
+  validate_requested_socket_mappings "$socket_mappings"
+  SOCKET_MOUNTS_TEXT="$socket_mappings"
   if [ "${#networks[@]}" -gt 0 ]; then
     validate_network_selection "${networks[@]}"
     network_text="$(network_args_to_text "${networks[@]}")"
@@ -6995,6 +7273,14 @@ upgrade_cmd() {
   local inspect_info=""
   local upgrade_package_reinstall_commands=""
   local -a requested_networks=()
+  local requested_socket_mappings=""
+  local removed_socket_mappings=""
+  local current_socket_mappings=""
+  local preserved_socket_mappings=""
+  local target_socket_mappings=""
+  local socket_mapping=""
+  local socket_destination=""
+  local socket_mount_arg=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -7007,6 +7293,19 @@ upgrade_cmd() {
       --mem) mem="$2"; shift 2 ;;
       --shm-size) shm_size="$2"; shift 2 ;;
       --network) [ "$#" -ge 2 ] || die "Missing value for --network"; requested_networks+=("$2"); shift 2 ;;
+      --mount-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --mount-socket"
+        socket_mapping="$(parse_socket_mapping "$2")"
+        requested_socket_mappings="${requested_socket_mappings}${requested_socket_mappings:+$'\n'}${socket_mapping}"
+        shift 2
+        ;;
+      --unmount-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --unmount-socket"
+        socket_destination="$2"
+        socket_mapping="$(socket_unmount_record "$socket_destination")"
+        removed_socket_mappings="${removed_socket_mappings}${removed_socket_mappings:+$'\n'}${socket_mapping}"
+        shift 2
+        ;;
       --ssh) ssh_enable_requested=1; shift ;;
       --no-ssh) ssh_disable_requested=1; shift ;;
       --backup-image) backup_image="$2"; shift 2 ;;
@@ -7022,6 +7321,14 @@ upgrade_cmd() {
     die "Invalid --shm-size: $shm_size (use a size such as 512M, 1.5G, or 2GiB)"
   fi
   [ "$ssh_enable_requested" -eq 0 ] || [ "$ssh_disable_requested" -eq 0 ] || die "Cannot combine --ssh with --no-ssh"
+  validate_requested_socket_mappings "$requested_socket_mappings"
+  validate_requested_socket_mappings "$removed_socket_mappings"
+  while IFS= read -r socket_mapping; do
+    [ -n "$socket_mapping" ] || continue
+    socket_destination="$(socket_mapping_destination "$socket_mapping")"
+    socket_text_has_destination "$requested_socket_mappings" "$socket_destination" \
+      && die "Cannot mount and unmount the same socket container path: $socket_destination"
+  done <<<"$removed_socket_mappings"
   require_container
 
   if [ -z "$name" ]; then
@@ -7055,6 +7362,9 @@ upgrade_cmd() {
   fi
 
   inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
+  current_socket_mappings="$(container_extra_mount_text "$name")"
+  preserved_socket_mappings="$(container_socket_mounts "$name" "$removed_socket_mappings")"
+  target_socket_mappings="$(merge_socket_mappings "$preserved_socket_mappings" "$requested_socket_mappings")"
   IFS=$'\t' read -r current_image current_workdir mount_mode current_cpu current_mem <<<"$inspect_info"
   current_shm_size="$(container_shm_size "$name")"
   current_ssh="$(container_ssh_enabled "$name")" || die "Unable to determine SSH forwarding configuration for $name"
@@ -7192,7 +7502,8 @@ upgrade_cmd() {
       "$mount_mode" "$current_cpu" "$cpu" "$current_mem" "$mem" "$current_shm_size" "$shm_size" "$was_running" \
       "$backup_mode" "$no_backup" "$backup_image" "$overwrite_config" "$copy_mode" \
       "$(printf '%s' "$current_network_names" | paste -sd, -)" "$(printf '%s' "$target_network_names" | paste -sd, -)" \
-      "$current_ssh" "$target_ssh" "$ensure_ssh_feature"
+      "$current_ssh" "$target_ssh" "$ensure_ssh_feature" \
+      "$current_socket_mappings" "$target_socket_mappings"
     return 0
   fi
 
@@ -7335,8 +7646,12 @@ upgrade_cmd() {
   create_cmd+=(
     --name "$target_name"
     --mount "$mount_opts"
-    "$image" sh -c 'sleep infinity'
   )
+  while IFS= read -r socket_mount_arg; do
+    [ -n "$socket_mount_arg" ] || continue
+    create_cmd+=(--volume "$socket_mount_arg")
+  done < <(socket_volume_arguments "$target_socket_mappings")
+  create_cmd+=("$image" sh -c 'sleep infinity')
   "${create_cmd[@]}"
 
   echo "Starting container: $target_name" >&2
@@ -7639,13 +7954,16 @@ simple_name_cmd() {
   case "$action" in
     start)
       warn_if_ssh_forwarding_unavailable_on_start "$name"
+      validate_container_socket_sources "$name"
       "$CONTAINER_CMD" start "$name"
       configure_container_host_alias "$name"
       ;;
     stop) "$CONTAINER_CMD" stop "$name" ;;
     restart)
       warn_if_ssh_forwarding_unavailable_on_start "$name"
-      "$CONTAINER_CMD" restart "$name"
+      validate_container_socket_sources "$name"
+      "$CONTAINER_CMD" stop "$name" >/dev/null
+      "$CONTAINER_CMD" start "$name"
       configure_container_host_alias "$name"
       ;;
     rm)

@@ -682,6 +682,134 @@ test_inspect_json_helpers_handle_schema_shapes_and_invalid_input() {
   [ "$(printf '%s' '' | container_upgrade_info)" = $'\t\t\t\t' ] || fail "Expected empty inspect tuple"
 }
 
+test_socket_mapping_helpers_validate_parse_and_merge() {
+  begin_test "socket mappings validate, parse inspect shapes, and merge by destination"
+
+  load_agentctl_functions
+  local temp_dir socket_one socket_two requested preserved merged removal long_path mappings
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-sockets.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  socket_one="$temp_dir/one.sock"
+  socket_two="$temp_dir/two.sock"
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' "$socket_one"
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' "$socket_two"
+
+  requested="$(parse_socket_mapping "$socket_one:/run/services/one.sock")"
+  [ "$requested" = "$socket_one"$'\t''/run/services/one.sock' ] || fail "Unexpected parsed socket mapping: $requested"
+  preserved="$socket_two"$'\t''/run/services/one.sock'$'\n'"$socket_one"$'\t''/run/services/old.sock'
+  merged="$(merge_socket_mappings "$preserved" "$requested")"
+  [ "$merged" = "$socket_one"$'\t''/run/services/old.sock'$'\n'"$socket_one"$'\t''/run/services/one.sock' ] \
+    || fail "Expected destination replacement while retaining other mappings, got: $merged"
+
+  [ "$(printf '%s' '{"configuration":{"mounts":[{"source":"/tmp/work","destination":"/workdir"},{"src":"/tmp/a.sock","dst":"/run/a.sock"}]}}' | container_extra_mounts)" = $'/tmp/work\t/workdir\n/tmp/a.sock\t/run/a.sock' ] \
+    || fail "Expected current Apple inspect mount fields"
+  [ "$(printf '%s' '[{"mounts":[{"hostPath":"/tmp/b.sock","containerPath":"/run/b.sock"}]}]' | container_extra_mounts)" = $'/tmp/b.sock\t/run/b.sock' ] \
+    || fail "Expected legacy inspect mount fields"
+
+  parse_socket_mapping_wrapper() { ( parse_socket_mapping "$@" ); }
+  run_capture parse_socket_mapping_wrapper "relative:/run/service.sock"
+  assert_status 1
+  assert_contains "must be absolute"
+  run_capture parse_socket_mapping_wrapper "$socket_one:/workdir/service.sock"
+  assert_status 1
+  assert_contains "reserved"
+  ln -s "$socket_one" "$temp_dir/link.sock"
+  run_capture parse_socket_mapping_wrapper "$temp_dir/link.sock:/run/service.sock"
+  assert_status 1
+  assert_contains "must not be a symlink"
+
+  printf 'not a socket\n' >"$temp_dir/file"
+  run_capture parse_socket_mapping_wrapper "$temp_dir/file:/run/service.sock"
+  assert_status 1
+  assert_contains "not a Unix socket"
+  run_capture parse_socket_mapping_wrapper "$temp_dir/missing.sock:/run/service.sock"
+  assert_status 1
+  assert_contains "does not exist"
+  run_capture parse_socket_mapping_wrapper "$socket_one:/run/service,sock"
+  assert_status 1
+  assert_contains "unsupported"
+  run_capture parse_socket_mapping_wrapper "$socket_one:/run/service:socket"
+  assert_status 1
+  assert_contains "unsupported"
+  long_path="/$(printf '%0110d' 0)"
+  run_capture parse_socket_mapping_wrapper "$long_path:/run/service.sock"
+  assert_status 1
+  assert_contains "exceeds the Unix-socket path limit"
+
+  removal="$(socket_unmount_record /run/services/one.sock)"
+  [ "$removal" = $'\t/run/services/one.sock' ] || fail "Expected a tab-prefixed removal record, got: $removal"
+  [ "$(socket_mapping_destination "$removal")" = /run/services/one.sock ] || fail "Expected removal destination parsing"
+
+  mappings="$requested"$'\n'"$socket_two"$'\t/run/services/one.sock'
+  validate_socket_mappings_wrapper() { ( validate_requested_socket_mappings "$@" ); }
+  run_capture validate_socket_mappings_wrapper "$mappings"
+  assert_status 1
+  assert_contains "Duplicate socket container path"
+
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = inspect ] || fail "Unexpected container invocation: $*"
+    printf '%s\n' "[{\"configuration\":{\"mounts\":[{\"source\":\"$TEST_ROOT\",\"destination\":\"/workdir\"},{\"source\":\"/missing-ssh.sock\",\"destination\":\"/var/host-services/ssh-auth.sock\"},{\"source\":\"$socket_one\",\"destination\":\"/run/services/one.sock\"}]}}]"
+  }
+  [ "$(container_socket_mounts unit-test-container)" = "$requested" ] \
+    || fail "Expected workdir and managed SSH relay mounts to be excluded"
+
+  upgrade_socket_options_wrapper() { ( upgrade_cmd "$@" ); }
+  run_capture upgrade_socket_options_wrapper --mount-socket
+  assert_status 1
+  assert_contains "Missing value for --mount-socket"
+  run_capture upgrade_socket_options_wrapper \
+    --mount-socket "$socket_one:/run/services/one.sock" \
+    --mount-socket "$socket_two:/run/services/one.sock"
+  assert_status 1
+  assert_contains "Duplicate socket container path"
+  run_capture upgrade_socket_options_wrapper \
+    --mount-socket "$socket_one:/run/services/one.sock" \
+    --unmount-socket /run/services/one.sock
+  assert_status 1
+  assert_contains "Cannot mount and unmount the same socket container path"
+  run_capture parse_socket_mapping_wrapper "$socket_one:"$'/run/service\n.sock'
+  assert_status 1
+  assert_contains "unsupported"
+  unset -f container
+}
+
+test_run_container_passes_socket_mount_as_one_exact_argument() {
+  begin_test "run_container preserves spaces and passes one exact volume argument per socket"
+
+  load_agentctl_functions
+  local temp_dir socket_path create_args_file expected_mount
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl socket args.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  socket_path="$temp_dir/service socket.sock"
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' "$socket_path"
+  SOCKET_MOUNTS_TEXT="$(parse_socket_mapping "$socket_path:/run/services/service socket.sock")"
+  create_args_file="$temp_dir/create-args"
+  expected_mount="$socket_path:/run/services/service socket.sock"
+
+  container_exists() { return 1; }
+  container_running() { return 1; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  configure_container_host_alias() { :; }
+  warn_if_container_agentctl_versions_differ() { :; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create) shift; printf '%s\n' "$@" >"$create_args_file" ;;
+      start|stop|exec) ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" 0 true
+  assert_status 0
+  [ "$(grep -Fxc -- "$expected_mount" "$create_args_file")" -eq 1 ] \
+    || fail "Expected one exact socket volume argument; got: $(tr '\n' '|' <"$create_args_file")"
+  [ "$(grep -Fxc -- '--volume' "$create_args_file")" -eq 1 ] \
+    || fail "Expected one --volume flag for the socket mapping"
+  unset -f container
+}
+
 test_shared_memory_size_helpers_normalize_and_compare_values() {
   begin_test "shared-memory helpers normalize documented units and compare existing containers"
 
@@ -1172,13 +1300,14 @@ test_start_and_restart_refresh_host_alias() {
   local alias_log=""
   require_container() { :; }
   configure_container_host_alias() { alias_log="${alias_log}$1"$'\n'; }
+  validate_container_socket_sources() { :; }
   CONTAINER_CMD=container
   container() { action_log="${action_log}$1:$2"$'\n'; }
 
   simple_name_cmd start --name unit-test-container
   simple_name_cmd restart --name unit-test-container
 
-  [ "${action_log%$'\n'}" = $'start:unit-test-container\nrestart:unit-test-container' ] \
+  [ "${action_log%$'\n'}" = $'start:unit-test-container\nstop:unit-test-container\nstart:unit-test-container' ] \
     || fail "Expected start and restart actions, got: $action_log"
   [ "${alias_log%$'\n'}" = $'unit-test-container\nunit-test-container' ] \
     || fail "Expected alias refresh after both actions, got: $alias_log"
@@ -2108,6 +2237,7 @@ require_container() { return 0; }
 container_exists() { [ "\$1" = "unit-test-container" ]; }
 container_running() { [ "\$1" = "unit-test-container" ]; }
 validate_mount_mode() { :; }
+validate_existing_socket_mappings() { :; }
 configure_container_host_alias() { :; }
 pre_reads_stdin() {
   local line=""
@@ -8905,7 +9035,7 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
   container() {
     case "$1" in
       inspect)
-        printf '{}\n'
+        printf '%s\n' '[{"configuration":{"mounts":[{"source":"/missing/socket.sock","destination":"/run/services/old.sock"}]}}]'
         ;;
       create)
         create_calls=$((create_calls + 1))
@@ -8934,7 +9064,7 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
     printf 'agent-python:latest\t/does/not/exist\tro\t2\t4294967296\n'
   }
 
-  run_capture upgrade_cmd --name unit-test-container --new-name renamed-container --image agent-python --workdir "$TEST_ROOT" --dry-run
+  run_capture upgrade_cmd --name unit-test-container --new-name renamed-container --image agent-python --workdir "$TEST_ROOT" --dry-run --unmount-socket /run/services/old.sock
   assert_status 0
   assert_contains "Preparing upgrade preflight: unit-test-container -> renamed-container"
   assert_contains "Warning: Skipping package-loss warning because original /workdir source does not exist and unit-test-container is stopped"
@@ -8944,6 +9074,9 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
   assert_contains "  Source workdir: /does/not/exist"
   assert_contains "  Target workdir: $TEST_ROOT"
   assert_contains "  Mount mode: read-only"
+  assert_contains "    /missing/socket.sock -> /run/services/old.sock"
+  assert_contains "  Target socket mappings:"
+  assert_contains "    none"
   assert_contains "  CPU: 2 -> 2"
   assert_contains "  Memory: 4G -> 4G"
   assert_contains "  Shared memory: 1G -> 1G"
@@ -11532,6 +11665,8 @@ main() {
   run_selected_test test_online_run_and_host_alias_fail_closed_on_network_inspect_errors "test_online_run_and_host_alias_fail_closed_on_network_inspect_errors"
   run_selected_test test_network_text_names_emits_readable_ordered_records "test_network_text_names_emits_readable_ordered_records"
   run_selected_test test_inspect_json_helpers_handle_schema_shapes_and_invalid_input "test_inspect_json_helpers_handle_schema_shapes_and_invalid_input"
+  run_selected_test test_socket_mapping_helpers_validate_parse_and_merge "test_socket_mapping_helpers_validate_parse_and_merge"
+  run_selected_test test_run_container_passes_socket_mount_as_one_exact_argument "test_run_container_passes_socket_mount_as_one_exact_argument"
   run_selected_test test_shared_memory_size_helpers_normalize_and_compare_values "test_shared_memory_size_helpers_normalize_and_compare_values"
   run_selected_test test_container_shm_size_reads_apple_container_inspect_shape "test_container_shm_size_reads_apple_container_inspect_shape"
   run_selected_test test_container_ssh_enabled_reads_inspect_shapes "test_container_ssh_enabled_reads_inspect_shapes"

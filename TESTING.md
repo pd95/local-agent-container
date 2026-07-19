@@ -44,6 +44,17 @@ host suite. The full tier includes the smoke tests plus build cleanup,
 upgrade/backup/rescue, package manifests, feature installation, and Alpine and
 Debian bootstrap coverage:
 
+Run the focused host Unix-socket lifecycle test on macOS first:
+
+```bash
+bash tests/run-tests.sh --tier full --filter socket-mount
+```
+
+It uses temporary host socket servers and `agent-python` to verify non-root
+`coder` data exchange, restart, upgrade preservation, destination replacement,
+`--copy`, inspect-visible removal, and cleanup. Because it requires Apple's host
+runtime it cannot run in the Linux development container.
+
 ```bash
 bash tests/run-tests.sh --tier full
 ```

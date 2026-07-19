@@ -6,6 +6,49 @@ host probe results, security constraints, possible command-line interfaces, and
 a phased implementation direction. It is a design input, not an implementation
 commitment.
 
+## Agreed Phase 1 design
+
+Phase 1 exposes repeatable host-to-container mappings as
+`--mount-socket HOST_PATH:CONTAINER_PATH` on `run`, `bootstrap`, and `upgrade`.
+`upgrade` additionally accepts repeatable `--unmount-socket CONTAINER_PATH`.
+Mappings use Apple container's `--volume HOST_PATH:CONTAINER_PATH` form, which
+activates its Unix-socket relay, and require no image feature. The equivalent
+directory-oriented `--mount` spelling must not be used here because Apple 1.1
+rejects a socket source as “not a directory” before relay setup.
+
+An existing container may be used by `run` or `bootstrap` only when explicitly
+requested mappings exactly match its inspected mappings. Upgrade preserves
+socket mappings by default, merges explicit mappings by container destination,
+and applies removals first. This makes it possible to remove a mapping after its
+host socket disappears. Any other extra mount that cannot be proven to be a
+live Unix socket blocks upgrade instead of being silently discarded.
+
+Both endpoints must be absolute, short enough for a Unix-domain socket address,
+and free of delimiters or control characters used by the container CLI. Host
+sources must be real sockets rather than symlinks. `/workdir`, `/home/coder`,
+and `/var/host-services/ssh-auth.sock` are reserved destinations. Stable literal
+host paths are required: unlike `--ssh`, a generic mount does not follow a
+launchd path change. Socket access grants the container the authority offered
+by that service, so users should expose narrowly scoped sockets and permissions.
+
+Dry-run and doctor output deliberately show endpoint paths needed for repair,
+but agentctl never reads, logs, or proxies protocol payloads.
+
+## Deferred MCP integration
+
+A later structured integration may use an interface such as:
+
+```bash
+agentctl run --mcp 'xcode,cmd=xcbridge …'
+```
+
+It may install an MCP/Xcode adapter feature on demand, launch `xcrun mcpbridge`
+through the configured host command, mount a private host relay with the Phase 1
+primitive, and run a guest loopback HTTP adapter for clients that cannot use
+HTTP over a Unix socket. The existing TCP bridge can remain available during
+rollout. The exact `--mcp` grammar, feature identifier, process supervision, and
+adapter implementation are intentionally deferred.
+
 Related documents:
 
 - [Apple container 1.1 development opportunities](apple-container-1.1-development-opportunities.md)

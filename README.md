@@ -111,6 +111,30 @@ In the normal case:
 - the directory you run `agentctl run` from becomes the mounted work directory
 - everything under that directory is visible to the agent
 - the agent can read and write files in that mounted directory tree
+
+Host Unix sockets can also be mounted at creation time:
+
+```bash
+agentctl run --mount-socket /tmp/my-service.sock:/run/host-services/my-service.sock
+```
+
+The option is repeatable and is also available to `bootstrap` and `upgrade`.
+Use stable, absolute socket paths: generic socket mounts store the literal host
+path and do not rediscover a moved socket. An existing container must exactly
+match mappings requested by `run` or `bootstrap`; use `upgrade` to add, replace,
+or remove mappings:
+
+```bash
+agentctl upgrade --name agent-my-project \
+  --mount-socket /tmp/new.sock:/run/host-services/service.sock
+agentctl upgrade --name agent-my-project \
+  --unmount-socket /run/host-services/service.sock
+```
+
+Upgrade preserves mappings by default, including in `--copy` mode. A missing
+preserved source is fatal until restored, replaced, or explicitly unmounted.
+Access to a socket grants the container the service's effective authority; only
+mount narrowly scoped sockets whose permissions are appropriate for `coder`.
 - the agent does **not** get unrestricted access to the rest of your host
   filesystem through `agentctl`
 

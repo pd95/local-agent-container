@@ -925,6 +925,116 @@ case "$output" in *"Could not open a connection"*) exit 1 ;; esac
   printf '%s' "$RUN_OUTPUT" | jq -e '.installed == true' >/dev/null || fail "Expected SSH client feature to remain installed"
 }
 
+test_host_socket_mount_lifecycle() {
+  begin_test "host Unix socket mount survives restart, upgrade, replacement, copy, and removal"
+  local name copy_name workdir socket_dir socket_one socket_two guest_socket server_script
+
+  command -v python3 >/dev/null 2>&1 || fail "socket-mount integration test requires host python3"
+  name="$(unique_name socket-mount)"
+  copy_name="${name}-copy"
+  workdir="$(new_workdir)"
+  socket_dir="$(mktemp -d /tmp/agentctl-sock.XXXXXX)"
+  register_dir_cleanup "$socket_dir"
+  socket_one="$socket_dir/one.sock"
+  socket_two="$socket_dir/two.sock"
+  guest_socket="/tmp/agentctl-test.sock"
+  server_script="$socket_dir/server.py"
+  register_container_cleanup "$name"
+  register_container_cleanup "$copy_name"
+
+  cat >"$server_script" <<'PY'
+import os
+import socket
+import sys
+
+path, response = sys.argv[1:]
+server = socket.socket(socket.AF_UNIX)
+server.bind(path)
+os.chmod(path, 0o666)
+server.listen()
+while True:
+    connection, _ = server.accept()
+    with connection:
+        request = connection.recv(1024)
+        connection.sendall(response.encode() + b":" + request)
+PY
+  python3 "$server_script" "$socket_one" one &
+  register_pid_cleanup "$!"
+  python3 "$server_script" "$socket_two" two &
+  register_pid_cleanup "$!"
+  for _ in 1 2 3 4 5; do
+    [ -S "$socket_one" ] && [ -S "$socket_two" ] && break
+    sleep 1
+  done
+  [ -S "$socket_one" ] && [ -S "$socket_two" ] || fail "host socket servers did not start"
+
+  if ! image_exists agent-python; then
+    run_capture "$AGENTCTL" build --image agent-python
+    assert_status 0
+  fi
+
+  assert_guest_socket_response() {
+    local target_name="$1"
+    local expected="$2"
+    run_capture "$AGENTCTL" exec --name "$target_name" --no-tty -- python3 -c \
+      'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b"ping"); print(s.recv(1024).decode())' \
+      "$guest_socket"
+    assert_status 0
+    assert_contains "$expected:ping"
+  }
+
+  run_capture "$AGENTCTL" run --name "$name" --image agent-python --workdir "$workdir" \
+    --mount-socket "$socket_one:$guest_socket" --cmd python3 -c \
+    'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b"ping"); print(s.recv(1024).decode())' \
+    "$guest_socket"
+  assert_status 0
+  assert_contains "one:ping"
+
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  assert_guest_socket_response "$name" one
+  run_capture "$AGENTCTL" restart --name "$name"
+  assert_status 0
+  assert_guest_socket_response "$name" one
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  assert_guest_socket_response "$name" one
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --mount-socket "$socket_two:$guest_socket"
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  assert_guest_socket_response "$name" two
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --new-name "$copy_name" --copy
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$copy_name"
+  assert_status 0
+  assert_guest_socket_response "$copy_name" two
+  run_capture "$AGENTCTL" stop --name "$copy_name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --unmount-socket "$guest_socket"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e --arg destination "$guest_socket" '
+    (if type == "array" then .[0] else . end)
+    | [(.configuration.mounts // .mounts // [])[]
+       | (.destination // .dst // .target // .containerPath // "")]
+    | index($destination) == null
+  ' >/dev/null || fail "Expected socket mapping removal in inspect: $RUN_OUTPUT"
+}
+
 test_bootstrap_works_on_existing_alpine_container() {
   begin_test "bootstrap works on an existing Alpine container"
   local name
@@ -1224,6 +1334,7 @@ main() {
   run_selected_test test_tool_home_smoke_claude_external_home_when_installed "tool-home smoke keeps Claude tools outside mounted home when installed" smoke
   run_selected_test test_feature_office_install_works_on_agent_python "feature install office works on agent-python" full
   run_selected_test test_ssh_feature_build_and_forwarding_lifecycle "SSH forwarding feature preinstall survives upgrade and can be disabled" full
+  run_selected_test test_host_socket_mount_lifecycle "host Unix socket mount survives restart, upgrade, replacement, copy, and removal" full
   run_selected_test test_bootstrap_works_on_existing_alpine_container "bootstrap works on an existing Alpine container" full
   run_selected_test test_bootstrap_can_create_and_bootstrap_new_alpine_container "bootstrap can create and bootstrap a new Alpine container" full
   run_selected_test test_bootstrap_works_on_existing_debian_container "bootstrap works on an existing Debian container" full
