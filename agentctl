@@ -8,6 +8,7 @@ DEFAULT_NAME_PREFIX="agent-"
 AUTH_NAME_PREFIX="agent-auth-"
 DEFAULT_LOGIN_SHELL="${AGENTCTL_SHELL:-bash}"
 CONTAINER_HOST_NAME="host.container.internal"
+AGENTCTL_NETWORK_LABEL="agentctl.managed"
 CLAUDE_MIN_INSTALL_MEM="4G"
 SYSTEM_BASELINE_MANIFEST_FILE="/etc/agentctl/system-manifest.json"
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --no-new-privs --)
@@ -618,6 +619,7 @@ Commands:
   refresh    Refresh agentctl-managed files in an existing container
   doctor     Check an existing container for common agentctl state problems
   host-address  Print the current host gateway for an Apple container network
+  network    Manage Apple container networks used by agentctl
   system-manifest  Print a container package manifest
   upgrade    Recreate a container from the latest image while preserving config
   rescue     Temporarily run a shell or command in a backup image
@@ -707,6 +709,7 @@ Options:
   --cpu NUM       CPU cores for container
   --mem SIZE      Memory limit (e.g. 8G)
   --shm-size SIZE Size of /dev/shm (e.g. 512M, 1G; requires new container)
+  --network NAME   Attach to a named network (repeatable; requires new container)
 EOF
 }
 
@@ -721,6 +724,7 @@ Options:
   --cpu NUM       CPU cores for a newly created bootstrap container
   --mem SIZE      Memory limit for a newly created bootstrap container
   --shm-size SIZE Size of /dev/shm for a newly created bootstrap container
+  --network NAME   Attach a newly created bootstrap container to a named network (repeatable)
 
 The current bootstrap slice supports Alpine and Debian/Ubuntu-based containers.
 It installs the current managed control surface into the container so that
@@ -767,6 +771,31 @@ Usage: $CLI_NAME host-address [--network NAME]
 
 Print the IPv4 gateway that containers use to reach the macOS host on the
 selected Apple container network (default: default).
+EOF
+}
+
+usage_network() {
+  cat <<EOF
+Usage: $CLI_NAME network <list|create|inspect|rm> [options]
+
+Commands:
+  list, ls       List all Apple container networks and agentctl ownership
+  create         Create an agentctl-managed NAT or host-only network
+  inspect        Print Apple container's JSON for one network
+  rm, delete     Delete agentctl-managed networks
+
+Options for network list:
+  --raw          Print network names only
+
+Options for network create:
+  --internal     Create a host-only network without an external route
+  --subnet CIDR  Set the IPv4 subnet
+  --subnet-v6 CIDR  Set the IPv6 subnet
+  --label KEY=VALUE  Add a label (repeatable)
+
+Host-only networks isolate containers from external networks. Containers that
+share a host-only network can communicate with each other. Network attachment
+is selected when a container is created and cannot be changed afterward.
 EOF
 }
 
@@ -820,6 +849,7 @@ Options:
   --cpu NUM           CPU cores for recreated container (default: preserve existing setting)
   --mem SIZE          Memory limit for recreated container (default: preserve existing setting)
   --shm-size SIZE     Size of /dev/shm for recreated container (default: preserve explicit existing setting)
+  --network NAME      Replace preserved network attachments (repeatable)
   --backup-image NAME Backup image name for container export (default: <new-name-or-name>-backup-<timestamp>)
   --no-backup         Skip container export backup image creation
   --dry-run           Show the planned upgrade actions without recreating the container
@@ -846,6 +876,7 @@ Options:
   --cpu NUM      CPU cores for the rescue container
   --mem SIZE     Memory limit for the rescue container
   --shm-size SIZE  Size of /dev/shm for the rescue container
+  --network NAME   Attach the rescue container to a named network (repeatable)
   --cmd ...      Run a custom command instead of an interactive /bin/sh shell
 
 Rescue runs a backup image directly without refresh, auth sync, runtime install,
@@ -3711,6 +3742,7 @@ bootstrap_cmd() {
   local cpu=""
   local mem=""
   local shm_size=""
+  local -a networks=()
   local was_running=0
   local started_for_bootstrap=0
   local created_for_bootstrap=0
@@ -3724,12 +3756,16 @@ bootstrap_cmd() {
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
       --shm-size) shm_size="$2"; shift 2 ;;
+      --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
       --help) usage_bootstrap; return 0 ;;
       *) die "Unknown option for bootstrap: $1" ;;
     esac
   done
 
   require_container
+  if [ "${#networks[@]}" -gt 0 ]; then
+    validate_network_selection "${networks[@]}"
+  fi
   if [ -z "$name" ]; then
     if [ -z "$workdir" ]; then
       name="$(default_name "$DEFAULT_NAME_PREFIX")"
@@ -3746,8 +3782,8 @@ bootstrap_cmd() {
   fi
 
   if container_exists "$name"; then
-    if [ -n "$image" ] || [ -n "$cpu" ] || [ -n "$mem" ] || [ -n "$shm_size" ]; then
-      die "--image, --cpu, --mem, and --shm-size only apply when bootstrap creates a new container"
+    if [ -n "$image" ] || [ -n "$cpu" ] || [ -n "$mem" ] || [ -n "$shm_size" ] || [ "${#networks[@]}" -gt 0 ]; then
+      die "--image, --cpu, --mem, --shm-size, and --network only apply when bootstrap creates a new container"
     fi
   else
     [ -n "$image" ] || die "Container not found: $name (pass --image to create and bootstrap a new container)"
@@ -3762,6 +3798,12 @@ bootstrap_cmd() {
     if [ -n "$shm_size" ]; then
       require_container_shm_size_support
       create_cmd+=(--shm-size "$shm_size")
+    fi
+    local network_name=""
+    if [ "${#networks[@]}" -gt 0 ]; then
+      for network_name in "${networks[@]}"; do
+        create_cmd+=(--network "$network_name")
+      done
     fi
     create_cmd+=(
       --name "$name"
@@ -4020,6 +4062,8 @@ host_doctor() {
   host_capability 'SSH agent forwarding' container_help_contains --ssh run
   host_capability 'Unix socket publish' container_help_contains --publish-socket run
   host_capability 'shared memory size' container_help_contains --shm-size run
+  host_capability 'custom networks' container_command_available network
+  host_capability 'host-only networks' container_help_contains --internal network create
   host_capability 'container machine' container_command_available machine
   host_capability 'storage accounting' container_system_df_supported
 
@@ -4035,6 +4079,306 @@ host_doctor() {
   fi
 
   return "$status"
+}
+
+container_network_list_json() {
+  "$CONTAINER_CMD" network list --format json 2>/dev/null \
+    || "$CONTAINER_CMD" network ls --format json 2>/dev/null
+}
+
+network_normalized_json() {
+  jq -Rrs --arg managed_label "$AGENTCTL_NETWORK_LABEL" '
+    (try fromjson catch null) as $parsed
+    | if ($parsed | type) != "array" then error("invalid network list JSON") else $parsed end
+    | map(
+        . as $item
+        | ($item.configuration // $item) as $config
+        | ($item.status // {}) as $status
+        | {
+            name: ($item.id // $item.name // $config.name // $config.id // ""),
+            mode: ($config.mode // $item.mode // "unknown"),
+            ipv4Subnet: ($status.ipv4Subnet // $config.ipv4Subnet // $config.subnet // ""),
+            ipv6Subnet: ($status.ipv6Subnet // $config.ipv6Subnet // ""),
+            labels: ($config.labels // $item.labels // {}),
+            managed: (($config.labels // $item.labels // {})[$managed_label] == "true")
+          }
+      )
+    | if any(.name == "") then error("network entry has no name") else sort_by(.name) end
+  '
+}
+
+network_list_normalized_json() {
+  container_network_list_json | network_normalized_json
+}
+
+network_inspect_normalized_json() {
+  local name="$1"
+
+  "$CONTAINER_CMD" network inspect "$name" 2>/dev/null | jq -Rrs --arg name "$name" --arg managed_label "$AGENTCTL_NETWORK_LABEL" '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then error("invalid network inspect JSON")
+      elif ($parsed | type) == "array" then ($parsed[0] // {})
+      elif ($parsed | type) == "object" then $parsed
+      else error("invalid network inspect JSON") end
+    | . as $item
+    | ($item.configuration // $item) as $config
+    | ($item.status // {}) as $status
+    | {
+        name: ($item.id // $item.name // $config.name // $config.id // $name),
+        mode: ($config.mode // $item.mode // "unknown"),
+        ipv4Subnet: ($status.ipv4Subnet // $config.ipv4Subnet // $config.subnet // ""),
+        ipv4Gateway: ($status.ipv4Gateway // $status.gateway // ""),
+        ipv6Subnet: ($status.ipv6Subnet // $config.ipv6Subnet // ""),
+        labels: ($config.labels // $item.labels // {}),
+        managed: (($config.labels // $item.labels // {})[$managed_label] == "true")
+      }
+  '
+}
+
+network_mode() {
+  network_inspect_normalized_json "$1" | jq -er '.mode | strings | select(length > 0)'
+}
+
+network_is_managed() {
+  network_inspect_normalized_json "$1" | jq -e '.managed == true' >/dev/null
+}
+
+network_exists() {
+  "$CONTAINER_CMD" network inspect "$1" >/dev/null 2>&1
+}
+
+require_custom_network_support() {
+  container_command_available network \
+    || die "Custom networks require an Apple container runtime with 'container network' support"
+  container_help_contains --network create \
+    || die "Custom networks require an Apple container runtime with 'container create --network <name>' support"
+}
+
+require_host_only_network_support() {
+  if ! "$CONTAINER_CMD" network create --help 2>/dev/null | grep -Fq -- '--internal'; then
+    die "Host-only networks require an Apple container runtime with 'container network create --internal' support"
+  fi
+}
+
+validate_network_name_argument() {
+  local name="$1"
+
+  [ -n "$name" ] || die "Network name cannot be empty"
+  case "$name" in
+    *,*) die "Network attachment options are not supported by agentctl: $name (pass a network name only)" ;;
+  esac
+}
+
+validate_network_selection() {
+  local name=""
+  local mode=""
+  local seen=""
+  local count=0
+  local host_only_count=0
+
+  [ "$#" -gt 0 ] || return 0
+  require_custom_network_support
+  for name in "$@"; do
+    validate_network_name_argument "$name"
+    if printf '%s\n' "$seen" | grep -Fqx -- "$name"; then
+      die "Duplicate network attachment: $name"
+    fi
+    seen="${seen}${name}"$'\n'
+    network_exists "$name" || die "Container network not found: $name"
+    mode="$(network_mode "$name")" || die "Unable to determine mode for container network: $name"
+    case "$mode" in
+      hostOnly|hostonly|host-only|internal) host_only_count=$((host_only_count + 1)) ;;
+      nat) ;;
+      *) die "Unsupported container network mode for $name: $mode" ;;
+    esac
+    count=$((count + 1))
+  done
+  if [ "$host_only_count" -gt 0 ] && [ "$count" -gt 1 ]; then
+    die "A host-only network cannot be combined with another network because that could restore external access"
+  fi
+}
+
+network_selection_is_host_only() {
+  local name=""
+  for name in "$@"; do
+    case "$(network_mode "$name" 2>/dev/null || true)" in
+      hostOnly|hostonly|host-only|internal) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+container_network_specs() {
+  local name="$1"
+
+  "$CONTAINER_CMD" inspect "$name" 2>/dev/null | jq -Rrs '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then error("invalid container inspect JSON")
+      elif ($parsed | type) == "array" then ($parsed[0] // {})
+      elif ($parsed | type) == "object" then $parsed
+      else error("invalid container inspect JSON") end
+    | . as $data
+    | ($data.configuration // $data) as $config
+    | (($config.networks // []) | if length > 0 then . else ($data.status.networks // $data.networks // []) end)[]
+    | if type == "string" then .
+      else (.network // .name // .id // "") as $name
+      | if $name == "" then error("network attachment has no name") else
+          ($name
+           + (if (.options.macAddress // null) != null then ",mac=" + (.options.macAddress | tostring) else "" end)
+           + (if (.options.mtu // .mtu // null) != null then ",mtu=" + ((.options.mtu // .mtu) | tostring) else "" end))
+        end
+      end
+  '
+}
+
+network_spec_name() {
+  printf '%s\n' "${1%%,*}"
+}
+
+container_network_names() {
+  local name="$1"
+  local spec=""
+  local specs=""
+
+  specs="$(container_network_specs "$name")" || return 1
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    network_spec_name "$spec"
+  done <<<"$specs"
+}
+
+network_specs_without_mac() {
+  awk -F, '
+    NF > 0 {
+      output = $1
+      for (i = 2; i <= NF; i++) {
+        if ($i !~ /^mac=/) output = output "," $i
+      }
+      print output
+    }
+  '
+}
+
+network_args_to_text() {
+  local name=""
+  for name in "$@"; do printf '%s\n' "$name"; done
+}
+
+network_text_names() {
+  local text="$1"
+  printf '%s\n' "$text" | sed '/^$/d'
+}
+
+validate_existing_container_networks() {
+  local container_name="$1"
+  local requested_text="$2"
+  local actual_text=""
+
+  [ -n "$requested_text" ] || return 0
+  actual_text="$(container_network_names "$container_name")" \
+    || die "Unable to determine network attachments for existing container: $container_name"
+  if [ "$actual_text" != "${requested_text%$'\n'}" ]; then
+    die "Container already exists with different network attachments: $container_name (remove or upgrade it to change networks)"
+  fi
+}
+
+network_create_cmd() {
+  local internal=0
+  local subnet=""
+  local subnet_v6=""
+  local name=""
+  local label=""
+  local key=""
+  local -a labels=()
+  local -a create_cmd=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --internal) internal=1; shift ;;
+      --subnet) [ "$#" -ge 2 ] || die "Missing value for --subnet"; subnet="$2"; shift 2 ;;
+      --subnet-v6) [ "$#" -ge 2 ] || die "Missing value for --subnet-v6"; subnet_v6="$2"; shift 2 ;;
+      --label) [ "$#" -ge 2 ] || die "Missing value for --label"; labels+=("$2"); shift 2 ;;
+      --help) usage_network; return 0 ;;
+      --*) die "Unknown option for network create: $1" ;;
+      *) [ -z "$name" ] || die "Unexpected network create argument: $1"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "Network name is required"
+  validate_network_name_argument "$name"
+  require_custom_network_support
+  [ "$internal" -eq 0 ] || require_host_only_network_support
+  network_exists "$name" && die "Container network already exists: $name"
+  if [ "${#labels[@]}" -gt 0 ]; then
+    for label in "${labels[@]}"; do
+      case "$label" in
+        *=*) key="${label%%=*}" ;;
+        *) die "Invalid network label (expected KEY=VALUE): $label" ;;
+      esac
+      [ "$key" != "$AGENTCTL_NETWORK_LABEL" ] || die "The network ownership label is managed by agentctl: $AGENTCTL_NETWORK_LABEL"
+    done
+  fi
+  create_cmd=("$CONTAINER_CMD" network create --label "$AGENTCTL_NETWORK_LABEL=true")
+  [ "$internal" -eq 0 ] || create_cmd+=(--internal)
+  [ -z "$subnet" ] || create_cmd+=(--subnet "$subnet")
+  [ -z "$subnet_v6" ] || create_cmd+=(--subnet-v6 "$subnet_v6")
+  if [ "${#labels[@]}" -gt 0 ]; then
+    for label in "${labels[@]}"; do create_cmd+=(--label "$label"); done
+  fi
+  create_cmd+=("$name")
+  "${create_cmd[@]}"
+}
+
+network_list_cmd() {
+  local raw=0
+  local json=""
+  local rows=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --raw) raw=1; shift ;;
+      --help) usage_network; return 0 ;;
+      *) die "Unknown option for network list: $1" ;;
+    esac
+  done
+  require_custom_network_support
+  json="$(network_list_normalized_json)" || die "Unable to parse container network list"
+  if [ "$raw" -eq 1 ]; then
+    printf '%s\n' "$json" | jq -r '.[].name'
+    return 0
+  fi
+  rows="$(printf '%s\t%s\t%s\t%s\t%s\n' NAME MODE IPV4 IPV6 MANAGED)"
+  rows="${rows}"$'\n'"$(printf '%s\n' "$json" | jq -r '.[] | [.name, .mode, (.ipv4Subnet // ""), (.ipv6Subnet // ""), (if .managed then "yes" else "no" end)] | @tsv')"
+  printf '%s\n' "$rows" | format_tsv_table
+}
+
+network_inspect_cmd() {
+  [ "$#" -eq 1 ] || die "Usage: $CLI_NAME network inspect NAME"
+  require_custom_network_support
+  "$CONTAINER_CMD" network inspect "$1"
+}
+
+network_remove_cmd() {
+  local name=""
+  [ "$#" -gt 0 ] || die "At least one network name is required"
+  require_custom_network_support
+  for name in "$@"; do
+    network_exists "$name" || die "Container network not found: $name"
+    network_is_managed "$name" || die "Refusing to delete network not managed by agentctl: $name"
+  done
+  "$CONTAINER_CMD" network delete "$@"
+}
+
+network_cmd() {
+  local subcommand="${1:-list}"
+  [ "$#" -eq 0 ] || shift
+  case "$subcommand" in
+    list|ls) network_list_cmd "$@" ;;
+    create) network_create_cmd "$@" ;;
+    inspect) network_inspect_cmd "$@" ;;
+    rm|delete) network_remove_cmd "$@" ;;
+    --help|-h|help) usage_network ;;
+    *) die "Unknown network command: $subcommand" ;;
+  esac
 }
 
 container_network_host_address() {
@@ -4101,9 +4445,17 @@ host_address_cmd() {
 
 configure_container_host_alias() {
   local name="$1"
+  local network="${2:-}"
+  local networks=""
   local host_address=""
 
-  host_address="$(container_network_host_address default)"
+  if [ -z "$network" ]; then
+    networks="$(container_network_names "$name")" \
+      || die "Unable to determine network attachment for host alias configuration: $name"
+    [ -n "$networks" ] || die "Container has no network attachment for host alias configuration: $name"
+    network="${networks%%$'\n'*}"
+  fi
+  host_address="$(container_network_host_address "$network")"
   "$CONTAINER_CMD" exec --user root "$name" sh -c '
     address="$1"
     hostname="$2"
@@ -5662,6 +6014,8 @@ print_upgrade_dry_run_summary() {
   local backup_image="${17}"
   local overwrite_config="${18}"
   local copy_mode="${19:-0}"
+  local current_networks="${20:-default}"
+  local target_networks="${21:-default}"
   local state_label=""
   local mount_label=""
   local config_label=""
@@ -5729,6 +6083,7 @@ print_upgrade_dry_run_summary() {
   echo "  CPU: ${current_cpu:-unlimited} -> ${target_cpu:-unlimited}" >&2
   echo "  Memory: $current_mem_display -> $target_mem_display" >&2
   echo "  Shared memory: $current_shm_display -> $target_shm_display" >&2
+  echo "  Networks: ${current_networks:-default} -> ${target_networks:-default}" >&2
   echo "  Current state: $state_label" >&2
   echo "  Config backup: $config_label" >&2
   echo "  Backup image: $backup_label" >&2
@@ -5818,7 +6173,8 @@ run_container() {
   local reset_config="${12}"
   local stdio="${13}"
   local shm_size="${14}"
-  shift 14
+  local network_text="${15}"
+  shift 15
   local cmd=("$@")
   local exit_code=0
   local started=0
@@ -5847,6 +6203,7 @@ run_container() {
   if [ -n "$actual_name" ] && container_exists "$actual_name"; then
     validate_mount_mode "$actual_name" "$read_only"
     validate_existing_container_shm_size "$actual_name" "$shm_size"
+    validate_existing_container_networks "$actual_name" "$network_text"
   fi
   if [ -n "$actual_name" ] && container_running "$actual_name"; then
     already_running=1
@@ -5871,6 +6228,10 @@ run_container() {
         require_container_shm_size_support
         create_cmd+=(--shm-size "$shm_size")
       fi
+      while IFS= read -r network_name; do
+        [ -n "$network_name" ] || continue
+        create_cmd+=(--network "$network_name")
+      done < <(network_text_names "$network_text")
       if [ -n "$actual_name" ]; then
         create_cmd+=(--name "$actual_name")
       fi
@@ -5972,7 +6333,8 @@ run_mode() {
   local model_override="${15}"
   local stdio="${16}"
   local shm_size="${17}"
-  shift 17
+  local network_text="${18}"
+  shift 18
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
@@ -6008,7 +6370,7 @@ run_mode() {
     shell=0
   fi
 
-  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "$stdio" "$shm_size" "${cmd[@]}"
+  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "$stdio" "$shm_size" "$network_text" "${cmd[@]}"
 }
 
 RUN_SELECTED_RUNTIME=""
@@ -6118,10 +6480,12 @@ run_cmd() {
   local cpu=""
   local mem=""
   local shm_size=""
+  local network_text=""
   local home_mount=""
   local workdir=""
   local stdio=0
   local -a runtime_config_entries=()
+  local -a networks=()
   local -a cmd_override=()
   local cmd_override_set=0
   local shell_set=0
@@ -6148,12 +6512,20 @@ run_cmd() {
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
       --shm-size) shm_size="$2"; shift 2 ;;
+      --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
       --help) usage_run; return 0 ;;
       *) die "Unknown option for run: $1" ;;
     esac
   done
 
   require_container
+  if [ "${#networks[@]}" -gt 0 ]; then
+    validate_network_selection "${networks[@]}"
+    network_text="$(network_args_to_text "${networks[@]}")"
+    if [ "$online" -eq 1 ] && network_selection_is_host_only "${networks[@]}"; then
+      die "Online mode cannot use a host-only network because it has no external route"
+    fi
+  fi
   if [ "$shell_set" -eq 1 ] && [ "$cmd_override_set" -eq 1 ]; then
     die "Cannot combine --shell with --cmd"
   fi
@@ -6196,6 +6568,22 @@ run_cmd() {
   if [ -z "$name" ] && [ "$temp" -eq 0 ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
   fi
+  if [ "$online" -eq 1 ] && [ "${#networks[@]}" -eq 0 ] && [ -n "$name" ] && container_exists "$name"; then
+    local -a existing_networks=()
+    local existing_network=""
+    local existing_network_text=""
+    existing_network_text="$(container_network_names "$name")" \
+      || die "Unable to determine network attachments for online container: $name"
+    [ -n "$existing_network_text" ] \
+      || die "Container has no inspectable network attachment for online mode: $name"
+    while IFS= read -r existing_network; do
+      [ -n "$existing_network" ] || continue
+      existing_networks+=("$existing_network")
+    done <<<"$existing_network_text"
+    if network_selection_is_host_only "${existing_networks[@]}"; then
+      die "Online mode cannot use a host-only network because it has no external route"
+    fi
+  fi
   if [ "$install_runtime" -eq 1 ] && [ "$runtime" = "claude" ] && [ -z "$mem" ] && { [ "$temp" -eq 1 ] || [ -z "$name" ] || ! container_exists "$name"; }; then
     mem="$CLAUDE_MIN_INSTALL_MEM"
   fi
@@ -6234,7 +6622,7 @@ run_cmd() {
     RUN_UPDATE_CODEX=1
   fi
 
-  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" "$stdio" "$shm_size" ${cmd_override[@]+"${cmd_override[@]}"}
+  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" "$stdio" "$shm_size" "$network_text" ${cmd_override[@]+"${cmd_override[@]}"}
 }
 
 auth_cmd() {
@@ -6287,6 +6675,10 @@ upgrade_cmd() {
   local current_cpu=""
   local current_mem=""
   local current_shm_size=""
+  local current_network_specs=""
+  local current_network_names=""
+  local target_network_specs=""
+  local target_network_names=""
   local read_only=0
   local was_running=0
   local started_for_backup=0
@@ -6302,6 +6694,7 @@ upgrade_cmd() {
   local preflight_target_manifest=""
   local inspect_info=""
   local upgrade_package_reinstall_commands=""
+  local -a requested_networks=()
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -6313,6 +6706,7 @@ upgrade_cmd() {
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
       --shm-size) shm_size="$2"; shift 2 ;;
+      --network) [ "$#" -ge 2 ] || die "Missing value for --network"; requested_networks+=("$2"); shift 2 ;;
       --backup-image) backup_image="$2"; shift 2 ;;
       --no-backup) no_backup=1; shift ;;
       --dry-run) dry_run=1; shift ;;
@@ -6360,6 +6754,10 @@ upgrade_cmd() {
   inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
   IFS=$'\t' read -r current_image current_workdir mount_mode current_cpu current_mem <<<"$inspect_info"
   current_shm_size="$(container_shm_size "$name")"
+  current_network_specs="$(container_network_specs "$name")" \
+    || die "Unable to determine network attachments for $name; pass --network explicitly"
+  current_network_names="$(printf '%s\n' "$current_network_specs" | sed '/^$/d; s/,.*//')"
+  [ -n "$current_network_names" ] || current_network_names="default"
   [ -n "$current_image" ] || die "Unable to determine image for $name"
   [ -n "$current_workdir" ] || die "Unable to determine /workdir mount source for $name"
 
@@ -6381,6 +6779,26 @@ upgrade_cmd() {
   [ -n "$cpu" ] || cpu="$current_cpu"
   [ -n "$mem" ] || mem="$current_mem"
   [ -n "$shm_size" ] || shm_size="$current_shm_size"
+  if [ "${#requested_networks[@]}" -gt 0 ]; then
+    validate_network_selection "${requested_networks[@]}"
+    target_network_names="$(network_args_to_text "${requested_networks[@]}")"
+    target_network_specs="$target_network_names"
+  else
+    target_network_names="$current_network_names"
+    target_network_specs="$current_network_specs"
+    if [ -n "$target_network_specs" ]; then
+      local -a preserved_networks=()
+      local preserved_network=""
+      while IFS= read -r preserved_network; do
+        [ -n "$preserved_network" ] || continue
+        preserved_networks+=("$preserved_network")
+      done <<<"$target_network_names"
+      validate_network_selection "${preserved_networks[@]}"
+    fi
+  fi
+  if [ "$copy_mode" -eq 1 ] && [ -n "$target_network_specs" ]; then
+    target_network_specs="$(printf '%s\n' "$target_network_specs" | network_specs_without_mac)"
+  fi
   if [ -n "$shm_size" ]; then
     require_container_shm_size_support
   fi
@@ -6434,7 +6852,8 @@ upgrade_cmd() {
     print_upgrade_dry_run_summary \
       "$name" "$target_name" "$current_image" "$image" "$current_workdir" "$workdir" \
       "$mount_mode" "$current_cpu" "$cpu" "$current_mem" "$mem" "$current_shm_size" "$shm_size" "$was_running" \
-      "$backup_mode" "$no_backup" "$backup_image" "$overwrite_config" "$copy_mode"
+      "$backup_mode" "$no_backup" "$backup_image" "$overwrite_config" "$copy_mode" \
+      "$(printf '%s' "$current_network_names" | paste -sd, -)" "$(printf '%s' "$target_network_names" | paste -sd, -)"
     return 0
   fi
 
@@ -6564,6 +6983,11 @@ upgrade_cmd() {
   if [ -n "$shm_size" ]; then
     create_cmd+=(--shm-size "$shm_size")
   fi
+  local network_spec=""
+  while IFS= read -r network_spec; do
+    [ -n "$network_spec" ] || continue
+    create_cmd+=(--network "$network_spec")
+  done <<<"$target_network_specs"
   local mount_opts="type=bind,src=$workdir,dst=/workdir"
   if [ "$read_only" -eq 1 ]; then
     mount_opts="${mount_opts},readonly"
@@ -6637,6 +7061,7 @@ rescue_cmd() {
   local -a cmd=()
   local cmd_override_set=0
   local -a create_cmd=()
+  local -a networks=()
 
   cleanup_rescue_container() {
     if [ "$keep" -eq 1 ]; then
@@ -6666,6 +7091,7 @@ rescue_cmd() {
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
       --shm-size) shm_size="$2"; shift 2 ;;
+      --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
       --cmd) shift; cmd_override_set=1; cmd=("$@"); break ;;
       --help) usage_rescue; return 0 ;;
       --*) die "Unknown option for rescue: $1" ;;
@@ -6684,6 +7110,9 @@ rescue_cmd() {
   [ -n "$image" ] || die "--image is required for rescue"
   if [ -n "$shm_size" ]; then
     require_container_shm_size_support
+  fi
+  if [ "${#networks[@]}" -gt 0 ]; then
+    validate_network_selection "${networks[@]}"
   fi
   if [ "$cmd_override_set" -eq 1 ] && [ "${#cmd[@]}" -eq 0 ]; then
     die "Missing command after --cmd"
@@ -6718,6 +7147,12 @@ rescue_cmd() {
   fi
   if [ -n "$shm_size" ]; then
     create_cmd+=(--shm-size "$shm_size")
+  fi
+  local network_name=""
+  if [ "${#networks[@]}" -gt 0 ]; then
+    for network_name in "${networks[@]}"; do
+      create_cmd+=(--network "$network_name")
+    done
   fi
   create_cmd+=(--name "$name" "$image" /bin/sh -c 'sleep infinity')
 
@@ -7043,6 +7478,7 @@ case "$cmd" in
   refresh) shift; refresh_cmd "$@" ;;
   doctor) shift; doctor_cmd "$@" ;;
   host-address) shift; host_address_cmd "$@" ;;
+  network) shift; network_cmd "$@" ;;
   system-manifest) shift; system_manifest_cmd "$@" ;;
   upgrade) shift; upgrade_cmd "$@" ;;
   rescue) shift; rescue_cmd "$@" ;;

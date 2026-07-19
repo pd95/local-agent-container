@@ -81,6 +81,18 @@ version is:
 
 Details and options are in [docs/networking.md](docs/networking.md).
 
+Apple container 1.1 custom networks can be managed and selected directly. For
+example, create a host-only network for an offline workload:
+
+```bash
+agentctl network create --internal agent-isolated
+agentctl run --network agent-isolated
+```
+
+`--network` is also available on `bootstrap`, `upgrade`, and `rescue`. Host-only
+networks deliberately reject `--online`; see [docs/networking.md](docs/networking.md)
+for lifecycle, isolation, and upgrade behavior.
+
 For isolated Ollama listeners or non-default ports, pass the container-reachable
 base URL explicitly:
 

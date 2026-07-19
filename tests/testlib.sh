@@ -20,6 +20,8 @@ CLEANUP_CONTAINERS=""
 CLEANUP_RAW_CONTAINERS=""
 CLEANUP_IMAGES=""
 CLEANUP_BACKUP_IMAGES=""
+CLEANUP_NETWORKS=""
+CLEANUP_PIDS=""
 CLEANUP_DIRS=""
 LEAK_TRACKING_DIR=""
 
@@ -83,6 +85,22 @@ register_image_cleanup() {
     *" $image_ref "*) return 0 ;;
   esac
   CLEANUP_IMAGES="$CLEANUP_IMAGES $image_ref"
+}
+
+register_network_cleanup() {
+  local name="$1"
+  case " $CLEANUP_NETWORKS " in
+    *" $name "*) return 0 ;;
+  esac
+  CLEANUP_NETWORKS="$CLEANUP_NETWORKS $name"
+}
+
+register_pid_cleanup() {
+  local pid="$1"
+  case " $CLEANUP_PIDS " in
+    *" $pid "*) return 0 ;;
+  esac
+  CLEANUP_PIDS="$CLEANUP_PIDS $pid"
 }
 
 register_dir_cleanup() {
@@ -210,6 +228,13 @@ cleanup() {
   local path
   local cleanup_log
 
+  for name in $CLEANUP_PIDS; do
+    if kill -0 "$name" >/dev/null 2>&1; then
+      kill "$name" >/dev/null 2>&1 || true
+      wait "$name" >/dev/null 2>&1 || true
+    fi
+  done
+
   for name in $CLEANUP_CONTAINERS; do
     if container_exists "$name"; then
       cleanup_log="$(mktemp "${TMPDIR:-/tmp}/agentctl-cleanup.XXXXXX")"
@@ -256,6 +281,18 @@ cleanup() {
     cleanup_log="$(mktemp "${TMPDIR:-/tmp}/agentctl-cleanup.XXXXXX")"
     if ! "$CONTAINER_CMD" image rm "$image_ref" >"$cleanup_log" 2>&1; then
       printf '[test] cleanup failed for image %s:\n' "$image_ref" >&2
+      cat "$cleanup_log" >&2
+    fi
+    rm -f "$cleanup_log" >/dev/null 2>&1 || true
+  done
+
+  for name in $CLEANUP_NETWORKS; do
+    if ! "$CONTAINER_CMD" network inspect "$name" >/dev/null 2>&1; then
+      continue
+    fi
+    cleanup_log="$(mktemp "${TMPDIR:-/tmp}/agentctl-cleanup.XXXXXX")"
+    if ! "$AGENTCTL" network rm "$name" >"$cleanup_log" 2>&1; then
+      printf '[test] cleanup failed for network %s:\n' "$name" >&2
       cat "$cleanup_log" >&2
     fi
     rm -f "$cleanup_log" >/dev/null 2>&1 || true

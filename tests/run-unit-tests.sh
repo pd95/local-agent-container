@@ -519,6 +519,155 @@ test_host_address_handles_non_24_and_rejects_malformed_networks() {
   unset -f container
 }
 
+test_network_json_normalization_reports_mode_subnets_and_ownership() {
+  begin_test "network JSON normalization reports mode, subnets, and agentctl ownership"
+
+  load_agentctl_functions
+
+  local normalized
+  normalized="$(printf '%s' '[{"id":"isolated","configuration":{"mode":"hostOnly","labels":{"agentctl.managed":"true"}},"status":{"ipv4Subnet":"10.20.0.0/24"}},{"name":"shared","mode":"nat","subnet":"10.21.0.0/24","labels":{}}]' | network_normalized_json)"
+  [ "$(printf '%s' "$normalized" | jq -r '.[0] | [.name,.mode,.ipv4Subnet,.managed] | @tsv')" = $'isolated\thostOnly\t10.20.0.0/24\ttrue' ] \
+    || fail "Expected managed host-only network normalization, got: $normalized"
+  [ "$(printf '%s' "$normalized" | jq -r '.[1] | [.name,.mode,.ipv4Subnet,.managed] | @tsv')" = $'shared\tnat\t10.21.0.0/24\tfalse' ] \
+    || fail "Expected unmanaged NAT network normalization, got: $normalized"
+}
+
+test_network_create_adds_ownership_and_standard_options() {
+  begin_test "network create adds ownership and forwards standard vmnet options"
+
+  load_agentctl_functions
+
+  local create_args=""
+  require_custom_network_support() { return 0; }
+  require_host_only_network_support() { return 0; }
+  network_exists() { return 1; }
+  CONTAINER_CMD=container
+  container() { create_args="$*"; }
+
+  network_create_cmd --internal --subnet 10.30.0.0/24 --subnet-v6 fd00:30::/64 --label purpose=test isolated
+  [ "$create_args" = "network create --label $AGENTCTL_NETWORK_LABEL=true --internal --subnet 10.30.0.0/24 --subnet-v6 fd00:30::/64 --label purpose=test isolated" ] \
+    || fail "Unexpected network create arguments: $create_args"
+
+  create_args=""
+  network_create_cmd --internal unlabeled
+  [ "$create_args" = "network create --label $AGENTCTL_NETWORK_LABEL=true --internal unlabeled" ] \
+    || fail "Unexpected unlabeled network create arguments: $create_args"
+}
+
+test_network_selection_enforces_host_only_isolation() {
+  begin_test "network selection rejects missing, duplicate, and mixed host-only attachments"
+
+  load_agentctl_functions
+
+  require_custom_network_support() { return 0; }
+  network_exists() { [ "$1" != "missing" ]; }
+  network_mode() { [ "$1" = "isolated" ] && printf 'hostOnly\n' || printf 'nat\n'; }
+  validate_network_wrapper() { ( validate_network_selection "$@" ); }
+
+  run_capture validate_network_wrapper missing
+  assert_status 1
+  assert_contains "Container network not found: missing"
+  run_capture validate_network_wrapper shared shared
+  assert_status 1
+  assert_contains "Duplicate network attachment: shared"
+  run_capture validate_network_wrapper isolated shared
+  assert_status 1
+  assert_contains "cannot be combined with another network"
+  run_capture validate_network_wrapper isolated
+  assert_status 0
+}
+
+test_network_remove_refuses_foreign_networks() {
+  begin_test "network rm refuses networks not owned by agentctl"
+
+  load_agentctl_functions
+
+  local delete_args=""
+  require_custom_network_support() { return 0; }
+  network_exists() { return 0; }
+  network_is_managed() { [ "$1" = "managed" ]; }
+  CONTAINER_CMD=container
+  container() { delete_args="$*"; }
+  network_remove_wrapper() { ( network_remove_cmd "$@" ); }
+
+  run_capture network_remove_wrapper foreign
+  assert_status 1
+  assert_contains "Refusing to delete network not managed by agentctl: foreign"
+  network_remove_cmd managed
+  [ "$delete_args" = "network delete managed" ] || fail "Expected managed network deletion, got: $delete_args"
+}
+
+test_container_network_specs_preserve_attachment_options() {
+  begin_test "container network inspection preserves explicit options but not runtime MACs"
+
+  load_agentctl_functions
+
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = "inspect" ] || fail "Unexpected container invocation: $*"
+    printf '%s\n' '{"configuration":{"networks":[{"network":"frontend","options":{"macAddress":"02:00:00:00:00:11","mtu":1400}},{"network":"services","options":{"hostname":"unit-test"}}]}}'
+  }
+
+  [ "$(container_network_specs unit-test-container)" = $'frontend,mac=02:00:00:00:00:11,mtu=1400\nservices' ] \
+    || fail "Expected ordered network attachment options to be preserved"
+
+  container() {
+    [ "$1" = "inspect" ] || fail "Unexpected container invocation: $*"
+    printf '%s\n' '{"status":{"networks":[{"network":"frontend","macAddress":"02:00:00:00:00:99","mtu":1280}]}}'
+  }
+  [ "$(container_network_specs unit-test-container)" = 'frontend,mtu=1280' ] \
+    || fail "Expected runtime-assigned status MAC to be omitted"
+}
+
+test_container_network_names_propagates_inspect_failure() {
+  begin_test "container network names propagates malformed inspect failures"
+
+  load_agentctl_functions
+
+  CONTAINER_CMD=container
+  container() { printf 'not-json\n'; }
+  if container_network_names unit-test-container >/dev/null 2>&1; then
+    fail "Expected malformed container inspect data to fail network discovery"
+  fi
+}
+
+test_online_run_and_host_alias_fail_closed_on_network_inspect_errors() {
+  begin_test "online run and host alias fail closed when network inspection fails"
+
+  load_agentctl_functions
+
+  require_container() { return 0; }
+  container_exists() { return 0; }
+  image_ref_for_runtime() { printf '%s\n' "$1"; }
+  warn_legacy_compat_image_usage() { :; }
+  container_network_names() { return 1; }
+  run_mode() { fail "Online run should not launch when network inspection fails"; }
+  online_run_wrapper() { ( run_cmd "$@" ); }
+  host_alias_wrapper() { ( configure_container_host_alias "$@" ); }
+
+  run_capture online_run_wrapper --name unit-test-container --image agent-plain --workdir "$TEST_ROOT" --online --cmd true
+  assert_status 1
+  assert_contains "Unable to determine network attachments for online container: unit-test-container"
+
+  run_capture host_alias_wrapper unit-test-container
+  assert_status 1
+  assert_contains "Unable to determine network attachment for host alias configuration: unit-test-container"
+}
+
+test_network_text_names_emits_readable_ordered_records() {
+  begin_test "network argument text emits newline-terminated ordered records"
+
+  load_agentctl_functions
+
+  local captured=""
+  local network=""
+  while IFS= read -r network; do
+    captured="${captured}${network},"
+  done < <(network_text_names $'frontend\nservices')
+  [ "$captured" = "frontend,services," ] \
+    || fail "Expected both network records to reach a while-read consumer, got: $captured"
+}
+
 test_inspect_json_helpers_handle_schema_shapes_and_invalid_input() {
   begin_test "inspect JSON helpers handle objects, arrays, and invalid input"
 
@@ -616,7 +765,7 @@ test_run_container_passes_shared_memory_size_to_create() {
     esac
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 1GiB true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 1GiB "" true
   assert_status 0
   printf '%s\n' "$create_log" | grep -Fq -- "--shm-size 1GiB" \
     || fail "Expected shared-memory create flag, got: $create_log"
@@ -651,7 +800,7 @@ test_configure_container_host_alias_replaces_stale_entry() {
     update_hostname="${10}"
   }
 
-  configure_container_host_alias unit-test-container
+  configure_container_host_alias unit-test-container default
   sh -c "$update_script" sh "$update_address" "$update_hostname" "$hosts_file"
 
   awk '$1 == "192.168.65.1" && $2 == "host.container.internal" { found = 1 } END { exit !found }' "$hosts_file" \
@@ -833,7 +982,7 @@ test_run_container_refreshes_host_alias_before_exec() {
     [ "$1" = "exec" ] || fail "Expected agent exec, got: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" true
   assert_status 0
   [ "$configured_name" = "unit-test-container" ] \
     || fail "Expected host alias refresh before exec, got: $configured_name"
@@ -905,7 +1054,7 @@ test_new_container_launch_checks_agentctl_versions() {
     esac
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" true
   assert_status 0
   assert_contains "Creating container..."
   assert_contains "Starting container: unit-test-container"
@@ -1574,6 +1723,7 @@ test_exec_cmd_no_tty_omits_interactive_flags() {
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
   container_running() { [ "$1" = "unit-test-container" ]; }
+  configure_container_host_alias() { :; }
   CONTAINER_CMD=container
   container() {
     case "$1" in
@@ -1607,6 +1757,7 @@ test_exec_cmd_stdio_uses_interactive_without_tty() {
 
   require_container() { return 0; }
   container_running() { [ "$1" = "unit-test-container" ]; }
+  configure_container_host_alias() { :; }
   CONTAINER_CMD=container
   container() {
     case "$1" in
@@ -1723,6 +1874,7 @@ test_run_cmd_stdio_uses_interactive_without_tty() {
   require_container() { return 0; }
   container_exists() { [ "$1" = "unit-test-container" ]; }
   container_running() { [ "$1" = "unit-test-container" ]; }
+  configure_container_host_alias() { :; }
   validate_mount_mode() { :; }
   CONTAINER_CMD=container
   container() {
@@ -1762,6 +1914,7 @@ test_run_cmd_stdio_suppresses_lifecycle_stdout() {
   require_container() { return 0; }
   container_exists() { return 1; }
   container_running() { return 1; }
+  configure_container_host_alias() { :; }
   persist_container_system_manifest_baseline_from_image() { :; }
   validate_mount_mode() { :; }
   CONTAINER_CMD=container
@@ -1837,7 +1990,7 @@ container() {
       ;;
   esac
 }
-printf 'protocol-input\n' | run_container unit-test-container agent-python 0 0 "" "" 0 "$TEST_ROOT" "" pre_reads_stdin "" 0 1 "" cat
+printf 'protocol-input\n' | run_container unit-test-container agent-python 0 0 "" "" 0 "$TEST_ROOT" "" pre_reads_stdin "" 0 1 "" "" cat
 EOF
   chmod +x "$unit_script"
 
@@ -1975,6 +2128,7 @@ test_run_container_reset_config_uses_runtime_helper() {
   container_exists() { [ "$1" = "unit-test-container" ]; }
   container_running() { return 0; }
   validate_mount_mode() { :; }
+  configure_container_host_alias() { :; }
   local CONTAINER_CMD=mock_reset_config_container
   mock_reset_config_container() {
     case "$1" in
@@ -1999,7 +2153,7 @@ test_run_container_reset_config_uses_runtime_helper() {
     fail "Unexpected agent.sh invocation: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" "" true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:codex' || fail "Expected runtime reset-config helper call, got: $helper_log"
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:codex' || fail "Expected preferred runtime to be preserved, got: $helper_log"
@@ -2017,6 +2171,7 @@ test_run_container_reset_config_uses_selected_runtime() {
   container_exists() { [ "$1" = "unit-test-container" ]; }
   container_running() { return 0; }
   validate_mount_mode() { :; }
+  configure_container_host_alias() { :; }
   local CONTAINER_CMD=mock_reset_config_container
   mock_reset_config_container() {
     case "$1" in
@@ -2037,7 +2192,7 @@ test_run_container_reset_config_uses_selected_runtime() {
     fail "Did not expect preferred runtime lookup when selected runtime is set: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" "" true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:opencode' || fail "Expected selected runtime reset-config helper call, got: $helper_log"
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:opencode' || fail "Expected selected runtime to be preserved, got: $helper_log"
@@ -2055,6 +2210,7 @@ test_run_container_reset_config_preserves_preferred_runtime() {
   container_exists() { [ "$1" = "unit-test-container" ]; }
   container_running() { return 0; }
   validate_mount_mode() { :; }
+  configure_container_host_alias() { :; }
   local CONTAINER_CMD=mock_reset_config_container
   mock_reset_config_container() {
     case "$1" in
@@ -2079,7 +2235,7 @@ test_run_container_reset_config_preserves_preferred_runtime() {
     fail "Unexpected agent.sh invocation: $*"
   }
 
-  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" true
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 1 0 "" "" true
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:reset:opencode' || fail "Expected preferred runtime reset-config helper call, got: $helper_log"
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:opencode' || fail "Expected preferred runtime to be restored after reset, got: $helper_log"
@@ -8103,7 +8259,7 @@ CONTAINER_CMD=container
 container() {
   case "\$1" in
     inspect)
-      printf 'placeholder\n'
+      printf '{}\n'
       ;;
     *)
       echo "unexpected container invocation: \$*" >&2
@@ -8114,6 +8270,7 @@ container() {
 container_upgrade_info() {
   printf 'agent-plain\t%s\trw\t2\t4G\n' "$TEST_ROOT"
 }
+container_network_specs() { :; }
 upgrade_cmd --name unit-test-container --no-backup
 EOF
   chmod +x "$script"
@@ -8163,7 +8320,7 @@ test_upgrade_uses_explicit_resource_overrides() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         shift
@@ -8189,6 +8346,8 @@ test_upgrade_uses_explicit_resource_overrides() {
   container_upgrade_info() {
     printf 'codex\t%s\trw\t2\t4G\n' "$TEST_ROOT"
   }
+  container_network_specs() { printf 'services,mac=02:00:00:00:00:11,mtu=1400\n'; }
+  validate_network_selection() { return 0; }
 
   run_capture upgrade_cmd --name unit-test-container --cpu 6 --mem 12G --shm-size 2GiB
   assert_status 0
@@ -8199,6 +8358,8 @@ test_upgrade_uses_explicit_resource_overrides() {
   printf '%s\n' "$create_args" | grep -F -- "-c 6" >/dev/null || fail "Expected create args to include overridden cpu, got: $create_args"
   printf '%s\n' "$create_args" | grep -F -- "-m 12G" >/dev/null || fail "Expected create args to include overridden mem, got: $create_args"
   printf '%s\n' "$create_args" | grep -F -- "--shm-size 2GiB" >/dev/null || fail "Expected create args to include overridden shared-memory size, got: $create_args"
+  printf '%s\n' "$create_args" | grep -F -- "--network services,mac=02:00:00:00:00:11,mtu=1400" >/dev/null \
+    || fail "Expected destructive upgrade to preserve explicit MAC and MTU, got: $create_args"
   printf '%s\n' "$create_args" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected create args to include container name, got: $create_args"
   [ "$start_calls" -eq 2 ] || fail "Expected 2 start calls, got: $start_calls"
   [ "$stop_calls" -eq 2 ] || fail "Expected 2 stop calls, got: $stop_calls"
@@ -8264,7 +8425,7 @@ test_upgrade_can_rename_container_during_recreation() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         shift
@@ -8290,7 +8451,6 @@ test_upgrade_can_rename_container_during_recreation() {
   container_upgrade_info() {
     printf 'codex\t%s\trw\t2\t4G\n' "$TEST_ROOT"
   }
-
   run_capture upgrade_cmd --name unit-test-container --new-name renamed-container --no-backup
   assert_status 0
   assert_contains "Removing container: unit-test-container"
@@ -8345,7 +8505,7 @@ test_upgrade_export_failure_restarts_running_source() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         create_calls=$((create_calls + 1))
@@ -8432,7 +8592,7 @@ test_upgrade_copy_keeps_running_source_container() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         shift
@@ -8458,6 +8618,8 @@ test_upgrade_copy_keeps_running_source_container() {
   container_upgrade_info() {
     printf 'codex\t%s\trw\t2\t4G\n' "$TEST_ROOT"
   }
+  container_network_specs() { printf 'services,mac=02:00:00:00:00:11,mtu=1400\n'; }
+  validate_network_selection() { return 0; }
 
   run_capture upgrade_cmd --name unit-test-container --new-name copied-container --copy
   assert_status 0
@@ -8467,6 +8629,11 @@ test_upgrade_copy_keeps_running_source_container() {
   assert_contains "Restoring user state into copied-container"
   assert_contains "Copy complete: copied-container (source preserved)"
   printf '%s\n' "$create_args" | grep -F -- "--name copied-container" >/dev/null || fail "Expected create args to include copied container, got: $create_args"
+  printf '%s\n' "$create_args" | grep -F -- "--network services,mtu=1400" >/dev/null \
+    || fail "Expected copy to preserve network and MTU, got: $create_args"
+  if printf '%s\n' "$create_args" | grep -F -- "mac=02:00:00:00:00:11" >/dev/null; then
+    fail "Expected copy to allocate a fresh MAC, got: $create_args"
+  fi
   [ -z "$rm_log" ] || fail "Expected source container to remain present, got rm log: $rm_log"
   if printf '%s\n' "$stop_log" | grep -Fx -- "unit-test-container" >/dev/null; then
     fail "Expected running source container to remain running during copy"
@@ -8538,7 +8705,7 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         create_calls=$((create_calls + 1))
@@ -8627,7 +8794,7 @@ test_upgrade_copy_dry_run_reports_copy_plan() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         create_calls=$((create_calls + 1))
@@ -8715,7 +8882,7 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         create_log="${create_log}$(printf '%s\n' "$*")"$'\n'
@@ -9037,7 +9204,7 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         create_log="${create_log}$(printf '%s\n' "$*")"$'\n'
@@ -9128,7 +9295,7 @@ test_upgrade_reinstalls_missing_default_runtime_after_restore() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         create_log="${create_log}$(printf '%s\n' "$*")"$'\n'
@@ -9203,7 +9370,7 @@ test_upgrade_warns_and_clears_missing_preferred_runtime() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create|start|stop|rm)
         ;;
@@ -9276,7 +9443,7 @@ test_upgrade_uses_stored_baseline_when_current_image_is_missing() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         create_log="${create_log}$(printf '%s\n' "$*")"$'\n'
@@ -9369,7 +9536,7 @@ test_upgrade_accepts_workdir_override_when_original_mount_is_missing() {
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         shift
@@ -9453,7 +9620,7 @@ EOF
   container() {
     case "$1" in
       inspect)
-        printf 'placeholder\n'
+        printf '{}\n'
         ;;
       create)
         shift
@@ -11156,6 +11323,14 @@ main() {
   run_selected_test test_host_address_reads_container_1_1_gateway "test_host_address_reads_container_1_1_gateway"
   run_selected_test test_host_address_supports_custom_network_subnet_fallback "test_host_address_supports_custom_network_subnet_fallback"
   run_selected_test test_host_address_handles_non_24_and_rejects_malformed_networks "test_host_address_handles_non_24_and_rejects_malformed_networks"
+  run_selected_test test_network_json_normalization_reports_mode_subnets_and_ownership "test_network_json_normalization_reports_mode_subnets_and_ownership"
+  run_selected_test test_network_create_adds_ownership_and_standard_options "test_network_create_adds_ownership_and_standard_options"
+  run_selected_test test_network_selection_enforces_host_only_isolation "test_network_selection_enforces_host_only_isolation"
+  run_selected_test test_network_remove_refuses_foreign_networks "test_network_remove_refuses_foreign_networks"
+  run_selected_test test_container_network_specs_preserve_attachment_options "test_container_network_specs_preserve_attachment_options"
+  run_selected_test test_container_network_names_propagates_inspect_failure "test_container_network_names_propagates_inspect_failure"
+  run_selected_test test_online_run_and_host_alias_fail_closed_on_network_inspect_errors "test_online_run_and_host_alias_fail_closed_on_network_inspect_errors"
+  run_selected_test test_network_text_names_emits_readable_ordered_records "test_network_text_names_emits_readable_ordered_records"
   run_selected_test test_inspect_json_helpers_handle_schema_shapes_and_invalid_input "test_inspect_json_helpers_handle_schema_shapes_and_invalid_input"
   run_selected_test test_shared_memory_size_helpers_normalize_and_compare_values "test_shared_memory_size_helpers_normalize_and_compare_values"
   run_selected_test test_container_shm_size_reads_apple_container_inspect_shape "test_container_shm_size_reads_apple_container_inspect_shape"

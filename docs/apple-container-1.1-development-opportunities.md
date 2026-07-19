@@ -61,7 +61,7 @@ The candidate tables use these labels:
 | `container cp` transfer backend | implemented | medium; simpler and less guest-tool dependent | complete | selected |
 | OCI recovery-image export | unused | high for off-host disaster recovery | medium | high |
 | Effective runtime defaults in doctor | implicit only | medium; clearer resource behavior | small-medium | medium |
-| Custom and host-only networks | partial network awareness | medium-high for isolation | medium-large | medium |
+| Custom and host-only networks | implemented and host-verified | medium-high for isolation | complete | selected |
 | SSH and socket forwarding | detected | medium for developer integrations | medium | medium |
 | Builder DNS controls | unused | medium in VPN/private-network environments | medium | medium |
 | Pull concurrency and progress | unused | low-medium | small-medium | medium-low |
@@ -325,14 +325,22 @@ container network create --plugin PLUGIN --option key=value NAME
 The release also refreshes the default network from current system
 configuration during service startup.
 
-### Current agentctl state
+### Implemented agentctl state
 
-`agentctl` dynamically discovers the default gateway and maintains
-`host.container.internal`; this is already the correct response to changing
-default subnets. `host-address` can inspect a named network, but `agentctl run`
-does not expose network selection or network lifecycle management.
+`agentctl network` now creates, lists, inspects, and removes reusable networks.
+Created networks carry an ownership label, and removal refuses foreign
+networks. Standard IPv4/IPv6 subnet, label, and host-only options are exposed;
+plugin-specific options intentionally remain outside the managed interface.
 
-### Candidate interface
+Repeated `--network` flags are supported by durable `run`, `bootstrap`,
+`upgrade`, and `rescue` flows. Upgrade preserves ordered attachments and their
+explicit MAC/MTU options unless explicit networks replace them. Runtime-assigned
+MACs are not persisted, and copy mode requests fresh MACs to avoid conflicts.
+Host-only networks cannot be mixed with other attachments and reject online mode.
+`host.container.internal` is derived from the selected network rather than
+always from `default`.
+
+### Interface
 
 ```bash
 agentctl network create agent-isolated --internal
@@ -344,15 +352,19 @@ An internal network could reduce exposure for agents working on untrusted code.
 It cannot be the unconditional default because online runtimes, Git hosts,
 registries, package managers, and other integrations need external access.
 
-### Investigation before implementation
+### Verified behavior and remaining integration checks
 
-- Verify exactly what `--internal` permits between containers and the host.
-- Test online runtimes, local Ollama, package installation, and MCP relays.
-- Determine how to preserve all network attachments during upgrade.
-- Determine whether host alias configuration must inspect the selected network
-  instead of `default`.
-- Establish ownership/naming rules before adding network prune or delete.
-- Avoid deleting user-created networks that merely share an `agent-` prefix.
+The macOS Apple container 1.1 integration test verifies same-network
+communication, cross-network isolation, loss of external routing, online-mode
+rejection, host access through the selected gateway and
+`host.container.internal`, upgrade attachment preservation, and safe refusal to
+delete attached networks. Ownership labels also prevent deletion of foreign
+networks based only on their names.
+
+Local Ollama, package installation, and individual MCP relays remain
+integration-specific checks. They require the host service to listen on the
+selected gateway (or all interfaces); a service bound only to `127.0.0.1` is
+not made reachable merely by selecting a host-only network.
 
 ## Localhost DNS forwarding
 

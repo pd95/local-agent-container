@@ -27,6 +27,9 @@ dependencies:
   packages installed through multiple tagged APK repositories
 - `refresh` accepts explicit `--cpu` and `--mem` overrides when recreating a container
 - refresh preflight failures do not remove the original container
+- managed host-only networks enforce same-network communication, cross-network
+  isolation, no external route, host-service access through the selected
+  gateway, host alias selection, and upgrade preservation
 - `run --reset-config` restores image-owned config, model metadata, and `AGENTS.md`
 - `refresh --overwrite-config` restores image-owned config, model metadata, and `AGENTS.md`
 
@@ -37,12 +40,22 @@ bash tests/run-tests.sh
 ```
 
 Before a release, runtime upgrade, or compatibility sign-off, run the full
-20-test host suite. The full tier includes the smoke tests plus build cleanup,
+host suite. The full tier includes the smoke tests plus build cleanup,
 upgrade/backup/rescue, package manifests, feature installation, and Alpine and
 Debian bootstrap coverage:
 
 ```bash
 bash tests/run-tests.sh --tier full
+```
+
+The host-only network test creates two managed internal networks and three
+containers, checks same-network and cross-network connectivity, verifies that
+external and online access are rejected, starts a temporary host HTTP service
+bound to the selected gateway and reaches it through `host.container.internal`,
+and confirms upgrade preservation and attached-network deletion safety:
+
+```bash
+bash tests/run-tests.sh --tier full --filter host-only
 ```
 
 For a focused Apple container 1.1 storage-accounting smoke check, run:

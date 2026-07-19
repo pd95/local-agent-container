@@ -959,6 +959,167 @@ test_bootstrap_works_on_existing_debian_container() {
   assert_status 0
 }
 
+test_host_only_network_lifecycle_isolation_and_upgrade() {
+  begin_test "host-only networks isolate external and cross-network traffic and survive upgrade"
+
+  local network
+  local other_network
+  local server
+  local peer
+  local outsider
+  local workdir
+  local gateway
+  local server_address
+  local host_server_dir
+  local host_server_log
+  local host_server_pid
+  local host_server_port
+  local host_server_port_file
+  local host_server_script
+  network="$(unique_name internal-net)"
+  other_network="$(unique_name other-net)"
+  server="$(unique_name internal-server)"
+  peer="$(unique_name internal-peer)"
+  outsider="$(unique_name internal-outsider)"
+  workdir="$(new_workdir)"
+  register_network_cleanup "$network"
+  register_network_cleanup "$other_network"
+  register_container_cleanup "$server"
+  register_container_cleanup "$peer"
+  register_container_cleanup "$outsider"
+
+  ensure_agent_plain_image
+
+  run_capture "$AGENTCTL" network create --internal "$network"
+  assert_status 0
+  run_capture "$AGENTCTL" network create --internal "$other_network"
+  assert_status 0
+  run_capture "$AGENTCTL" network list
+  assert_status 0
+  assert_contains "$network"
+  assert_contains "yes"
+
+  run_capture "$AGENTCTL" run --name "$server" --image agent-plain --workdir "$workdir" --network "$network" --cmd true
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$server"
+  assert_status 0
+  log "host-only: checking same-network connectivity"
+  run_capture "$AGENTCTL" exec --name "$server" --no-tty -- sh -lc 'nohup node -e '\''require("http").createServer((_request, response) => response.end("ok")).listen(18080, "0.0.0.0")'\'' >/tmp/agentctl-network-server.log 2>&1 &'
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$server"
+  assert_status 0
+  if ! server_address="$(printf '%s' "$RUN_OUTPUT" | jq -er --arg network "$network" '
+    (if type == "array" then .[0] else . end)
+    | first(
+        (.networks // .status.networks // [])[]
+        | select((.network // .name // .id) == $network)
+        | (.address // .ipv4Address // empty)
+        | split("/")[0]
+      )
+  ')"; then
+    fail "Unable to parse server address on network $network from container inspect: $RUN_OUTPUT"
+  fi
+  [ -n "$server_address" ] || fail "Unable to determine server address on network $network"
+  sleep 1
+  run_capture "$AGENTCTL" exec --name "$server" --no-tty -- curl -fsS --connect-timeout 3 --max-time 5 http://127.0.0.1:18080
+  if [ "$RUN_STATUS" -ne 0 ]; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    "$AGENTCTL" exec --name "$server" --no-tty -- sh -lc 'ps -ef; cat /tmp/agentctl-network-server.log 2>/dev/null || true' >&2 || true
+    fail "Expected the network test server to answer inside its own container"
+  fi
+
+  # Apple container's own host-only test attaches the client after the server
+  # and network are running. Preserve that ordering because vmnet attachment
+  # initialization can otherwise race peer reachability.
+  run_capture "$AGENTCTL" run --name "$peer" --image agent-plain --workdir "$workdir" --network "$network" --cmd true
+  assert_status 0
+  run_capture "$AGENTCTL" run --name "$outsider" --image agent-plain --workdir "$workdir" --network "$other_network" --cmd true
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$peer"
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$outsider"
+  assert_status 0
+  run_capture "$AGENTCTL" exec --name "$peer" --no-tty -- curl -fsS --retry 10 --retry-connrefused --retry-delay 1 --connect-timeout 3 --max-time 20 "http://$server_address:18080"
+  if [ "$RUN_STATUS" -ne 0 ]; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    "$AGENTCTL" exec --name "$server" --no-tty -- sh -lc 'ps -ef; printf "\n--- server log ---\n"; cat /tmp/agentctl-network-server.log 2>/dev/null || true' >&2 || true
+    "$CONTAINER_CMD" inspect "$server" "$peer" >&2 || true
+    fail "Expected same-network connection to $server_address:18080 to succeed"
+  fi
+
+  log "host-only: checking cross-network and external isolation"
+  run_capture "$AGENTCTL" exec --name "$outsider" --no-tty -- curl -fsS --connect-timeout 3 --max-time 5 "http://$server_address:18080"
+  [ "$RUN_STATUS" -ne 0 ] || fail "Expected distinct host-only networks to be isolated"
+  run_capture "$AGENTCTL" exec --name "$peer" --no-tty -- curl -fsS --connect-timeout 3 --max-time 5 https://example.com/
+  [ "$RUN_STATUS" -ne 0 ] || fail "Expected a host-only network to have no external route"
+  log "host-only: checking online-mode rejection and host alias"
+  run_capture "$AGENTCTL" run --name "$peer" --online --cmd true
+  assert_status 1
+  assert_contains "Online mode cannot use a host-only network"
+
+  run_capture "$AGENTCTL" host-address --network "$network"
+  assert_status 0
+  gateway="$RUN_OUTPUT"
+  [ -n "$gateway" ] || fail "Expected a host gateway for network $network"
+  run_capture "$AGENTCTL" exec --name "$peer" --no-tty -- awk -v gateway="$gateway" '$1 == gateway && $2 == "host.container.internal" { found=1 } END { exit !found }' /etc/hosts
+  assert_status 0
+
+  log "host-only: checking connectivity to a host service"
+  command -v python3 >/dev/null 2>&1 || fail "The host-only host-service test requires python3 on the macOS host"
+  host_server_dir="$(new_workdir)"
+  host_server_script="$host_server_dir/server.py"
+  host_server_port_file="$host_server_dir/port"
+  host_server_log="$host_server_dir/server.log"
+  printf 'host-only gateway reached\n' >"$host_server_dir/index.html"
+  cat >"$host_server_script" <<'PY'
+import http.server
+import pathlib
+import sys
+
+address, port_file, directory = sys.argv[1:]
+handler = lambda *args, **kwargs: http.server.SimpleHTTPRequestHandler(
+    *args, directory=directory, **kwargs
+)
+server = http.server.ThreadingHTTPServer((address, 0), handler)
+pathlib.Path(port_file).write_text(str(server.server_port), encoding="utf-8")
+server.serve_forever()
+PY
+  python3 "$host_server_script" "$gateway" "$host_server_port_file" "$host_server_dir" >"$host_server_log" 2>&1 &
+  host_server_pid=$!
+  register_pid_cleanup "$host_server_pid"
+  for _ in 1 2 3 4 5; do
+    [ -s "$host_server_port_file" ] && break
+    kill -0 "$host_server_pid" >/dev/null 2>&1 || break
+    sleep 1
+  done
+  if [ ! -s "$host_server_port_file" ]; then
+    cat "$host_server_log" >&2 || true
+    fail "Unable to start a host HTTP server on host-only gateway $gateway"
+  fi
+  host_server_port="$(cat "$host_server_port_file")"
+  run_capture "$AGENTCTL" exec --name "$peer" --no-tty -- curl -fsS --connect-timeout 3 --max-time 10 "http://host.container.internal:$host_server_port/"
+  if [ "$RUN_STATUS" -ne 0 ]; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    cat "$host_server_log" >&2 || true
+    fail "Expected host-only container to reach the host service at $gateway:$host_server_port"
+  fi
+  assert_contains "host-only gateway reached"
+
+  log "host-only: checking upgrade preservation and deletion safety"
+  run_capture "$AGENTCTL" upgrade --name "$peer" --image agent-plain --no-backup
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$peer"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e --arg network "$network" '
+    (if type == "array" then .[0] else . end)
+    | ((.configuration.networks // .status.networks // .networks // []) | tostring)
+    | contains($network)
+  ' >/dev/null || fail "Expected upgrade to preserve network $network"
+
+  run_capture "$AGENTCTL" network rm "$network"
+  [ "$RUN_STATUS" -ne 0 ] || fail "Expected deletion of an attached network to fail"
+}
+
 main() {
   require_host_prereqs
 
@@ -996,6 +1157,7 @@ main() {
   run_selected_test test_bootstrap_works_on_existing_alpine_container "bootstrap works on an existing Alpine container" full
   run_selected_test test_bootstrap_can_create_and_bootstrap_new_alpine_container "bootstrap can create and bootstrap a new Alpine container" full
   run_selected_test test_bootstrap_works_on_existing_debian_container "bootstrap works on an existing Debian container" full
+  run_selected_test test_host_only_network_lifecycle_isolation_and_upgrade "host-only networks isolate external and cross-network traffic and survive upgrade" full
   assert_selected_tests_ran
 
   log "PASS: all host integration tests completed"
