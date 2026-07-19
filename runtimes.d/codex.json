@@ -11,7 +11,8 @@
     "auth_read": true,
     "auth_write": true,
     "local_mode": true,
-    "online_mode": true
+    "online_mode": true,
+    "mcp_http": true
   },
   "auth_formats": [
     "json_refresh_token"
@@ -40,6 +41,7 @@
     "runtime install codex",
     "runtime update codex",
     "runtime reset-config codex",
+    "runtime mcp-add codex NAME URL",
     "auth login codex",
     "auth read codex json_refresh_token",
     "auth write codex json_refresh_token",

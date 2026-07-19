@@ -23,8 +23,8 @@ You need:
 - the system Bash and Apple-provided `jq` (jq 1.6 or newer; macOS 26
   provides `jq 1.7.1-apple`)
 
-This baseline is Homebrew-free and does not require host-side Python, Node.js,
-or another package manager. Ollama is only required for local-model workflows;
+This baseline is Homebrew-free and does not require host-side Python or another
+package manager. The managed MCP bridge requires host-side Node.js. Ollama is only required for local-model workflows;
 online runtime workflows do not require it.
 
 Recommended memory:
@@ -81,6 +81,44 @@ version is:
 
 Details and options are in [docs/networking.md](docs/networking.md).
 
+## Managed host MCP bridge
+
+`run --mcp` exposes an explicitly authorized host stdio MCP server to the
+container through a private Unix socket and a guest proxy bound only to
+`127.0.0.1`. It does not open a host TCP port or edit runtime configuration.
+
+```bash
+# Built-in Xcode preset (host command: xcrun mcpbridge)
+agentctl run --mcp xcode
+
+# Generic inline definition
+agentctl run --mcp '{"name":"example","command":"/absolute/path/to/server","args":[]}'
+
+# Private file containing one definition or an array
+agentctl run --mcp @"$HOME/.config/agentctl/private-mcp.json"
+```
+
+For Codex, `agentctl` automatically registers every enabled server as a
+Streamable HTTP endpoint before launching the runtime. This also works in
+temporary containers. Other runtimes currently retain manual configuration
+using URLs such as `http://127.0.0.1:47123/mcp/xcode` or
+`http://127.0.0.1:47123/mcp/example`. Existing containers created without MCP
+wiring need one explicit migration:
+
+```bash
+agentctl upgrade --name agent-project --enable-mcp
+agentctl upgrade --name agent-project --mcp-port 48123
+agentctl upgrade --name agent-project --disable-mcp
+```
+
+Definitions accept `name`, `command`, `args`, `cwd`, `env`, `env_vars`, and
+`shared`. The Xcode preset enables `shared` so reconnecting HTTP sessions reuse
+one `xcrun mcpbridge` process; generic definitions default to per-session
+process isolation.
+Literal `env` values live only for the active invocation. The private host
+registry persists resolved commands and inherited variable names, never literal
+values. A container request cannot add or change a host command.
+
 Apple container 1.1 custom networks can be managed and selected directly. For
 example, create a host-only network for an offline workload:
 
@@ -111,6 +149,8 @@ In the normal case:
 - the directory you run `agentctl run` from becomes the mounted work directory
 - everything under that directory is visible to the agent
 - the agent can read and write files in that mounted directory tree
+- the agent does **not** get unrestricted access to the rest of your host
+  filesystem through `agentctl`
 
 Host Unix sockets can also be mounted at creation time:
 
@@ -135,8 +175,33 @@ Upgrade preserves mappings by default, including in `--copy` mode. A missing
 preserved source is fatal until restored, replaced, or explicitly unmounted.
 Access to a socket grants the container the service's effective authority; only
 mount narrowly scoped sockets whose permissions are appropriate for `coder`.
-- the agent does **not** get unrestricted access to the rest of your host
-  filesystem through `agentctl`
+
+Services running inside a container can be published as host Unix sockets:
+
+```bash
+mkdir -m 700 "$HOME/.agentctl-sockets"
+agentctl run \
+  --publish-socket "$HOME/.agentctl-sockets/service.sock:/run/service.sock"
+```
+
+`--publish-socket` is repeatable and is also available to `bootstrap` and
+`upgrade`. The parent directory must already be canonical, owned by you,
+writable/searchable by you, and inaccessible to group and other users. The host
+destination must not already exist. agentctl never creates the directory or
+deletes socket paths, including stale listeners left by the container runtime.
+
+Existing containers must exactly match mappings requested by `run` or
+`bootstrap`. Upgrade preserves mappings and merges replacements by host path:
+
+```bash
+agentctl upgrade --name agent-my-project \
+  --publish-socket "$HOME/.agentctl-sockets/second.sock:/run/service.sock"
+agentctl upgrade --name agent-my-project \
+  --unpublish-socket "$HOME/.agentctl-sockets/service.sock"
+```
+
+Multiple private host paths may intentionally publish the same container
+service. Published services and authentication are the user's responsibility.
 
 So the normal workflow is:
 1. `cd` into the project or document folder you want the agent to work on

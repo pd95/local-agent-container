@@ -687,7 +687,8 @@ test_socket_mapping_helpers_validate_parse_and_merge() {
 
   load_agentctl_functions
   local temp_dir socket_one socket_two requested preserved merged removal long_path mappings
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-sockets.XXXXXX")"
+  temp_dir="$(mktemp -d /tmp/agentctl-sockets.XXXXXX)"
+  temp_dir="$(CDPATH= cd -- "$temp_dir" && pwd -P)"
   register_dir_cleanup "$temp_dir"
   socket_one="$temp_dir/one.sock"
   socket_two="$temp_dir/two.sock"
@@ -768,6 +769,17 @@ test_socket_mapping_helpers_validate_parse_and_merge() {
     --unmount-socket /run/services/one.sock
   assert_status 1
   assert_contains "Cannot mount and unmount the same socket container path"
+  run_capture upgrade_socket_options_wrapper --publish-socket
+  assert_status 1
+  assert_contains "Missing value for --publish-socket"
+  run_capture upgrade_socket_options_wrapper --unpublish-socket
+  assert_status 1
+  assert_contains "Missing value for --unpublish-socket"
+  run_capture upgrade_socket_options_wrapper \
+    --publish-socket "$temp_dir/published.sock:/run/services/published.sock" \
+    --unpublish-socket "$temp_dir/published.sock"
+  assert_status 1
+  assert_contains "Cannot publish and unpublish the same socket host path"
   run_capture parse_socket_mapping_wrapper "$socket_one:"$'/run/service\n.sock'
   assert_status 1
   assert_contains "unsupported"
@@ -807,6 +819,157 @@ test_run_container_passes_socket_mount_as_one_exact_argument() {
     || fail "Expected one exact socket volume argument; got: $(tr '\n' '|' <"$create_args_file")"
   [ "$(grep -Fxc -- '--volume' "$create_args_file")" -eq 1 ] \
     || fail "Expected one --volume flag for the socket mapping"
+  unset -f container
+}
+
+test_published_socket_helpers_validate_parse_merge_and_inspect() {
+  begin_test "published socket helpers enforce private host paths and merge by host path"
+
+  load_agentctl_functions
+  local private_dir host_one host_two mappings merged parsed
+  private_dir="$(mktemp -d '/tmp/agentctl published.XXXXXX')"
+  private_dir="$(CDPATH= cd -- "$private_dir" && pwd -P)"
+  register_dir_cleanup "$private_dir"
+  chmod 700 "$private_dir"
+  host_one="$private_dir/one socket.sock"
+  host_two="$private_dir/two.sock"
+
+  parsed="$(parse_published_socket_mapping "$host_one:/run/services/one socket.sock")"
+  [ "$parsed" = "$host_one"$'\t''/run/services/one socket.sock' ] \
+    || fail "Unexpected published socket mapping: $parsed"
+  mappings="$parsed"$'\n'"$host_two"$'\t''/run/services/shared.sock'
+  validate_requested_published_sockets "$mappings"
+  validate_published_container_collisions "$mappings" ""
+
+  merged="$(merge_published_sockets "$mappings" "$host_one"$'\t' "$host_one"$'\t''/run/services/replaced.sock')"
+  [ "$merged" = "$host_two"$'\t''/run/services/shared.sock'$'\n'"$host_one"$'\t''/run/services/replaced.sock' ] \
+    || fail "Expected host-path replacement after removal, got: $merged"
+
+  [ "$(printf '%s' '{"configuration":{"publishedSockets":[{"hostPath":"/tmp/a.sock","containerPath":"/run/a.sock"}]}}' | container_published_sockets_from_inspect)" = $'/tmp/a.sock\t/run/a.sock' ] \
+    || fail "Expected object inspect publishedSockets parsing"
+  [ "$(printf '%s' '[{"configuration":{"publishedSockets":[{"host_path":"/tmp/b.sock","container_path":"/run/b.sock"}]}}]' | container_published_sockets_from_inspect)" = $'/tmp/b.sock\t/run/b.sock' ] \
+    || fail "Expected array inspect publishedSockets parsing"
+
+  published_wrapper() { ( parse_published_socket_mapping "$@" ); }
+  published_start_wrapper() { ( validate_published_host_paths_for_start "$@" ); }
+  published_requested_wrapper() { ( validate_requested_published_sockets "$@" ); }
+  published_records_wrapper() { ( validate_published_socket_records "$@" ); }
+  published_collision_wrapper() { ( validate_published_container_collisions "$@" ); }
+  run_capture published_wrapper "relative:/run/service.sock"
+  assert_status 1
+  assert_contains "must be absolute"
+  chmod 750 "$private_dir"
+  run_capture published_wrapper "$host_one:/run/service.sock"
+  assert_status 1
+  assert_contains "inaccessible to group and other users"
+  chmod 700 "$private_dir"
+  : >"$host_one"
+  run_capture published_start_wrapper "$parsed"
+  assert_status 1
+  assert_contains "already exists"
+  rm -f "$host_one"
+  mkdir "$host_one"
+  run_capture published_start_wrapper "$parsed"
+  assert_status 1
+  assert_contains "already exists"
+  rmdir "$host_one"
+  ln -s "$host_two" "$host_one"
+  run_capture published_start_wrapper "$parsed"
+  assert_status 1
+  assert_contains "already exists"
+  rm -f "$host_one"
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' "$host_one"
+  run_capture published_start_wrapper "$parsed"
+  assert_status 1
+  assert_contains "already exists"
+  rm -f "$host_one"
+
+  run_capture published_requested_wrapper "$parsed"$'\n'"$host_one"$'\t''/run/other.sock'
+  assert_status 1
+  assert_contains "Duplicate published socket host path"
+  run_capture published_collision_wrapper "$parsed" "$host_two"$'\t''/run/services/one socket.sock'
+  assert_status 1
+  assert_contains "collides with a mounted host socket destination"
+  run_capture published_records_wrapper "$host_two"$'\t''/workdir/foreign.sock'
+  assert_status 1
+  assert_contains "Socket container path is reserved by agentctl"
+
+  [ "$(published_socket_unpublish_record /missing/private/service.sock)" = $'/missing/private/service.sock\t' ] \
+    || fail "Unpublish should not require the removed path's parent to exist"
+  validate_published_upgrade_preflight $'/missing/private/service.sock\t/run/service.sock' "" 0
+}
+
+test_published_socket_safe_lifecycle_helpers_refuse_collisions_and_report_leftovers() {
+  begin_test "published socket lifecycle helpers validate starts and never delete leftovers"
+
+  load_agentctl_functions
+  local private_dir host_path mapping start_calls=0 stop_calls=0
+  private_dir="$(mktemp -d /tmp/agentctl-published-lifecycle.XXXXXX)"
+  private_dir="$(CDPATH= cd -- "$private_dir" && pwd -P)"
+  register_dir_cleanup "$private_dir"
+  chmod 700 "$private_dir"
+  host_path="$private_dir/service.sock"
+  mapping="$host_path"$'\t''/run/service.sock'
+  container_published_sockets() { printf '%s\n' "$mapping"; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      start) start_calls=$((start_calls + 1)) ;;
+      stop) stop_calls=$((stop_calls + 1)) ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  : >"$host_path"
+  safe_start_wrapper() { ( start_existing_container_safely unit-test-container ); }
+  run_capture safe_start_wrapper
+  assert_status 1
+  assert_contains "already exists"
+  [ "$start_calls" -eq 0 ] || fail "Collision validation must happen before container start"
+
+  run_capture stop_existing_container_safely unit-test-container
+  assert_status 0
+  assert_contains "not removing it"
+  [ -f "$host_path" ] || fail "Safe stop helper deleted a user-owned leftover"
+  [ "$stop_calls" -eq 1 ] || fail "Expected exactly one stop call"
+  unset -f container container_published_sockets
+}
+
+test_run_container_passes_published_socket_as_one_exact_argument() {
+  begin_test "run_container preserves spaces and passes one exact published-socket argument"
+
+  load_agentctl_functions
+  local private_dir host_path args_file expected
+  private_dir="$(mktemp -d '/tmp/agentctl published args.XXXXXX')"
+  private_dir="$(CDPATH= cd -- "$private_dir" && pwd -P)"
+  register_dir_cleanup "$private_dir"
+  chmod 700 "$private_dir"
+  host_path="$private_dir/service socket.sock"
+  expected="$host_path:/run/services/service socket.sock"
+  PUBLISHED_SOCKETS_TEXT="$(parse_published_socket_mapping "$expected")"
+  args_file="$private_dir/create-args"
+
+  container_exists() { return 1; }
+  container_running() { return 1; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  configure_container_host_alias() { :; }
+  warn_if_container_agentctl_versions_differ() { :; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      create) shift; printf '%s\n' "$@" >"$args_file" ;;
+      start|stop|exec) ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" 0 true
+  assert_status 0
+  [ "$(grep -Fxc -- '--publish-socket' "$args_file")" -eq 1 ] \
+    || fail "Expected one --publish-socket flag"
+  [ "$(grep -Fxc -- "$expected" "$args_file")" -eq 1 ] \
+    || fail "Expected one exact published socket argument; got: $(tr '\n' '|' <"$args_file")"
+  [ ! -e "$host_path" ] || fail "Unit mock unexpectedly created or retained the host path"
   unset -f container
 }
 
@@ -1301,6 +1464,7 @@ test_start_and_restart_refresh_host_alias() {
   require_container() { :; }
   configure_container_host_alias() { alias_log="${alias_log}$1"$'\n'; }
   validate_container_socket_sources() { :; }
+  container_published_sockets() { :; }
   CONTAINER_CMD=container
   container() { action_log="${action_log}$1:$2"$'\n'; }
 
@@ -2238,6 +2402,8 @@ container_exists() { [ "\$1" = "unit-test-container" ]; }
 container_running() { [ "\$1" = "unit-test-container" ]; }
 validate_mount_mode() { :; }
 validate_existing_socket_mappings() { :; }
+validate_existing_published_sockets() { :; }
+validate_running_published_listeners() { :; }
 configure_container_host_alias() { :; }
 pre_reads_stdin() {
   local line=""
@@ -2879,9 +3045,16 @@ test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
   local exec_log=""
   local workdir
   local expected_workdir
+  local published_dir
+  local published_path
 
   workdir="$(new_workdir)"
   expected_workdir="$(CDPATH= cd -- "$workdir" && pwd)"
+  published_dir="$(mktemp -d /tmp/agentctl-bootstrap-published.XXXXXX)"
+  published_dir="$(CDPATH= cd -- "$published_dir" && pwd -P)"
+  register_dir_cleanup "$published_dir"
+  chmod 700 "$published_dir"
+  published_path="$published_dir/service.sock"
 
   require_container() { return 0; }
   require_container_shm_size_support() { return 0; }
@@ -2922,7 +3095,8 @@ test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
     esac
   }
 
-  run_capture bootstrap_cmd --name unit-bootstrap-container --image docker.io/library/alpine:latest --workdir "$workdir" --cpu 2 --mem 3G --shm-size 1G
+  run_capture bootstrap_cmd --name unit-bootstrap-container --image docker.io/library/alpine:latest --workdir "$workdir" --cpu 2 --mem 3G --shm-size 1G \
+    --publish-socket "$published_path:/run/bootstrap-service.sock"
   assert_status 0
   assert_contains "Bootstrap container ready: unit-bootstrap-container"
   assert_contains "Bootstrap complete: unit-bootstrap-container"
@@ -2934,6 +3108,8 @@ test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
   printf '%s\n' "$create_log" | grep -Fq -- "dst=/workdir" || fail "Expected create mount to target /workdir"
   printf '%s\n' "$create_log" | grep -Fq -- "-c 2 -m 3G" || fail "Expected create to include cpu/mem settings"
   printf '%s\n' "$create_log" | grep -Fq -- "--shm-size 1G" || fail "Expected create to include shared-memory size"
+  printf '%s\n' "$create_log" | grep -Fq -- "--publish-socket $published_path:/run/bootstrap-service.sock" \
+    || fail "Expected create to include the exact published socket mapping"
   printf '%s\n' "$create_log" | grep -Fq -- "docker.io/library/alpine:latest sh -c sleep infinity" || fail "Expected create to use requested image"
   printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
 }
@@ -8720,6 +8896,7 @@ test_upgrade_can_rename_container_during_recreation() {
   local rm_log=""
   local persisted_baseline_name=""
   local restored_name=""
+  local leftover_report_calls=0
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -8740,6 +8917,7 @@ test_upgrade_can_rename_container_during_recreation() {
   backup_codex_config() { :; }
   restore_codex_config() { restored_name="$1"; }
   persist_container_system_manifest_baseline_from_image() { persisted_baseline_name="$1"; }
+  report_leftover_published_sockets() { leftover_report_calls=$((leftover_report_calls + 1)); }
   collect_upgrade_container_preflight() {
     UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":[]}'
     UPGRADE_PREFLIGHT_BASELINE_MANIFEST=''
@@ -8797,6 +8975,7 @@ test_upgrade_can_rename_container_during_recreation() {
   printf '%s\n' "$stop_log" | grep -Fx -- "renamed-container" >/dev/null || fail "Expected renamed container to stop after recreation, got: $stop_log"
   [ "$persisted_baseline_name" = "renamed-container" ] || fail "Expected baseline persistence on renamed container, got: $persisted_baseline_name"
   [ "$restored_name" = "renamed-container" ] || fail "Expected config restore on renamed container, got: $restored_name"
+  [ "$leftover_report_calls" -ge 1 ] || fail "Expected stopped-source upgrade to report leftover published listeners"
 }
 
 test_upgrade_export_failure_restarts_running_source() {
@@ -9165,6 +9344,49 @@ test_upgrade_copy_dry_run_reports_copy_plan() {
   [ "$start_calls" -eq 0 ] || fail "Expected no start calls during dry-run, got: $start_calls"
   [ "$stop_calls" -eq 0 ] || fail "Expected no stop calls during dry-run, got: $stop_calls"
   [ "$rm_calls" -eq 0 ] || fail "Expected no rm calls during dry-run, got: $rm_calls"
+}
+
+test_upgrade_stopped_dry_run_does_not_start_source() {
+  begin_test "upgrade stopped-source dry-run never starts or stops the source"
+
+  load_agentctl_functions
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  require_container_backup_support() { return 0; }
+  warn_upgrade_package_loss() { :; }
+  upgrade_added_runtimes_json() { printf '[]\n'; }
+  upgrade_added_features_json() { printf '[]\n'; }
+  image_system_manifest_json() { return 1; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 1; }
+  image_exists() { return 0; }
+  container_extra_mount_text() { :; }
+  container_socket_mounts() { :; }
+  container_published_sockets() { :; }
+  container_shm_size() { :; }
+  container_ssh_enabled() { printf 'false\n'; }
+  container_network_specs() { printf 'default\n'; }
+  validate_network_selection() { :; }
+  collect_upgrade_container_preflight() { fail "dry-run must not collect an exec-based stopped-source preflight"; }
+  sanitize_image_name() { printf '%s\n' "$1"; }
+  trap() { :; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect) printf '{}\n' ;;
+      start|stop) fail "dry-run must not mutate stopped source lifecycle: $*" ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  container_upgrade_info() {
+    printf 'agent-python:latest\t%s\trw\t2\t4G\n' "$TEST_ROOT"
+  }
+
+  run_capture upgrade_cmd --name unit-test-container --image agent-python --dry-run
+  assert_status 0
+  assert_contains "Dry run complete: no container changes applied"
 }
 
 test_upgrade_warns_about_added_packages_missing_from_target_image() {
@@ -9911,6 +10133,65 @@ test_upgrade_accepts_workdir_override_when_original_mount_is_missing() {
   [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
 }
 
+test_upgrade_unpublishes_stale_mapping_without_starting_stopped_source() {
+  begin_test "upgrade removes stale published mapping from stopped source without starting it"
+
+  load_agentctl_functions
+
+  local stale_host="/missing/private/agentctl-stale.sock"
+  local create_args=""
+  local export_calls=0
+  local start_calls=0
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  require_container_backup_support() { return 0; }
+  export_root_supports_state_contract() { return 0; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 1; }
+  container_published_sockets() { printf '%s\t/run/stale.sock\n' "$stale_host"; }
+  image_exists() { return 0; }
+  backup_codex_config() { fail "stale unpublish must use export backup without starting the source"; }
+  backup_codex_config_from_export() {
+    local extract_root="$3"
+    mkdir -p "$extract_root/home/coder/.codex"
+    ln -sf /etc/agentctl/image.md "$extract_root/home/coder/.codex/AGENTS.md"
+  }
+  extract_export_root() { mkdir -p "$2/home/coder/.codex"; }
+  restore_codex_config() { :; }
+  persist_container_system_manifest_baseline_from_image() { :; }
+  sanitize_image_name() { printf '%s\n' "$1"; }
+  build_backup_image_from_export() { :; }
+  trap() { :; }
+
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      inspect) printf '{}\n' ;;
+      create) shift; create_args="$(printf '%s\n' "$*")" ;;
+      export) export_calls=$((export_calls + 1)) ;;
+      start) start_calls=$((start_calls + 1)) ;;
+      stop|rm) ;;
+      exec) fail "stale unpublish must not exec into the stopped source" ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  container_upgrade_info() {
+    printf 'agent-plain\t%s\trw\t2\t4G\n' "$TEST_ROOT"
+  }
+
+  run_capture upgrade_cmd --name unit-test-container --unpublish-socket "$stale_host" --no-backup
+  assert_status 0
+  assert_contains "Warning: Skipping live package-loss preflight because removed published socket mappings make stopped source startup unsafe"
+  assert_contains "Exporting container filesystem for state backup: unit-test-container"
+  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  [ "$start_calls" -eq 1 ] || fail "Expected only the recreated target to start, got: $start_calls starts"
+  if printf '%s\n' "$create_args" | grep -F -- '--publish-socket' >/dev/null; then
+    fail "Recreated container must not retain stale published mapping"
+  fi
+  [ "$export_calls" -eq 1 ] || fail "Expected one stopped-source filesystem export, got: $export_calls"
+}
+
 test_upgrade_allows_no_backup_for_modern_export_source() {
   begin_test "upgrade allows --no-backup for a modern export-backed source"
 
@@ -10208,6 +10489,7 @@ test_collect_upgrade_container_preflight_starts_stopped_container_once() {
     esac
   }
   container_running() { [ "$running" -eq 1 ]; }
+  container_published_sockets() { :; }
 
   collect_upgrade_container_preflight unit-test-container
 
@@ -11667,6 +11949,9 @@ main() {
   run_selected_test test_inspect_json_helpers_handle_schema_shapes_and_invalid_input "test_inspect_json_helpers_handle_schema_shapes_and_invalid_input"
   run_selected_test test_socket_mapping_helpers_validate_parse_and_merge "test_socket_mapping_helpers_validate_parse_and_merge"
   run_selected_test test_run_container_passes_socket_mount_as_one_exact_argument "test_run_container_passes_socket_mount_as_one_exact_argument"
+  run_selected_test test_published_socket_helpers_validate_parse_merge_and_inspect "test_published_socket_helpers_validate_parse_merge_and_inspect"
+  run_selected_test test_published_socket_safe_lifecycle_helpers_refuse_collisions_and_report_leftovers "test_published_socket_safe_lifecycle_helpers_refuse_collisions_and_report_leftovers"
+  run_selected_test test_run_container_passes_published_socket_as_one_exact_argument "test_run_container_passes_published_socket_as_one_exact_argument"
   run_selected_test test_shared_memory_size_helpers_normalize_and_compare_values "test_shared_memory_size_helpers_normalize_and_compare_values"
   run_selected_test test_container_shm_size_reads_apple_container_inspect_shape "test_container_shm_size_reads_apple_container_inspect_shape"
   run_selected_test test_container_ssh_enabled_reads_inspect_shapes "test_container_ssh_enabled_reads_inspect_shapes"
@@ -11889,6 +12174,7 @@ main() {
   run_selected_test test_upgrade_copy_requires_new_name "test_upgrade_copy_requires_new_name"
   run_selected_test test_upgrade_dry_run_reports_plan_without_recreating_container "test_upgrade_dry_run_reports_plan_without_recreating_container"
   run_selected_test test_upgrade_copy_dry_run_reports_copy_plan "test_upgrade_copy_dry_run_reports_copy_plan"
+  run_selected_test test_upgrade_stopped_dry_run_does_not_start_source "test_upgrade_stopped_dry_run_does_not_start_source"
   run_selected_test test_upgrade_warns_about_added_packages_missing_from_target_image "test_upgrade_warns_about_added_packages_missing_from_target_image"
   run_selected_test test_upgrade_reinstall_command_prefers_requested_apk_packages "test_upgrade_reinstall_command_prefers_requested_apk_packages"
   run_selected_test test_upgrade_reinstall_command_restores_missing_apk_repository_tags "test_upgrade_reinstall_command_restores_missing_apk_repository_tags"
@@ -11901,6 +12187,7 @@ main() {
   run_selected_test test_upgrade_warns_and_clears_missing_preferred_runtime "test_upgrade_warns_and_clears_missing_preferred_runtime"
   run_selected_test test_upgrade_uses_stored_baseline_when_current_image_is_missing "test_upgrade_uses_stored_baseline_when_current_image_is_missing"
   run_selected_test test_upgrade_accepts_workdir_override_when_original_mount_is_missing "test_upgrade_accepts_workdir_override_when_original_mount_is_missing"
+  run_selected_test test_upgrade_unpublishes_stale_mapping_without_starting_stopped_source "test_upgrade_unpublishes_stale_mapping_without_starting_stopped_source"
   run_selected_test test_upgrade_allows_no_backup_for_modern_export_source "test_upgrade_allows_no_backup_for_modern_export_source"
   run_selected_test test_container_baseline_manifest_starts_stopped_container_and_restores_state "test_container_baseline_manifest_starts_stopped_container_and_restores_state"
   run_selected_test test_image_system_manifest_removes_temp_container_after_success "test_image_system_manifest_removes_temp_container_after_success"

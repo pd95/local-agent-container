@@ -352,6 +352,7 @@ reset_runtime_hooks() {
     agent_runtime_auth_read \
     agent_runtime_auth_write \
     agent_runtime_auth_login \
+    agent_runtime_mcp_add \
     >/dev/null 2>&1 || true
 }
 
@@ -1003,6 +1004,17 @@ runtime_reset_config() {
   agent_runtime_reset_config "$runtime" "$(runtime_default_config_dir "$runtime")"
 }
 
+runtime_mcp_add() {
+  local runtime="${1:-}"
+  local name="${2:-}"
+  local url="${3:-}"
+  ensure_runtime_known "$runtime"
+  [ -n "$name" ] && [ -n "$url" ] || die "runtime mcp-add requires RUNTIME NAME URL"
+  load_runtime_adapter "$runtime"
+  declare -F agent_runtime_mcp_add >/dev/null 2>&1 || die "runtime does not support managed HTTP MCP configuration: $runtime"
+  agent_runtime_mcp_add "$runtime" "$name" "$url"
+}
+
 refresh_agent() {
   jq -n \
     --arg preferred "$(runtime_preferred)" \
@@ -1026,6 +1038,7 @@ Usage:
   agent.sh runtime install codex
   agent.sh runtime update codex
   agent.sh runtime reset-config codex
+  agent.sh runtime mcp-add codex NAME URL
   agent.sh feature info office
   agent.sh feature install office
   agent.sh feature remove office
@@ -1074,6 +1087,9 @@ main() {
           ;;
         reset-config)
           runtime_reset_config "${2:-}"
+          ;;
+        mcp-add)
+          runtime_mcp_add "${2:-}" "${3:-}" "${4:-}"
           ;;
         *)
           die "unknown runtime command: ${1:-}"

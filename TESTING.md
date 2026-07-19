@@ -48,12 +48,21 @@ Run the focused host Unix-socket lifecycle test on macOS first:
 
 ```bash
 bash tests/run-tests.sh --tier full --filter socket-mount
+bash tests/run-tests.sh --tier full --filter published-socket
 ```
 
 It uses temporary host socket servers and `agent-python` to verify non-root
 `coder` data exchange, restart, upgrade preservation, destination replacement,
 `--copy`, inspect-visible removal, and cleanup. Because it requires Apple's host
 runtime it cannot run in the Linux development container.
+
+The published-socket test uses an explicit mode-0700 host directory and a
+non-root `coder` Unix-socket server. It verifies host data exchange, listener
+removal and recreation across stop/start/restart, upgrade preservation and
+addition/replacement, stopped-source copy, running-copy refusal, targeted
+removal, inspect state, doctor diagnostics, unsafe permissions, and collisions
+with files, directories, sockets, and symlinks. agentctl must report but never
+delete a leftover or colliding host entry.
 
 ```bash
 bash tests/run-tests.sh --tier full
@@ -77,6 +86,22 @@ client feature:
 ```bash
 bash tests/run-tests.sh --tier full --filter ssh-forwarding
 ```
+
+The transport itself has a Linux-compatible Node test using a fake stdio MCP
+server. It checks lazy initialization, session reuse, tool listing, deletion,
+and the nonce health endpoint without creating a TCP listener:
+
+```bash
+node tests/run-mcp-node-tests.mjs
+```
+
+The focused macOS MCP test writes redacted host-relay diagnostics beneath
+`./tmp/mcp/`. On failure it also prints the guest proxy log before cleanup.
+
+On macOS, additionally create a container with `agentctl run --mcp` and point a
+client at `http://127.0.0.1:47123/mcp/<name>`. Use `lsof -nP -iTCP:47123` to
+confirm the host has no TCP listener; the only host listener is the private
+socket below `/tmp/agentctl-$(id -u)/`.
 
 For a focused Apple container 1.1 storage-accounting smoke check, run:
 

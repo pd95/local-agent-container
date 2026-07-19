@@ -1,0 +1,10 @@
+{
+  "id": "mcp-bridge",
+  "display_name": "Managed Host MCP Bridge",
+  "install_method": "apk-or-apt",
+  "description": "Node loopback proxy for agentctl-managed host stdio MCP servers.",
+  "supported_image_families": ["agent-plain", "agent-python", "agent-swift"],
+  "system_packages": {"apk": ["nodejs"], "dpkg": ["nodejs"]},
+  "capabilities": {"install": true, "remove": false, "update": true},
+  "commands": ["feature info mcp-bridge", "feature install mcp-bridge"]
+}
