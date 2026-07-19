@@ -494,9 +494,9 @@ Success criteria for the socket-based Xcode bridge:
 - socket paths live in a private short directory
 - logs redact MCP environment secrets
 
-## Proposed implementation phases
+## Implementation status and remaining phases
 
-### Phase 1: SSH forwarding
+### Completed foundation: SSH forwarding
 
 - add `--ssh` to `run`, `bootstrap`, and `upgrade`
 - inspect and preserve `configuration.ssh`
@@ -509,18 +509,22 @@ Success criteria for the socket-based Xcode bridge:
 - add unit fixtures for 0.12.3 and 1.1 inspect shapes
 - add a host integration test as non-root `coder`
 
-This is the smallest useful user-facing slice.
+This slice is implemented and host-verified.
 
-### Phase 2: generic socket mounts
+### Completed Phase 1: generic host socket mounts
 
 - add repeatable `--mount-socket`
 - require an existing host socket
 - validate absolute paths and guest destination collisions
 - preserve mappings during upgrade
 - document stable-path requirements
-- test non-root permissions and restart failure behavior
+- test non-root access and restart lifecycle behavior
 
-### Phase 3: published sockets
+This slice is implemented and host-verified. It also includes targeted removal,
+destination-based replacement, copy-mode preservation, conservative refusal of
+unknown extra mounts, doctor diagnostics, and fail-safe missing-source checks.
+
+### Remaining Phase 2: published sockets
 
 - add repeatable `--publish-socket`
 - reject all pre-existing host destinations
@@ -529,7 +533,7 @@ This is the smallest useful user-facing slice.
 - preserve mappings and show them in dry-run
 - test stop, restart, crash recovery, and collisions
 
-### Phase 4: MCP transport prototype
+### Remaining Phase 3: MCP transport prototype
 
 - change the host relay to listen on a Unix socket
 - mount it into the Xcode project container
@@ -537,9 +541,9 @@ This is the smallest useful user-facing slice.
 - compare latency and reliability with the current TCP relay
 - retain a configuration switch for TCP fallback
 
-## Required tests
+## Test status
 
-### Repo-local unit coverage
+### Completed repo-local unit coverage
 
 - argument parsing and repeatable mappings
 - host and container path validation
@@ -547,29 +551,37 @@ This is the smallest useful user-facing slice.
 - 0.12.3 and 1.1 inspect parsing
 - upgrade preservation, override, and dry-run output
 - command construction with exact Apple flags
-- rejection of existing files, symlinks, directories, and sockets
-- short managed-path generation and length rejection
+- rejection of missing sources, files, symlinks, invalid characters, reserved
+  destinations, and overlong paths
 - stdin-dependent commands retain `container exec -i`
 
 Run shell checks under current Bash and macOS-compatible Bash 3.2 when
 implementation changes begin.
 
-### macOS integration coverage
+### Completed macOS integration coverage
 
 - `coder` connects to the forwarded SSH agent
 - an actual `ssh-add -L` or `ssh-add -l` request completes
-- Git SSH authentication reaches a disposable test remote or fails only at the
-  expected authorization boundary
 - restart uses the current host SSH socket
-- generic incoming socket permissions match the host socket
+- generic incoming sockets carry data as non-root `coder`
+- restart and upgrade preserve generic mappings
+- replacement, copy mode, and targeted removal behave as configured
+
+### Deferred published-socket and MCP coverage
+
 - published socket carries bidirectional data
 - published socket disappears on stop and reappears on start
 - destination collisions never delete user data
-- upgrade preserves every selected mapping
-- containers without requested forwarding remain unchanged
+- upgrade preserves every selected published mapping
+- containers without requested published forwarding remain unchanged
+- Git SSH authentication reaches a disposable test remote or fails only at the
+  expected authorization boundary
+- explicitly compare generic guest socket permissions with the host socket
 
 ## Recommended next decision
 
-Select Phase 1 as the first implementation with SSH client tooling delivered by
-an explicit `ssh` feature. Generic socket flags can follow without coupling them
-to the Xcode MCP redesign.
+Choose whether container-to-host published sockets provide enough immediate
+value to implement before the structured MCP/Xcode adapter. Keep both efforts
+separate: published sockets serve host clients consuming container services,
+while the Xcode MCP design uses the completed host-to-container mount primitive
+plus a protocol adapter. Retain the current TCP MCP bridge during rollout.

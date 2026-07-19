@@ -63,7 +63,8 @@ The candidate tables use these labels:
 | Effective runtime defaults in doctor | implicit only | medium; clearer resource behavior | small-medium | medium |
 | Custom and host-only networks | implemented and host-verified | medium-high for isolation | complete | selected |
 | SSH agent forwarding | implemented and host-verified | medium for developer integrations | complete | selected |
-| Arbitrary Unix-socket forwarding | detected | medium for MCP and developer integrations | medium | medium |
+| Host-to-container Unix-socket mounting | implemented and host-verified | medium for MCP and developer integrations | complete | selected |
+| Container-to-host published sockets | detected | medium for local service integrations | medium | medium |
 | Builder DNS controls | unused | medium in VPN/private-network environments | medium | medium |
 | Pull concurrency and progress | unused | low-medium | small-medium | medium-low |
 | Stop-signal support | unused | low with the current keepalive process | medium | low-medium |
@@ -389,7 +390,7 @@ explain how to recreate it after a restart.
 ## SSH agent and Unix-socket forwarding
 
 Detailed behavior, host probe results, security constraints, MCP transport
-options, and proposed implementation phases are recorded in
+options, implementation status, and remaining phases are recorded in
 [SSH and Unix-socket forwarding research](ssh-socket-forwarding-research.md).
 
 ### Upstream capability and fix
@@ -408,8 +409,26 @@ the feature when needed, accepts an explicit `--ssh`, and supports `--no-ssh`
 to disable forwarding. The complete SSH lifecycle is covered by a macOS host
 integration test.
 
-Arbitrary `--publish-socket` forwarding is detected but is not yet exposed by
-normal `agentctl` commands.
+Host-to-container Unix-socket mounting is also implemented and host-verified.
+`run`, `bootstrap`, and `upgrade` accept repeatable
+`--mount-socket HOST_PATH:CONTAINER_PATH`; upgrade preserves mappings by
+default and supports destination replacement, addition, and targeted
+`--unmount-socket`. Existing-container reuse requires an exact mapping match.
+Upgrade copy mode follows the same preservation and merge rules, while dry-run
+and doctor expose paths needed for diagnosis without reading protocol data.
+
+The implementation validates absolute paths, socket path length, delimiters,
+symlinks, source type, reserved destinations, duplicates, and conflicting
+mount/removal requests before lifecycle changes. It uses Apple's socket-aware
+`--volume` form because Apple 1.1 rejects socket sources passed through the
+directory-oriented `--mount` form. A focused macOS integration test verifies
+non-root data exchange, restart, upgrade preservation, replacement, copy mode,
+inspect-visible removal, and cleanup.
+
+Container-to-host `--publish-socket` forwarding is detected but is not yet
+exposed by normal `agentctl` commands. The structured MCP/Xcode adapter remains
+a separate deferred integration built on the completed incoming-socket
+primitive.
 
 ### Candidate interface
 
@@ -417,13 +436,12 @@ normal `agentctl` commands.
 agentctl run --publish-socket HOST_PATH:CONTAINER_PATH
 ```
 
-Future socket forwarding should preserve requested configuration where
-meaningful while distinguishing ephemeral host paths from stable
-configuration.
+Published-socket support should preserve requested configuration where
+meaningful while distinguishing managed destinations from user-owned paths.
 
 ### Investigation before implementation
 
-- Test arbitrary published-socket access as `coder`, not only root.
+- Test arbitrary published-socket access from host clients.
 - Verify behavior when an ephemeral host socket path changes.
 - Validate socket paths and avoid printing sensitive path or connection data.
 - Define lifecycle, upgrade-preservation, and collision behavior for multiple
