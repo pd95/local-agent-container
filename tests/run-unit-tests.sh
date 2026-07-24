@@ -62,6 +62,12 @@ load_agentctl_functions() {
   . "$harness"
 }
 
+stub_doctor_transport_checks() {
+  doctor_socket_mount_status() { printf '%s\n' 'no user-managed host Unix-socket mappings configured'; }
+  doctor_published_socket_status() { printf '%s\n' 'no container-to-host published sockets configured'; }
+  doctor_mcp_status() { printf '%s\n' 'managed MCP bridge is disabled'; }
+}
+
 run_agent_sh_capture() {
   local temp_home="$1"
   shift
@@ -276,6 +282,7 @@ test_doctor_host_reports_runtime_and_capabilities() {
   begin_test "doctor --host reports runtime and capabilities"
 
   load_agentctl_functions
+  host_doctor_mcp_status() { printf '%s\n' 'Managed MCP relays' '  state                    none configured'; }
 
   require_container() { return 0; }
   command() {
@@ -369,6 +376,7 @@ test_doctor_host_tolerates_unsupported_storage_accounting() {
   begin_test "doctor --host treats unsupported storage accounting as informational"
 
   load_agentctl_functions
+  host_doctor_mcp_status() { printf '%s\n' 'Managed MCP relays' '  state                    none configured'; }
 
   command() {
     if [ "$1" = "-v" ] && [ "$2" = "mock_container" ]; then
@@ -398,6 +406,7 @@ test_doctor_host_rejects_malformed_supported_storage_data() {
   begin_test "doctor --host fails when supported storage accounting returns malformed JSON"
 
   load_agentctl_functions
+  host_doctor_mcp_status() { printf '%s\n' 'Managed MCP relays' '  state                    none configured'; }
 
   command() {
     if [ "$1" = "-v" ] && [ "$2" = "mock_container" ]; then
@@ -10573,6 +10582,7 @@ test_doctor_reports_state_permission_problems() {
   begin_test "doctor reports user-state permission problems"
 
   load_agentctl_functions
+  stub_doctor_transport_checks
 
   local running=0
 
@@ -10608,10 +10618,115 @@ test_doctor_reports_state_permission_problems() {
   assert_contains "Stopping container: unit-test-container"
 }
 
+test_doctor_excludes_managed_mcp_from_user_socket_failures() {
+  begin_test "doctor treats a stopped managed MCP socket separately from user and published sockets"
+
+  load_agentctl_functions
+  container_extra_mounts() { printf '%s\t%s\n' '/tmp/agentctl-test/mcp.sock' "$MCP_GUEST_SOCKET"; }
+  container_running() { return 1; }
+  CONTAINER_CMD=container
+  container() { [ "$1" = inspect ] && printf '%s\n' '{}'; }
+
+  run_capture doctor_socket_mount_status unit-test-container
+  assert_status 0
+  assert_contains "no user-managed host Unix-socket mappings configured"
+  assert_not_contains "host source unavailable"
+  assert_not_contains "$MCP_GUEST_SOCKET"
+}
+
+test_mcp_runtime_paths_normalize_trailing_tmpdir_separator() {
+  begin_test "managed MCP runtime paths normalize trailing TMPDIR separators"
+
+  load_agentctl_functions
+  local TMPDIR="/private/tmp/agentctl-tests/" normalized
+  normalized="$(mcp_runtime_dir)"
+  [ "$normalized" = "/private/tmp/agentctl-tests/agentctl-$(id -u)" ] \
+    || fail "Unexpected normalized MCP runtime directory: $normalized"
+  mcp_paths_equal "/private/tmp/agentctl-tests//agentctl-1/socket" "/private/tmp/agentctl-tests/agentctl-1/socket" \
+    || fail "Expected legacy double-slash MCP paths to compare equal"
+}
+
+test_doctor_temporarily_supervises_stopped_mcp_container() {
+  begin_test "doctor temporarily supervises MCP while checking a stopped container"
+
+  load_agentctl_functions
+  local registry running=0 lifecycle=""
+  registry="$(mktemp "${TMPDIR:-/tmp}/agentctl-mcp-registry.XXXXXX")"
+  register_dir_cleanup "$registry"
+  mcp_registry_path() { printf '%s\n' "$registry"; }
+  require_container() { :; }
+  default_name() { printf '%s\n' unit-test-container; }
+  container_exists() { return 0; }
+  container_running() { [ "$running" -eq 1 ]; }
+  doctor_socket_mount_status() { printf '%s\n' 'no user-managed host Unix-socket mappings configured'; }
+  doctor_published_socket_status() { printf '%s\n' 'no container-to-host published sockets configured'; }
+  doctor_mcp_status() {
+    if [ "$running" -eq 1 ]; then printf '%s\n' 'host relay healthy' 'guest loopback proxy healthy' 'guest-to-host MCP route healthy';
+    else printf '%s\n' 'host relay inactive because the container is stopped'; fi
+  }
+  mcp_start_from_registry() { lifecycle="${lifecycle}relay-start\n"; }
+  mcp_configure_guest() { lifecycle="${lifecycle}proxy-start\n"; }
+  mcp_stop_managed() { lifecycle="${lifecycle}relay-stop\n"; }
+  start_existing_container_safely() { running=1; lifecycle="${lifecycle}container-start\n"; }
+  stop_existing_container_safely() { running=0; lifecycle="${lifecycle}container-stop\n"; }
+  ensure_started_container_is_running() { return 0; }
+  doctor_state_permissions() { return 0; }
+  doctor_state_backup_readable() { return 0; }
+  doctor_runtime_health() { return 0; }
+  doctor_runtime_state_summary() { return 0; }
+  doctor_ssh_status() { return 0; }
+
+  run_capture doctor_cmd --name unit-test-container
+  assert_status 0
+  assert_contains "host relay inactive because the container is stopped"
+  assert_contains "Doctor confirmed managed MCP health after temporarily starting unit-test-container"
+  assert_not_contains "published-socket problem exists"
+  [ "$lifecycle" = 'relay-start\ncontainer-start\nproxy-start\ncontainer-stop\nrelay-stop\n' ] \
+    || fail "Unexpected MCP doctor lifecycle: $lifecycle"
+}
+
+test_host_doctor_reports_mcp_inventory_and_orphans() {
+  begin_test "host doctor maps stopped MCP registries and reports orphan artifacts"
+
+  load_agentctl_functions
+  local root registry_path_dir runtime_path_dir logs_path_dir orphan
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-doctor.XXXXXX")"; register_dir_cleanup "$root"
+  registry_path_dir="$root/registry"; runtime_path_dir="$root/runtime"; logs_path_dir="$root/logs"
+  mkdir -m 700 "$registry_path_dir" "$runtime_path_dir" "$logs_path_dir"
+  printf '%s\n' '{"schema_version":1,"container":"agent-unit","port":47123,"servers":[{"name":"xcode","command":"/private/secret-command","args":["secret-argument"],"env":{"TOKEN":"secret-value"},"env_vars":[]}]}' >"$registry_path_dir/agent-unit.json"
+  chmod 600 "$registry_path_dir/agent-unit.json"
+  mcp_registry_dir() { printf '%s\n' "$registry_path_dir"; }
+  mcp_runtime_dir() { printf '%s\n' "$runtime_path_dir"; }
+  mcp_log_dir() { printf '%s\n' "$logs_path_dir"; }
+  mcp_labeled_process_names() { :; }
+  container_exists() { [ "$1" = agent-unit ]; }
+  container_running() { return 1; }
+  container_has_mcp_wiring() { return 0; }
+
+  run_capture host_doctor_mcp_status
+  assert_status 0
+  assert_contains "Managed MCP relays"
+  assert_contains "Container agent-unit"
+  assert_contains "state                  stopped"
+  assert_contains "definitions: xcode"
+  assert_contains "host relay inactive because the container is stopped"
+  assert_contains "active leases: 0"
+  assert_not_contains "secret-command"
+  assert_not_contains "secret-argument"
+  assert_not_contains "secret-value"
+
+  orphan="$runtime_path_dir/mcp-deadbeef.sock"; : >"$orphan"; chmod 600 "$orphan"
+  run_capture host_doctor_mcp_status
+  assert_status 1
+  assert_contains "unassociated managed MCP artifact: $orphan"
+  [ -e "$orphan" ] || fail "Host doctor unexpectedly removed an orphan MCP artifact"
+}
+
 test_doctor_reports_container_startup_problem() {
   begin_test "doctor reports containers that do not stay running"
 
   load_agentctl_functions
+  stub_doctor_transport_checks
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -10683,6 +10798,7 @@ test_doctor_fix_repairs_state_permission_problems() {
   begin_test "doctor --fix repairs user-state permission problems"
 
   load_agentctl_functions
+  stub_doctor_transport_checks
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -10712,6 +10828,7 @@ test_doctor_reports_runtime_health_problems() {
   begin_test "doctor reports runtime health problems"
 
   load_agentctl_functions
+  stub_doctor_transport_checks
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -10747,6 +10864,7 @@ test_doctor_fix_repairs_runtime_health_problems() {
   begin_test "doctor --fix repairs runtime health problems"
 
   load_agentctl_functions
+  stub_doctor_transport_checks
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -10852,6 +10970,7 @@ test_doctor_reports_runtime_state_summary() {
   begin_test "doctor reports runtime state summary"
 
   load_agentctl_functions
+  stub_doctor_transport_checks
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
@@ -12195,6 +12314,10 @@ main() {
   run_selected_test test_collect_upgrade_container_preflight_starts_stopped_container_once "test_collect_upgrade_container_preflight_starts_stopped_container_once"
   run_selected_test test_refresh_updates_managed_files_without_recreate "test_refresh_updates_managed_files_without_recreate"
   run_selected_test test_doctor_reports_state_permission_problems "test_doctor_reports_state_permission_problems"
+  run_selected_test test_doctor_excludes_managed_mcp_from_user_socket_failures "test_doctor_excludes_managed_mcp_from_user_socket_failures"
+  run_selected_test test_mcp_runtime_paths_normalize_trailing_tmpdir_separator "test_mcp_runtime_paths_normalize_trailing_tmpdir_separator"
+  run_selected_test test_doctor_temporarily_supervises_stopped_mcp_container "test_doctor_temporarily_supervises_stopped_mcp_container"
+  run_selected_test test_host_doctor_reports_mcp_inventory_and_orphans "test_host_doctor_reports_mcp_inventory_and_orphans"
   run_selected_test test_doctor_reports_container_startup_problem "test_doctor_reports_container_startup_problem"
   run_selected_test test_doctor_state_backup_readability_runs_real_export "test_doctor_state_backup_readability_runs_real_export"
   run_selected_test test_doctor_state_permission_script_attaches_stdin "test_doctor_state_permission_script_attaches_stdin"

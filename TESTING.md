@@ -114,6 +114,14 @@ Containers, and Volumes rows. Values are global runtime accounting;
 `Reclaimable` is not a statement that stopped containers or volumes are safe
 to delete.
 
+For MCP-enabled containers, the same command includes `Managed MCP relays` and
+maps each `agentctl-mcp-relay:<container>` process to its registry, socket,
+definitions, leases, and health. A stopped container is expected to report an
+inactive relay. `agentctl doctor --name NAME` must treat the managed MCP mount
+separately from user socket mounts and published sockets; when it temporarily
+starts a stopped container, confirm it also starts and then removes the relay
+without launching the configured MCP child.
+
 Focused integration filters are available for narrower validation. The tool-home smoke
 builds or requires `agent-plain`, creates a real container with host directories mounted
 over both `/workdir` and `/home/coder`, then verifies runtime launchers and package

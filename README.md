@@ -119,6 +119,16 @@ Literal `env` values live only for the active invocation. The private host
 registry persists resolved commands and inherited variable names, never literal
 values. A container request cannot add or change a host command.
 
+Managed relays are container-scoped background services and therefore normally
+appear with parent PID 1 after `agentctl` exits. Their process label includes the
+container name, for example `agentctl-mcp-relay:agent-project`. Use
+`agentctl doctor --host` for the authoritative mapping of relay PIDs, containers,
+definitions, leases, sockets, and host/guest route health. The health checks do
+not initialize a server or invoke MCP tools. For a stopped MCP-enabled container,
+`agentctl doctor --name agent-project` may temporarily start the persisted relay,
+container, and guest proxy for its existing live checks, then restore the stopped
+state.
+
 Apple container 1.1 custom networks can be managed and selected directly. For
 example, create a host-only network for an offline workload:
 

@@ -15,6 +15,13 @@ fs.writeFileSync(config, JSON.stringify({socket_path:socket,nonce:'test-nonce',c
 const relay = spawn(process.execPath, [path.join(root,'mcp/host-relay.mjs'),config], {stdio:['ignore','ignore','inherit']});
 for (let count=0; count<100 && !fs.existsSync(socket); count++) await new Promise(resolve => setTimeout(resolve, 10));
 assert.ok(fs.statSync(socket).isSocket());
+const portServer=http.createServer();
+await new Promise(resolve=>portServer.listen(0,'127.0.0.1',resolve));
+const proxyPort=portServer.address().port;
+await new Promise(resolve=>portServer.close(resolve));
+const proxyConfig=path.join(temporary,'proxy.json');
+fs.writeFileSync(proxyConfig,JSON.stringify({port:proxyPort,socket_path:socket}),{mode:0o600});
+const proxy=spawn(process.execPath,[path.join(root,'mcp/guest-proxy.mjs'),proxyConfig],{stdio:['ignore','ignore','inherit']});
 function request(method, route, payload, headers={}) {
   return new Promise((resolve,reject) => {
     const req=http.request({socketPath:socket,path:route,method,headers:{...headers,...(payload?{'content-type':'application/json'}:{})}},res=>{
@@ -22,9 +29,23 @@ function request(method, route, payload, headers={}) {
     }); req.on('error',reject); if(payload)req.write(JSON.stringify(payload)); req.end();
   });
 }
+async function proxyRequest(route) {
+  return new Promise((resolve,reject)=>{
+    const req=http.request({host:'127.0.0.1',port:proxyPort,path:route},res=>{const chunks=[];res.on('data',c=>chunks.push(c));res.on('end',()=>resolve({status:res.statusCode,body:Buffer.concat(chunks).toString()}));});
+    req.on('error',reject);req.end();
+  });
+}
+let proxyHealth;
+for(let count=0;count<100;count++){
+  try{proxyHealth=await proxyRequest('/.well-known/agentctl-mcp-proxy-health');break;}catch{await new Promise(resolve=>setTimeout(resolve,10));}
+}
+assert.equal(proxyHealth.status,200);assert.equal(JSON.parse(proxyHealth.body).bridge_version,1);
+assert.equal(fs.existsSync(starts),false);
 const health=await request('GET','/.well-known/agentctl-mcp-health');
 assert.equal(JSON.parse(health.body).nonce,'test-nonce');
 assert.equal(JSON.parse(health.body).container,'test-container');
+assert.equal(JSON.parse(health.body).bridge_version,1);
+assert.equal(fs.existsSync(starts),false);
 relay.kill('SIGINT');
 await new Promise(resolve=>setTimeout(resolve,50));
 assert.equal(JSON.parse((await request('GET','/.well-known/agentctl-mcp-health')).body).nonce,'test-nonce');
@@ -56,5 +77,6 @@ const recovered=await request('POST','/mcp/fake',{jsonrpc:'2.0',id:4,method:'too
 assert.equal(recovered.status,200); assert.equal(JSON.parse(recovered.body).result.tools[0].name,'echo');
 assert.equal((await request('DELETE','/mcp/fake',null,{'mcp-session-id':session})).status,204);
 relay.kill('SIGTERM'); await new Promise(resolve=>relay.once('exit',resolve));
+proxy.kill('SIGTERM'); await new Promise(resolve=>proxy.once('exit',resolve));
 fs.rmSync(temporary,{recursive:true,force:true});
 console.log('MCP Node tests passed');

@@ -359,7 +359,9 @@ mcp_validate_port() {
   [ "$1" -ge 1024 ] && [ "$1" -le 65535 ] || die "Invalid MCP port: $1 (use an unprivileged loopback port from 1024 to 65535)"
 }
 
-mcp_runtime_dir() { printf '%s/agentctl-%s\n' "${TMPDIR:-/tmp}" "$(id -u)"; }
+mcp_normalize_managed_path() { printf '%s\n' "$1" | sed 's#//*#/#g'; }
+mcp_paths_equal() { [ "$(mcp_normalize_managed_path "$1")" = "$(mcp_normalize_managed_path "$2")" ]; }
+mcp_runtime_dir() { mcp_normalize_managed_path "${TMPDIR:-/tmp}/agentctl-$(id -u)"; }
 mcp_log_dir() { printf '%s\n' "${AGENTCTL_MCP_LOG_DIR:-$(mcp_runtime_dir)}"; }
 mcp_registry_dir() { printf '%s/Library/Application Support/agentctl/mcp\n' "${HOME}"; }
 mcp_identity_hash() { printf '%s' "$1" | cksum | awk '{printf "%08x%08x\n", $1, $2}'; }
@@ -587,7 +589,7 @@ mcp_start_relay() {
   fi
   MCP_RELAY_METADATA="$dir/mcp-$(mcp_identity_hash "$name").process.json"
   metadata_temp="${MCP_RELAY_METADATA}.tmp.$$"
-  if ! jq -n --argjson pid "$MCP_RELAY_PID" --arg nonce "$MCP_RELAY_NONCE" --arg socket "$MCP_RELAY_SOCKET" --arg fingerprint "$(mcp_config_fingerprint)" '{schema_version:1,pid:$pid,nonce:$nonce,socket:$socket,fingerprint:$fingerprint}' >"$metadata_temp" \
+  if ! jq -n --argjson pid "$MCP_RELAY_PID" --arg nonce "$MCP_RELAY_NONCE" --arg socket "$MCP_RELAY_SOCKET" --arg container "$name" --arg fingerprint "$(mcp_config_fingerprint)" '{schema_version:2,container:$container,pid:$pid,nonce:$nonce,socket:$socket,fingerprint:$fingerprint}' >"$metadata_temp" \
     || ! chmod 600 "$metadata_temp" || ! mv "$metadata_temp" "$MCP_RELAY_METADATA"; then
     kill "$MCP_RELAY_PID" 2>/dev/null || true; wait "$MCP_RELAY_PID" 2>/dev/null || true
     rm -f "$metadata_temp" "$MCP_RELAY_SOCKET" "$config"
@@ -607,7 +609,7 @@ mcp_acquire_relay() {
     mcp_validate_private_file "$metadata" "Managed MCP process metadata"
     existing_fingerprint="$(jq -r '.fingerprint // empty' "$metadata")"
     pid="$(jq -r '.pid' "$metadata")"; nonce="$(jq -r '.nonce' "$metadata")"; socket="$(jq -r '.socket' "$metadata")"
-    [ "$socket" = "$(mcp_socket_path "$name")" ] || die "Managed MCP metadata socket does not match expected path for $name"
+    mcp_paths_equal "$socket" "$(mcp_socket_path "$name")" || die "Managed MCP metadata socket does not match expected path for $name"
     response="$(curl --silent --max-time 2 --unix-socket "$socket" http://localhost/.well-known/agentctl-mcp-health 2>/dev/null || true)"
     if printf '%s' "$response" | jq -e --arg nonce "$nonce" --argjson pid "$pid" '.ok and .nonce==$nonce and .pid==$pid' >/dev/null 2>&1; then
       if [ "$existing_fingerprint" != "$fingerprint" ]; then mcp_lock_release; die "Conflicting managed MCP definitions are already active for container $name"; fi
@@ -640,7 +642,7 @@ mcp_stop_managed() {
   mcp_validate_private_file "$metadata" "Managed MCP process metadata"
   pid="$(jq -r '.pid // empty' "$metadata" 2>/dev/null)"; nonce="$(jq -r '.nonce // empty' "$metadata" 2>/dev/null)"; socket="$(jq -r '.socket // empty' "$metadata" 2>/dev/null)"
   expected_socket="$(mcp_socket_path "$name")"
-  [ "$socket" = "$expected_socket" ] || die "Managed MCP metadata socket does not match expected path for $name"
+  mcp_paths_equal "$socket" "$expected_socket" || die "Managed MCP metadata socket does not match expected path for $name"
   case "$pid" in ''|*[!0-9]*) die "Managed MCP metadata contains an invalid PID for $name" ;; esac
   [ -n "$nonce" ] || die "Managed MCP metadata contains an invalid nonce for $name"
   if [ ! -e "$socket" ] && [ ! -L "$socket" ]; then rm -f "$metadata"; return 0; fi
@@ -1647,7 +1649,7 @@ Usage: $CLI_NAME doctor [options]
 Options:
   --name NAME  Container name (default: agent-<dir>)
   --fix        Repair detected user-state ownership and readability problems
-  --host       Check the host container CLI, service, capabilities, and runtime storage
+  --host       Check host runtime, storage, and managed MCP relay ownership and health
 
 Doctor checks that the container can stay running for exec-based maintenance,
 checks known agentctl user-state paths in /home/coder, and verifies installed
@@ -1656,6 +1658,8 @@ state permissions, reinstalls missing installable runtimes, restores missing
 Codex AGENTS.md, and resets broken Codex runtime config when needed.
 Host storage figures are global Apple container runtime accounting and do not
 measure free host disk space or predict the temporary space required by backup.
+Host doctor is read-only. It identifies container-scoped MCP relays (normally
+reparented to PID 1), validates their private state, and never invokes MCP tools.
 EOF
 }
 
@@ -5097,6 +5101,8 @@ host_doctor() {
     status=1
   fi
 
+  host_doctor_mcp_status || status=1
+
   return "$status"
 }
 
@@ -5535,15 +5541,13 @@ doctor_ssh_status() {
   return "$status"
 }
 
-doctor_socket_status() {
+doctor_socket_mount_status() {
   local name="$1"
   local mounts=""
   local source=""
   local destination=""
   local status=0
-  local published=""
-  local parent_error=""
-  local host_path=""
+  local configured=0
 
   mounts="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_extra_mounts)" || {
     printf '%s\n' "unable to inspect socket mappings"
@@ -5551,7 +5555,8 @@ doctor_socket_status() {
   }
   while IFS=$'\t' read -r source destination; do
     [ -n "$source" ] && [ -n "$destination" ] || continue
-    case "$destination" in /workdir|/home/coder|/var/host-services/ssh-auth.sock) continue ;; esac
+    case "$destination" in /workdir|/home/coder|/var/host-services/ssh-auth.sock|"$MCP_GUEST_SOCKET") continue ;; esac
+    configured=1
     printf '%s\n' "configured: $source -> $destination"
     if [ -L "$source" ] || [ ! -S "$source" ]; then
       printf '%s\n' "host source unavailable or not a Unix socket: $source"
@@ -5561,7 +5566,12 @@ doctor_socket_status() {
       status=1
     fi
   done <<<"$mounts"
-  [ -n "$mounts" ] || printf '%s\n' "no host Unix-socket mappings configured"
+  [ "$configured" -eq 1 ] || printf '%s\n' "no user-managed host Unix-socket mappings configured"
+  return "$status"
+}
+
+doctor_published_socket_status() {
+  local name="$1" published="" parent_error="" host_path="" destination="" status=0
   published="$(container_published_sockets "$name" 2>/dev/null)" || {
     printf '%s\n' "unable to inspect published socket mappings"
     return 1
@@ -5590,25 +5600,229 @@ doctor_socket_status() {
 }
 
 doctor_mcp_status() {
-  local name="$1" registry metadata socket nonce response status=0 missing="" variable=""
+  local name="$1" registry metadata socket nonce response status=0 missing="" variable="" port="" definitions="" proxy_response=""
   registry="$(mcp_registry_path "$name")"
-  if [ ! -f "$registry" ]; then printf '%s\n' 'managed MCP bridge is disabled'; return 0; fi
+  if [ ! -f "$registry" ]; then
+    if container_has_mcp_wiring "$name"; then
+      printf '%s\n' 'managed MCP wiring exists but its host registry is missing; reconfigure definitions with run --mcp'
+      return 1
+    elif [ -e "$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").process.json" ] || [ -S "$(mcp_socket_path "$name")" ]; then
+      printf '%s\n' 'managed MCP relay state exists without a registry; stop it with agentctl or inspect with doctor --host'
+      return 1
+    fi
+    printf '%s\n' 'managed MCP bridge is disabled'; return 0
+  fi
   if [ -L "$registry" ] || [ "$(host_path_uid "$registry")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$registry") & 077))" -ne 0 ]; then
     printf '%s\n' "unsafe MCP registry ownership or permissions: $registry"; return 1
   fi
-  printf '%s\n' "enabled on 127.0.0.1:$(jq -r '.port' "$registry"); definitions: $(jq -r '[.servers[].name]|join(", ")' "$registry")"
+  if ! jq -e --arg name "$name" '
+    .schema_version==1 and .container==$name and (.port|type)=="number" and (.port>=1024 and .port<=65535) and
+    (.servers|type)=="array" and
+    all(.servers[]; (.name|type)=="string" and (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")) and
+      ((.env_vars // [])|type)=="array" and all((.env_vars // [])[]; type=="string"))
+  ' "$registry" >/dev/null 2>&1; then
+    printf '%s\n' "invalid MCP registry schema or container identity: $registry"; return 1
+  fi
+  if ! container_has_mcp_wiring "$name"; then
+    printf '%s\n' 'MCP registry exists but the container has no managed MCP socket wiring; recreate with upgrade --enable-mcp'
+    status=1
+  fi
+  port="$(jq -r '.port' "$registry")"; definitions="$(jq -r '[.servers[].name]|sort|join(", ")' "$registry")"
+  printf '%s\n' "enabled on 127.0.0.1:$port; definitions: ${definitions:-none}"
   while IFS= read -r variable; do [ -z "$variable" ] || [ "${!variable+x}" = x ] || missing="${missing}${missing:+, }${variable}"; done < <(jq -r '.servers[].env_vars[]' "$registry")
   [ -z "$missing" ] || { printf '%s\n' "missing inherited host variables: $missing"; status=1; }
   metadata="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").process.json"
   if container_running "$name"; then
     if [ ! -f "$metadata" ]; then printf '%s\n' 'host relay metadata is missing'; status=1
     else
+      if [ -L "$metadata" ] || [ "$(host_path_uid "$metadata")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$metadata") & 077))" -ne 0 ]; then
+        printf '%s\n' "unsafe relay metadata ownership or permissions: $metadata"
+        return 1
+      fi
       socket="$(jq -r '.socket' "$metadata")"; nonce="$(jq -r '.nonce' "$metadata")"
+      if ! mcp_paths_equal "$socket" "$(mcp_socket_path "$name")"; then
+        printf '%s\n' 'relay metadata contains an unexpected socket path'; return 1
+      fi
+      if ! jq -e --arg name "$name" '
+        (.schema_version==1 or .schema_version==2) and (.pid|type)=="number" and (.nonce|type)=="string" and (.nonce|length)>0 and
+        (.socket|type)=="string" and (.schema_version==1 or .container==$name)
+      ' "$metadata" >/dev/null 2>&1; then
+        printf '%s\n' 'invalid relay metadata schema or container identity'; return 1
+      fi
+      if [ -L "$socket" ] || [ ! -S "$socket" ] || [ "$(host_path_uid "$socket")" != "$(id -u)" ]; then
+        printf '%s\n' 'managed relay socket is missing, unsafe, or foreign-owned'; return 1
+      fi
+      local relay_pid
+      relay_pid="$(jq -r '.pid' "$metadata")"
       response="$(curl --silent --max-time 2 --unix-socket "$socket" http://localhost/.well-known/agentctl-mcp-health 2>/dev/null || true)"
-      printf '%s' "$response" | jq -e --arg n "$nonce" '.ok and .nonce==$n' >/dev/null 2>&1 || { printf '%s\n' 'host relay identity/health check failed'; status=1; }
+      if printf '%s' "$response" | jq -e --arg n "$nonce" --arg name "$name" --arg socket "$socket" --argjson pid "$relay_pid" \
+        --arg defs "$definitions" '.ok and .bridge_version==1 and .nonce==$n and .pid==$pid and .container==$name and .socket_path==$socket and ((.definitions|sort|join(", "))==$defs)' >/dev/null 2>&1; then
+        printf '%s\n' "host relay healthy; PID $(printf '%s' "$response" | jq -r .pid); process agentctl-mcp-relay:$name"
+      else
+        printf '%s\n' 'host relay identity, version, or health check failed'; status=1
+      fi
+      proxy_response="$("$CONTAINER_CMD" exec "$name" sh -c 'curl -fsS --max-time 2 "http://127.0.0.1:$1/.well-known/agentctl-mcp-proxy-health"' sh "$port" 2>/dev/null || true)"
+      printf '%s' "$proxy_response" | jq -e --argjson port "$port" --arg guest_socket "$MCP_GUEST_SOCKET" '.ok and .bridge_version==1 and .port==$port and .socket_path==$guest_socket' >/dev/null 2>&1 \
+        && printf '%s\n' 'guest loopback proxy healthy' \
+        || { printf '%s\n' 'guest loopback proxy health check failed'; status=1; }
+      proxy_response="$("$CONTAINER_CMD" exec "$name" sh -c 'curl -fsS --max-time 2 "http://127.0.0.1:$1/.well-known/agentctl-mcp-health"' sh "$port" 2>/dev/null || true)"
+      printf '%s' "$proxy_response" | jq -e --arg n "$nonce" --arg name "$name" '.ok and .nonce==$n and .container==$name' >/dev/null 2>&1 \
+        && printf '%s\n' 'guest-to-host MCP route healthy' \
+        || { printf '%s\n' 'guest-to-host MCP route health check failed'; status=1; }
     fi
-  elif [ -f "$metadata" ] || [ -S "$(mcp_socket_path "$name")" ]; then printf '%s\n' 'stale MCP relay metadata or socket while container is stopped'; status=1
+  elif [ -f "$metadata" ] || [ -S "$(mcp_socket_path "$name")" ]; then
+    printf '%s\n' "managed host relay state remains while the container is stopped; clean it safely with: ${CLI_NAME} stop --name $name"; status=1
+  else
+    printf '%s\n' 'host relay inactive because the container is stopped'
   fi
+  return "$status"
+}
+
+doctor_mcp_lease_status() {
+  local name="$1" file="" lease_pid="" lease_token="" current_token="" active=0 stale=0 status=0 pattern
+  pattern="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lease."
+  for file in "${pattern}"*.json; do
+    [ -e "$file" ] || continue
+    if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
+      printf '%s\n' "unsafe lease path: $file"; status=1; continue
+    fi
+    lease_pid="$(jq -r '.owner_pid // empty' "$file" 2>/dev/null || true)"
+    lease_token="$(jq -r '.owner_token // empty' "$file" 2>/dev/null || true)"
+    case "$lease_pid" in ''|*[!0-9]*) stale=$((stale+1)); continue ;; esac
+    current_token="$(mcp_process_token "$lease_pid")"
+    if kill -0 "$lease_pid" 2>/dev/null && { [ -z "$lease_token" ] || [ -z "$current_token" ] || [ "$lease_token" = "$current_token" ]; }; then
+      active=$((active+1))
+    else
+      stale=$((stale+1))
+    fi
+  done
+  printf '%s\n' "active leases: $active"
+  if [ "$stale" -gt 0 ]; then printf '%s\n' "stale leases: $stale"; status=1; fi
+  return "$status"
+}
+
+doctor_mcp_lock_status() {
+  local name="$1" file="" owner="" owner_pid="" owner_token="" current_token="" active=0 stale=0 status=0 base
+  base="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lock"
+  for file in "$base" "$base".*; do
+    [ -e "$file" ] || continue
+    if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
+      printf '%s\n' "unsafe lock path: $file"; status=1; continue
+    fi
+    owner="$(sed -n '1p' "$file" 2>/dev/null || true)"; owner_pid="${owner%%:*}"; owner_token="${owner#*:}"; owner_token="${owner_token%:*}"
+    case "$owner_pid" in ''|*[!0-9]*) stale=$((stale+1)); continue ;; esac
+    current_token="$(mcp_process_token "$owner_pid")"
+    if kill -0 "$owner_pid" 2>/dev/null && { [ -z "$current_token" ] || [ "$current_token" = "$owner_token" ]; }; then active=$((active+1)); else stale=$((stale+1)); fi
+  done
+  [ "$active" -eq 0 ] || printf '%s\n' "active lifecycle locks: $active"
+  if [ "$stale" -gt 0 ]; then printf '%s\n' "stale lifecycle locks: $stale"; status=1; fi
+  return "$status"
+}
+
+mcp_labeled_process_names() {
+  ps -axo command= 2>/dev/null | sed -n 's/^agentctl-mcp-relay:\([^[:space:]]*\).*/\1/p'
+}
+
+host_doctor_mcp_status() {
+  local registry_dir runtime_dir log_dir names="" process_names="" name="" file="" metadata_container="" output="" lease_output="" lock_output="" status=0 found=0 known_hashes="" artifact_hash=""
+  registry_dir="$(mcp_registry_dir)"; runtime_dir="$(mcp_runtime_dir)"; log_dir="$(mcp_log_dir)"
+  printf 'Managed MCP relays\n'
+  printf '  %-24s %s\n' ownership 'container-scoped relays normally have parent PID 1'
+
+  if [ -e "$registry_dir" ]; then
+    if [ ! -d "$registry_dir" ] || [ -L "$registry_dir" ] || [ "$(host_path_uid "$registry_dir")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$registry_dir") & 077))" -ne 0 ]; then
+      printf '  %-24s %s\n' registry 'unsafe registry directory ownership or permissions'
+      status=1
+    fi
+    for file in "$registry_dir"/*.json; do
+      [ -e "$file" ] || [ -L "$file" ] || continue
+      if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
+        printf '  %-24s %s\n' registry "unsafe registry file: $file"
+        status=1
+        continue
+      fi
+      name="$(jq -r '.container // empty' "$file" 2>/dev/null || true)"
+      if [ -z "$name" ]; then
+        printf '  %-24s %s\n' registry "invalid registry: $file"
+        status=1
+      else
+        names="${names}${names:+$'\n'}${name}"
+      fi
+    done
+  fi
+
+  if [ -e "$runtime_dir" ]; then
+    if [ ! -d "$runtime_dir" ] || [ -L "$runtime_dir" ] || [ "$(host_path_uid "$runtime_dir")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$runtime_dir") & 077))" -ne 0 ]; then
+      printf '  %-24s %s\n' runtime 'unsafe runtime directory ownership or permissions'
+      status=1
+    fi
+    for file in "$runtime_dir"/mcp-*.process.json; do
+      [ -e "$file" ] || [ -L "$file" ] || continue
+      if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
+        printf '  %-24s %s\n' runtime "unsafe process metadata: $file"
+        status=1
+        continue
+      fi
+      metadata_container="$(jq -r '.container // empty' "$file" 2>/dev/null || true)"
+      [ -z "$metadata_container" ] || names="${names}${names:+$'\n'}${metadata_container}"
+    done
+  fi
+  if [ "$log_dir" != "$runtime_dir" ] && [ -e "$log_dir" ]; then
+    if [ ! -d "$log_dir" ] || [ -L "$log_dir" ] || [ "$(host_path_uid "$log_dir")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$log_dir") & 077))" -ne 0 ]; then
+      printf '  %-24s %s\n' logs 'unsafe log directory ownership or permissions'
+      status=1
+    fi
+  fi
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    process_names="${process_names}${process_names:+$'\n'}${name}"
+    names="${names}${names:+$'\n'}${name}"
+  done < <(mcp_labeled_process_names)
+
+  names="$(printf '%s\n' "$names" | sed '/^$/d' | LC_ALL=C sort -u)"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    found=1
+    printf '  Container %s\n' "$name"
+    if container_exists "$name"; then
+      if container_running "$name"; then printf '    %-22s %s\n' state running; else printf '    %-22s %s\n' state stopped; fi
+      if output="$(doctor_mcp_status "$name")"; then :; else status=1; fi
+      printf '%s\n' "$output" | sed 's/^/    - /'
+    else
+      printf '    %-22s %s\n' state 'container missing'
+      printf '    - persisted or runtime MCP state has no matching container\n'
+      status=1
+    fi
+    if printf '%s\n' "$process_names" | grep -Fqx -- "$name" && [ ! -f "$(mcp_registry_path "$name")" ]; then
+      printf '    - labeled relay process exists without a private registry\n'
+      status=1
+    fi
+    if lease_output="$(doctor_mcp_lease_status "$name")"; then :; else status=1; fi
+    printf '%s\n' "$lease_output" | sed 's/^/    - /'
+    if lock_output="$(doctor_mcp_lock_status "$name")"; then :; else status=1; fi
+    [ -z "$lock_output" ] || printf '%s\n' "$lock_output" | sed 's/^/    - /'
+    printf '    %-22s %s\n' registry "$(mcp_registry_path "$name")"
+    printf '    %-22s %s\n' socket "$(mcp_socket_path "$name")"
+    known_hashes="${known_hashes}${known_hashes:+$'\n'}$(mcp_identity_hash "$name")"
+  done <<<"$names"
+  for file in "$runtime_dir"/mcp-*; do
+    [ -e "$file" ] || [ -L "$file" ] || continue
+    case "$file" in *.log) continue ;; esac
+    artifact_hash="$(basename -- "$file" | sed -n 's/^mcp-\([0-9a-fA-F]*\)\..*$/\1/p')"
+    [ -n "$artifact_hash" ] || continue
+    if ! printf '%s\n' "$known_hashes" | grep -Fqx -- "$artifact_hash"; then
+      printf '  %-24s %s\n' orphan "unassociated managed MCP artifact: $file"
+      status=1
+    fi
+  done
+  for file in "$log_dir"/mcp-*.log "$log_dir"/guest-*.log; do
+    [ -e "$file" ] || [ -L "$file" ] || continue
+    if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
+      printf '  %-24s %s\n' logs "permissions too broad or ownership unsafe (expected owner-only 0600): $file"
+      status=1
+    fi
+  done
+  [ "$found" -eq 1 ] || printf '  %-24s %s\n' state 'none configured'
   return "$status"
 }
 
@@ -5622,10 +5836,13 @@ doctor_cmd() {
   local runtime_output=""
   local state_summary_output=""
   local ssh_output=""
-  local socket_output=""
+  local socket_output="" published_output="" mcp_output=""
   local doctor_status=0
   local status=0
-  local stopped_socket_problem=0
+  local stopped_mount_problem=0
+  local stopped_published_problem=0
+  local mcp_problem=0
+  local mcp_started_for_doctor=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -5652,39 +5869,79 @@ doctor_cmd() {
     die "Container not found: $name"
   fi
 
-  if socket_output="$(doctor_socket_status "$name")"; then
-    echo "Doctor socket mappings in $name:" >&2
+  if socket_output="$(doctor_socket_mount_status "$name")"; then
+    echo "Doctor user-managed socket mappings in $name:" >&2
   else
     doctor_status=$?
-    echo "Doctor found a socket-mapping problem in $name:" >&2
+    echo "Doctor found a user-managed socket-mapping problem in $name:" >&2
     status="$doctor_status"
-    if ! container_running "$name"; then
-      stopped_socket_problem=1
-    fi
+    container_running "$name" || stopped_mount_problem=1
   fi
   [ -z "$socket_output" ] || printf '%s\n' "$socket_output" | sed 's/^/  - /' >&2
-  local mcp_output=""
+  if published_output="$(doctor_published_socket_status "$name")"; then
+    echo "Doctor published socket mappings in $name:" >&2
+  else
+    doctor_status=$?
+    echo "Doctor found a published-socket problem in $name:" >&2
+    status="$doctor_status"
+    container_running "$name" || stopped_published_problem=1
+  fi
+  [ -z "$published_output" ] || printf '%s\n' "$published_output" | sed 's/^/  - /' >&2
   if mcp_output="$(doctor_mcp_status "$name")"; then
     echo "Doctor managed MCP bridge in $name:" >&2
   else
-    doctor_status=$?; status="$doctor_status"; echo "Doctor found a managed MCP bridge problem in $name:" >&2
+    doctor_status=$?; status="$doctor_status"; mcp_problem=1; echo "Doctor found a managed MCP bridge problem in $name:" >&2
   fi
   printf '%s\n' "$mcp_output" | sed 's/^/  - /' >&2
-  if [ "$stopped_socket_problem" -eq 1 ]; then
-    echo "Doctor will not start $name while a stopped-container published-socket problem exists." >&2
+  if [ "$stopped_mount_problem" -eq 1 ]; then
+    echo "Doctor will not start $name while a required user-managed host socket source is unavailable." >&2
+    return "$status"
+  fi
+  if [ "$stopped_published_problem" -eq 1 ]; then
+    echo "Doctor will not start $name while a stopped-container published-socket destination is unsafe or occupied." >&2
+    return "$status"
+  fi
+  if [ "$mcp_problem" -eq 1 ] && ! container_running "$name"; then
+    echo "Doctor will not start $name while its managed MCP registry or wiring is invalid." >&2
     return "$status"
   fi
 
   if container_running "$name"; then
     was_running=1
   else
+    if [ -f "$(mcp_registry_path "$name")" ]; then
+      if ! mcp_start_from_registry "$name"; then
+        echo "Doctor could not start the managed MCP host relay for $name." >&2
+        return 1
+      fi
+      mcp_started_for_doctor=1
+    fi
     echo "Starting container for doctor: $name" >&2
-    start_existing_container_safely "$name" >/dev/null
+    if ! start_existing_container_safely "$name" >/dev/null; then
+      [ "$mcp_started_for_doctor" -eq 0 ] || mcp_stop_managed "$name"
+      echo "Doctor could not start container $name." >&2
+      return 1
+    fi
     started_for_doctor=1
     if ! ensure_started_container_is_running "$name" "doctor"; then
+      [ "$mcp_started_for_doctor" -eq 0 ] || mcp_stop_managed "$name"
       echo "Doctor found a container startup problem in $name." >&2
       echo "The container must stay running for exec-based checks, repair, and live upgrade backup." >&2
       return 1
+    fi
+    if [ "$mcp_started_for_doctor" -eq 1 ]; then
+      if ! mcp_configure_guest "$name"; then
+        stop_existing_container_safely "$name" >/dev/null 2>&1 || true
+        mcp_stop_managed "$name"
+        echo "Doctor could not start the managed MCP guest proxy in $name." >&2
+        return 1
+      fi
+      if mcp_output="$(doctor_mcp_status "$name")"; then
+        echo "Doctor confirmed managed MCP health after temporarily starting $name:" >&2
+      else
+        doctor_status=$?; status="$doctor_status"; echo "Doctor found a managed MCP problem after temporarily starting $name:" >&2
+      fi
+      printf '%s\n' "$mcp_output" | sed 's/^/  - /' >&2
     fi
   fi
 
@@ -5752,6 +6009,7 @@ doctor_cmd() {
   if [ "$started_for_doctor" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     echo "Stopping container: $name" >&2
     stop_existing_container_safely "$name" >/dev/null
+    [ "$mcp_started_for_doctor" -eq 0 ] || mcp_stop_managed "$name"
   fi
   return "$status"
 }

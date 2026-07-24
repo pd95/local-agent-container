@@ -12,6 +12,7 @@ if (!configPath) {
 }
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 const {socket_path:socketPath, nonce, container:containerName} = config;
+const bridgeVersion = 1;
 if (!socketPath || !nonce || !containerName) {
   console.error('MCP relay config requires socket_path, nonce, and container');
   process.exit(64);
@@ -171,7 +172,7 @@ function queuedTransact(state, payload, timeoutMs) {
 const server = http.createServer(async (req, res) => {
   if (!originAllowed(req.headers.origin)) return rpcError(res,403,null,-32000,'origin is not allowed');
   if (req.url === '/.well-known/agentctl-mcp-health') {
-    return json(res, 200, {ok:true, nonce, pid:process.pid, container:containerName, definitions:[...definitions.keys()]});
+    return json(res, 200, {ok:true, bridge_version:bridgeVersion, nonce, pid:process.pid, container:containerName, socket_path:socketPath, definitions:[...definitions.keys()].sort()});
   }
   const match = /^\/mcp\/([A-Za-z0-9][A-Za-z0-9._-]{0,62})$/.exec(new URL(req.url, 'http://localhost').pathname);
   if (!match) return json(res, 404, {error:'unknown MCP route'});

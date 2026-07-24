@@ -1046,7 +1046,7 @@ test_managed_mcp_bridge_lifecycle() {
   node_path="$(command -v node)"
   registry="$HOME/Library/Application Support/agentctl/mcp/$name.json"
   port=47123
-  debug_dir="$TEST_ROOT/tmp/mcp"
+  debug_dir="$TEST_ROOT/tmp/mcp/$name"
   mkdir -p "$debug_dir"
   chmod 700 "$TEST_ROOT/tmp" "$debug_dir" 2>/dev/null || true
   export AGENTCTL_MCP_LOG_DIR="$debug_dir"
@@ -1136,6 +1136,33 @@ curl -fsS -X POST -H "content-type: application/json" \
   assert_status 0
   assert_contains "Doctor managed MCP bridge"
   assert_contains "definitions: fake"
+  assert_contains "guest-to-host MCP route healthy"
+
+  run_capture "$AGENTCTL" doctor --host
+  assert_contains "Managed MCP relays"
+  assert_contains "Container $name"
+  assert_contains "container-scoped relays normally have parent PID 1"
+  assert_contains "process agentctl-mcp-relay:$name"
+
+  log "managed-mcp: checking stopped-container doctor supervision"
+  local starts_before_doctor
+  starts_before_doctor="$(wc -l <"$marker" | tr -d ' ')"
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" doctor --name "$name"
+  assert_status 0
+  assert_contains "host relay inactive because the container is stopped"
+  assert_contains "Doctor confirmed managed MCP health after temporarily starting $name"
+  assert_not_contains "host source unavailable or not a Unix socket"
+  assert_not_contains "stopped-container published-socket problem"
+  [ "$(wc -l <"$marker" | tr -d ' ')" = "$starts_before_doctor" ] || fail "Doctor health checks unexpectedly started the MCP child"
+  run_capture "$CONTAINER_CMD" ls --quiet
+  if printf '%s\n' "$RUN_OUTPUT" | grep -Fqx -- "$name"; then fail "Doctor did not restore the stopped container state"; fi
+  run_capture "$AGENTCTL" doctor --host
+  assert_contains "Container $name"
+  assert_contains "host relay inactive because the container is stopped"
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
 
   log "managed-mcp: checking upgrade preservation"
   run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
