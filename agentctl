@@ -8,9 +8,27 @@ DEFAULT_NAME_PREFIX="agent-"
 AUTH_NAME_PREFIX="agent-auth-"
 DEFAULT_LOGIN_SHELL="${AGENTCTL_SHELL:-bash}"
 CONTAINER_HOST_NAME="host.container.internal"
+AGENTCTL_NETWORK_LABEL="agentctl.managed"
 CLAUDE_MIN_INSTALL_MEM="4G"
 SYSTEM_BASELINE_MANIFEST_FILE="/etc/agentctl/system-manifest.json"
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --no-new-privs --)
+CONTAINER_COPY_SUPPORT=""
+SOCKET_MOUNTS_TEXT=""
+PUBLISHED_SOCKETS_TEXT=""
+SOCKET_PATH_MAX_BYTES=103
+MCP_DEFAULT_PORT=47123
+MCP_GUEST_SOCKET="/run/agentctl/mcp-host.sock"
+MCP_CONFIG_JSON='[]'
+MCP_REQUESTED=0
+MCP_PORT="$MCP_DEFAULT_PORT"
+MCP_RELAY_PID=""
+MCP_RELAY_SOCKET=""
+MCP_RELAY_NONCE=""
+MCP_RELAY_METADATA=""
+MCP_GUEST_EXEC_PID=""
+MCP_LEASE_FILE=""
+MCP_LOCK_DIR=""
+MCP_LOCK_TOKEN=""
 
 resolve_script_path() {
   local path="$1"
@@ -80,6 +98,26 @@ require_container_backup_support() {
   fi
 }
 
+require_container_shm_size_support() {
+  if ! container_help_contains --shm-size create; then
+    die "Shared-memory sizing requires an Apple container runtime with 'container create --shm-size <size>' support"
+  fi
+}
+
+require_container_ssh_support() {
+  container_help_contains --ssh create || die "Apple container does not support SSH agent forwarding (--ssh); upgrade the container CLI"
+}
+
+host_ssh_socket_available() {
+  [ -n "${SSH_AUTH_SOCK:-}" ] && [ "${SSH_AUTH_SOCK#/}" != "$SSH_AUTH_SOCK" ] && [ -S "$SSH_AUTH_SOCK" ]
+}
+
+require_host_ssh_socket() {
+  [ -n "${SSH_AUTH_SOCK:-}" ] || die "--ssh requires SSH_AUTH_SOCK to be set on the host"
+  [ "${SSH_AUTH_SOCK#/}" != "$SSH_AUTH_SOCK" ] || die "--ssh requires an absolute SSH_AUTH_SOCK path: $SSH_AUTH_SOCK"
+  [ -S "$SSH_AUTH_SOCK" ] || die "--ssh requires SSH_AUTH_SOCK to reference an existing Unix socket: $SSH_AUTH_SOCK"
+}
+
 container_list_all() {
   "$CONTAINER_CMD" ls -a 2>/dev/null || true
 }
@@ -145,32 +183,35 @@ extract_container_export_rootfs() {
   local manifest_digest=""
   local manifest_file=""
   local layer_file=""
+  local layer_digest=""
+  local layer_digests=""
   local extracted_layer=0
 
-  rm -rf "$rootfs_dir" "$staging_dir"
-  mkdir -p "$rootfs_dir" "$staging_dir"
-  tar -xf "$export_file" -C "$staging_dir"
+  rm -rf "$rootfs_dir" "$staging_dir" || return 1
+  mkdir -p "$rootfs_dir" "$staging_dir" || return 1
+  tar -xf "$export_file" -C "$staging_dir" || return 1
 
   if [ -f "$staging_dir/oci-layout" ] && [ -d "$staging_dir/blobs" ]; then
     [ -f "$staging_dir/index.json" ] || die "Container export did not contain an OCI index"
     manifest_digest="$(jq -er '.manifests[0].digest // empty' "$staging_dir/index.json")" || die "Container export did not contain an OCI manifest"
     manifest_file="$(oci_blob_path "$staging_dir" "$manifest_digest")" || die "Container export contained an invalid OCI manifest digest"
     [ -f "$manifest_file" ] || die "Container export referenced a missing OCI manifest blob"
-    while IFS= read -r layer_file; do
-      [ -n "$layer_file" ] || continue
+    layer_digests="$(jq -er '.layers | if type == "array" and length > 0 then .[].digest else error("missing layers") end' "$manifest_file")" \
+      || die "Container export did not contain valid OCI layer digests"
+    while IFS= read -r layer_digest; do
+      [ -n "$layer_digest" ] || continue
+      layer_file="$(oci_blob_path "$staging_dir" "$layer_digest")" || die "Container export contained an invalid OCI layer digest"
       [ -f "$layer_file" ] || die "Container export referenced a missing OCI layer blob"
-      tar -xf "$layer_file" -C "$rootfs_dir"
+      tar -xf "$layer_file" -C "$rootfs_dir" || return 1
       extracted_layer=1
-    done <<EOF_LAYERS
-$(jq -er '.layers[].digest' "$manifest_file" | while IFS= read -r layer_digest; do oci_blob_path "$staging_dir" "$layer_digest"; done)
-EOF_LAYERS
-    rm -rf "$staging_dir"
+    done <<<"$layer_digests"
+    rm -rf "$staging_dir" || return 1
     [ "$extracted_layer" -eq 1 ] || die "Container export did not contain any extractable filesystem layers"
     return 0
   fi
 
-  tar -C "$staging_dir" -cf - . | tar -C "$rootfs_dir" -xf -
-  rm -rf "$staging_dir"
+  tar -C "$staging_dir" -cf - . | tar -C "$rootfs_dir" -xf - || return 1
+  rm -rf "$staging_dir" || return 1
 }
 
 container_export_is_oci_layout() {
@@ -225,6 +266,7 @@ build_backup_image_from_export() {
   local export_file="$3"
   local backup_root="$4"
   local backup_dockerfile="$5"
+  local restart_source_on_failure="${6:-0}"
   local backup_context="${backup_root}.context"
   local context_rootfs="$backup_context/rootfs"
   local context_dockerfile="$backup_context/Dockerfile"
@@ -241,7 +283,17 @@ ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ADD rootfs.tar /
 EOF
   cp "$context_dockerfile" "$backup_dockerfile"
-  "$CONTAINER_CMD" build -t "$backup_image" -f "$context_dockerfile" "$backup_context"
+  if ! "$CONTAINER_CMD" build -t "$backup_image" -f "$context_dockerfile" "$backup_context"; then
+    stop_buildkit_container
+    if [ "$restart_source_on_failure" -eq 1 ]; then
+      echo "Restarting original container after failed backup image build: $container_name" >&2
+      if ! start_existing_container_safely "$container_name" >/dev/null 2>&1; then
+        warn "Failed to restart $container_name after backup image build failure; start it manually with: ${CLI_NAME} start --name $container_name"
+      fi
+    fi
+    report_backup_storage_diagnostics || true
+    die "Failed to build backup image $backup_image. The original container $container_name was not removed."
+  fi
   stop_buildkit_container
   validate_backup_image "$backup_image"
 }
@@ -257,6 +309,816 @@ container_mount_mode() {
       elif (($mount.options // []) | if type == "string" then [.] else . end | index("ro")) != null then "ro"
       else "rw" end
   ' 2>/dev/null || printf 'unknown\n'
+}
+
+container_extra_mounts() {
+  jq -Rrs '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then error("invalid container inspect JSON")
+      elif ($parsed | type) == "array" then ($parsed[0] // {})
+      elif ($parsed | type) == "object" then $parsed
+      else error("invalid container inspect JSON") end
+    | (.configuration // .) as $config
+    | ($config.mounts // [])[]
+    | [(.source // .src // .hostPath // ""),
+       (.destination // .dst // .target // .containerPath // "")]
+    | @tsv
+  '
+}
+
+validate_socket_path() {
+  local path="$1"
+  local label="$2"
+  local byte_count=""
+
+  [ -n "$path" ] || die "$label must not be empty"
+  [ "${path#/}" != "$path" ] || die "$label must be absolute: $path"
+  case "$path" in
+    *:*|*,*|*$'\n'*) die "$label contains a character unsupported by Apple container mount syntax: $path" ;;
+  esac
+  if printf '%s' "$path" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+    die "$label contains a control character"
+  fi
+  byte_count="$(printf '%s' "$path" | LC_ALL=C wc -c | tr -d ' ')"
+  [ "$byte_count" -le "$SOCKET_PATH_MAX_BYTES" ] \
+    || die "$label exceeds the Unix-socket path limit ($SOCKET_PATH_MAX_BYTES bytes): $path"
+}
+
+validate_socket_destination() {
+  local destination="$1"
+  validate_socket_path "$destination" "Socket container path"
+  case "$destination" in
+    /workdir|/workdir/*|/home/coder|/home/coder/*|/var/host-services/ssh-auth.sock|/run/agentctl|/run/agentctl/*)
+      die "Socket container path is reserved by agentctl: $destination"
+      ;;
+  esac
+}
+
+mcp_validate_port() {
+  case "$1" in ''|*[!0-9]*) die "Invalid MCP port: $1 (use an unprivileged loopback port from 1024 to 65535)" ;; esac
+  [ "$1" -ge 1024 ] && [ "$1" -le 65535 ] || die "Invalid MCP port: $1 (use an unprivileged loopback port from 1024 to 65535)"
+}
+
+mcp_normalize_managed_path() { printf '%s\n' "$1" | sed 's#//*#/#g'; }
+mcp_paths_equal() { [ "$(mcp_normalize_managed_path "$1")" = "$(mcp_normalize_managed_path "$2")" ]; }
+mcp_runtime_dir() { mcp_normalize_managed_path "${TMPDIR:-/tmp}/agentctl-$(id -u)"; }
+mcp_log_dir() { printf '%s\n' "${AGENTCTL_MCP_LOG_DIR:-$(mcp_runtime_dir)}"; }
+mcp_registry_dir() { printf '%s/Library/Application Support/agentctl/mcp\n' "${HOME}"; }
+mcp_identity_hash() { printf '%s' "$1" | cksum | awk '{printf "%08x%08x\n", $1, $2}'; }
+mcp_socket_path() { printf '%s/mcp-%s.sock\n' "$(mcp_runtime_dir)" "$(mcp_identity_hash "$1")"; }
+mcp_registry_path() { printf '%s/%s.json\n' "$(mcp_registry_dir)" "$1"; }
+
+mcp_definition_json() {
+  local value="$1" raw="" base=""
+  if [ "$value" = xcode ]; then
+    raw='{"name":"xcode","command":"xcrun","args":["mcpbridge"],"shared":true}'
+  elif [ "${value#@}" != "$value" ]; then
+    local file="${value#@}"
+    [ -f "$file" ] && [ ! -L "$file" ] || die "MCP definition file must be a regular, non-symlink file: $file"
+    [ "$(host_path_uid "$file")" = "$(id -u)" ] || die "MCP definition file must be owned by the current user: $file"
+    [ "$((8#$(host_path_mode "$file") & 077))" -eq 0 ] || die "MCP definition file must be inaccessible to group and other users: $file"
+    raw="$(<"$file")"
+    base="$(CDPATH= cd -- "$(dirname -- "$file")" && pwd -P)"
+  else
+    raw="$value"
+  fi
+  printf '%s' "$raw" | jq -ce --arg base "$base" '
+    (if type == "array" then . else [.] end)[] |
+    if type != "object" then error("server must be an object") else . end |
+    if ((keys - ["name","command","args","cwd","env","env_vars","shared"])|length)>0 then error("unknown field") else . end |
+    if (.name|type)!="string" or (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")|not) then error("invalid name") else . end |
+    if (.command|type)!="string" or (.command|length)==0 then error("invalid command") else . end |
+    if ((.args // [])|type)!="array" or any((.args // [])[]; type!="string") then error("args must contain strings") else . end |
+    if ((.env // {})|type)!="object" or any((.env // {})[]; type!="string") then error("env values must be strings") else . end |
+    if any((.env // {})|keys[]; test("^[A-Za-z_][A-Za-z0-9_]*$")|not) then error("invalid env name") else . end |
+    if ((.env_vars // [])|type)!="array" or any((.env_vars // [])[]; type!="string" or test("^[A-Za-z_][A-Za-z0-9_]*$")|not) then error("invalid env_vars") else . end |
+    if ((.shared // false)|type)!="boolean" then error("shared must be boolean") else . end |
+    .args=(.args // []) | .env=(.env // {}) | .env_vars=(.env_vars // []) |
+    if .cwd then .cwd=(if (.cwd|startswith("/")) then .cwd elif $base!="" then ($base+"/"+.cwd) else .cwd end) else . end
+  ' 2>/dev/null || die "Invalid MCP server definition"
+}
+
+mcp_add_definition() {
+  local entries="" entry="" name="" command="" resolved="" cwd="" inherited='{}'
+  entries="$(mcp_definition_json "$1")"
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    name="$(printf '%s' "$entry" | jq -r .name)"
+    printf '%s' "$MCP_CONFIG_JSON" | jq -e --arg n "$name" 'any(.[]; .name==$n)' >/dev/null && die "Duplicate MCP server name: $name"
+    command="$(printf '%s' "$entry" | jq -r .command)"
+    if [ "${command#/}" = "$command" ]; then resolved="$(command -v "$command" 2>/dev/null || true)"; else resolved="$command"; fi
+    [ -n "$resolved" ] && [ -x "$resolved" ] || die "MCP command not found or not executable on the host: $command"
+    resolved="$(CDPATH= cd -- "$(dirname -- "$resolved")" && pwd -P)/$(basename -- "$resolved")"
+    cwd="$(printf '%s' "$entry" | jq -r '.cwd // empty')"
+    if [ -n "$cwd" ]; then [ -d "$cwd" ] || die "MCP working directory not found: $cwd"; cwd="$(CDPATH= cd -- "$cwd" && pwd -P)"; fi
+    inherited='{}'
+    while IFS= read -r name; do
+      [ -n "$name" ] || continue
+      if [ "${!name+x}" = x ]; then inherited="$(printf '%s' "$inherited" | jq -c --arg k "$name" --arg v "${!name}" '.+{($k):$v}')"; fi
+    done < <(printf '%s' "$entry" | jq -r '.env_vars[]')
+    entry="$(printf '%s' "$entry" | jq -c --arg cmd "$resolved" --arg cwd "$cwd" --argjson inherited "$inherited" '.command=$cmd | .cwd=(if $cwd=="" then null else $cwd end) | .inherited_env=$inherited | .shared_process=(.shared // false)')"
+    MCP_CONFIG_JSON="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --argjson item "$entry" '.+[$item]')"
+  done <<<"$entries"
+  MCP_REQUESTED=1
+}
+
+mcp_prepare_private_dir() {
+  local dir="$1"
+  if [ -e "$dir" ]; then
+    [ -d "$dir" ] && [ ! -L "$dir" ] && [ "$(host_path_uid "$dir")" = "$(id -u)" ] || die "Unsafe managed MCP directory collision: $dir"
+    [ "$((8#$(host_path_mode "$dir") & 077))" -eq 0 ] || die "Unsafe managed MCP directory permissions: $dir"
+  else mkdir -m 700 -p "$dir"; fi
+}
+
+mcp_validate_private_file() {
+  local path="$1" label="$2"
+  [ -f "$path" ] && [ ! -L "$path" ] || die "$label must be a regular, non-symlink file: $path"
+  [ "$(host_path_uid "$path")" = "$(id -u)" ] || die "$label must be owned by the current user: $path"
+  [ "$((8#$(host_path_mode "$path") & 077))" -eq 0 ] || die "$label must be inaccessible to group and other users: $path"
+}
+
+mcp_prepare_log_file() {
+  local path="$1"
+  if [ -e "$path" ] || [ -L "$path" ]; then mcp_validate_private_file "$path" "Managed MCP log"; fi
+  : >"$path"; chmod 600 "$path"
+}
+
+mcp_persist_registry() {
+  local name="$1" path temp safe
+  mcp_prepare_private_dir "$(mcp_registry_dir)"
+  path="$(mcp_registry_path "$name")"; temp="${path}.tmp.$$"
+  safe="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c '[.[]|del(.env,.inherited_env)]')"
+  jq -n --arg name "$name" --argjson port "$MCP_PORT" --argjson servers "$safe" '{schema_version:1,container:$name,port:$port,servers:$servers}' >"$temp"
+  chmod 600 "$temp"; mv "$temp" "$path"
+}
+
+mcp_config_fingerprint() {
+  printf '%s' "$MCP_CONFIG_JSON" | jq -Sc 'sort_by(.name) | map(.env_vars = ((.env_vars // []) | sort))' | cksum | awk '{printf "%08x-%s\n", $1, $2}'
+}
+
+mcp_process_token() {
+  local pid="$1"
+  { ps -p "$pid" -o lstart= 2>/dev/null || true; } | cksum | awk 'NF {printf "%08x-%s\n", $1, $2}'
+}
+
+mcp_process_started() {
+  { ps -p "$1" -o lstart= 2>/dev/null || true; } | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+mcp_lock_acquire() {
+  local name="$1" base lock file owner owner_pid owner_token current_token candidate stage winner self_pid tries=0 stale=0
+  base="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lock."
+  lock="${base%.}"
+  self_pid="$$"
+  MCP_LOCK_TOKEN="${self_pid}:$(mcp_process_token "$self_pid"):${RANDOM:-0}"
+  candidate="${base}${self_pid}-${RANDOM:-0}"
+  stage="$(mcp_runtime_dir)/.mcp-lock-stage.${self_pid}-${RANDOM:-0}"
+  [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || die "Managed MCP lock path collision: $candidate"
+  [ ! -e "$stage" ] && [ ! -L "$stage" ] || die "Managed MCP lock staging collision: $stage"
+  printf '%s\n' "$MCP_LOCK_TOKEN" >"$stage"; chmod 600 "$stage"
+  if ! ln "$stage" "$candidate" 2>/dev/null; then rm -f "$stage"; die "Could not publish managed MCP lock contender: $candidate"; fi
+  rm -f "$stage"
+  while :; do
+    stale=0
+    if [ -e "$lock" ] || [ -L "$lock" ]; then
+      [ -f "$lock" ] && [ ! -L "$lock" ] || { rm -f "$candidate"; die "Unsafe managed MCP lock collision: $lock"; }
+      owner="$(sed -n '1p' "$lock" 2>/dev/null || true)"
+      owner_pid="${owner%%:*}"; owner_token="${owner#*:}"; owner_token="${owner_token%:*}"
+      case "$owner_pid" in ''|*[!0-9]*) rm -f "$candidate"; die "Invalid managed MCP lock owner: $lock" ;; esac
+      current_token="$(mcp_process_token "$owner_pid")"
+      if [ "$owner_pid" = "$self_pid" ] && [ "$owner" != "$MCP_LOCK_TOKEN" ]; then
+        stale=1
+      elif ! kill -0 "$owner_pid" 2>/dev/null || { [ -n "$current_token" ] && [ "$current_token" != "$owner_token" ]; }; then
+        stale=1
+      elif [ "$owner" = "$MCP_LOCK_TOKEN" ]; then
+        MCP_LOCK_DIR="$lock"; rm -f "$candidate"; return 0
+      fi
+    else
+      if ln "$candidate" "$lock" 2>/dev/null; then MCP_LOCK_DIR="$lock"; rm -f "$candidate"; return 0; fi
+    fi
+    if [ "$stale" -eq 1 ]; then
+      winner=""
+      for file in "${base}"*; do
+        [ -e "$file" ] || continue
+        [ -f "$file" ] && [ ! -L "$file" ] || { rm -f "$candidate"; die "Unsafe managed MCP lock contender collision: $file"; }
+        owner="$(sed -n '1p' "$file" 2>/dev/null || true)"
+        owner_pid="${owner%%:*}"; owner_token="${owner#*:}"; owner_token="${owner_token%:*}"
+        case "$owner_pid" in ''|*[!0-9]*) rm -f "$candidate"; die "Invalid managed MCP lock contender: $file" ;; esac
+        current_token="$(mcp_process_token "$owner_pid")"
+        if ! kill -0 "$owner_pid" 2>/dev/null || { [ -n "$current_token" ] && [ "$current_token" != "$owner_token" ]; }; then
+          rm -f "$file"
+          continue
+        fi
+        if [ -z "$winner" ] || [[ "$file" < "$winner" ]]; then winner="$file"; fi
+      done
+      if [ "$winner" = "$candidate" ]; then
+        owner="$(sed -n '1p' "$lock" 2>/dev/null || true)"
+        if [ "$owner" != "$MCP_LOCK_TOKEN" ]; then rm -f "$lock"; fi
+      fi
+    fi
+    [ -e "$candidate" ] || die "Managed MCP lock contender disappeared: $candidate"
+    tries=$((tries+1)); if [ "$tries" -ge 100 ]; then rm -f "$candidate"; die "Timed out waiting for managed MCP lock for $name"; fi
+    sleep 0.05
+  done
+}
+
+mcp_lock_release() {
+  if [ -n "$MCP_LOCK_DIR" ] && [ "$(sed -n '1p' "$MCP_LOCK_DIR" 2>/dev/null || true)" = "$MCP_LOCK_TOKEN" ]; then rm -f "$MCP_LOCK_DIR"; fi
+  MCP_LOCK_DIR=""; MCP_LOCK_TOKEN=""
+}
+
+mcp_lease_count() {
+  local name="$1" file="" lease_pid="" lease_token="" current_token="" count=0 pattern
+  pattern="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lease."
+  for file in "${pattern}"*.json; do
+    [ -e "$file" ] || continue
+    if [ -L "$file" ] || [ ! -f "$file" ]; then die "Unsafe managed MCP lease collision: $file"; fi
+    lease_pid="$(jq -r '.owner_pid // empty' "$file" 2>/dev/null)"
+    case "$lease_pid" in ''|*[!0-9]*) rm -f "$file"; continue ;; esac
+    if ! kill -0 "$lease_pid" 2>/dev/null; then rm -f "$file"; continue; fi
+    lease_token="$(jq -r '.owner_token // empty' "$file" 2>/dev/null)"; current_token="$(mcp_process_token "$lease_pid")"
+    if [ -n "$lease_token" ] && [ -n "$current_token" ] && [ "$lease_token" != "$current_token" ]; then rm -f "$file"; continue; fi
+    count=$((count+1))
+  done
+  printf '%s\n' "$count"
+}
+
+mcp_require_no_active_leases() {
+  local name="$1" action="$2" count
+  count="$(mcp_lease_count "$name")"
+  [ "$count" -eq 0 ] || die "Cannot $action container $name while $count managed MCP lease(s) are active"
+}
+
+mcp_create_lease() {
+  local name="$1" fingerprint temp self_pid
+  fingerprint="$(mcp_config_fingerprint)"
+  self_pid="$$"
+  temp="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lease.${self_pid}-${RANDOM:-0}.json"
+  [ ! -e "$temp" ] && [ ! -L "$temp" ] || die "Managed MCP lease path collision: $temp"
+  jq -n --argjson owner_pid "$self_pid" --arg owner_token "$(mcp_process_token "$self_pid")" --arg owner_started "$(mcp_process_started "$self_pid")" --arg fingerprint "$fingerprint" '{schema_version:1,owner_pid:$owner_pid,owner_token:$owner_token,owner_started:$owner_started,fingerprint:$fingerprint}' >"$temp"
+  chmod 600 "$temp"; MCP_LEASE_FILE="$temp"
+}
+
+mcp_release_lease() {
+  [ -z "$MCP_LEASE_FILE" ] || rm -f "$MCP_LEASE_FILE"
+  MCP_LEASE_FILE=""
+}
+
+mcp_start_relay() {
+  local name="$1" dir log_dir config log lease_prefix metadata_temp
+  command -v node >/dev/null 2>&1 || die "Managed MCP requires Node.js on the host"
+  dir="$(mcp_runtime_dir)"; mcp_prepare_private_dir "$dir"
+  log_dir="$(mcp_log_dir)"; mcp_prepare_private_dir "$log_dir"
+  MCP_RELAY_SOCKET="$(mcp_socket_path "$name")"
+  [ ! -e "$MCP_RELAY_SOCKET" ] && [ ! -L "$MCP_RELAY_SOCKET" ] || die "Managed MCP socket path collision: $MCP_RELAY_SOCKET"
+  MCP_RELAY_NONCE="${name}-$$-$(date +%s)-${RANDOM:-0}"
+  config="$dir/mcp-$(mcp_identity_hash "$name").lease.json"; log="$log_dir/mcp-$(mcp_identity_hash "$name").log"
+  [ ! -e "$config" ] && [ ! -L "$config" ] || die "Managed MCP lease path collision: $config"
+  lease_prefix="mcp-$(mcp_identity_hash "$name").lease."
+  mcp_prepare_log_file "$log"
+  jq -n --argjson servers "$MCP_CONFIG_JSON" --arg lease_dir "$dir" --arg lease_prefix "$lease_prefix" \
+    --arg socket_path "$MCP_RELAY_SOCKET" --arg nonce "$MCP_RELAY_NONCE" --arg container "$name" \
+    '{schema_version:1,timeout_ms:30000,servers:$servers,lease_dir:$lease_dir,lease_prefix:$lease_prefix,ephemeral_env:any($servers[]; ((.env // {})|length)>0),socket_path:$socket_path,nonce:$nonce,container:$container}' >"$config"; chmod 600 "$config"
+  ( exec -a "agentctl-mcp-relay:$name" node "$SCRIPT_DIR/mcp/host-relay.mjs" "$config" ) \
+    </dev/null >>"$log" 2>&1 & MCP_RELAY_PID=$!
+  local tries=0; while [ "$tries" -lt 50 ] && [ ! -S "$MCP_RELAY_SOCKET" ]; do sleep 0.02; tries=$((tries+1)); done
+  if ! { [ -S "$MCP_RELAY_SOCKET" ] && kill -0 "$MCP_RELAY_PID" 2>/dev/null; }; then
+    kill "$MCP_RELAY_PID" 2>/dev/null || true; wait "$MCP_RELAY_PID" 2>/dev/null || true
+    rm -f "$MCP_RELAY_SOCKET" "$config"
+    die "Managed MCP host relay failed to start (see $log)"
+  fi
+  MCP_RELAY_METADATA="$dir/mcp-$(mcp_identity_hash "$name").process.json"
+  metadata_temp="${MCP_RELAY_METADATA}.tmp.$$"
+  if ! jq -n --argjson pid "$MCP_RELAY_PID" --arg nonce "$MCP_RELAY_NONCE" --arg socket "$MCP_RELAY_SOCKET" --arg container "$name" --arg fingerprint "$(mcp_config_fingerprint)" '{schema_version:2,container:$container,pid:$pid,nonce:$nonce,socket:$socket,fingerprint:$fingerprint}' >"$metadata_temp" \
+    || ! chmod 600 "$metadata_temp" || ! mv "$metadata_temp" "$MCP_RELAY_METADATA"; then
+    kill "$MCP_RELAY_PID" 2>/dev/null || true; wait "$MCP_RELAY_PID" 2>/dev/null || true
+    rm -f "$metadata_temp" "$MCP_RELAY_SOCKET" "$config"
+    die "Managed MCP host relay metadata could not be installed"
+  fi
+  rm -f "$config"
+}
+
+mcp_acquire_relay() {
+  local name="$1" metadata fingerprint existing_fingerprint pid nonce socket response
+  mcp_prepare_private_dir "$(mcp_runtime_dir)"
+  mcp_lock_acquire "$name"
+  mcp_lease_count "$name" >/dev/null
+  metadata="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").process.json"
+  fingerprint="$(mcp_config_fingerprint)"
+  if [ -e "$metadata" ] || [ -L "$metadata" ]; then
+    mcp_validate_private_file "$metadata" "Managed MCP process metadata"
+    existing_fingerprint="$(jq -r '.fingerprint // empty' "$metadata")"
+    pid="$(jq -r '.pid' "$metadata")"; nonce="$(jq -r '.nonce' "$metadata")"; socket="$(jq -r '.socket' "$metadata")"
+    mcp_paths_equal "$socket" "$(mcp_socket_path "$name")" || die "Managed MCP metadata socket does not match expected path for $name"
+    response="$(curl --silent --max-time 2 --unix-socket "$socket" http://localhost/.well-known/agentctl-mcp-health 2>/dev/null || true)"
+    if printf '%s' "$response" | jq -e --arg nonce "$nonce" --argjson pid "$pid" '.ok and .nonce==$nonce and .pid==$pid' >/dev/null 2>&1; then
+      if [ "$existing_fingerprint" != "$fingerprint" ]; then mcp_lock_release; die "Conflicting managed MCP definitions are already active for container $name"; fi
+      MCP_RELAY_PID="$pid"; MCP_RELAY_NONCE="$nonce"; MCP_RELAY_SOCKET="$socket"; MCP_RELAY_METADATA="$metadata"
+      mcp_create_lease "$name"; mcp_lock_release; return 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null && { [ ! -e "$socket" ] && [ ! -L "$socket" ] || { [ -S "$socket" ] && [ ! -L "$socket" ] && [ "$(host_path_uid "$socket")" = "$(id -u)" ]; }; }; then
+      rm -f "$socket" "$metadata"
+    else
+      die "Refusing to replace an unverified managed MCP relay for $name"
+    fi
+  fi
+  mcp_start_relay "$name"
+  mcp_create_lease "$name"
+  mcp_lock_release
+}
+
+mcp_stop_relay() {
+  if [ -n "$MCP_RELAY_PID" ] && kill -0 "$MCP_RELAY_PID" 2>/dev/null; then kill "$MCP_RELAY_PID" 2>/dev/null || true; wait "$MCP_RELAY_PID" 2>/dev/null || true; fi
+  if [ -n "$MCP_RELAY_SOCKET" ] && [ -S "$MCP_RELAY_SOCKET" ] && [ ! -L "$MCP_RELAY_SOCKET" ]; then rm -f "$MCP_RELAY_SOCKET"; fi
+  [ -z "$MCP_RELAY_METADATA" ] || rm -f "$MCP_RELAY_METADATA"
+  MCP_RELAY_PID=""
+}
+
+mcp_stop_managed() {
+  local name="$1" metadata pid nonce socket response expected_socket runtime_dir
+  runtime_dir="$(mcp_runtime_dir)"; mcp_prepare_private_dir "$runtime_dir"
+  metadata="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").process.json"
+  [ -e "$metadata" ] || [ -L "$metadata" ] || return 0
+  mcp_validate_private_file "$metadata" "Managed MCP process metadata"
+  pid="$(jq -r '.pid // empty' "$metadata" 2>/dev/null)"; nonce="$(jq -r '.nonce // empty' "$metadata" 2>/dev/null)"; socket="$(jq -r '.socket // empty' "$metadata" 2>/dev/null)"
+  expected_socket="$(mcp_socket_path "$name")"
+  mcp_paths_equal "$socket" "$expected_socket" || die "Managed MCP metadata socket does not match expected path for $name"
+  case "$pid" in ''|*[!0-9]*) die "Managed MCP metadata contains an invalid PID for $name" ;; esac
+  [ -n "$nonce" ] || die "Managed MCP metadata contains an invalid nonce for $name"
+  if [ ! -e "$socket" ] && [ ! -L "$socket" ]; then rm -f "$metadata"; return 0; fi
+  [ -S "$socket" ] && [ ! -L "$socket" ] || die "Managed MCP socket is unsafe for $name"
+  response="$(curl --silent --max-time 2 --unix-socket "$socket" http://localhost/.well-known/agentctl-mcp-health 2>/dev/null || true)"
+  printf '%s' "$response" | jq -e --arg nonce "$nonce" --argjson pid "$pid" '.ok==true and .nonce==$nonce and .pid==$pid' >/dev/null 2>&1 \
+    || die "Refusing to signal unverified managed MCP process for $name"
+  kill "$pid" 2>/dev/null || true
+  local tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do sleep 0.05; tries=$((tries+1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do sleep 0.05; tries=$((tries+1)); done
+  fi
+  kill -0 "$pid" 2>/dev/null && die "Managed MCP process did not stop for $name; preserving ownership metadata"
+  [ ! -S "$socket" ] || rm -f "$socket"
+  rm -f "$metadata"
+}
+
+mcp_start_from_registry() {
+  local name="$1" registry variable inherited='{}'
+  registry="$(mcp_registry_path "$name")"; [ -f "$registry" ] && [ ! -L "$registry" ] || return 1
+  mcp_validate_private_file "$registry" "Managed MCP registry"
+  MCP_PORT="$(jq -r '.port // 47123' "$registry")"; mcp_validate_port "$MCP_PORT"
+  MCP_CONFIG_JSON="$(jq -c '[.servers[] | .env={} | .inherited_env={}]' "$registry")"
+  while IFS= read -r variable; do
+    [ -n "$variable" ] || continue
+    if [ "${!variable+x}" = x ]; then
+      MCP_CONFIG_JSON="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --arg k "$variable" --arg v "${!variable}" 'map(if (.env_vars|index($k)) then .inherited_env[$k]=$v else . end)')"
+    fi
+  done < <(printf '%s' "$MCP_CONFIG_JSON" | jq -r '.[].env_vars[]' | LC_ALL=C sort -u)
+  MCP_REQUESTED=1; mcp_start_relay "$name"
+}
+
+mcp_configure_guest() {
+  local name="$1" json guest_log tries=0
+  ensure_requested_feature_installed "$name" mcp-bridge
+  refresh_container_file "$name" "$SCRIPT_DIR/mcp/guest-proxy.mjs" "/usr/local/lib/agentctl/mcp-guest-proxy.mjs" "root:root" "755"
+  json="$(mktemp "${TMPDIR:-/tmp}/agentctl-mcp-guest.XXXXXX")"
+  printf '{"schema_version":1,"port":%s,"socket_path":"%s"}\n' "$MCP_PORT" "$MCP_GUEST_SOCKET" >"$json"
+  refresh_container_file "$name" "$json" "/etc/agentctl/mcp-bridge.json" "root:root" "644"; rm -f "$json"
+  "$CONTAINER_CMD" exec "$name" sh -c 'pkill -f "[m]cp-guest-proxy.mjs" >/dev/null 2>&1 || true'
+  guest_log="$(mcp_log_dir)/guest-$(mcp_identity_hash "$name").log"
+  mcp_prepare_log_file "$guest_log"
+  "$CONTAINER_CMD" exec "$name" node /usr/local/lib/agentctl/mcp-guest-proxy.mjs /etc/agentctl/mcp-bridge.json \
+    </dev/null >>"$guest_log" 2>&1 &
+  MCP_GUEST_EXEC_PID=$!
+  while [ "$tries" -lt 50 ]; do
+    if "$CONTAINER_CMD" exec "$name" sh -c \
+      'curl -fsS --max-time 1 "http://127.0.0.1:$1/.well-known/agentctl-mcp-health" >/dev/null' sh "$MCP_PORT" 2>/dev/null; then
+      return 0
+    fi
+    kill -0 "$MCP_GUEST_EXEC_PID" 2>/dev/null || break
+    sleep 0.1
+    tries=$((tries+1))
+  done
+  echo "Managed MCP guest proxy failed to become ready; diagnostics: $guest_log" >&2
+  sed -n '1,200p' "$guest_log" >&2 || true
+  return 1
+}
+
+validate_host_socket() {
+  local source="$1"
+  validate_socket_path "$source" "Host socket path"
+  [ ! -L "$source" ] || die "Host socket path must not be a symlink: $source"
+  [ -e "$source" ] || die "Host socket does not exist: $source"
+  [ -S "$source" ] || die "Host socket path is not a Unix socket: $source"
+}
+
+socket_mapping_destination() {
+  printf '%s\n' "${1#*$'\t'}"
+}
+
+socket_mapping_source() {
+  printf '%s\n' "${1%%$'\t'*}"
+}
+
+socket_text_has_destination() {
+  local mappings="$1"
+  local destination="$2"
+  local record=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    [ "$(socket_mapping_destination "$record")" != "$destination" ] || return 0
+  done <<<"$mappings"
+  return 1
+}
+
+parse_socket_mapping() {
+  local value="$1"
+  local source=""
+  local destination=""
+  case "$value" in
+    *:*) source="${value%%:*}"; destination="${value#*:}" ;;
+    *) die "Invalid --mount-socket value (expected HOST_PATH:CONTAINER_PATH): $value" ;;
+  esac
+  [ -n "$source" ] && [ -n "$destination" ] \
+    || die "Invalid --mount-socket value (expected HOST_PATH:CONTAINER_PATH): $value"
+  validate_host_socket "$source"
+  validate_socket_destination "$destination"
+  printf '%s\t%s\n' "$source" "$destination"
+}
+
+socket_unmount_record() {
+  local destination="$1"
+  validate_socket_destination "$destination"
+  printf '\t%s\n' "$destination"
+}
+
+validate_requested_socket_mappings() {
+  local mappings="$1"
+  local seen=""
+  local record=""
+  local destination=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    destination="$(socket_mapping_destination "$record")"
+    socket_text_has_destination "$seen" "$destination" \
+      && die "Duplicate socket container path: $destination"
+    seen="${seen}${seen:+$'\n'}${record}"
+  done <<<"$mappings"
+}
+
+container_socket_mounts() {
+  local name="$1"
+  local removals="${2:-}"
+  local mounts=""
+  local source=""
+  local destination=""
+  mounts="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_extra_mounts)" \
+    || die "Unable to inspect mounts for container: $name"
+  while IFS=$'\t' read -r source destination; do
+    [ -n "$source" ] && [ -n "$destination" ] || continue
+    case "$destination" in /workdir|/home/coder|/var/host-services/ssh-auth.sock|"$MCP_GUEST_SOCKET") continue ;; esac
+    if socket_text_has_destination "$removals" "$destination"; then
+      continue
+    fi
+    if [ -L "$source" ] || [ ! -S "$source" ]; then
+      die "Cannot preserve extra mount $source -> $destination because its source cannot be proven to be a Unix socket; remove it with --unmount-socket $destination"
+    fi
+    validate_host_socket "$source"
+    validate_socket_destination "$destination"
+    printf '%s\t%s\n' "$source" "$destination"
+  done <<<"$mounts"
+}
+
+container_extra_mount_text() {
+  local name="$1"
+  local mounts=""
+  local source=""
+  local destination=""
+  mounts="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_extra_mounts)" \
+    || die "Unable to inspect mounts for container: $name"
+  while IFS=$'\t' read -r source destination; do
+    [ -n "$source" ] && [ -n "$destination" ] || continue
+    case "$destination" in /workdir|/home/coder|/var/host-services/ssh-auth.sock|"$MCP_GUEST_SOCKET") continue ;; esac
+    printf '%s\t%s\n' "$source" "$destination"
+  done <<<"$mounts"
+}
+
+container_has_mcp_wiring() {
+  local name="$1"
+  "$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_extra_mounts | \
+    awk -F '\t' -v destination="$MCP_GUEST_SOCKET" '$2 == destination { found=1 } END { exit !found }'
+}
+
+socket_mappings_without_mcp() {
+  local mappings="$1"
+  local record="" destination=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    destination="$(socket_mapping_destination "$record")"
+    [ "$destination" = "$MCP_GUEST_SOCKET" ] || printf '%s\n' "$record"
+  done <<<"$mappings"
+}
+
+merge_socket_mappings() {
+  local preserved="$1"
+  local requested="$2"
+  local record=""
+  local destination=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    destination="$(socket_mapping_destination "$record")"
+    if ! socket_text_has_destination "$requested" "$destination"; then
+      printf '%s\n' "$record"
+    fi
+  done <<<"$preserved"
+  [ -z "$requested" ] || printf '%s\n' "$requested"
+}
+
+socket_volume_arguments() {
+  local mappings="$1"
+  local record=""
+  local source=""
+  local destination=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    source="$(socket_mapping_source "$record")"
+    destination="$(socket_mapping_destination "$record")"
+    printf '%s:%s\n' "$source" "$destination"
+  done <<<"$mappings"
+}
+
+normalize_socket_mappings() {
+  printf '%s\n' "$1" | sed '/^$/d' | LC_ALL=C sort
+}
+
+validate_existing_socket_mappings() {
+  local name="$1"
+  local requested="$2"
+  local current=""
+  current="$(container_socket_mounts "$name")"
+  [ "$(normalize_socket_mappings "$current")" = "$(normalize_socket_mappings "$requested")" ] \
+    || die "Container $name has different socket mappings. Recreate it with: ${CLI_NAME} upgrade --name $name"
+}
+
+validate_container_socket_sources() {
+  local name="$1"
+  container_socket_mounts "$name" >/dev/null
+}
+
+published_socket_parent() {
+  dirname -- "$1"
+}
+
+host_path_exists() {
+  [ -e "$1" ] || [ -L "$1" ]
+}
+
+host_path_uid() {
+  if stat -f '%u' "$1" >/dev/null 2>&1; then
+    stat -f '%u' "$1"
+  else
+    stat -c '%u' "$1"
+  fi
+}
+
+host_path_mode() {
+  if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
+}
+
+validate_published_socket_parent() {
+  local host_path="$1"
+  local parent=""
+  local canonical_parent=""
+  local mode=""
+  local mode_value=0
+
+  parent="$(published_socket_parent "$host_path")"
+  [ -d "$parent" ] || die "Published socket parent directory does not exist: $parent"
+  [ ! -L "$parent" ] || die "Published socket parent directory must not be a symlink: $parent"
+  canonical_parent="$(CDPATH= cd -- "$parent" && pwd -P)"
+  [ "$parent" = "$canonical_parent" ] \
+    || die "Published socket parent directory must be canonical (use $canonical_parent): $parent"
+  [ "$(host_path_uid "$parent")" = "$(id -u)" ] \
+    || die "Published socket parent directory must be owned by the current user: $parent"
+  [ -w "$parent" ] && [ -x "$parent" ] \
+    || die "Published socket parent directory must be writable and searchable by the current user: $parent"
+  mode="$(host_path_mode "$parent")"
+  case "$mode" in *[!0-7]*|'') die "Unable to determine published socket parent permissions: $parent" ;; esac
+  mode_value=$((8#$mode))
+  [ $((mode_value & 077)) -eq 0 ] \
+    || die "Published socket parent directory must be inaccessible to group and other users: $parent (mode $mode)"
+}
+
+parse_published_socket_mapping() {
+  local value="$1"
+  local host_path=""
+  local container_path=""
+  case "$value" in
+    *:*) host_path="${value%%:*}"; container_path="${value#*:}" ;;
+    *) die "Invalid --publish-socket value (expected HOST_PATH:CONTAINER_PATH): $value" ;;
+  esac
+  [ -n "$host_path" ] && [ -n "$container_path" ] \
+    || die "Invalid --publish-socket value (expected HOST_PATH:CONTAINER_PATH): $value"
+  validate_socket_path "$host_path" "Published socket host path"
+  validate_published_socket_parent "$host_path"
+  validate_socket_destination "$container_path"
+  printf '%s\t%s\n' "$host_path" "$container_path"
+}
+
+published_socket_unpublish_record() {
+  local host_path="$1"
+  validate_socket_path "$host_path" "Published socket host path"
+  printf '%s\t\n' "$host_path"
+}
+
+socket_text_has_source() {
+  local mappings="$1"
+  local source="$2"
+  local record=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    [ "$(socket_mapping_source "$record")" != "$source" ] || return 0
+  done <<<"$mappings"
+  return 1
+}
+
+validate_requested_published_sockets() {
+  local mappings="$1"
+  local seen=""
+  local record=""
+  local host_path=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    host_path="$(socket_mapping_source "$record")"
+    socket_text_has_source "$seen" "$host_path" && die "Duplicate published socket host path: $host_path"
+    seen="${seen}${seen:+$'\n'}${record}"
+  done <<<"$mappings"
+}
+
+validate_published_socket_records() {
+  local mappings="$1"
+  local record=""
+  local host_path=""
+  local container_path=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    host_path="$(socket_mapping_source "$record")"
+    container_path="$(socket_mapping_destination "$record")"
+    validate_socket_path "$host_path" "Published socket host path"
+    validate_socket_destination "$container_path"
+  done <<<"$mappings"
+}
+
+container_published_sockets_from_inspect() {
+  jq -Rrs '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then error("invalid container inspect JSON")
+      elif ($parsed | type) == "array" then ($parsed[0] // {})
+      elif ($parsed | type) == "object" then $parsed
+      else error("invalid container inspect JSON") end
+    | (.configuration // .) as $config
+    | ($config.publishedSockets // [])[]
+    | [(.hostPath // .host_path // .source // ""),
+       (.containerPath // .container_path // .destination // "")]
+    | @tsv
+  '
+}
+
+container_published_sockets() {
+  "$CONTAINER_CMD" inspect "$1" 2>/dev/null | container_published_sockets_from_inspect \
+    || die "Unable to inspect published sockets for container: $1"
+}
+
+merge_published_sockets() {
+  local current="$1"
+  local removals="$2"
+  local requested="$3"
+  local record=""
+  local host_path=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    host_path="$(socket_mapping_source "$record")"
+    socket_text_has_source "$removals" "$host_path" && continue
+    socket_text_has_source "$requested" "$host_path" && continue
+    printf '%s\n' "$record"
+  done <<<"$current"
+  [ -z "$requested" ] || printf '%s\n' "$requested"
+}
+
+validate_published_container_collisions() {
+  local published="$1"
+  local mounted="${2:-}"
+  local record=""
+  local path=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    path="$(socket_mapping_destination "$record")"
+    socket_text_has_destination "$mounted" "$path" \
+      && die "Published socket container path collides with a mounted host socket destination: $path"
+  done <<<"$published"
+  return 0
+}
+
+validate_existing_published_sockets() {
+  local current=""
+  current="$(container_published_sockets "$1")"
+  [ "$(normalize_socket_mappings "$current")" = "$(normalize_socket_mappings "$2")" ] \
+    || die "Container $1 has different published socket mappings. Recreate it with: ${CLI_NAME} upgrade --name $1"
+}
+
+validate_published_host_paths_for_start() {
+  local mappings="$1"
+  local record=""
+  local host_path=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    host_path="$(socket_mapping_source "$record")"
+    validate_published_socket_parent "$host_path"
+    ! host_path_exists "$host_path" \
+      || die "Published socket host destination already exists; agentctl will not remove it: $host_path"
+  done <<<"$mappings"
+}
+
+start_existing_container_safely() {
+  local name="$1"
+  local published_sockets=""
+
+  published_sockets="$(container_published_sockets "$name")"
+  validate_published_host_paths_for_start "$published_sockets"
+  "$CONTAINER_CMD" start "$name"
+}
+
+stop_existing_container_safely() {
+  local name="$1"
+  local published_sockets=""
+
+  published_sockets="$(container_published_sockets "$name")"
+  "$CONTAINER_CMD" stop "$name"
+  report_leftover_published_sockets "$published_sockets" || true
+}
+
+validate_running_published_listeners() {
+  local mappings="$1"
+  local record=""
+  local host_path=""
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    host_path="$(socket_mapping_source "$record")"
+    validate_published_socket_parent "$host_path"
+    [ ! -L "$host_path" ] && [ -S "$host_path" ] \
+      || die "Published socket listener is missing or is not a Unix socket: $host_path"
+  done <<<"$mappings"
+}
+
+report_leftover_published_sockets() {
+  local mappings="$1"
+  local record=""
+  local host_path=""
+  local found=0
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    host_path="$(socket_mapping_source "$record")"
+    if host_path_exists "$host_path"; then
+      warn "Published socket host path remains after container lifecycle action; not removing it: $host_path"
+      found=1
+    fi
+  done <<<"$mappings"
+  return "$found"
+}
+
+published_socket_arguments() {
+  socket_volume_arguments "$1"
+}
+
+validate_published_upgrade_preflight() {
+  local current="$1"
+  local target="$2"
+  local source_running="$3"
+  local record=""
+  local host_path=""
+  if [ "$source_running" -eq 1 ]; then
+    validate_running_published_listeners "$current"
+  else
+    while IFS= read -r record; do
+      [ -n "$record" ] || continue
+      host_path="$(socket_mapping_source "$record")"
+      ! host_path_exists "$host_path" \
+        || die "Stopped container has an occupied published socket host path; agentctl will not remove it: $host_path"
+    done <<<"$current"
+  fi
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    host_path="$(socket_mapping_source "$record")"
+    validate_published_socket_parent "$host_path"
+    if [ "$source_running" -eq 1 ] && socket_text_has_source "$current" "$host_path"; then
+      continue
+    fi
+    ! host_path_exists "$host_path" \
+      || die "Published socket host destination already exists; agentctl will not remove it: $host_path"
+  done <<<"$target"
 }
 
 container_upgrade_info() {
@@ -284,6 +1146,68 @@ container_upgrade_info() {
        ($cpus | resource), ($memory | resource)] end
     | join("\t")
   ' 2>/dev/null || printf '\t\t\t\t\n'
+}
+
+container_shm_size() {
+  local name="$1"
+
+  "$CONTAINER_CMD" inspect "$name" 2>/dev/null | jq -Rrs '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then empty
+      else $parsed
+      | (if type == "array" then (.[0] // {}) elif type == "object" then . else {} end) as $data
+      | ($data.configuration // $data) as $config
+      | ($config.shmSize // $config.shmSizeInBytes // $config.resources.shmSize // $config.resources.shmSizeInBytes // $data.shmSize // $data.shmSizeInBytes // empty)
+      | if type == "number" and . > 0 then floor | tostring
+        elif type == "string" and length > 0 and . != "0" then .
+        else empty end
+      end
+  ' 2>/dev/null
+}
+
+container_ssh_enabled() {
+  local name="$1"
+
+  "$CONTAINER_CMD" inspect "$name" 2>/dev/null | jq -Rrs '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then error("invalid container inspect JSON")
+      elif ($parsed | type) == "array" then ($parsed[0] // {})
+      elif ($parsed | type) == "object" then $parsed
+      else error("invalid container inspect JSON") end
+    | (.configuration // .) as $config
+    | ($config.ssh // false)
+    | if type == "boolean" then . else error("invalid SSH forwarding value") end
+  '
+}
+
+guest_ssh_socket_available() {
+  local name="$1"
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -c 'socket="${SSH_AUTH_SOCK:-/var/host-services/ssh-auth.sock}"; [ -S "$socket" ]' >/dev/null 2>&1
+}
+
+validate_existing_container_ssh() {
+  local name="$1"
+  local requested="$2"
+  local enabled=""
+
+  [ "$requested" -eq 1 ] || return 0
+  enabled="$(container_ssh_enabled "$name")" || die "Unable to determine SSH forwarding configuration for existing container: $name"
+  [ "$enabled" = "true" ] || die "Container $name was created without SSH forwarding. Recreate it with: ${CLI_NAME} upgrade --name $name --ssh"
+  if container_running "$name"; then
+    guest_ssh_socket_available "$name" || die "Container $name has SSH forwarding configured, but its guest agent socket is unavailable. Restart it from a shell with SSH_AUTH_SOCK set."
+  else
+    require_host_ssh_socket
+  fi
+}
+
+warn_if_ssh_forwarding_unavailable_on_start() {
+  local name="$1"
+  local enabled=""
+
+  enabled="$(container_ssh_enabled "$name" 2>/dev/null || true)"
+  if [ "$enabled" = "true" ] && ! host_ssh_socket_available; then
+    warn "Container $name has SSH forwarding enabled, but SSH_AUTH_SOCK is unavailable; the guest SSH agent socket will not be available after start"
+  fi
 }
 
 validate_mount_mode() {
@@ -583,6 +1507,7 @@ Commands:
   refresh    Refresh agentctl-managed files in an existing container
   doctor     Check an existing container for common agentctl state problems
   host-address  Print the current host gateway for an Apple container network
+  network    Manage Apple container networks used by agentctl
   system-manifest  Print a container package manifest
   upgrade    Recreate a container from the latest image while preserving config
   rescue     Temporarily run a shell or command in a backup image
@@ -621,12 +1546,13 @@ version_cmd() {
 
 usage_build() {
   cat <<EOF
-Usage: $CLI_NAME build [--image NAME] [--runtimes NAME[,NAME...]] [--default-runtime NAME] [--rebuild] [--snapshot] [--pull-base] [--refresh-base]
+Usage: $CLI_NAME build [--image NAME] [--runtimes NAME[,NAME...]] [--default-runtime NAME] [--features NAME[,NAME...]|all] [--rebuild] [--snapshot] [--pull-base] [--refresh-base]
 
 Options:
   --image NAME       Local image name to build (for example: agent-plain, agent-python, agent-swift, agent-my-team)
   --runtimes LIST    Comma-separated runtimes, or all, to preinstall in the image (default: $DEFAULT_RUNTIME)
   --default-runtime  Runtime to install as the image default (default: $DEFAULT_RUNTIME)
+  --features LIST    Comma-separated features, or all, to preinstall (default: none)
   --rebuild          Rebuild images even if they already exist (disables build cache only; does not refresh FROM tags)
   --snapshot         Add a fresh UTC timestamp tag for existing images without rebuilding
   --pull-base     Pull the base image before building (preferred way to refresh remote FROM tags)
@@ -656,6 +1582,9 @@ Options:
   --image NAME    Image to use (default: agent-plain)
   --workdir PATH  Host directory to mount at /workdir (default: cwd)
   --home PATH     Host directory to mount at /home/coder (requires new container)
+  --mount-socket HOST_PATH:CONTAINER_PATH  Mount a host Unix socket (repeatable)
+  --publish-socket HOST_PATH:CONTAINER_PATH  Publish a container Unix socket on the host (repeatable)
+  --mcp VALUE         Expose host stdio MCP (xcode, inline JSON, or @private-file; repeatable)
   --runtime NAME  Preferred runtime to launch in the container (e.g. codex, claude)
   --install-runtime  Install the selected runtime before launch
   -c, --config KEY=VALUE  Pass runtime-specific launch config (repeatable)
@@ -671,6 +1600,9 @@ Options:
   --stdio         With --cmd, keep stdin open without a TTY for stdio protocols such as ACP or MCP
   --cpu NUM       CPU cores for container
   --mem SIZE      Memory limit (e.g. 8G)
+  --shm-size SIZE Size of /dev/shm (e.g. 512M, 1G; requires new container)
+  --network NAME   Attach to a named network (repeatable; requires new container)
+  --ssh            Forward the host SSH agent and ensure SSH client tooling
 EOF
 }
 
@@ -684,6 +1616,11 @@ Options:
   --workdir PATH  Host directory to mount at /workdir when creating a container
   --cpu NUM       CPU cores for a newly created bootstrap container
   --mem SIZE      Memory limit for a newly created bootstrap container
+  --shm-size SIZE Size of /dev/shm for a newly created bootstrap container
+  --network NAME   Attach a newly created bootstrap container to a named network (repeatable)
+  --mount-socket HOST_PATH:CONTAINER_PATH  Mount a host Unix socket (repeatable)
+  --publish-socket HOST_PATH:CONTAINER_PATH  Publish a container Unix socket on the host (repeatable)
+  --ssh            Forward the host SSH agent and install SSH client tooling
 
 The current bootstrap slice supports Alpine and Debian/Ubuntu-based containers.
 It installs the current managed control surface into the container so that
@@ -712,13 +1649,17 @@ Usage: $CLI_NAME doctor [options]
 Options:
   --name NAME  Container name (default: agent-<dir>)
   --fix        Repair detected user-state ownership and readability problems
-  --host       Check the host container CLI, service, and agentctl capabilities
+  --host       Check host runtime, storage, and managed MCP relay ownership and health
 
 Doctor checks that the container can stay running for exec-based maintenance,
 checks known agentctl user-state paths in /home/coder, and verifies installed
 runtimes plus image-managed Codex local-mode config. With --fix, it repairs
 state permissions, reinstalls missing installable runtimes, restores missing
 Codex AGENTS.md, and resets broken Codex runtime config when needed.
+Host storage figures are global Apple container runtime accounting and do not
+measure free host disk space or predict the temporary space required by backup.
+Host doctor is read-only. It identifies container-scoped MCP relays (normally
+reparented to PID 1), validates their private state, and never invokes MCP tools.
 EOF
 }
 
@@ -728,6 +1669,31 @@ Usage: $CLI_NAME host-address [--network NAME]
 
 Print the IPv4 gateway that containers use to reach the macOS host on the
 selected Apple container network (default: default).
+EOF
+}
+
+usage_network() {
+  cat <<EOF
+Usage: $CLI_NAME network <list|create|inspect|rm> [options]
+
+Commands:
+  list, ls       List all Apple container networks and agentctl ownership
+  create         Create an agentctl-managed NAT or host-only network
+  inspect        Print Apple container's JSON for one network
+  rm, delete     Delete agentctl-managed networks
+
+Options for network list:
+  --raw          Print network names only
+
+Options for network create:
+  --internal     Create a host-only network without an external route
+  --subnet CIDR  Set the IPv4 subnet
+  --subnet-v6 CIDR  Set the IPv6 subnet
+  --label KEY=VALUE  Add a label (repeatable)
+
+Host-only networks isolate containers from external networks. Containers that
+share a host-only network can communicate with each other. Network attachment
+is selected when a container is created and cannot be changed afterward.
 EOF
 }
 
@@ -780,6 +1746,17 @@ Options:
   --workdir PATH      Host directory to mount at /workdir after recreation (default: preserve existing mount source)
   --cpu NUM           CPU cores for recreated container (default: preserve existing setting)
   --mem SIZE          Memory limit for recreated container (default: preserve existing setting)
+  --shm-size SIZE     Size of /dev/shm for recreated container (default: preserve explicit existing setting)
+  --network NAME      Replace preserved network attachments (repeatable)
+  --mount-socket HOST_PATH:CONTAINER_PATH  Add or replace a socket mapping (repeatable)
+  --unmount-socket CONTAINER_PATH  Remove a preserved socket mapping (repeatable)
+  --publish-socket HOST_PATH:CONTAINER_PATH  Add or replace a published socket by host path (repeatable)
+  --unpublish-socket HOST_PATH  Remove a preserved published socket (repeatable)
+  --ssh               Enable SSH-agent forwarding and ensure SSH client tooling
+  --no-ssh            Disable preserved SSH-agent forwarding
+  --enable-mcp        Enable the managed host MCP bridge
+  --disable-mcp       Disable the managed host MCP bridge and remove its registry after success
+  --mcp-port PORT     Set the guest loopback MCP port (default: preserve, or 47123)
   --backup-image NAME Backup image name for container export (default: <new-name-or-name>-backup-<timestamp>)
   --no-backup         Skip container export backup image creation
   --dry-run           Show the planned upgrade actions without recreating the container
@@ -805,6 +1782,8 @@ Options:
   --keep         Leave the rescue container running instead of removing it after exit
   --cpu NUM      CPU cores for the rescue container
   --mem SIZE     Memory limit for the rescue container
+  --shm-size SIZE  Size of /dev/shm for the rescue container
+  --network NAME   Attach the rescue container to a named network (repeatable)
   --cmd ...      Run a custom command instead of an interactive /bin/sh shell
 
 Rescue runs a backup image directly without refresh, auth sync, runtime install,
@@ -1457,6 +2436,9 @@ build_cmd() {
   local runtimes_overridden=0
   local default_runtime="$DEFAULT_RUNTIME"
   local default_runtime_overridden=0
+  local features_csv=""
+  local features_overridden=0
+  local features_all=0
   local rebuild=0
   local snapshot=0
   local refresh_base=0
@@ -1470,6 +2452,7 @@ build_cmd() {
       --image) image="$2"; shift 2 ;;
       --runtimes) runtimes_csv="$2"; runtimes_overridden=1; shift 2 ;;
       --default-runtime) default_runtime="$2"; default_runtime_overridden=1; shift 2 ;;
+      --features) features_csv="$2"; features_overridden=1; shift 2 ;;
       --rebuild) rebuild=1; shift ;;
       --snapshot) snapshot=1; shift ;;
       --refresh-base) refresh_base=1; shift ;;
@@ -1532,6 +2515,42 @@ build_cmd() {
     printf '%s\t%s\n' "$normalized" "$first"
   }
 
+  normalize_build_feature_csv() {
+    local raw="$1"
+    local entry=""
+    local manifest=""
+    local registered_feature=""
+    local normalized=""
+    local duplicate_guard=$'\n'
+    local IFS=','
+
+    if [ "$raw" = "all" ]; then
+      raw=""
+      for manifest in "$SCRIPT_DIR"/features.d/*.json; do
+        [ -e "$manifest" ] || continue
+        registered_feature="$(jq -er '.id | strings | select(length > 0)' "$manifest" 2>/dev/null)" \
+          || die "Invalid feature id in manifest: $manifest"
+        [ "$(basename "$manifest" .json)" = "$registered_feature" ] \
+          || die "Feature manifest filename must match id '$registered_feature': $manifest"
+        raw="${raw}${raw:+,}${registered_feature}"
+      done
+    fi
+    read -r -a build_features <<<"$raw"
+    for entry in "${build_features[@]}"; do
+      entry="${entry#"${entry%%[![:space:]]*}"}"
+      entry="${entry%"${entry##*[![:space:]]}"}"
+      [ -n "$entry" ] || continue
+      [ -f "$SCRIPT_DIR/features.d/${entry}.json" ] || die "Unknown feature for build: $entry"
+      if printf '%s' "$duplicate_guard" | grep -Fqx -- "$entry"; then
+        continue
+      fi
+      duplicate_guard="${duplicate_guard}${entry}"$'\n'
+      normalized="${normalized}${normalized:+,}${entry}"
+    done
+    [ -n "$normalized" ] || die "No valid features provided for build"
+    printf '%s\n' "$normalized"
+  }
+
   if [ "$runtimes_overridden" -eq 0 ] && [ "$default_runtime_overridden" -eq 1 ]; then
     runtimes_csv="$default_runtime"
   fi
@@ -1548,6 +2567,11 @@ build_cmd() {
   fi
   if { [ "$default_runtime_overridden" -eq 1 ] || [ "$runtimes_overridden" -eq 1 ]; } && [ "$snapshot" -eq 1 ]; then
     die "--runtimes and --default-runtime cannot be combined with --snapshot"
+  fi
+  if [ "$features_overridden" -eq 1 ]; then
+    [ "$features_csv" != "all" ] || features_all=1
+    features_csv="$(normalize_build_feature_csv "$features_csv")" || return 1
+    [ "$snapshot" -eq 0 ] || die "--features cannot be combined with --snapshot"
   fi
 
   require_container
@@ -1683,6 +2707,7 @@ build_cmd() {
   local build_order_lines=""
   local build_seen_lines=""
   local build_visiting_lines=""
+  local requested_build_lines=""
 
   list_has_line() {
     local lines="$1"
@@ -1734,6 +2759,26 @@ build_cmd() {
     build_order_lines="${build_order_lines}${name}"$'\n'
   }
 
+  build_features_for_image() {
+    local image_name="$1"
+    local feature=""
+    local selected=""
+    local family="${image_name%%:*}"
+    local manifest=""
+
+    [ -n "$features_csv" ] || return 0
+    while IFS= read -r feature; do
+      [ -n "$feature" ] || continue
+      manifest="$SCRIPT_DIR/features.d/$feature.json"
+      if jq -e --arg family "$family" '((.supported_image_families // []) | index($family)) != null' "$manifest" >/dev/null 2>&1; then
+        selected="${selected}${selected:+,}${feature}"
+      elif [ -n "$image" ] && [ "$image_name" = "$image" ] && [ "$features_all" -eq 0 ]; then
+        die "Feature $feature is not supported by image $image_name"
+      fi
+    done < <(printf '%s\n' "$features_csv" | tr ',' '\n')
+    printf '%s\n' "$selected"
+  }
+
   build_one() {
     local name="$1"
     local file
@@ -1744,9 +2789,10 @@ build_cmd() {
     local versioned_name="${name}:${build_stamp}"
     local base=""
     local existing_snapshot=""
+    local image_features=""
     file="$(dockerfile_name_for_image "$name")"
     file_path="$SCRIPT_DIR/$file"
-    if [ "$rebuild" -eq 0 ] && [ "$default_runtime_overridden" -eq 0 ] && [ "$runtimes_overridden" -eq 0 ] && image_exists "$name"; then
+    if [ "$rebuild" -eq 0 ] && [ "$default_runtime_overridden" -eq 0 ] && [ "$runtimes_overridden" -eq 0 ] && [ "$features_overridden" -eq 0 ] && image_exists "$name"; then
       if [ "$snapshot" -eq 1 ]; then
         echo "Snapshotting existing image tags: $name, $versioned_name"
         "$CONTAINER_CMD" image tag "$name" "$versioned_name"
@@ -1778,7 +2824,10 @@ build_cmd() {
       fi
     fi
     echo "Building image tags: $name, $versioned_name"
-    build_args=(build -t "$name" -f "$file_path" --build-arg "AGENT_RUNTIMES=$runtimes_csv" --build-arg "AGENT_DEFAULT_RUNTIME=$default_runtime" --build-arg "BUILD_TIME=$build_time_utc")
+    if list_has_line "$requested_build_lines" "$name"; then
+      image_features="$(build_features_for_image "$name")" || return 1
+    fi
+    build_args=(build -t "$name" -f "$file_path" --build-arg "AGENT_RUNTIMES=$runtimes_csv" --build-arg "AGENT_DEFAULT_RUNTIME=$default_runtime" --build-arg "AGENT_FEATURES=$image_features" --build-arg "BUILD_TIME=$build_time_utc")
     if [ -n "$no_cache" ]; then
       build_args+=("$no_cache")
       build_args+=("$context")
@@ -1790,10 +2839,12 @@ build_cmd() {
   }
 
   if [ -n "$image" ]; then
+    requested_build_lines="${image}"$'\n'
     resolve_build_dependencies "$image"
   else
     while IFS= read -r local_image; do
       [ -z "$local_image" ] && continue
+      requested_build_lines="${requested_build_lines}${local_image}"$'\n'
       resolve_build_dependencies "$local_image"
     done <<< "$(list_local_build_images)"
   fi
@@ -1804,7 +2855,7 @@ build_cmd() {
 
   while IFS= read -r build_image; do
     [ -z "$build_image" ] && continue
-    build_one "$build_image"
+    build_one "$build_image" || return 1
   done <<< "$build_order_lines"
 
   stop_buildkit_container
@@ -1986,11 +3037,12 @@ export_container_for_upgrade() {
 
   if [ "$restart_on_failure" -eq 1 ]; then
     echo "Restarting original container after failed export: $name" >&2
-    if ! "$CONTAINER_CMD" start "$name" >/dev/null 2>&1; then
+    if ! start_existing_container_safely "$name" >/dev/null 2>&1; then
       warn "Failed to restart $name after export failure; start it manually with: ${CLI_NAME} start --name $name"
     fi
   fi
 
+  report_backup_storage_diagnostics || true
   die "Failed to export container filesystem for backup image. The original container was not removed. This usually indicates a container runtime storage/export error; retry after checking the runtime, or use '${CLI_NAME} upgrade --name $name --new-name <new-name> --copy' to create an upgraded copy without a full backup export."
 }
 
@@ -2556,19 +3608,19 @@ container_supports_state_contract() {
   if container_running "$name"; then
     was_running=1
   else
-    "$CONTAINER_CMD" start "$name" >/dev/null || return 1
+    start_existing_container_safely "$name" >/dev/null || return 1
     started_for_check=1
     ensure_started_container_is_running "$name" "state contract check" || return 1
   fi
 
   if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh help 2>/dev/null | grep -Fq 'agent.sh state export'; then
     if [ "$started_for_check" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-      "$CONTAINER_CMD" stop "$name" >/dev/null 2>&1 || true
+      stop_existing_container_safely "$name" >/dev/null 2>&1 || true
     fi
     return 0
   fi
   if [ "$started_for_check" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-    "$CONTAINER_CMD" stop "$name" >/dev/null 2>&1 || true
+    stop_existing_container_safely "$name" >/dev/null 2>&1 || true
   fi
   return 1
 }
@@ -2605,7 +3657,7 @@ collect_upgrade_container_preflight() {
   if container_running "$name"; then
     was_running=1
   else
-    "$CONTAINER_CMD" start "$name" >/dev/null || return 1
+    start_existing_container_safely "$name" >/dev/null || return 1
     started_for_preflight=1
     if ! ensure_started_container_is_running "$name" "upgrade preflight"; then
       return 1
@@ -2629,7 +3681,7 @@ collect_upgrade_container_preflight() {
   fi
 
   if [ "$started_for_preflight" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-    "$CONTAINER_CMD" stop "$name" >/dev/null 2>&1 || true
+    stop_existing_container_safely "$name" >/dev/null 2>&1 || true
   fi
 }
 
@@ -2893,7 +3945,7 @@ write_auth_blob_to_container() {
   if container_running "$name"; then
     was_running=1
   else
-    "$CONTAINER_CMD" start "$name" >/dev/null
+    start_existing_container_safely "$name" >/dev/null
     started_for_command=1
   fi
 
@@ -2910,7 +3962,7 @@ write_auth_blob_to_container() {
   rm -f "$stderr_file"
 
   if [ "$started_for_command" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-    "$CONTAINER_CMD" stop "$name" >/dev/null
+    stop_existing_container_safely "$name" >/dev/null
   fi
 
   return "$status"
@@ -3194,19 +4246,107 @@ resolve_auth_image_for_container() {
   printf '%s\n' "$image"
 }
 
+container_copy_supported() {
+  if [ -z "$CONTAINER_COPY_SUPPORT" ]; then
+    if "$CONTAINER_CMD" copy --help >/dev/null 2>&1; then
+      CONTAINER_COPY_SUPPORT="yes"
+    else
+      CONTAINER_COPY_SUPPORT="no"
+    fi
+  fi
+  [ "$CONTAINER_COPY_SUPPORT" = "yes" ]
+}
+
+container_refresh_stage_path() {
+  local name="$1"
+  local target="$2"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    set -e
+    target="$1"
+    parent=${target%/*}
+    [ "$parent" != "$target" ] || parent=.
+    mkdir -p "$parent"
+    candidate="$target.agentctl-stage.$$"
+    suffix=0
+    while [ -e "$candidate" ] || [ -L "$candidate" ]; do
+      suffix=$((suffix + 1))
+      candidate="$target.agentctl-stage.$$.${suffix}"
+    done
+    printf "%s\n" "$candidate"
+  ' sh "$target"
+}
+
+cleanup_container_refresh_stage() {
+  local name="$1"
+  local stage="$2"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'rm -rf -- "$1"' sh "$stage" >/dev/null 2>&1 || true
+}
+
+activate_container_refresh_stage() {
+  local name="$1"
+  local stage="$2"
+  local target="$3"
+
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    stage="$1"
+    target="$2"
+    backup="$target.agentctl-backup.$$"
+    suffix=0
+    while [ -e "$backup" ] || [ -L "$backup" ]; do
+      suffix=$((suffix + 1))
+      backup="$target.agentctl-backup.$$.${suffix}"
+    done
+    had_target=0
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      mv -- "$target" "$backup" || exit 1
+      had_target=1
+    fi
+    if ! mv -- "$stage" "$target"; then
+      if [ "$had_target" -eq 1 ]; then
+        mv -- "$backup" "$target" || {
+          echo "Error: failed to restore managed target after activation failure: $target" >&2
+          exit 1
+        }
+      fi
+      exit 1
+    fi
+    if [ "$had_target" -eq 1 ] && ! rm -rf -- "$backup"; then
+      echo "Warning: installed managed target but could not remove backup: $backup" >&2
+    fi
+  ' sh "$stage" "$target"
+}
+
 refresh_container_file() {
   local name="$1"
   local source="$2"
   local target="$3"
   local owner="${4:-root:root}"
   local mode="${5:-644}"
-  local dir
+  local stage
 
   [ -f "$source" ] || die "Refresh source not found: $source"
-  dir="$(dirname "$target")"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "mkdir -p '$dir'"
-  "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc "cat > '$target'" <"$source"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "chmod $mode '$target' && chown $owner '$target'"
+  stage="$(container_refresh_stage_path "$name" "$target")" || die "Failed to prepare refresh staging path for $target"
+  if container_copy_supported && [[ "$source" != *:* ]] && [ ! -L "$source" ]; then
+    if ! "$CONTAINER_CMD" copy "$source" "$name:$stage" >/dev/null; then
+      cleanup_container_refresh_stage "$name" "$stage"
+      die "Failed to copy refresh source into $name: $source"
+    fi
+  elif ! "$CONTAINER_CMD" exec -i -u 0 "$name" sh -c 'cat > "$1"' sh "$stage" <"$source"; then
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to stream refresh source into $name: $source"
+  fi
+  if ! "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    [ -f "$2" ] && [ ! -L "$2" ] && chmod "$1" "$2" && chown "$3" "$2"
+  ' sh "$mode" "$stage" "$owner"; then
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to normalize refreshed file: $target"
+  fi
+  activate_container_refresh_stage "$name" "$stage" "$target" || {
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to activate refreshed file: $target"
+  }
 }
 
 refresh_codex_config_files() {
@@ -3403,11 +4543,38 @@ refresh_container_tree() {
   local owner="${4:-root:root}"
   local file_mode="${5:-644}"
   local dir_mode="${6:-755}"
+  local stage
 
   [ -d "$source" ] || die "Refresh source directory not found: $source"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "mkdir -p '$target'"
-  tar_create_tree_stream "$source" | "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc "tar -xf - -C '$target'"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "chown -R $owner '$target' && find '$target' -type d -exec chmod $dir_mode {} + && find '$target' -type f -exec chmod $file_mode {} +"
+  stage="$(container_refresh_stage_path "$name" "$target")" || die "Failed to prepare refresh staging path for $target"
+  if container_copy_supported && [[ "$source" != *:* ]] && [ ! -L "$source" ]; then
+    if ! "$CONTAINER_CMD" copy "$source" "$name:$stage" >/dev/null; then
+      cleanup_container_refresh_stage "$name" "$stage"
+      die "Failed to copy refresh tree into $name: $source"
+    fi
+  else
+    if ! "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'mkdir "$1"' sh "$stage"; then
+      cleanup_container_refresh_stage "$name" "$stage"
+      die "Failed to create refresh tree staging directory: $target"
+    fi
+    if ! tar_create_tree_stream "$source" | "$CONTAINER_CMD" exec -i -u 0 "$name" sh -c 'tar -xf - -C "$1"' sh "$stage"; then
+      cleanup_container_refresh_stage "$name" "$stage"
+      die "Failed to stream refresh tree into $name: $source"
+    fi
+  fi
+  if ! "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+    [ -d "$2" ] && [ ! -L "$2" ] &&
+      chown -h -R "$1" "$2" &&
+      find "$2" -type d -exec chmod "$3" {} + &&
+      find "$2" -type f -exec chmod "$4" {} +
+  ' sh "$owner" "$stage" "$dir_mode" "$file_mode"; then
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to normalize refreshed tree: $target"
+  fi
+  activate_container_refresh_stage "$name" "$stage" "$target" || {
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to activate refreshed tree: $target"
+  }
 }
 
 bootstrap_container_alpine() {
@@ -3553,24 +4720,51 @@ bootstrap_cmd() {
   local workdir=""
   local cpu=""
   local mem=""
+  local shm_size=""
+  local -a networks=()
   local was_running=0
   local started_for_bootstrap=0
   local created_for_bootstrap=0
   local package_manager=""
+  local ssh_requested=0
+  local socket_mappings=""
+  local published_sockets=""
+  local mapping=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --name) name="$2"; shift 2 ;;
+      --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
       --image) image="$2"; shift 2 ;;
       --workdir) workdir="$2"; shift 2 ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
+      --shm-size) shm_size="$2"; shift 2 ;;
+      --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
+      --ssh) ssh_requested=1; shift ;;
+      --mount-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --mount-socket"
+        mapping="$(parse_socket_mapping "$2")"
+        socket_mappings="${socket_mappings}${socket_mappings:+$'\n'}${mapping}"
+        shift 2
+        ;;
+      --publish-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --publish-socket"
+        mapping="$(parse_published_socket_mapping "$2")"
+        published_sockets="${published_sockets}${published_sockets:+$'\n'}${mapping}"
+        shift 2
+        ;;
       --help) usage_bootstrap; return 0 ;;
       *) die "Unknown option for bootstrap: $1" ;;
     esac
   done
 
   require_container
+  validate_requested_socket_mappings "$socket_mappings"
+  validate_requested_published_sockets "$published_sockets"
+  validate_published_container_collisions "$published_sockets" "$socket_mappings"
+  if [ "${#networks[@]}" -gt 0 ]; then
+    validate_network_selection "${networks[@]}"
+  fi
   if [ -z "$name" ]; then
     if [ -z "$workdir" ]; then
       name="$(default_name "$DEFAULT_NAME_PREFIX")"
@@ -3587,31 +4781,60 @@ bootstrap_cmd() {
   fi
 
   if container_exists "$name"; then
-    if [ -n "$image" ] || [ -n "$cpu" ] || [ -n "$mem" ]; then
-      die "--image, --cpu, and --mem only apply when bootstrap creates a new container"
+    if [ -n "$image" ] || [ -n "$cpu" ] || [ -n "$mem" ] || [ -n "$shm_size" ] || [ "${#networks[@]}" -gt 0 ]; then
+      die "--image, --cpu, --mem, --shm-size, and --network only apply when bootstrap creates a new container"
     fi
+    validate_existing_container_ssh "$name" "$ssh_requested"
+    validate_existing_socket_mappings "$name" "$socket_mappings"
+    validate_existing_published_sockets "$name" "$published_sockets"
   else
     [ -n "$image" ] || die "Container not found: $name (pass --image to create and bootstrap a new container)"
+    validate_published_host_paths_for_start "$published_sockets"
     echo "Creating bootstrap container..." >&2
     local create_cmd=("$CONTAINER_CMD" create -t)
+    if [ "$ssh_requested" -eq 1 ]; then
+      require_container_ssh_support
+      require_host_ssh_socket
+      create_cmd+=(--ssh)
+    fi
     if [ -n "$cpu" ]; then
       create_cmd+=(-c "$cpu")
     fi
     if [ -n "$mem" ]; then
       create_cmd+=(-m "$mem")
     fi
+    if [ -n "$shm_size" ]; then
+      require_container_shm_size_support
+      create_cmd+=(--shm-size "$shm_size")
+    fi
+    local network_name=""
+    if [ "${#networks[@]}" -gt 0 ]; then
+      for network_name in "${networks[@]}"; do
+        create_cmd+=(--network "$network_name")
+      done
+    fi
     create_cmd+=(
       --name "$name"
       --mount "type=bind,src=$workdir,dst=/workdir"
-      "$image" sh -c 'sleep infinity'
     )
+    while IFS= read -r mapping; do
+      [ -n "$mapping" ] || continue
+      create_cmd+=(--volume "$mapping")
+    done < <(socket_volume_arguments "$socket_mappings")
+    while IFS= read -r mapping; do
+      [ -n "$mapping" ] || continue
+      create_cmd+=(--publish-socket "$mapping")
+    done < <(published_socket_arguments "$published_sockets")
+    create_cmd+=("$image" sh -c 'sleep infinity')
     "${create_cmd[@]}"
     created_for_bootstrap=1
   fi
 
   if container_running "$name"; then
     was_running=1
+    validate_running_published_listeners "$published_sockets"
   else
+    validate_published_host_paths_for_start "$published_sockets"
     "$CONTAINER_CMD" start "$name" >/dev/null
     started_for_bootstrap=1
   fi
@@ -3626,14 +4849,19 @@ bootstrap_cmd() {
       ;;
     *)
       if [ "$started_for_bootstrap" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-        "$CONTAINER_CMD" stop "$name" >/dev/null
+        stop_existing_container_safely "$name" >/dev/null
       fi
       die "Unsupported bootstrap container base for current bootstrap slice: $name (need Alpine/apk or Debian/Ubuntu apt-get)"
       ;;
   esac
 
+  if [ "$ssh_requested" -eq 1 ]; then
+    ensure_requested_feature_installed "$name" ssh
+  fi
+
   if [ "$started_for_bootstrap" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     "$CONTAINER_CMD" stop "$name" >/dev/null
+    report_leftover_published_sockets "$published_sockets" || true
   fi
   if [ "$created_for_bootstrap" -eq 1 ]; then
     echo "Bootstrap container ready: $name" >&2
@@ -3666,7 +4894,7 @@ refresh_cmd() {
     was_running=1
   else
     echo "Starting container for refresh: $name" >&2
-    "$CONTAINER_CMD" start "$name" >/dev/null
+    start_existing_container_safely "$name" >/dev/null
     started_for_refresh=1
   fi
 
@@ -3688,7 +4916,7 @@ refresh_cmd() {
 
   if [ "$started_for_refresh" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     echo "Stopping container: $name" >&2
-    "$CONTAINER_CMD" stop "$name" >/dev/null
+    stop_existing_container_safely "$name" >/dev/null
   fi
   echo "Refresh complete: $name" >&2
 }
@@ -3718,12 +4946,101 @@ container_command_available() {
     | grep -Eq "^[[:space:]]+${command_name}([,[:space:]]|$)"
 }
 
+container_system_df_supported() {
+  "$CONTAINER_CMD" system df --help 2>/dev/null | grep -Fq -- '--format'
+}
+
+container_storage_usage_json() {
+  local output=""
+
+  output="$("$CONTAINER_CMD" system df --format json 2>&1)" || {
+    printf '%s\n' "$output" >&2
+    return 1
+  }
+  printf '%s' "$output" | jq -ce '
+    def valid_usage:
+      type == "object"
+      and ([.total, .active, .sizeInBytes, .reclaimable]
+        | all(type == "number" and . >= 0 and floor == .));
+    if type == "object"
+      and (.images | valid_usage)
+      and (.containers | valid_usage)
+      and (.volumes | valid_usage)
+    then {
+      images: .images,
+      containers: .containers,
+      volumes: .volumes
+    }
+    else error("invalid container system df JSON")
+    end
+  '
+}
+
+format_storage_bytes() {
+  local bytes="$1"
+
+  awk -v bytes="$bytes" 'BEGIN {
+    split("B KiB MiB GiB TiB PiB", units, " ")
+    value = bytes + 0
+    unit = 1
+    while (value >= 1024 && unit < 6) {
+      value /= 1024
+      unit++
+    }
+    if (unit == 1) printf "%.0f %s", value, units[unit]
+    else if (value >= 10) printf "%.1f %s", value, units[unit]
+    else printf "%.2f %s", value, units[unit]
+  }'
+}
+
+print_container_storage_usage() {
+  local storage_json="$1"
+  local label=""
+  local total=""
+  local active=""
+  local size=""
+  local reclaimable=""
+
+  printf '  %-14s %7s %7s %12s %12s\n' Type Total Active Size Reclaimable
+  while IFS=$'\t' read -r label total active size reclaimable; do
+    [ -n "$label" ] || continue
+    printf '  %-14s %7s %7s %12s %12s\n' \
+      "$label" "$total" "$active" \
+      "$(format_storage_bytes "$size")" \
+      "$(format_storage_bytes "$reclaimable")"
+  done < <(printf '%s' "$storage_json" | jq -r '
+    [["Images", .images], ["Containers", .containers], ["Volumes", .volumes]][]
+    | [.[0], .[1].total, .[1].active, .[1].sizeInBytes, .[1].reclaimable]
+    | @tsv
+  ')
+}
+
+report_backup_storage_diagnostics() {
+  local storage_json=""
+
+  if ! container_system_df_supported; then
+    warn "Apple container storage diagnostics are unavailable; inspect the runtime and host free space before retrying"
+    return 0
+  fi
+  if ! storage_json="$(container_storage_usage_json 2>/dev/null)"; then
+    warn "Unable to read Apple container storage diagnostics; run: ${CLI_NAME} doctor --host"
+    return 0
+  fi
+
+  echo "Apple container runtime storage at backup failure:" >&2
+  print_container_storage_usage "$storage_json" >&2
+  echo "  Reclaimable is a runtime classification, not confirmation that data is safe to delete." >&2
+  echo "  Inspect with: ${CLI_NAME} doctor --host" >&2
+  echo "  Preview agent image cleanup with: ${CLI_NAME} images prune --dry-run" >&2
+}
+
 host_doctor() {
   local cli_path=""
   local cli_version=""
   local system_version=""
   local jq_path=""
   local detected_jq_version=""
+  local storage_json=""
   local status=0
 
   printf 'Host JSON processor\n'
@@ -3768,9 +5085,325 @@ host_doctor() {
   host_capability 'SSH agent forwarding' container_help_contains --ssh run
   host_capability 'Unix socket publish' container_help_contains --publish-socket run
   host_capability 'shared memory size' container_help_contains --shm-size run
+  host_capability 'custom networks' container_command_available network
+  host_capability 'host-only networks' container_help_contains --internal network create
   host_capability 'container machine' container_command_available machine
+  host_capability 'storage accounting' container_system_df_supported
+
+  printf 'Container storage\n'
+  if ! container_system_df_supported; then
+    printf '  unavailable: container system df is not supported by this runtime\n'
+  elif storage_json="$(container_storage_usage_json 2>&1)"; then
+    print_container_storage_usage "$storage_json"
+    printf '  Note: values cover the global Apple container runtime. Reclaimable does not mean safe to delete; stopped containers and volumes may contain valuable state.\n'
+  else
+    printf '  unavailable: %s\n' "${storage_json:-invalid container system df response}"
+    status=1
+  fi
+
+  host_doctor_mcp_status || status=1
 
   return "$status"
+}
+
+container_network_list_json() {
+  "$CONTAINER_CMD" network list --format json 2>/dev/null \
+    || "$CONTAINER_CMD" network ls --format json 2>/dev/null
+}
+
+network_normalized_json() {
+  jq -Rrs --arg managed_label "$AGENTCTL_NETWORK_LABEL" '
+    (try fromjson catch null) as $parsed
+    | if ($parsed | type) != "array" then error("invalid network list JSON") else $parsed end
+    | map(
+        . as $item
+        | ($item.configuration // $item) as $config
+        | ($item.status // {}) as $status
+        | {
+            name: ($item.id // $item.name // $config.name // $config.id // ""),
+            mode: ($config.mode // $item.mode // "unknown"),
+            ipv4Subnet: ($status.ipv4Subnet // $config.ipv4Subnet // $config.subnet // ""),
+            ipv6Subnet: ($status.ipv6Subnet // $config.ipv6Subnet // ""),
+            labels: ($config.labels // $item.labels // {}),
+            managed: (($config.labels // $item.labels // {})[$managed_label] == "true")
+          }
+      )
+    | if any(.name == "") then error("network entry has no name") else sort_by(.name) end
+  '
+}
+
+network_list_normalized_json() {
+  container_network_list_json | network_normalized_json
+}
+
+network_inspect_normalized_json() {
+  local name="$1"
+
+  "$CONTAINER_CMD" network inspect "$name" 2>/dev/null | jq -Rrs --arg name "$name" --arg managed_label "$AGENTCTL_NETWORK_LABEL" '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then error("invalid network inspect JSON")
+      elif ($parsed | type) == "array" then ($parsed[0] // {})
+      elif ($parsed | type) == "object" then $parsed
+      else error("invalid network inspect JSON") end
+    | . as $item
+    | ($item.configuration // $item) as $config
+    | ($item.status // {}) as $status
+    | {
+        name: ($item.id // $item.name // $config.name // $config.id // $name),
+        mode: ($config.mode // $item.mode // "unknown"),
+        ipv4Subnet: ($status.ipv4Subnet // $config.ipv4Subnet // $config.subnet // ""),
+        ipv4Gateway: ($status.ipv4Gateway // $status.gateway // ""),
+        ipv6Subnet: ($status.ipv6Subnet // $config.ipv6Subnet // ""),
+        labels: ($config.labels // $item.labels // {}),
+        managed: (($config.labels // $item.labels // {})[$managed_label] == "true")
+      }
+  '
+}
+
+network_mode() {
+  network_inspect_normalized_json "$1" | jq -er '.mode | strings | select(length > 0)'
+}
+
+network_is_managed() {
+  network_inspect_normalized_json "$1" | jq -e '.managed == true' >/dev/null
+}
+
+network_exists() {
+  "$CONTAINER_CMD" network inspect "$1" >/dev/null 2>&1
+}
+
+require_custom_network_support() {
+  container_command_available network \
+    || die "Custom networks require an Apple container runtime with 'container network' support"
+  container_help_contains --network create \
+    || die "Custom networks require an Apple container runtime with 'container create --network <name>' support"
+}
+
+require_host_only_network_support() {
+  if ! "$CONTAINER_CMD" network create --help 2>/dev/null | grep -Fq -- '--internal'; then
+    die "Host-only networks require an Apple container runtime with 'container network create --internal' support"
+  fi
+}
+
+validate_network_name_argument() {
+  local name="$1"
+
+  [ -n "$name" ] || die "Network name cannot be empty"
+  case "$name" in
+    *,*) die "Network attachment options are not supported by agentctl: $name (pass a network name only)" ;;
+  esac
+}
+
+validate_network_selection() {
+  local name=""
+  local mode=""
+  local seen=""
+  local count=0
+  local host_only_count=0
+
+  [ "$#" -gt 0 ] || return 0
+  require_custom_network_support
+  for name in "$@"; do
+    validate_network_name_argument "$name"
+    if printf '%s\n' "$seen" | grep -Fqx -- "$name"; then
+      die "Duplicate network attachment: $name"
+    fi
+    seen="${seen}${name}"$'\n'
+    network_exists "$name" || die "Container network not found: $name"
+    mode="$(network_mode "$name")" || die "Unable to determine mode for container network: $name"
+    case "$mode" in
+      hostOnly|hostonly|host-only|internal) host_only_count=$((host_only_count + 1)) ;;
+      nat) ;;
+      *) die "Unsupported container network mode for $name: $mode" ;;
+    esac
+    count=$((count + 1))
+  done
+  if [ "$host_only_count" -gt 0 ] && [ "$count" -gt 1 ]; then
+    die "A host-only network cannot be combined with another network because that could restore external access"
+  fi
+}
+
+network_selection_is_host_only() {
+  local name=""
+  for name in "$@"; do
+    case "$(network_mode "$name" 2>/dev/null || true)" in
+      hostOnly|hostonly|host-only|internal) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+container_network_specs() {
+  local name="$1"
+
+  "$CONTAINER_CMD" inspect "$name" 2>/dev/null | jq -Rrs '
+    (try fromjson catch null) as $parsed
+    | if $parsed == null then error("invalid container inspect JSON")
+      elif ($parsed | type) == "array" then ($parsed[0] // {})
+      elif ($parsed | type) == "object" then $parsed
+      else error("invalid container inspect JSON") end
+    | . as $data
+    | ($data.configuration // $data) as $config
+    | (($config.networks // []) | if length > 0 then . else ($data.status.networks // $data.networks // []) end)[]
+    | if type == "string" then .
+      else (.network // .name // .id // "") as $name
+      | if $name == "" then error("network attachment has no name") else
+          ($name
+           + (if (.options.macAddress // null) != null then ",mac=" + (.options.macAddress | tostring) else "" end)
+           + (if (.options.mtu // .mtu // null) != null then ",mtu=" + ((.options.mtu // .mtu) | tostring) else "" end))
+        end
+      end
+  '
+}
+
+network_spec_name() {
+  printf '%s\n' "${1%%,*}"
+}
+
+container_network_names() {
+  local name="$1"
+  local spec=""
+  local specs=""
+
+  specs="$(container_network_specs "$name")" || return 1
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    network_spec_name "$spec"
+  done <<<"$specs"
+}
+
+network_specs_without_mac() {
+  awk -F, '
+    NF > 0 {
+      output = $1
+      for (i = 2; i <= NF; i++) {
+        if ($i !~ /^mac=/) output = output "," $i
+      }
+      print output
+    }
+  '
+}
+
+network_args_to_text() {
+  local name=""
+  for name in "$@"; do printf '%s\n' "$name"; done
+}
+
+network_text_names() {
+  local text="$1"
+  printf '%s\n' "$text" | sed '/^$/d'
+}
+
+validate_existing_container_networks() {
+  local container_name="$1"
+  local requested_text="$2"
+  local actual_text=""
+
+  [ -n "$requested_text" ] || return 0
+  actual_text="$(container_network_names "$container_name")" \
+    || die "Unable to determine network attachments for existing container: $container_name"
+  if [ "$actual_text" != "${requested_text%$'\n'}" ]; then
+    die "Container already exists with different network attachments: $container_name (remove or upgrade it to change networks)"
+  fi
+}
+
+network_create_cmd() {
+  local internal=0
+  local subnet=""
+  local subnet_v6=""
+  local name=""
+  local label=""
+  local key=""
+  local -a labels=()
+  local -a create_cmd=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --internal) internal=1; shift ;;
+      --subnet) [ "$#" -ge 2 ] || die "Missing value for --subnet"; subnet="$2"; shift 2 ;;
+      --subnet-v6) [ "$#" -ge 2 ] || die "Missing value for --subnet-v6"; subnet_v6="$2"; shift 2 ;;
+      --label) [ "$#" -ge 2 ] || die "Missing value for --label"; labels+=("$2"); shift 2 ;;
+      --help) usage_network; return 0 ;;
+      --*) die "Unknown option for network create: $1" ;;
+      *) [ -z "$name" ] || die "Unexpected network create argument: $1"; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "Network name is required"
+  validate_network_name_argument "$name"
+  require_custom_network_support
+  [ "$internal" -eq 0 ] || require_host_only_network_support
+  network_exists "$name" && die "Container network already exists: $name"
+  if [ "${#labels[@]}" -gt 0 ]; then
+    for label in "${labels[@]}"; do
+      case "$label" in
+        *=*) key="${label%%=*}" ;;
+        *) die "Invalid network label (expected KEY=VALUE): $label" ;;
+      esac
+      [ "$key" != "$AGENTCTL_NETWORK_LABEL" ] || die "The network ownership label is managed by agentctl: $AGENTCTL_NETWORK_LABEL"
+    done
+  fi
+  create_cmd=("$CONTAINER_CMD" network create --label "$AGENTCTL_NETWORK_LABEL=true")
+  [ "$internal" -eq 0 ] || create_cmd+=(--internal)
+  [ -z "$subnet" ] || create_cmd+=(--subnet "$subnet")
+  [ -z "$subnet_v6" ] || create_cmd+=(--subnet-v6 "$subnet_v6")
+  if [ "${#labels[@]}" -gt 0 ]; then
+    for label in "${labels[@]}"; do create_cmd+=(--label "$label"); done
+  fi
+  create_cmd+=("$name")
+  "${create_cmd[@]}"
+}
+
+network_list_cmd() {
+  local raw=0
+  local json=""
+  local rows=""
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --raw) raw=1; shift ;;
+      --help) usage_network; return 0 ;;
+      *) die "Unknown option for network list: $1" ;;
+    esac
+  done
+  require_custom_network_support
+  json="$(network_list_normalized_json)" || die "Unable to parse container network list"
+  if [ "$raw" -eq 1 ]; then
+    printf '%s\n' "$json" | jq -r '.[].name'
+    return 0
+  fi
+  rows="$(printf '%s\t%s\t%s\t%s\t%s\n' NAME MODE IPV4 IPV6 MANAGED)"
+  rows="${rows}"$'\n'"$(printf '%s\n' "$json" | jq -r '.[] | [.name, .mode, (.ipv4Subnet // ""), (.ipv6Subnet // ""), (if .managed then "yes" else "no" end)] | @tsv')"
+  printf '%s\n' "$rows" | format_tsv_table
+}
+
+network_inspect_cmd() {
+  [ "$#" -eq 1 ] || die "Usage: $CLI_NAME network inspect NAME"
+  require_custom_network_support
+  "$CONTAINER_CMD" network inspect "$1"
+}
+
+network_remove_cmd() {
+  local name=""
+  [ "$#" -gt 0 ] || die "At least one network name is required"
+  require_custom_network_support
+  for name in "$@"; do
+    network_exists "$name" || die "Container network not found: $name"
+    network_is_managed "$name" || die "Refusing to delete network not managed by agentctl: $name"
+  done
+  "$CONTAINER_CMD" network delete "$@"
+}
+
+network_cmd() {
+  local subcommand="${1:-list}"
+  [ "$#" -eq 0 ] || shift
+  case "$subcommand" in
+    list|ls) network_list_cmd "$@" ;;
+    create) network_create_cmd "$@" ;;
+    inspect) network_inspect_cmd "$@" ;;
+    rm|delete) network_remove_cmd "$@" ;;
+    --help|-h|help) usage_network ;;
+    *) die "Unknown network command: $subcommand" ;;
+  esac
 }
 
 container_network_host_address() {
@@ -3837,9 +5470,17 @@ host_address_cmd() {
 
 configure_container_host_alias() {
   local name="$1"
+  local network="${2:-}"
+  local networks=""
   local host_address=""
 
-  host_address="$(container_network_host_address default)"
+  if [ -z "$network" ]; then
+    networks="$(container_network_names "$name")" \
+      || die "Unable to determine network attachment for host alias configuration: $name"
+    [ -n "$networks" ] || die "Container has no network attachment for host alias configuration: $name"
+    network="${networks%%$'\n'*}"
+  fi
+  host_address="$(container_network_host_address "$network")"
   "$CONTAINER_CMD" exec --user root "$name" sh -c '
     address="$1"
     hostname="$2"
@@ -3863,6 +5504,330 @@ configure_container_host_alias() {
     || die "Unable to configure $CONTAINER_HOST_NAME in container: $name"
 }
 
+doctor_ssh_status() {
+  local name="$1"
+  local relay=""
+  local feature_info=""
+  local client_installed=false
+  local status=0
+
+  relay="$(container_ssh_enabled "$name")" || {
+    printf '%s\n' "unable to inspect SSH forwarding configuration"
+    return 0
+  }
+  feature_info="$(run_agent_sh_in_container "$name" feature info ssh 2>/dev/null || true)"
+  if [ -n "$feature_info" ] && printf '%s' "$feature_info" | jq -e '.installed == true' >/dev/null 2>&1; then
+    client_installed=true
+  fi
+
+  if [ "$relay" = "true" ]; then
+    if guest_ssh_socket_available "$name"; then
+      printf '%s\n' "SSH agent relay is enabled and available"
+    else
+      printf '%s\n' "SSH agent relay is enabled but its guest socket is unavailable; restart from a shell with SSH_AUTH_SOCK set"
+      status=1
+    fi
+    if [ "$client_installed" = "true" ]; then
+      printf '%s\n' "SSH client feature is installed"
+    else
+      printf '%s\n' "SSH client feature is missing; run: ${CLI_NAME} feature install ssh --name $name"
+      status=1
+    fi
+  elif [ "$client_installed" = "true" ]; then
+    printf '%s\n' "SSH client feature is installed; agent forwarding is disabled (enable with: ${CLI_NAME} upgrade --name $name --ssh)"
+  else
+    printf '%s\n' "SSH agent forwarding and client feature are not configured"
+  fi
+  return "$status"
+}
+
+doctor_socket_mount_status() {
+  local name="$1"
+  local mounts=""
+  local source=""
+  local destination=""
+  local status=0
+  local configured=0
+
+  mounts="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_extra_mounts)" || {
+    printf '%s\n' "unable to inspect socket mappings"
+    return 0
+  }
+  while IFS=$'\t' read -r source destination; do
+    [ -n "$source" ] && [ -n "$destination" ] || continue
+    case "$destination" in /workdir|/home/coder|/var/host-services/ssh-auth.sock|"$MCP_GUEST_SOCKET") continue ;; esac
+    configured=1
+    printf '%s\n' "configured: $source -> $destination"
+    if [ -L "$source" ] || [ ! -S "$source" ]; then
+      printf '%s\n' "host source unavailable or not a Unix socket: $source"
+      status=1
+    elif container_running "$name" && ! "$CONTAINER_CMD" exec "$name" sh -c '[ -S "$1" ]' sh "$destination" >/dev/null 2>&1; then
+      printf '%s\n' "guest socket unavailable: $destination"
+      status=1
+    fi
+  done <<<"$mounts"
+  [ "$configured" -eq 1 ] || printf '%s\n' "no user-managed host Unix-socket mappings configured"
+  return "$status"
+}
+
+doctor_published_socket_status() {
+  local name="$1" published="" parent_error="" host_path="" destination="" status=0
+  published="$(container_published_sockets "$name" 2>/dev/null)" || {
+    printf '%s\n' "unable to inspect published socket mappings"
+    return 1
+  }
+  while IFS=$'\t' read -r host_path destination; do
+    [ -n "$host_path" ] && [ -n "$destination" ] || continue
+    printf '%s\n' "published: $host_path -> $destination"
+    if ! parent_error="$( ( validate_published_socket_parent "$host_path" ) 2>&1)"; then
+      printf '%s\n' "unsafe published socket parent: ${parent_error#Error: }"
+      status=1
+    fi
+    if container_running "$name"; then
+      if [ -L "$host_path" ] || [ ! -S "$host_path" ]; then
+        printf '%s\n' "published listener missing or not a Unix socket: $host_path"
+        status=1
+      fi
+    elif host_path_exists "$host_path"; then
+      printf '%s\n' "stopped container left a published host entry behind; not removing it: $host_path"
+      status=1
+    else
+      printf '%s\n' "published listener absent while container is stopped: $host_path"
+    fi
+  done <<<"$published"
+  [ -n "$published" ] || printf '%s\n' "no container-to-host published sockets configured"
+  return "$status"
+}
+
+doctor_mcp_status() {
+  local name="$1" registry metadata socket nonce response status=0 missing="" variable="" port="" definitions="" proxy_response=""
+  registry="$(mcp_registry_path "$name")"
+  if [ ! -f "$registry" ]; then
+    if container_has_mcp_wiring "$name"; then
+      printf '%s\n' 'managed MCP wiring exists but its host registry is missing; reconfigure definitions with run --mcp'
+      return 1
+    elif [ -e "$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").process.json" ] || [ -S "$(mcp_socket_path "$name")" ]; then
+      printf '%s\n' 'managed MCP relay state exists without a registry; stop it with agentctl or inspect with doctor --host'
+      return 1
+    fi
+    printf '%s\n' 'managed MCP bridge is disabled'; return 0
+  fi
+  if [ -L "$registry" ] || [ "$(host_path_uid "$registry")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$registry") & 077))" -ne 0 ]; then
+    printf '%s\n' "unsafe MCP registry ownership or permissions: $registry"; return 1
+  fi
+  if ! jq -e --arg name "$name" '
+    .schema_version==1 and .container==$name and (.port|type)=="number" and (.port>=1024 and .port<=65535) and
+    (.servers|type)=="array" and
+    all(.servers[]; (.name|type)=="string" and (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")) and
+      ((.env_vars // [])|type)=="array" and all((.env_vars // [])[]; type=="string"))
+  ' "$registry" >/dev/null 2>&1; then
+    printf '%s\n' "invalid MCP registry schema or container identity: $registry"; return 1
+  fi
+  if ! container_has_mcp_wiring "$name"; then
+    printf '%s\n' 'MCP registry exists but the container has no managed MCP socket wiring; recreate with upgrade --enable-mcp'
+    status=1
+  fi
+  port="$(jq -r '.port' "$registry")"; definitions="$(jq -r '[.servers[].name]|sort|join(", ")' "$registry")"
+  printf '%s\n' "enabled on 127.0.0.1:$port; definitions: ${definitions:-none}"
+  while IFS= read -r variable; do [ -z "$variable" ] || [ "${!variable+x}" = x ] || missing="${missing}${missing:+, }${variable}"; done < <(jq -r '.servers[].env_vars[]' "$registry")
+  [ -z "$missing" ] || { printf '%s\n' "missing inherited host variables: $missing"; status=1; }
+  metadata="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").process.json"
+  if container_running "$name"; then
+    if [ ! -f "$metadata" ]; then printf '%s\n' 'host relay metadata is missing'; status=1
+    else
+      if [ -L "$metadata" ] || [ "$(host_path_uid "$metadata")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$metadata") & 077))" -ne 0 ]; then
+        printf '%s\n' "unsafe relay metadata ownership or permissions: $metadata"
+        return 1
+      fi
+      socket="$(jq -r '.socket' "$metadata")"; nonce="$(jq -r '.nonce' "$metadata")"
+      if ! mcp_paths_equal "$socket" "$(mcp_socket_path "$name")"; then
+        printf '%s\n' 'relay metadata contains an unexpected socket path'; return 1
+      fi
+      if ! jq -e --arg name "$name" '
+        (.schema_version==1 or .schema_version==2) and (.pid|type)=="number" and (.nonce|type)=="string" and (.nonce|length)>0 and
+        (.socket|type)=="string" and (.schema_version==1 or .container==$name)
+      ' "$metadata" >/dev/null 2>&1; then
+        printf '%s\n' 'invalid relay metadata schema or container identity'; return 1
+      fi
+      if [ -L "$socket" ] || [ ! -S "$socket" ] || [ "$(host_path_uid "$socket")" != "$(id -u)" ]; then
+        printf '%s\n' 'managed relay socket is missing, unsafe, or foreign-owned'; return 1
+      fi
+      local relay_pid
+      relay_pid="$(jq -r '.pid' "$metadata")"
+      response="$(curl --silent --max-time 2 --unix-socket "$socket" http://localhost/.well-known/agentctl-mcp-health 2>/dev/null || true)"
+      if printf '%s' "$response" | jq -e --arg n "$nonce" --arg name "$name" --arg socket "$socket" --argjson pid "$relay_pid" \
+        --arg defs "$definitions" '.ok and .bridge_version==1 and .nonce==$n and .pid==$pid and .container==$name and .socket_path==$socket and ((.definitions|sort|join(", "))==$defs)' >/dev/null 2>&1; then
+        printf '%s\n' "host relay healthy; PID $(printf '%s' "$response" | jq -r .pid); process agentctl-mcp-relay:$name"
+      else
+        printf '%s\n' 'host relay identity, version, or health check failed'; status=1
+      fi
+      proxy_response="$("$CONTAINER_CMD" exec "$name" sh -c 'curl -fsS --max-time 2 "http://127.0.0.1:$1/.well-known/agentctl-mcp-proxy-health"' sh "$port" 2>/dev/null || true)"
+      printf '%s' "$proxy_response" | jq -e --argjson port "$port" --arg guest_socket "$MCP_GUEST_SOCKET" '.ok and .bridge_version==1 and .port==$port and .socket_path==$guest_socket' >/dev/null 2>&1 \
+        && printf '%s\n' 'guest loopback proxy healthy' \
+        || { printf '%s\n' 'guest loopback proxy health check failed'; status=1; }
+      proxy_response="$("$CONTAINER_CMD" exec "$name" sh -c 'curl -fsS --max-time 2 "http://127.0.0.1:$1/.well-known/agentctl-mcp-health"' sh "$port" 2>/dev/null || true)"
+      printf '%s' "$proxy_response" | jq -e --arg n "$nonce" --arg name "$name" '.ok and .nonce==$n and .container==$name' >/dev/null 2>&1 \
+        && printf '%s\n' 'guest-to-host MCP route healthy' \
+        || { printf '%s\n' 'guest-to-host MCP route health check failed'; status=1; }
+    fi
+  elif [ -f "$metadata" ] || [ -S "$(mcp_socket_path "$name")" ]; then
+    printf '%s\n' 'WARNING: managed host relay is still running although the container is stopped'
+    printf '%s\n' "Suggested action: ${CLI_NAME} stop --name $name"
+    status=1
+  else
+    printf '%s\n' 'host relay inactive because the container is stopped'
+  fi
+  return "$status"
+}
+
+doctor_mcp_lease_status() {
+  local name="$1" file="" lease_pid="" lease_token="" current_token="" active=0 stale=0 status=0 pattern
+  pattern="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lease."
+  for file in "${pattern}"*.json; do
+    [ -e "$file" ] || continue
+    if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
+      printf '%s\n' "unsafe lease path: $file"; status=1; continue
+    fi
+    lease_pid="$(jq -r '.owner_pid // empty' "$file" 2>/dev/null || true)"
+    lease_token="$(jq -r '.owner_token // empty' "$file" 2>/dev/null || true)"
+    case "$lease_pid" in ''|*[!0-9]*) stale=$((stale+1)); continue ;; esac
+    current_token="$(mcp_process_token "$lease_pid")"
+    if kill -0 "$lease_pid" 2>/dev/null && { [ -z "$lease_token" ] || [ -z "$current_token" ] || [ "$lease_token" = "$current_token" ]; }; then
+      active=$((active+1))
+    else
+      stale=$((stale+1))
+    fi
+  done
+  printf '%s\n' "active leases: $active"
+  if [ "$stale" -gt 0 ]; then printf '%s\n' "stale leases: $stale"; status=1; fi
+  return "$status"
+}
+
+doctor_mcp_lock_status() {
+  local name="$1" file="" owner="" owner_pid="" owner_token="" current_token="" active=0 stale=0 status=0 base
+  base="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lock"
+  for file in "$base" "$base".*; do
+    [ -e "$file" ] || continue
+    if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
+      printf '%s\n' "unsafe lock path: $file"; status=1; continue
+    fi
+    owner="$(sed -n '1p' "$file" 2>/dev/null || true)"; owner_pid="${owner%%:*}"; owner_token="${owner#*:}"; owner_token="${owner_token%:*}"
+    case "$owner_pid" in ''|*[!0-9]*) stale=$((stale+1)); continue ;; esac
+    current_token="$(mcp_process_token "$owner_pid")"
+    if kill -0 "$owner_pid" 2>/dev/null && { [ -z "$current_token" ] || [ "$current_token" = "$owner_token" ]; }; then active=$((active+1)); else stale=$((stale+1)); fi
+  done
+  [ "$active" -eq 0 ] || printf '%s\n' "active lifecycle locks: $active"
+  if [ "$stale" -gt 0 ]; then printf '%s\n' "stale lifecycle locks: $stale"; status=1; fi
+  return "$status"
+}
+
+mcp_labeled_process_names() {
+  ps -axo command= 2>/dev/null | sed -n 's/^agentctl-mcp-relay:\([^[:space:]]*\).*/\1/p'
+}
+
+host_doctor_mcp_status() {
+  local registry_dir runtime_dir log_dir names="" process_names="" name="" file="" metadata_container="" output="" lease_output="" lock_output="" status=0 found=0 known_hashes="" artifact_hash=""
+  registry_dir="$(mcp_registry_dir)"; runtime_dir="$(mcp_runtime_dir)"; log_dir="$(mcp_log_dir)"
+  printf 'Managed MCP relays\n'
+  printf '  %-24s %s\n' ownership 'container-scoped relays normally have parent PID 1'
+
+  if [ -e "$registry_dir" ]; then
+    if [ ! -d "$registry_dir" ] || [ -L "$registry_dir" ] || [ "$(host_path_uid "$registry_dir")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$registry_dir") & 077))" -ne 0 ]; then
+      printf '  %-24s %s\n' registry 'unsafe registry directory ownership or permissions'
+      status=1
+    fi
+    for file in "$registry_dir"/*.json; do
+      [ -e "$file" ] || [ -L "$file" ] || continue
+      if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
+        printf '  %-24s %s\n' registry "unsafe registry file: $file"
+        status=1
+        continue
+      fi
+      name="$(jq -r '.container // empty' "$file" 2>/dev/null || true)"
+      if [ -z "$name" ]; then
+        printf '  %-24s %s\n' registry "invalid registry: $file"
+        status=1
+      else
+        names="${names}${names:+$'\n'}${name}"
+      fi
+    done
+  fi
+
+  if [ -e "$runtime_dir" ]; then
+    if [ ! -d "$runtime_dir" ] || [ -L "$runtime_dir" ] || [ "$(host_path_uid "$runtime_dir")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$runtime_dir") & 077))" -ne 0 ]; then
+      printf '  %-24s %s\n' runtime 'unsafe runtime directory ownership or permissions'
+      status=1
+    fi
+    for file in "$runtime_dir"/mcp-*.process.json; do
+      [ -e "$file" ] || [ -L "$file" ] || continue
+      if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
+        printf '  %-24s %s\n' runtime "unsafe process metadata: $file"
+        status=1
+        continue
+      fi
+      metadata_container="$(jq -r '.container // empty' "$file" 2>/dev/null || true)"
+      [ -z "$metadata_container" ] || names="${names}${names:+$'\n'}${metadata_container}"
+    done
+  fi
+  if [ "$log_dir" != "$runtime_dir" ] && [ -e "$log_dir" ]; then
+    if [ ! -d "$log_dir" ] || [ -L "$log_dir" ] || [ "$(host_path_uid "$log_dir")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$log_dir") & 077))" -ne 0 ]; then
+      printf '  %-24s %s\n' logs 'unsafe log directory ownership or permissions'
+      status=1
+    fi
+  fi
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    process_names="${process_names}${process_names:+$'\n'}${name}"
+    names="${names}${names:+$'\n'}${name}"
+  done < <(mcp_labeled_process_names)
+
+  names="$(printf '%s\n' "$names" | sed '/^$/d' | LC_ALL=C sort -u)"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    found=1
+    printf '  Container %s\n' "$name"
+    if container_exists "$name"; then
+      if container_running "$name"; then printf '    %-22s %s\n' state running; else printf '    %-22s %s\n' state stopped; fi
+      if output="$(doctor_mcp_status "$name")"; then :; else status=1; fi
+      printf '%s\n' "$output" | sed 's/^/    - /'
+    else
+      printf '    %-22s %s\n' state 'container missing'
+      printf '    - persisted or runtime MCP state has no matching container\n'
+      status=1
+    fi
+    if printf '%s\n' "$process_names" | grep -Fqx -- "$name" && [ ! -f "$(mcp_registry_path "$name")" ]; then
+      printf '    - labeled relay process exists without a private registry\n'
+      status=1
+    fi
+    if lease_output="$(doctor_mcp_lease_status "$name")"; then :; else status=1; fi
+    printf '%s\n' "$lease_output" | sed 's/^/    - /'
+    if lock_output="$(doctor_mcp_lock_status "$name")"; then :; else status=1; fi
+    [ -z "$lock_output" ] || printf '%s\n' "$lock_output" | sed 's/^/    - /'
+    printf '    %-22s %s\n' registry "$(mcp_registry_path "$name")"
+    printf '    %-22s %s\n' socket "$(mcp_socket_path "$name")"
+    known_hashes="${known_hashes}${known_hashes:+$'\n'}$(mcp_identity_hash "$name")"
+  done <<<"$names"
+  for file in "$runtime_dir"/mcp-*; do
+    [ -e "$file" ] || [ -L "$file" ] || continue
+    case "$file" in *.log) continue ;; esac
+    artifact_hash="$(basename -- "$file" | sed -n 's/^mcp-\([0-9a-fA-F]*\)\..*$/\1/p')"
+    [ -n "$artifact_hash" ] || continue
+    if ! printf '%s\n' "$known_hashes" | grep -Fqx -- "$artifact_hash"; then
+      printf '  %-24s %s\n' orphan "unassociated managed MCP artifact: $file"
+      status=1
+    fi
+  done
+  for file in "$log_dir"/mcp-*.log "$log_dir"/guest-*.log; do
+    [ -e "$file" ] || [ -L "$file" ] || continue
+    if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
+      printf '  %-24s %s\n' logs "permissions too broad or ownership unsafe (expected owner-only 0600): $file"
+      status=1
+    fi
+  done
+  [ "$found" -eq 1 ] || printf '  %-24s %s\n' state 'none configured'
+  return "$status"
+}
+
 doctor_cmd() {
   local name=""
   local fix=0
@@ -3872,8 +5837,14 @@ doctor_cmd() {
   local permission_output=""
   local runtime_output=""
   local state_summary_output=""
+  local ssh_output=""
+  local socket_output="" published_output="" mcp_output=""
   local doctor_status=0
   local status=0
+  local stopped_mount_problem=0
+  local stopped_published_problem=0
+  local mcp_problem=0
+  local mcp_started_for_doctor=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3900,16 +5871,79 @@ doctor_cmd() {
     die "Container not found: $name"
   fi
 
+  if socket_output="$(doctor_socket_mount_status "$name")"; then
+    echo "Doctor user-managed socket mappings in $name:" >&2
+  else
+    doctor_status=$?
+    echo "Doctor found a user-managed socket-mapping problem in $name:" >&2
+    status="$doctor_status"
+    container_running "$name" || stopped_mount_problem=1
+  fi
+  [ -z "$socket_output" ] || printf '%s\n' "$socket_output" | sed 's/^/  - /' >&2
+  if published_output="$(doctor_published_socket_status "$name")"; then
+    echo "Doctor published socket mappings in $name:" >&2
+  else
+    doctor_status=$?
+    echo "Doctor found a published-socket problem in $name:" >&2
+    status="$doctor_status"
+    container_running "$name" || stopped_published_problem=1
+  fi
+  [ -z "$published_output" ] || printf '%s\n' "$published_output" | sed 's/^/  - /' >&2
+  if mcp_output="$(doctor_mcp_status "$name")"; then
+    echo "Doctor managed MCP bridge in $name:" >&2
+  else
+    doctor_status=$?; status="$doctor_status"; mcp_problem=1; echo "Doctor found a managed MCP bridge problem in $name:" >&2
+  fi
+  printf '%s\n' "$mcp_output" | sed 's/^/  - /' >&2
+  if [ "$stopped_mount_problem" -eq 1 ]; then
+    echo "Doctor will not start $name while a required user-managed host socket source is unavailable." >&2
+    return "$status"
+  fi
+  if [ "$stopped_published_problem" -eq 1 ]; then
+    echo "Doctor will not start $name while a stopped-container published-socket destination is unsafe or occupied." >&2
+    return "$status"
+  fi
+  if [ "$mcp_problem" -eq 1 ] && ! container_running "$name"; then
+    echo "Doctor will not start $name while its managed MCP registry or wiring is invalid." >&2
+    return "$status"
+  fi
+
   if container_running "$name"; then
     was_running=1
   else
+    if [ -f "$(mcp_registry_path "$name")" ]; then
+      if ! mcp_start_from_registry "$name"; then
+        echo "Doctor could not start the managed MCP host relay for $name." >&2
+        return 1
+      fi
+      mcp_started_for_doctor=1
+    fi
     echo "Starting container for doctor: $name" >&2
-    "$CONTAINER_CMD" start "$name" >/dev/null
+    if ! start_existing_container_safely "$name" >/dev/null; then
+      [ "$mcp_started_for_doctor" -eq 0 ] || mcp_stop_managed "$name"
+      echo "Doctor could not start container $name." >&2
+      return 1
+    fi
     started_for_doctor=1
     if ! ensure_started_container_is_running "$name" "doctor"; then
+      [ "$mcp_started_for_doctor" -eq 0 ] || mcp_stop_managed "$name"
       echo "Doctor found a container startup problem in $name." >&2
       echo "The container must stay running for exec-based checks, repair, and live upgrade backup." >&2
       return 1
+    fi
+    if [ "$mcp_started_for_doctor" -eq 1 ]; then
+      if ! mcp_configure_guest "$name"; then
+        stop_existing_container_safely "$name" >/dev/null 2>&1 || true
+        mcp_stop_managed "$name"
+        echo "Doctor could not start the managed MCP guest proxy in $name." >&2
+        return 1
+      fi
+      if mcp_output="$(doctor_mcp_status "$name")"; then
+        echo "Doctor confirmed managed MCP health after temporarily starting $name:" >&2
+      else
+        doctor_status=$?; status="$doctor_status"; echo "Doctor found a managed MCP problem after temporarily starting $name:" >&2
+      fi
+      printf '%s\n' "$mcp_output" | sed 's/^/  - /' >&2
     fi
   fi
 
@@ -3965,9 +5999,19 @@ doctor_cmd() {
     printf '%s\n' "$state_summary_output" | sed 's/^/  - /' >&2
   fi
 
+  if ssh_output="$(doctor_ssh_status "$name")"; then
+    echo "Doctor SSH state in $name:" >&2
+  else
+    doctor_status=$?
+    echo "Doctor found an SSH configuration problem in $name:" >&2
+    status="$doctor_status"
+  fi
+  [ -z "$ssh_output" ] || printf '%s\n' "$ssh_output" | sed 's/^/  - /' >&2
+
   if [ "$started_for_doctor" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     echo "Stopping container: $name" >&2
-    "$CONTAINER_CMD" stop "$name" >/dev/null
+    stop_existing_container_safely "$name" >/dev/null
+    [ "$mcp_started_for_doctor" -eq 0 ] || mcp_stop_managed "$name"
   fi
   return "$status"
 }
@@ -3986,7 +6030,7 @@ run_agent_sh_in_container() {
   if container_running "$name"; then
     was_running=1
   else
-    "$CONTAINER_CMD" start "$name" >/dev/null
+    start_existing_container_safely "$name" >/dev/null
     started_for_command=1
   fi
 
@@ -3997,7 +6041,7 @@ run_agent_sh_in_container() {
   fi
 
   if [ "$started_for_command" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-    "$CONTAINER_CMD" stop "$name" >/dev/null
+    stop_existing_container_safely "$name" >/dev/null
   fi
 
   return "$status"
@@ -4034,7 +6078,7 @@ run_agent_sh_in_container_env() {
   if container_running "$name"; then
     was_running=1
   else
-    "$CONTAINER_CMD" start "$name" >/dev/null
+    start_existing_container_safely "$name" >/dev/null
     started_for_command=1
   fi
 
@@ -4045,7 +6089,7 @@ run_agent_sh_in_container_env() {
   fi
 
   if [ "$started_for_command" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-    "$CONTAINER_CMD" stop "$name" >/dev/null
+    stop_existing_container_safely "$name" >/dev/null
   fi
 
   return "$status"
@@ -4065,7 +6109,7 @@ run_agent_sh_in_container_root() {
   if container_running "$name"; then
     was_running=1
   else
-    "$CONTAINER_CMD" start "$name" >/dev/null
+    start_existing_container_safely "$name" >/dev/null
     started_for_command=1
   fi
 
@@ -4076,7 +6120,7 @@ run_agent_sh_in_container_root() {
   fi
 
   if [ "$started_for_command" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-    "$CONTAINER_CMD" stop "$name" >/dev/null
+    stop_existing_container_safely "$name" >/dev/null
   fi
 
   return "$status"
@@ -4137,6 +6181,105 @@ size_to_bytes() {
     return 0
   fi
   return 1
+}
+
+shared_memory_size_to_bytes() {
+  local value="$1"
+  local normalized=""
+  local number=""
+  local whole=""
+  local fraction=""
+  local fraction_digits=""
+  local fraction_scale=1
+  local fraction_bytes=0
+  local multiplier_quotient=0
+  local multiplier_remainder=0
+  local suffix=""
+  local multiplier=1
+  local max_value=9223372036854775807
+  local max_whole=""
+
+  [ -n "$value" ] || return 1
+  normalized="$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')"
+  if [[ "$normalized" =~ ^([0-9]+)(\.([0-9]+))?(B|K|KB|KIB|M|MB|MIB|G|GB|GIB|T|TB|TIB|P|PB|PIB)?$ ]]; then
+    number="${BASH_REMATCH[1]}"
+    fraction="${BASH_REMATCH[3]}"
+    suffix="${BASH_REMATCH[4]}"
+  else
+    return 1
+  fi
+
+  while [ "${number#0}" != "$number" ]; do
+    number="${number#0}"
+  done
+  [ -n "$number" ] || number=0
+  [ "${#number}" -le 19 ] || return 1
+
+  case "$suffix" in
+    ""|B) multiplier=1 ;;
+    K|KB|KIB) multiplier=1024 ;;
+    M|MB|MIB) multiplier=1048576 ;;
+    G|GB|GIB) multiplier=1073741824 ;;
+    T|TB|TIB) multiplier=1099511627776 ;;
+    P|PB|PIB) multiplier=1125899906842624 ;;
+    *) return 1 ;;
+  esac
+
+  max_whole="$((max_value / multiplier))"
+  [ "${#number}" -lt "${#max_whole}" ] \
+    || { [ "${#number}" -eq "${#max_whole}" ] && [[ "$number" < "$max_whole" || "$number" = "$max_whole" ]]; } \
+    || return 1
+  whole=$((10#$number))
+  whole=$((whole * multiplier))
+
+  if [ -n "$fraction" ]; then
+    while [ "${fraction%0}" != "$fraction" ]; do
+      fraction="${fraction%0}"
+    done
+    if [ -n "$fraction" ]; then
+      [ "${#fraction}" -le 9 ] || return 1
+      fraction_digits="${#fraction}"
+      while [ "$fraction_digits" -gt 0 ]; do
+        fraction_scale=$((fraction_scale * 10))
+        fraction_digits=$((fraction_digits - 1))
+      done
+      fraction=$((10#$fraction))
+      multiplier_quotient=$((multiplier / fraction_scale))
+      multiplier_remainder=$((multiplier % fraction_scale))
+      fraction_bytes=$((multiplier_quotient * fraction + (multiplier_remainder * fraction) / fraction_scale))
+    fi
+  fi
+
+  [ "$whole" -le $((max_value - fraction_bytes)) ] || return 1
+  printf '%s\n' "$((whole + fraction_bytes))"
+}
+
+display_shared_memory_size() {
+  local value="$1"
+
+  if [ -z "$value" ] || [ "$value" = "0" ]; then
+    printf 'runtime default\n'
+    return 0
+  fi
+  display_memory_limit "$value"
+}
+
+validate_existing_container_shm_size() {
+  local name="$1"
+  local requested="$2"
+  local requested_bytes=""
+  local current_bytes=""
+
+  [ -n "$requested" ] || return 0
+  requested_bytes="$(shared_memory_size_to_bytes "$requested" 2>/dev/null || true)"
+  [ -n "$requested_bytes" ] \
+    || die "Unable to compare --shm-size '$requested' with existing container $name; use a size such as 512M, 1.5G, or 2GiB"
+  current_bytes="$(container_shm_size "$name")"
+  [ -n "$current_bytes" ] \
+    || die "Unable to determine the shared-memory size of existing container $name; omit --shm-size or recreate it with ${CLI_NAME} upgrade --name $name --shm-size $requested"
+  if [ "$requested_bytes" != "$current_bytes" ]; then
+    die "Container $name uses /dev/shm size $(display_shared_memory_size "$current_bytes"), not $requested. Recreate it with: ${CLI_NAME} upgrade --name $name --shm-size $requested"
+  fi
 }
 
 runtime_install_memory_pressure_limit() {
@@ -4222,6 +6365,21 @@ target_feature_installed() {
 
   feature_info="$(run_agent_sh_in_container "$name" feature info "$feature" 2>/dev/null)" || return 1
   printf '%s' "$feature_info" | jq -e '.installed == true' >/dev/null 2>&1
+}
+
+ensure_requested_feature_installed() {
+  local name="$1"
+  local feature="$2"
+
+  if target_feature_installed "$name" "$feature"; then
+    return 0
+  fi
+  if target_feature_installable "$name" "$feature"; then
+    echo "Installing requested feature in $name: $feature" >&2
+    run_agent_sh_in_container_root "$name" feature install "$feature" || die "Failed to install requested feature: $feature"
+    return 0
+  fi
+  die "Feature $feature is unavailable in $name. Run '${CLI_NAME} refresh --name $name' and retry."
 }
 
 ensure_target_feature_installed() {
@@ -4665,20 +6823,20 @@ container_system_manifest_json() {
   if container_running "$name"; then
     was_running=1
   else
-    "$CONTAINER_CMD" start "$name" >/dev/null
+    start_existing_container_safely "$name" >/dev/null
     started_for_manifest=1
   fi
 
   if ! manifest="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh system manifest)"; then
     if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-      "$CONTAINER_CMD" stop "$name" >/dev/null 2>&1 || true
+      stop_existing_container_safely "$name" >/dev/null 2>&1 || true
     fi
     return 1
   fi
   manifest="$(augment_manifest_with_container_apk_repositories "$name" "$manifest")"
 
   if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-    "$CONTAINER_CMD" stop "$name" >/dev/null
+    stop_existing_container_safely "$name" >/dev/null
   fi
 
   printf '%s\n' "$manifest"
@@ -4693,24 +6851,24 @@ container_baseline_manifest_json() {
   if container_running "$name"; then
     was_running=1
   else
-    "$CONTAINER_CMD" start "$name" >/dev/null
+    start_existing_container_safely "$name" >/dev/null
     started_for_manifest=1
   fi
 
   if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -f "$SYSTEM_BASELINE_MANIFEST_FILE"; then
     if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-      "$CONTAINER_CMD" stop "$name" >/dev/null 2>&1 || true
+      stop_existing_container_safely "$name" >/dev/null 2>&1 || true
     fi
     return 1
   fi
   if ! manifest="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" cat "$SYSTEM_BASELINE_MANIFEST_FILE")"; then
     if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-      "$CONTAINER_CMD" stop "$name" >/dev/null 2>&1 || true
+      stop_existing_container_safely "$name" >/dev/null 2>&1 || true
     fi
     return 1
   fi
   if [ "$started_for_manifest" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-    "$CONTAINER_CMD" stop "$name" >/dev/null
+    stop_existing_container_safely "$name" >/dev/null
   fi
   [ -n "$manifest" ] || return 1
   printf '%s\n' "$manifest"
@@ -5291,12 +7449,23 @@ print_upgrade_dry_run_summary() {
   local target_cpu="$9"
   local current_mem="${10}"
   local target_mem="${11}"
-  local was_running="${12}"
-  local backup_mode="${13}"
-  local no_backup="${14}"
-  local backup_image="${15}"
-  local overwrite_config="${16}"
-  local copy_mode="${17:-0}"
+  local current_shm_size="${12}"
+  local target_shm_size="${13}"
+  local was_running="${14}"
+  local backup_mode="${15}"
+  local no_backup="${16}"
+  local backup_image="${17}"
+  local overwrite_config="${18}"
+  local copy_mode="${19:-0}"
+  local current_networks="${20:-default}"
+  local target_networks="${21:-default}"
+  local current_ssh="${22:-false}"
+  local target_ssh="${23:-false}"
+  local ensure_ssh_feature="${24:-0}"
+  local current_socket_mappings="${25:-}"
+  local target_socket_mappings="${26:-}"
+  local current_published_sockets="${27:-}"
+  local target_published_sockets="${28:-}"
   local state_label=""
   local mount_label=""
   local config_label=""
@@ -5306,6 +7475,8 @@ print_upgrade_dry_run_summary() {
   local target_image_display=""
   local current_mem_display=""
   local target_mem_display=""
+  local current_shm_display=""
+  local target_shm_display=""
 
   if [ "$was_running" -eq 1 ]; then
     state_label="running"
@@ -5350,6 +7521,8 @@ print_upgrade_dry_run_summary() {
   target_image_display="$(display_upgrade_image_ref "$target_image")"
   current_mem_display="$(display_upgrade_memory_limit "$current_mem")"
   target_mem_display="$(display_upgrade_memory_limit "$target_mem")"
+  current_shm_display="$(display_shared_memory_size "$current_shm_size")"
+  target_shm_display="$(display_shared_memory_size "$target_shm_size")"
 
   echo "Dry run: upgrade plan for $name -> $target_name" >&2
   echo "  Source image: $source_image_display" >&2
@@ -5359,6 +7532,36 @@ print_upgrade_dry_run_summary() {
   echo "  Mount mode: $mount_label" >&2
   echo "  CPU: ${current_cpu:-unlimited} -> ${target_cpu:-unlimited}" >&2
   echo "  Memory: $current_mem_display -> $target_mem_display" >&2
+  echo "  Shared memory: $current_shm_display -> $target_shm_display" >&2
+  echo "  Networks: ${current_networks:-default} -> ${target_networks:-default}" >&2
+  echo "  SSH forwarding: $([ "$current_ssh" = "true" ] && printf enabled || printf disabled) -> $([ "$target_ssh" = "true" ] && printf enabled || printf disabled)" >&2
+  echo "  Current socket mappings:" >&2
+  if [ -n "$current_socket_mappings" ]; then
+    printf '%s\n' "$current_socket_mappings" | sed $'s/\t/ -> /; s/^/    /' >&2
+  else
+    echo "    none" >&2
+  fi
+  echo "  Target socket mappings:" >&2
+  if [ -n "$target_socket_mappings" ]; then
+    printf '%s\n' "$target_socket_mappings" | sed $'s/\t/ -> /; s/^/    /' >&2
+  else
+    echo "    none" >&2
+  fi
+  echo "  Current published sockets:" >&2
+  if [ -n "$current_published_sockets" ]; then
+    printf '%s\n' "$current_published_sockets" | sed $'s/\t/ -> /; s/^/    /' >&2
+  else
+    echo "    none" >&2
+  fi
+  echo "  Target published sockets:" >&2
+  if [ -n "$target_published_sockets" ]; then
+    printf '%s\n' "$target_published_sockets" | sed $'s/\t/ -> /; s/^/    /' >&2
+  else
+    echo "    none" >&2
+  fi
+  if [ "$ensure_ssh_feature" -eq 1 ]; then
+    echo "  SSH client feature: ensure installed" >&2
+  fi
   echo "  Current state: $state_label" >&2
   echo "  Config backup: $config_label" >&2
   echo "  Backup image: $backup_label" >&2
@@ -5371,6 +7574,58 @@ print_upgrade_dry_run_summary() {
     echo "  Actions: remove $name and recreate it as $target_name" >&2
   fi
   echo "Dry run complete: no container changes applied" >&2
+}
+
+upgrade_should_ensure_ssh_feature() {
+  local target_ssh="$1"
+  local ssh_enable_requested="$2"
+  local source_manifest="${3:-}"
+
+  [ "$target_ssh" = "true" ] || return 1
+  [ "$ssh_enable_requested" -eq 0 ] || return 0
+  [ -n "$source_manifest" ] || return 1
+  printf '%s' "$source_manifest" | jq -e '((.installed_features // []) | index("ssh")) != null' >/dev/null 2>&1
+}
+
+exported_container_ssh_feature_installed() {
+  local name="$1"
+  local temp_dir=""
+  local export_file=""
+  local export_root=""
+  local status=1
+
+  temp_dir="$(mktemp -d)"
+  export_file="$temp_dir/container-export.tar"
+  export_root="$temp_dir/rootfs"
+  if ! "$CONTAINER_CMD" export "$name" --output "$export_file"; then
+    report_backup_storage_diagnostics || true
+    cleanup_temp_dir "$temp_dir"
+    return 2
+  fi
+  mkdir -p "$export_root"
+  if ! ( extract_container_export_rootfs "$export_file" "$export_root" ) >/dev/null 2>&1; then
+    cleanup_temp_dir "$temp_dir"
+    return 2
+  fi
+  if [ -f "$export_root/var/lib/agentctl/features/ssh/install-complete" ] \
+    && { [ -x "$export_root/usr/bin/ssh" ] || [ -x "$export_root/usr/local/bin/ssh" ]; }; then
+    status=0
+  fi
+  cleanup_temp_dir "$temp_dir"
+  return "$status"
+}
+
+upgrade_source_ssh_feature_installed() {
+  local name="$1"
+  local source_manifest="${2:-}"
+  local allow_export_fallback="${3:-0}"
+
+  if [ -n "$source_manifest" ]; then
+    printf '%s' "$source_manifest" | jq -e '((.installed_features // []) | index("ssh")) != null' >/dev/null 2>&1
+    return
+  fi
+  [ "$allow_export_fallback" -eq 1 ] || return 1
+  exported_container_ssh_feature_installed "$name"
 }
 
 display_upgrade_image_ref() {
@@ -5447,37 +7702,41 @@ run_container() {
   local post_exec="${11}"
   local reset_config="${12}"
   local stdio="${13}"
-  shift 13
+  local shm_size="${14}"
+  local network_text="${15}"
+  local ssh_requested="${16}"
+  shift 16
   local cmd=("$@")
   local exit_code=0
   local started=0
   local already_running=0
   local created=0
   local actual_name="$name"
+  local socket_mount_arg=""
 
   # Execute command inside the container and preserve the exit code.
   run_exec() {
     if [ "$stdio" -eq 1 ]; then
-      if ! "$CONTAINER_CMD" exec --interactive "$actual_name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"; then
-        exit_code=$?
-      fi
+      "$CONTAINER_CMD" exec --interactive "$actual_name" "${SETPRIV_ARGS[@]}" "${cmd[@]}" || exit_code=$?
     elif [ "$shell" -eq 1 ]; then
-      if ! "$CONTAINER_CMD" exec -it "$actual_name" "${SETPRIV_ARGS[@]}" "$DEFAULT_LOGIN_SHELL" "-l"; then
-        exit_code=$?
-      fi
+      "$CONTAINER_CMD" exec -it "$actual_name" "${SETPRIV_ARGS[@]}" "$DEFAULT_LOGIN_SHELL" "-l" || exit_code=$?
     else
-      if ! "$CONTAINER_CMD" exec -it "$actual_name" "${SETPRIV_ARGS[@]}" "${cmd[@]}"; then
-        exit_code=$?
-      fi
+      "$CONTAINER_CMD" exec -it "$actual_name" "${SETPRIV_ARGS[@]}" "${cmd[@]}" || exit_code=$?
     fi
   }
 
   # Lifecycle: create if missing, start if needed, pre_exec, exec, stop, remove if temp.
   if [ -n "$actual_name" ] && container_exists "$actual_name"; then
     validate_mount_mode "$actual_name" "$read_only"
+    validate_existing_container_shm_size "$actual_name" "$shm_size"
+    validate_existing_container_networks "$actual_name" "$network_text"
+    validate_existing_container_ssh "$actual_name" "$ssh_requested"
+    validate_existing_socket_mappings "$actual_name" "$(socket_mappings_without_mcp "$SOCKET_MOUNTS_TEXT")"
+    validate_existing_published_sockets "$actual_name" "$PUBLISHED_SOCKETS_TEXT"
   fi
   if [ -n "$actual_name" ] && container_running "$actual_name"; then
     already_running=1
+    validate_running_published_listeners "$PUBLISHED_SOCKETS_TEXT"
   else
     if [ -n "$actual_name" ] && [ "$temp" -eq 1 ] && container_exists "$actual_name"; then
       die "Container already exists: $actual_name (omit --temp or remove it)"
@@ -5487,6 +7746,11 @@ run_container() {
     fi
 
     if [ -z "$actual_name" ] || ! container_exists "$actual_name"; then
+      validate_published_host_paths_for_start "$PUBLISHED_SOCKETS_TEXT"
+      if [ "$ssh_requested" -eq 1 ]; then
+        require_container_ssh_support
+        require_host_ssh_socket
+      fi
       echo "Creating container..." >&2
       local create_cmd=("$CONTAINER_CMD" create -t)
       if [ -n "$cpu" ]; then
@@ -5495,6 +7759,15 @@ run_container() {
       if [ -n "$mem" ]; then
         create_cmd+=(-m "$mem")
       fi
+      if [ -n "$shm_size" ]; then
+        require_container_shm_size_support
+        create_cmd+=(--shm-size "$shm_size")
+      fi
+      while IFS= read -r network_name; do
+        [ -n "$network_name" ] || continue
+        create_cmd+=(--network "$network_name")
+      done < <(network_text_names "$network_text")
+      [ "$ssh_requested" -eq 0 ] || create_cmd+=(--ssh)
       if [ -n "$actual_name" ]; then
         create_cmd+=(--name "$actual_name")
       fi
@@ -5506,6 +7779,14 @@ run_container() {
       if [ -n "$home_mount" ]; then
         create_cmd+=(--mount "type=bind,src=$home_mount,dst=/home/coder")
       fi
+      while IFS= read -r socket_mount_arg; do
+        [ -n "$socket_mount_arg" ] || continue
+        create_cmd+=(--volume "$socket_mount_arg")
+      done < <(socket_volume_arguments "$SOCKET_MOUNTS_TEXT")
+      while IFS= read -r socket_mount_arg; do
+        [ -n "$socket_mount_arg" ] || continue
+        create_cmd+=(--publish-socket "$socket_mount_arg")
+      done < <(published_socket_arguments "$PUBLISHED_SOCKETS_TEXT")
       create_cmd+=("$image" sh -c 'sleep infinity')
       if [ -z "$actual_name" ]; then
         actual_name="$("${create_cmd[@]}")"
@@ -5520,6 +7801,14 @@ run_container() {
       created=1
     fi
 
+    if [ "$created" -eq 0 ] && [ "$ssh_requested" -eq 0 ]; then
+      warn_if_ssh_forwarding_unavailable_on_start "$actual_name"
+    fi
+    if [ "$created" -eq 0 ]; then
+      validate_container_socket_sources "$actual_name"
+      validate_published_host_paths_for_start "$PUBLISHED_SOCKETS_TEXT"
+    fi
+
     echo "Starting container: $actual_name" >&2
     if [ "$stdio" -eq 1 ]; then
       "$CONTAINER_CMD" start "$actual_name" >/dev/null
@@ -5531,6 +7820,11 @@ run_container() {
 
   if [ "$created" -eq 1 ]; then
     persist_container_system_manifest_baseline_from_image "$actual_name" "$image"
+  fi
+
+  if [ "$MCP_REQUESTED" -eq 1 ]; then
+    mcp_configure_guest "$actual_name"
+    [ -z "$name" ] || mcp_persist_registry "$actual_name"
   fi
 
   configure_container_host_alias "$actual_name"
@@ -5564,12 +7858,21 @@ run_container() {
       warn "post-run step failed for $actual_name"
     fi
   fi
+  if [ "$exit_code" -ne 0 ] && [ "$MCP_REQUESTED" -eq 1 ]; then
+    echo "Managed MCP guest proxy diagnostics from $actual_name:" >&2
+    "$CONTAINER_CMD" exec "$actual_name" sh -c 'cat /tmp/agentctl-mcp-proxy.log 2>/dev/null || printf "%s\n" "guest proxy log is empty"' >&2 || true
+  fi
   if [ "$already_running" -eq 1 ]; then
     return "$exit_code"
   fi
   if [ "$started" -eq 1 ]; then
-    echo "Stopping container: $actual_name" >&2
-    "$CONTAINER_CMD" stop "$actual_name" >/dev/null 2>&1
+    if [ "$MCP_REQUESTED" -eq 1 ] && [ "$(mcp_lease_count "$actual_name")" -gt 1 ]; then
+      echo "Leaving container running for another active managed MCP lease: $actual_name" >&2
+    else
+      echo "Stopping container: $actual_name" >&2
+      "$CONTAINER_CMD" stop "$actual_name" >/dev/null 2>&1
+      report_leftover_published_sockets "$PUBLISHED_SOCKETS_TEXT" || true
+    fi
   fi
   if [ "$temp" -eq 1 ]; then
     echo "Removing container: $actual_name" >&2
@@ -5595,7 +7898,10 @@ run_mode() {
   local runtime_config_json="${14}"
   local model_override="${15}"
   local stdio="${16}"
-  shift 16
+  local shm_size="${17}"
+  local network_text="${18}"
+  local ssh_requested="${19}"
+  shift 19
   local -a cmd_override=("$@")
   local pre_exec=""
   local post_exec=""
@@ -5622,7 +7928,7 @@ run_mode() {
       cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "$launch_env exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override" "$ollama_host")
     fi
   fi
-  if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ]; then
+  if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_ENSURE_SSH_FEATURE" -eq 1 ] || [ "$MCP_REQUESTED" -eq 1 ]; then
     pre_exec="run_pre_exec"
   fi
 
@@ -5631,7 +7937,7 @@ run_mode() {
     shell=0
   fi
 
-  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "$stdio" "${cmd[@]}"
+  run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "$stdio" "$shm_size" "$network_text" "$ssh_requested" "${cmd[@]}"
 }
 
 RUN_SELECTED_RUNTIME=""
@@ -5644,6 +7950,8 @@ RUN_UPDATE_CODEX=0
 RUN_EFFECTIVE_MODE="local"
 RUN_REQUESTED_IMAGE=""
 RUN_RUNTIME_CONFIG_JSON='{}'
+RUN_ENSURE_SSH_FEATURE=0
+RUN_MCP_CONFIG_JSON='[]'
 
 run_post_exec() {
   local name="$1"
@@ -5671,6 +7979,10 @@ run_pre_exec() {
   local keychain_token=""
   local keychain_refresh=""
 
+  if [ "$RUN_ENSURE_SSH_FEATURE" -eq 1 ]; then
+    ensure_requested_feature_installed "$name" ssh
+  fi
+
   if [ "$RUN_UPDATE_CODEX" -eq 1 ]; then
     update_codex_pre_exec "$name"
   fi
@@ -5680,6 +7992,24 @@ run_pre_exec() {
       install_runtime_in_container "$name" "$RUN_SELECTED_RUNTIME"
     fi
     run_agent_sh_in_container "$name" preferred set "$RUN_SELECTED_RUNTIME"
+  fi
+
+  if [ "$MCP_REQUESTED" -eq 1 ]; then
+    effective_runtime="$RUN_SELECTED_RUNTIME"
+    if [ -z "$effective_runtime" ]; then
+      effective_runtime="$(run_agent_sh_in_container "$name" preferred get 2>/dev/null || true)"
+    fi
+    if [ "$effective_runtime" = codex ]; then
+      local mcp_name=""
+      while IFS= read -r mcp_name; do
+        [ -n "$mcp_name" ] || continue
+        run_agent_sh_in_container "$name" runtime mcp-add codex "$mcp_name" \
+          "http://127.0.0.1:${MCP_PORT}/mcp/${mcp_name}" \
+          || die "Failed to register managed MCP server $mcp_name with Codex in $name"
+      done < <(printf '%s' "$RUN_MCP_CONFIG_JSON" | jq -r '.[].name')
+    elif [ -n "$effective_runtime" ]; then
+      warn "Managed MCP URLs were not registered automatically because runtime $effective_runtime has no HTTP MCP adapter"
+    fi
   fi
 
   if [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_SYNC_POST_RUNTIME_AUTH" -eq 1 ]; then
@@ -5740,10 +8070,18 @@ run_cmd() {
   local read_only=0
   local cpu=""
   local mem=""
+  local shm_size=""
+  local network_text=""
   local home_mount=""
   local workdir=""
   local stdio=0
+  local ssh_requested=0
+  local socket_mappings=""
+  local published_sockets=""
+  local socket_mapping=""
+  local mcp_value=""
   local -a runtime_config_entries=()
+  local -a networks=()
   local -a cmd_override=()
   local cmd_override_set=0
   local shell_set=0
@@ -5769,12 +8107,45 @@ run_cmd() {
       --cmd) shift; cmd_override_set=1; cmd_override=("$@"); break ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
+      --shm-size) shm_size="$2"; shift 2 ;;
+      --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
+      --ssh) ssh_requested=1; shift ;;
+      --mcp)
+        [ "$#" -ge 2 ] || die "Missing value for --mcp"
+        mcp_value="$2"
+        mcp_add_definition "$mcp_value"
+        shift 2
+        ;;
+      --mount-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --mount-socket"
+        socket_mapping="$(parse_socket_mapping "$2")"
+        socket_mappings="${socket_mappings}${socket_mappings:+$'\n'}${socket_mapping}"
+        shift 2
+        ;;
+      --publish-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --publish-socket"
+        socket_mapping="$(parse_published_socket_mapping "$2")"
+        published_sockets="${published_sockets}${published_sockets:+$'\n'}${socket_mapping}"
+        shift 2
+        ;;
       --help) usage_run; return 0 ;;
       *) die "Unknown option for run: $1" ;;
     esac
   done
 
   require_container
+  validate_requested_socket_mappings "$socket_mappings"
+  validate_requested_published_sockets "$published_sockets"
+  validate_published_container_collisions "$published_sockets" "$socket_mappings"
+  SOCKET_MOUNTS_TEXT="$socket_mappings"
+  PUBLISHED_SOCKETS_TEXT="$published_sockets"
+  if [ "${#networks[@]}" -gt 0 ]; then
+    validate_network_selection "${networks[@]}"
+    network_text="$(network_args_to_text "${networks[@]}")"
+    if [ "$online" -eq 1 ] && network_selection_is_host_only "${networks[@]}"; then
+      die "Online mode cannot use a host-only network because it has no external route"
+    fi
+  fi
   if [ "$shell_set" -eq 1 ] && [ "$cmd_override_set" -eq 1 ]; then
     die "Cannot combine --shell with --cmd"
   fi
@@ -5817,11 +8188,40 @@ run_cmd() {
   if [ -z "$name" ] && [ "$temp" -eq 0 ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
   fi
+  if [ "$MCP_REQUESTED" -eq 1 ]; then
+    mcp_validate_port "$MCP_PORT"
+    if [ -n "$name" ] && container_exists "$name" && ! container_has_mcp_wiring "$name"; then
+      die "Container $name does not have managed MCP wiring. Recreate it with: ${CLI_NAME} upgrade --name $name --enable-mcp"
+    fi
+    mcp_acquire_relay "${name:-temporary-$$}"
+    socket_mapping="${MCP_RELAY_SOCKET}"$'\t'"${MCP_GUEST_SOCKET}"
+    socket_mappings="${socket_mappings}${socket_mappings:+$'\n'}${socket_mapping}"
+    SOCKET_MOUNTS_TEXT="$socket_mappings"
+  fi
+  if [ "$online" -eq 1 ] && [ "${#networks[@]}" -eq 0 ] && [ -n "$name" ] && container_exists "$name"; then
+    local -a existing_networks=()
+    local existing_network=""
+    local existing_network_text=""
+    existing_network_text="$(container_network_names "$name")" \
+      || die "Unable to determine network attachments for online container: $name"
+    [ -n "$existing_network_text" ] \
+      || die "Container has no inspectable network attachment for online mode: $name"
+    while IFS= read -r existing_network; do
+      [ -n "$existing_network" ] || continue
+      existing_networks+=("$existing_network")
+    done <<<"$existing_network_text"
+    if network_selection_is_host_only "${existing_networks[@]}"; then
+      die "Online mode cannot use a host-only network because it has no external route"
+    fi
+  fi
   if [ "$install_runtime" -eq 1 ] && [ "$runtime" = "claude" ] && [ -z "$mem" ] && { [ "$temp" -eq 1 ] || [ -z "$name" ] || ! container_exists "$name"; }; then
     mem="$CLAUDE_MIN_INSTALL_MEM"
   fi
   if [ "$temp" -eq 0 ] && [ -n "$name" ] && container_exists "$name" && { [ -n "$cpu" ] || [ -n "$mem" ]; }; then
     die "--cpu and --mem only apply when creating a new container. Use ${CLI_NAME} upgrade --name $name${image:+ --image $image}${cpu:+ --cpu $cpu}${mem:+ --mem $mem} to recreate the container with updated resources"
+  fi
+  if [ -n "$shm_size" ]; then
+    require_container_shm_size_support
   fi
   if [ "$temp" -eq 0 ] && [ -n "$name" ] && container_exists "$name" && [ -n "$home_mount" ]; then
     die "--home only applies when creating a new container"
@@ -5842,6 +8242,8 @@ run_cmd() {
   RUN_EFFECTIVE_MODE="local"
   RUN_REQUESTED_IMAGE="$image"
   RUN_RUNTIME_CONFIG_JSON="$runtime_config_json"
+  RUN_ENSURE_SSH_FEATURE="$ssh_requested"
+  RUN_MCP_CONFIG_JSON="$MCP_CONFIG_JSON"
   if [ "$online" -eq 1 ]; then
     RUN_EFFECTIVE_MODE="online"
     RUN_SYNC_RUNTIME_AUTH=1
@@ -5852,7 +8254,21 @@ run_cmd() {
     RUN_UPDATE_CODEX=1
   fi
 
-  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" "$stdio" ${cmd_override[@]+"${cmd_override[@]}"}
+  local run_status=0
+  run_mode "$name" "$image" "$temp" "$shell" "$online" "$auth" "$update" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$reset_config" "$runtime_config_json" "$model_override" "$stdio" "$shm_size" "$network_text" "$ssh_requested" ${cmd_override[@]+"${cmd_override[@]}"} || run_status=$?
+  if [ "$MCP_REQUESTED" -eq 1 ]; then
+    mcp_release_lease
+    if [ -z "$name" ]; then
+      mcp_stop_relay
+    elif [ "$(mcp_lease_count "$name")" -eq 0 ]; then
+      mcp_stop_managed "$name"
+      if container_running "$name" && [ -f "$(mcp_registry_path "$name")" ]; then
+        mcp_start_from_registry "$name"
+        mcp_configure_guest "$name"
+      fi
+    fi
+  fi
+  return "$run_status"
 }
 
 auth_cmd() {
@@ -5893,6 +8309,7 @@ upgrade_cmd() {
   local workdir_override=""
   local cpu=""
   local mem=""
+  local shm_size=""
   local backup_image=""
   local no_backup=0
   local dry_run=0
@@ -5903,11 +8320,25 @@ upgrade_cmd() {
   local mount_mode=""
   local current_cpu=""
   local current_mem=""
+  local current_shm_size=""
+  local current_network_specs=""
+  local current_network_names=""
+  local target_network_specs=""
+  local target_network_names=""
+  local current_ssh="false"
+  local target_ssh="false"
+  local ssh_enable_requested=0
+  local ssh_disable_requested=0
+  local ensure_ssh_feature=0
+  local source_ssh_feature_installed=0
+  local ssh_feature_status=0
+  local allow_ssh_export_fallback=0
   local read_only=0
   local was_running=0
   local started_for_backup=0
   local used_export_for_config_backup=0
   local backup_mode=""
+  local source_requires_export=0
   local source_supports_state_contract=""
   local added_runtimes_json='[]'
   local added_features_json='[]'
@@ -5918,6 +8349,28 @@ upgrade_cmd() {
   local preflight_target_manifest=""
   local inspect_info=""
   local upgrade_package_reinstall_commands=""
+  local -a requested_networks=()
+  local requested_socket_mappings=""
+  local removed_socket_mappings=""
+  local current_socket_mappings=""
+  local preserved_socket_mappings=""
+  local target_socket_mappings=""
+  local socket_mapping=""
+  local socket_destination=""
+  local socket_mount_arg=""
+  local requested_published_sockets=""
+  local unpublished_sockets=""
+  local current_published_sockets=""
+  local target_published_sockets=""
+  local published_mapping=""
+  local published_host_path=""
+  local published_arg=""
+  local mcp_enable_requested=0
+  local mcp_disable_requested=0
+  local mcp_port_requested=0
+  local mcp_current_enabled=0
+  local mcp_target_enabled=0
+  local mcp_registry=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -5928,6 +8381,38 @@ upgrade_cmd() {
       --workdir) workdir_override="$2"; shift 2 ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
+      --shm-size) shm_size="$2"; shift 2 ;;
+      --network) [ "$#" -ge 2 ] || die "Missing value for --network"; requested_networks+=("$2"); shift 2 ;;
+      --mount-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --mount-socket"
+        socket_mapping="$(parse_socket_mapping "$2")"
+        requested_socket_mappings="${requested_socket_mappings}${requested_socket_mappings:+$'\n'}${socket_mapping}"
+        shift 2
+        ;;
+      --unmount-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --unmount-socket"
+        socket_destination="$2"
+        socket_mapping="$(socket_unmount_record "$socket_destination")"
+        removed_socket_mappings="${removed_socket_mappings}${removed_socket_mappings:+$'\n'}${socket_mapping}"
+        shift 2
+        ;;
+      --publish-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --publish-socket"
+        published_mapping="$(parse_published_socket_mapping "$2")"
+        requested_published_sockets="${requested_published_sockets}${requested_published_sockets:+$'\n'}${published_mapping}"
+        shift 2
+        ;;
+      --unpublish-socket)
+        [ "$#" -ge 2 ] || die "Missing value for --unpublish-socket"
+        published_mapping="$(published_socket_unpublish_record "$2")"
+        unpublished_sockets="${unpublished_sockets}${unpublished_sockets:+$'\n'}${published_mapping}"
+        shift 2
+        ;;
+      --ssh) ssh_enable_requested=1; shift ;;
+      --no-ssh) ssh_disable_requested=1; shift ;;
+      --enable-mcp) mcp_enable_requested=1; shift ;;
+      --disable-mcp) mcp_disable_requested=1; shift ;;
+      --mcp-port) [ "$#" -ge 2 ] || die "Missing value for --mcp-port"; MCP_PORT="$2"; mcp_port_requested=1; shift 2 ;;
       --backup-image) backup_image="$2"; shift 2 ;;
       --no-backup) no_backup=1; shift ;;
       --dry-run) dry_run=1; shift ;;
@@ -5937,6 +8422,28 @@ upgrade_cmd() {
     esac
   done
 
+  if [ -n "$shm_size" ] && ! shared_memory_size_to_bytes "$shm_size" >/dev/null 2>&1; then
+    die "Invalid --shm-size: $shm_size (use a size such as 512M, 1.5G, or 2GiB)"
+  fi
+  [ "$ssh_enable_requested" -eq 0 ] || [ "$ssh_disable_requested" -eq 0 ] || die "Cannot combine --ssh with --no-ssh"
+  [ "$mcp_enable_requested" -eq 0 ] || [ "$mcp_disable_requested" -eq 0 ] || die "Cannot combine --enable-mcp with --disable-mcp"
+  [ "$mcp_port_requested" -eq 0 ] || mcp_validate_port "$MCP_PORT"
+  validate_requested_socket_mappings "$requested_socket_mappings"
+  validate_requested_socket_mappings "$removed_socket_mappings"
+  validate_requested_published_sockets "$requested_published_sockets"
+  validate_requested_published_sockets "$unpublished_sockets"
+  while IFS= read -r socket_mapping; do
+    [ -n "$socket_mapping" ] || continue
+    socket_destination="$(socket_mapping_destination "$socket_mapping")"
+    socket_text_has_destination "$requested_socket_mappings" "$socket_destination" \
+      && die "Cannot mount and unmount the same socket container path: $socket_destination"
+  done <<<"$removed_socket_mappings"
+  while IFS= read -r published_mapping; do
+    [ -n "$published_mapping" ] || continue
+    published_host_path="$(socket_mapping_source "$published_mapping")"
+    socket_text_has_source "$requested_published_sockets" "$published_host_path" \
+      && die "Cannot publish and unpublish the same socket host path: $published_host_path"
+  done <<<"$unpublished_sockets"
   require_container
 
   if [ -z "$name" ]; then
@@ -5968,9 +8475,63 @@ upgrade_cmd() {
   if [ "$target_name" != "$name" ] && container_exists "$target_name"; then
     die "Target container name already exists: $target_name"
   fi
+  mcp_lock_acquire "$name"
+  local mcp_upgrade_relay_started=0
+  local mcp_upgrade_relay_name=""
+  trap '[ "$mcp_upgrade_relay_started" -eq 0 ] || mcp_stop_managed "$mcp_upgrade_relay_name" >/dev/null 2>&1 || true; mcp_lock_release' EXIT
+  mcp_require_no_active_leases "$name" upgrade
+
+  mcp_registry="$(mcp_registry_path "$name")"
+  if [ -f "$mcp_registry" ] && [ ! -L "$mcp_registry" ]; then
+    mcp_validate_private_file "$mcp_registry" "Managed MCP registry"
+    mcp_current_enabled=1
+    if [ "$mcp_port_requested" -eq 0 ]; then MCP_PORT="$(jq -r '.port // 47123' "$mcp_registry")"; fi
+    MCP_CONFIG_JSON="$(jq -c '[.servers[] | .env={} | .inherited_env={}]' "$mcp_registry")"
+  fi
+  mcp_target_enabled="$mcp_current_enabled"
+  [ "$mcp_enable_requested" -eq 0 ] || mcp_target_enabled=1
+  [ "$mcp_disable_requested" -eq 0 ] || mcp_target_enabled=0
+  if [ "$mcp_target_enabled" -eq 1 ]; then
+    MCP_REQUESTED=1
+    if [ "$dry_run" -eq 0 ]; then
+      MCP_RELAY_SOCKET="$(mcp_socket_path "$target_name")"
+      requested_socket_mappings="${requested_socket_mappings}${requested_socket_mappings:+$'\n'}${MCP_RELAY_SOCKET}"$'\t'"${MCP_GUEST_SOCKET}"
+    fi
+  else
+    removed_socket_mappings="${removed_socket_mappings}${removed_socket_mappings:+$'\n'}"$'\t'"${MCP_GUEST_SOCKET}"
+  fi
 
   inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
+  current_socket_mappings="$(container_extra_mount_text "$name")"
+  preserved_socket_mappings="$(container_socket_mounts "$name" "$removed_socket_mappings")"
+  target_socket_mappings="$(merge_socket_mappings "$preserved_socket_mappings" "$requested_socket_mappings")"
+  current_published_sockets="$(container_published_sockets "$name")"
+  target_published_sockets="$(merge_published_sockets "$current_published_sockets" "$unpublished_sockets" "$requested_published_sockets")"
+  validate_requested_published_sockets "$current_published_sockets"
+  validate_requested_published_sockets "$target_published_sockets"
+  validate_published_socket_records "$target_published_sockets"
+  validate_published_container_collisions "$target_published_sockets" "$target_socket_mappings"
   IFS=$'\t' read -r current_image current_workdir mount_mode current_cpu current_mem <<<"$inspect_info"
+  current_shm_size="$(container_shm_size "$name")"
+  current_ssh="$(container_ssh_enabled "$name")" || die "Unable to determine SSH forwarding configuration for $name"
+  target_ssh="$current_ssh"
+  if [ "$ssh_enable_requested" -eq 1 ]; then
+    target_ssh=true
+  elif [ "$ssh_disable_requested" -eq 1 ]; then
+    target_ssh=false
+  fi
+  if [ "$target_ssh" = "true" ]; then
+    require_container_ssh_support
+    if [ "$ssh_enable_requested" -eq 1 ]; then
+      require_host_ssh_socket
+    elif ! host_ssh_socket_available; then
+      warn "Preserving SSH forwarding for $name, but the current SSH_AUTH_SOCK is unavailable; forwarding will reconnect on a later start from a shell with SSH_AUTH_SOCK set"
+    fi
+  fi
+  current_network_specs="$(container_network_specs "$name")" \
+    || die "Unable to determine network attachments for $name; pass --network explicitly"
+  current_network_names="$(printf '%s\n' "$current_network_specs" | sed '/^$/d; s/,.*//')"
+  [ -n "$current_network_names" ] || current_network_names="default"
   [ -n "$current_image" ] || die "Unable to determine image for $name"
   [ -n "$current_workdir" ] || die "Unable to determine /workdir mount source for $name"
 
@@ -5991,6 +8552,30 @@ upgrade_cmd() {
   fi
   [ -n "$cpu" ] || cpu="$current_cpu"
   [ -n "$mem" ] || mem="$current_mem"
+  [ -n "$shm_size" ] || shm_size="$current_shm_size"
+  if [ "${#requested_networks[@]}" -gt 0 ]; then
+    validate_network_selection "${requested_networks[@]}"
+    target_network_names="$(network_args_to_text "${requested_networks[@]}")"
+    target_network_specs="$target_network_names"
+  else
+    target_network_names="$current_network_names"
+    target_network_specs="$current_network_specs"
+    if [ -n "$target_network_specs" ]; then
+      local -a preserved_networks=()
+      local preserved_network=""
+      while IFS= read -r preserved_network; do
+        [ -n "$preserved_network" ] || continue
+        preserved_networks+=("$preserved_network")
+      done <<<"$target_network_names"
+      validate_network_selection "${preserved_networks[@]}"
+    fi
+  fi
+  if [ "$copy_mode" -eq 1 ] && [ -n "$target_network_specs" ]; then
+    target_network_specs="$(printf '%s\n' "$target_network_specs" | network_specs_without_mac)"
+  fi
+  if [ -n "$shm_size" ]; then
+    require_container_shm_size_support
+  fi
   image_exists "$image" || die "Image not found: $image"
   if [ -z "$workdir_override" ]; then
     [ -e "$workdir" ] || die "Preserved /workdir source does not exist: $workdir"
@@ -5999,12 +8584,64 @@ upgrade_cmd() {
   if container_running "$name"; then
     was_running=1
   fi
+  if [ "$was_running" -eq 0 ]; then
+    while IFS= read -r published_mapping; do
+      [ -n "$published_mapping" ] || continue
+      published_host_path="$(socket_mapping_source "$published_mapping")"
+      if ! socket_text_has_source "$target_published_sockets" "$published_host_path"; then
+        source_requires_export=1
+        break
+      fi
+    done <<<"$current_published_sockets"
+  fi
+  validate_published_upgrade_preflight "$current_published_sockets" "$target_published_sockets" "$was_running"
+  if [ "$copy_mode" -eq 1 ] && [ "$was_running" -eq 1 ]; then
+    while IFS= read -r published_mapping; do
+      [ -n "$published_mapping" ] || continue
+      published_host_path="$(socket_mapping_source "$published_mapping")"
+      if socket_text_has_source "$target_published_sockets" "$published_host_path"; then
+        die "Cannot copy running container $name while retaining published socket host path $published_host_path; stop the source or unpublish/remap it"
+      fi
+    done <<<"$current_published_sockets"
+  fi
   echo "Preparing upgrade preflight: $name -> $target_name" >&2
-  if [ "$was_running" -eq 0 ] && [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; then
-    warn "Skipping package-loss warning because original /workdir source does not exist and $name is stopped"
+  if [ "$was_running" -eq 0 ] && { { [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; } || [ "$source_requires_export" -eq 1 ]; }; then
+    if [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; then
+      warn "Skipping package-loss warning because original /workdir source does not exist and $name is stopped"
+    else
+      warn "Skipping live package-loss preflight because removed published socket mappings make stopped source startup unsafe"
+    fi
     backup_mode="export"
+  elif [ "$dry_run" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+    validate_published_host_paths_for_start "$current_published_sockets"
+    preflight_target_manifest="$(image_system_manifest_json "$image" target 2>/dev/null || true)"
+    if [ "$current_image" = "$image" ] && [ -n "$preflight_target_manifest" ]; then
+      preflight_source_manifest="$preflight_target_manifest"
+    elif image_exists "$current_image"; then
+      preflight_source_manifest="$(image_system_manifest_json "$current_image" source 2>/dev/null || true)"
+    fi
+    added_runtimes_json="$(upgrade_added_runtimes_json "$name" "$current_image" "$image" \
+      "" "$preflight_source_manifest" "$preflight_target_manifest" 2>/dev/null || printf '[]\n')"
+    added_features_json="$(upgrade_added_features_json "$name" "$current_image" "$image" \
+      "" "$preflight_source_manifest" "$preflight_target_manifest" 2>/dev/null || printf '[]\n')"
+    warn_upgrade_package_loss "$name" "$current_image" "$image" \
+      "" "$preflight_source_manifest" "$preflight_target_manifest" "$target_name" \
+      "$added_features_json"
+    backup_mode="start"
   else
+    if [ "$was_running" -eq 0 ] && container_has_mcp_wiring "$name"; then
+      if [ "$mcp_current_enabled" -ne 1 ]; then
+        die "Container $name has managed MCP wiring but its private host registry is unavailable. Reconfigure it with: ${CLI_NAME} run --name $name --mcp VALUE"
+      fi
+      mcp_start_from_registry "$name" \
+        || die "Unable to start the managed MCP relay required to inspect stopped container $name"
+      mcp_upgrade_relay_started=1
+      mcp_upgrade_relay_name="$name"
+    fi
     collect_upgrade_container_preflight "$name" || true
+    if [ "$was_running" -eq 0 ]; then
+      validate_published_host_paths_for_start "$current_published_sockets"
+    fi
     preflight_current_manifest="$UPGRADE_PREFLIGHT_CONTAINER_MANIFEST"
     preflight_source_manifest="$UPGRADE_PREFLIGHT_BASELINE_MANIFEST"
     source_supports_state_contract="$UPGRADE_PREFLIGHT_SOURCE_SUPPORTS_STATE_CONTRACT"
@@ -6037,11 +8674,38 @@ upgrade_cmd() {
   if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ] && [ -z "$backup_image" ]; then
     backup_image="$(sanitize_image_name "${target_name}-backup-$(date -u +%Y%m%d%H%M%S)")"
   fi
+  if [ "$target_ssh" = "true" ] && [ "$ssh_enable_requested" -eq 0 ]; then
+    if [ "$was_running" -eq 0 ] && [ "$backup_mode" = "export" ]; then
+      allow_ssh_export_fallback=1
+    fi
+    if upgrade_source_ssh_feature_installed \
+      "$name" \
+      "$preflight_current_manifest" \
+      "$allow_ssh_export_fallback"; then
+      source_ssh_feature_installed=1
+    else
+      ssh_feature_status=$?
+      if [ "$ssh_feature_status" -gt 1 ]; then
+        die "Unable to determine whether stopped container $name has the SSH feature; refusing to recreate it while preserving SSH forwarding"
+      fi
+    fi
+  fi
+  if upgrade_should_ensure_ssh_feature "$target_ssh" "$ssh_enable_requested" "$preflight_current_manifest" \
+    || { [ "$target_ssh" = "true" ] && [ "$source_ssh_feature_installed" -eq 1 ]; }; then
+    ensure_ssh_feature=1
+  fi
   if [ "$dry_run" -eq 1 ]; then
+    echo "  MCP bridge: current=$mcp_current_enabled target=$mcp_target_enabled port=$MCP_PORT socket=$(mcp_socket_path "$target_name") definitions=$(printf '%s' "$MCP_CONFIG_JSON" | jq -r '[.[].name]|join(",")')" >&2
     print_upgrade_dry_run_summary \
       "$name" "$target_name" "$current_image" "$image" "$current_workdir" "$workdir" \
-      "$mount_mode" "$current_cpu" "$cpu" "$current_mem" "$mem" "$was_running" \
-      "$backup_mode" "$no_backup" "$backup_image" "$overwrite_config" "$copy_mode"
+      "$mount_mode" "$current_cpu" "$cpu" "$current_mem" "$mem" "$current_shm_size" "$shm_size" "$was_running" \
+      "$backup_mode" "$no_backup" "$backup_image" "$overwrite_config" "$copy_mode" \
+      "$(printf '%s' "$current_network_names" | paste -sd, -)" "$(printf '%s' "$target_network_names" | paste -sd, -)" \
+      "$current_ssh" "$target_ssh" "$ensure_ssh_feature" \
+      "$current_socket_mappings" "$target_socket_mappings" \
+      "$current_published_sockets" "$target_published_sockets"
+    mcp_lock_release
+    trap - EXIT
     return 0
   fi
 
@@ -6059,7 +8723,7 @@ upgrade_cmd() {
   export_config_root="$backup_dir/export-config"
   trap 'cleanup_temp_dir "$backup_dir"' RETURN
 
-  if [ "$was_running" -eq 0 ] && [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; then
+  if [ "$was_running" -eq 0 ] && [ "$backup_mode" = "export" ]; then
     echo "Exporting container filesystem for state backup: $name" >&2
     export_container_for_upgrade "$name" "$export_file" 0
     extract_export_root "$export_file" "$export_config_root"
@@ -6107,7 +8771,7 @@ upgrade_cmd() {
       if [ "$overwrite_config" -eq 0 ]; then
         if [ "$started_for_backup" -eq 1 ]; then
           echo "Stopping container: $name" >&2
-          "$CONTAINER_CMD" stop "$name" >/dev/null || true
+          stop_existing_container_safely "$name" >/dev/null || true
         fi
         die "Container has ~/.codex/AGENTS.md as a regular file. Re-run with --overwrite-config to replace ~/.codex/config.toml, default ~/.codex/*.config.toml profiles, and ~/.codex/local_models.json and recreate ~/.codex/AGENTS.md as a symlink to /etc/agentctl/image.md. If no valid AGENTS.md configuration already exists, use ${CLI_NAME} run --name $name --reset-config"
       fi
@@ -6117,7 +8781,7 @@ upgrade_cmd() {
       if [ "$overwrite_config" -eq 0 ]; then
         if [ "$started_for_backup" -eq 1 ]; then
           echo "Stopping container: $name" >&2
-          "$CONTAINER_CMD" stop "$name" >/dev/null || true
+          stop_existing_container_safely "$name" >/dev/null || true
         fi
         die "Container has ~/.codex/AGENTS.md in a non-symlink form. Re-run with --overwrite-config to recreate it as a symlink to /etc/agentctl/image.md. If no valid AGENTS.md configuration already exists, use ${CLI_NAME} run --name $name --reset-config"
       fi
@@ -6138,6 +8802,9 @@ upgrade_cmd() {
   if { [ "$copy_mode" -eq 0 ] && [ "$was_running" -eq 1 ]; } || [ "$started_for_backup" -eq 1 ]; then
     echo "Stopping container: $name" >&2
     "$CONTAINER_CMD" stop "$name" >/dev/null
+    if ! report_leftover_published_sockets "$current_published_sockets"; then
+      die "Apple container did not remove all published socket listeners for $name; refusing to continue"
+    fi
   fi
 
   if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ]; then
@@ -6148,7 +8815,7 @@ upgrade_cmd() {
     else
       echo "Reusing exported container state for backup image: $backup_image" >&2
     fi
-    build_backup_image_from_export "$backup_image" "$name" "$export_file" "$backup_root" "$backup_dockerfile"
+    build_backup_image_from_export "$backup_image" "$name" "$export_file" "$backup_root" "$backup_dockerfile" "$was_running"
     echo >&2
   elif [ "$copy_mode" -eq 0 ]; then
     echo "Skipping backup image export for $name" >&2
@@ -6161,6 +8828,18 @@ upgrade_cmd() {
   else
     echo "Creating copy: $target_name" >&2
   fi
+  if [ "$mcp_target_enabled" -eq 1 ]; then
+    if [ "$mcp_upgrade_relay_started" -eq 1 ]; then
+      mcp_stop_managed "$mcp_upgrade_relay_name"
+      mcp_upgrade_relay_started=0
+      mcp_upgrade_relay_name=""
+    elif [ "$target_name" = "$name" ]; then
+      mcp_stop_managed "$name"
+    fi
+    mcp_start_relay "$target_name"
+    mcp_upgrade_relay_started=1
+    mcp_upgrade_relay_name="$target_name"
+  fi
   local create_cmd=("$CONTAINER_CMD" create -t)
   if [ -n "$cpu" ]; then
     create_cmd+=(-c "$cpu")
@@ -6168,6 +8847,15 @@ upgrade_cmd() {
   if [ -n "$mem" ]; then
     create_cmd+=(-m "$mem")
   fi
+  if [ -n "$shm_size" ]; then
+    create_cmd+=(--shm-size "$shm_size")
+  fi
+  local network_spec=""
+  while IFS= read -r network_spec; do
+    [ -n "$network_spec" ] || continue
+    create_cmd+=(--network "$network_spec")
+  done <<<"$target_network_specs"
+  [ "$target_ssh" = "false" ] || create_cmd+=(--ssh)
   local mount_opts="type=bind,src=$workdir,dst=/workdir"
   if [ "$read_only" -eq 1 ]; then
     mount_opts="${mount_opts},readonly"
@@ -6175,12 +8863,24 @@ upgrade_cmd() {
   create_cmd+=(
     --name "$target_name"
     --mount "$mount_opts"
-    "$image" sh -c 'sleep infinity'
   )
+  while IFS= read -r socket_mount_arg; do
+    [ -n "$socket_mount_arg" ] || continue
+    create_cmd+=(--volume "$socket_mount_arg")
+  done < <(socket_volume_arguments "$target_socket_mappings")
+  while IFS= read -r published_arg; do
+    [ -n "$published_arg" ] || continue
+    create_cmd+=(--publish-socket "$published_arg")
+  done < <(published_socket_arguments "$target_published_sockets")
+  create_cmd+=("$image" sh -c 'sleep infinity')
   "${create_cmd[@]}"
 
   echo "Starting container: $target_name" >&2
   "$CONTAINER_CMD" start "$target_name" >/dev/null
+  if [ "$mcp_target_enabled" -eq 1 ]; then
+    mcp_configure_guest "$target_name"
+    mcp_persist_registry "$target_name"
+  fi
   if [ -n "$preflight_target_manifest" ]; then
     persist_container_system_manifest_baseline "$target_name" "$preflight_target_manifest" "image" "$image"
   else
@@ -6188,6 +8888,9 @@ upgrade_cmd() {
   fi
 
   reinstall_added_runtimes_and_features "$target_name" "$added_runtimes_json" "$added_features_json"
+  if [ "$ensure_ssh_feature" -eq 1 ]; then
+    ensure_requested_feature_installed "$target_name" ssh
+  fi
 
   echo "Restoring user state into $target_name" >&2
   restore_codex_config "$target_name" "$state_backup_file"
@@ -6208,6 +8911,8 @@ upgrade_cmd() {
   if [ "$was_running" -eq 0 ]; then
     echo "Stopping container: $target_name" >&2
     "$CONTAINER_CMD" stop "$target_name" >/dev/null
+    report_leftover_published_sockets "$target_published_sockets"
+    if [ "$mcp_target_enabled" -eq 1 ]; then mcp_stop_managed "$target_name"; fi
   fi
 
   if [ "$copy_mode" -eq 1 ]; then
@@ -6217,6 +8922,15 @@ upgrade_cmd() {
   else
     echo "Upgrade complete: $target_name (backup skipped)" >&2
   fi
+  if [ "$copy_mode" -eq 0 ] && { [ "$mcp_disable_requested" -eq 1 ] || [ "$target_name" != "$name" ]; }; then
+    mcp_stop_managed "$name"
+  fi
+  if [ "$mcp_disable_requested" -eq 1 ]; then rm -f "$(mcp_registry_path "$target_name")"; fi
+  if [ "$copy_mode" -eq 0 ] && [ "$target_name" != "$name" ]; then rm -f "$(mcp_registry_path "$name")"; fi
+  mcp_upgrade_relay_started=0
+  mcp_upgrade_relay_name=""
+  mcp_lock_release
+  trap - EXIT
   echo >&2
   if [ -n "$upgrade_package_reinstall_commands" ]; then
     echo "Reminder: reinstall top-level packages removed by the upgrade if you still need them:" >&2
@@ -6234,12 +8948,14 @@ rescue_cmd() {
   local keep=0
   local cpu=""
   local mem=""
+  local shm_size=""
   local created=0
   local started=0
   local exit_code=0
   local -a cmd=()
   local cmd_override_set=0
   local -a create_cmd=()
+  local -a networks=()
 
   cleanup_rescue_container() {
     if [ "$keep" -eq 1 ]; then
@@ -6268,6 +8984,8 @@ rescue_cmd() {
       --keep) keep=1; shift ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
+      --shm-size) shm_size="$2"; shift 2 ;;
+      --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
       --cmd) shift; cmd_override_set=1; cmd=("$@"); break ;;
       --help) usage_rescue; return 0 ;;
       --*) die "Unknown option for rescue: $1" ;;
@@ -6284,6 +9002,12 @@ rescue_cmd() {
 
   require_container
   [ -n "$image" ] || die "--image is required for rescue"
+  if [ -n "$shm_size" ]; then
+    require_container_shm_size_support
+  fi
+  if [ "${#networks[@]}" -gt 0 ]; then
+    validate_network_selection "${networks[@]}"
+  fi
   if [ "$cmd_override_set" -eq 1 ] && [ "${#cmd[@]}" -eq 0 ]; then
     die "Missing command after --cmd"
   fi
@@ -6314,6 +9038,15 @@ rescue_cmd() {
   fi
   if [ -n "$mem" ]; then
     create_cmd+=(-m "$mem")
+  fi
+  if [ -n "$shm_size" ]; then
+    create_cmd+=(--shm-size "$shm_size")
+  fi
+  local network_name=""
+  if [ "${#networks[@]}" -gt 0 ]; then
+    for network_name in "${networks[@]}"; do
+      create_cmd+=(--network "$network_name")
+    done
   fi
   create_cmd+=(--name "$name" "$image" /bin/sh -c 'sleep infinity')
 
@@ -6438,6 +9171,7 @@ simple_name_cmd() {
   shift
   local name=""
   local force=0
+  local published_sockets=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -6453,25 +9187,54 @@ simple_name_cmd() {
   if [ -z "$name" ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX")"
   fi
+  published_sockets="$(container_published_sockets "$name")"
+  mcp_lock_acquire "$name"
+  trap 'mcp_lock_release' EXIT
+  mcp_require_no_active_leases "$name" "$action"
 
   case "$action" in
     start)
+      warn_if_ssh_forwarding_unavailable_on_start "$name"
+      validate_container_socket_sources "$name"
+      validate_published_host_paths_for_start "$published_sockets"
+      if [ -f "$(mcp_registry_path "$name")" ]; then mcp_stop_managed "$name"; mcp_start_from_registry "$name"; fi
       "$CONTAINER_CMD" start "$name"
       configure_container_host_alias "$name"
+      if [ "$MCP_REQUESTED" -eq 1 ]; then mcp_configure_guest "$name"; fi
       ;;
-    stop) "$CONTAINER_CMD" stop "$name" ;;
+    stop)
+      "$CONTAINER_CMD" stop "$name"
+      report_leftover_published_sockets "$published_sockets" || true
+      mcp_stop_managed "$name"
+      ;;
     restart)
-      "$CONTAINER_CMD" restart "$name"
+      warn_if_ssh_forwarding_unavailable_on_start "$name"
+      validate_container_socket_sources "$name"
+      "$CONTAINER_CMD" stop "$name" >/dev/null
+      mcp_stop_managed "$name"
+      if ! report_leftover_published_sockets "$published_sockets"; then
+        die "Apple container did not remove all published socket listeners for $name; refusing to restart"
+      fi
+      validate_published_host_paths_for_start "$published_sockets"
+      if [ -f "$(mcp_registry_path "$name")" ]; then mcp_start_from_registry "$name"; fi
+      "$CONTAINER_CMD" start "$name"
       configure_container_host_alias "$name"
+      if [ "$MCP_REQUESTED" -eq 1 ]; then mcp_configure_guest "$name"; fi
       ;;
     rm)
+      mcp_stop_managed "$name"
       if [ "$force" -eq 1 ] && container_running "$name"; then
         "$CONTAINER_CMD" stop "$name" >/dev/null
+        report_leftover_published_sockets "$published_sockets" || true
       fi
       "$CONTAINER_CMD" rm "$name"
+      report_leftover_published_sockets "$published_sockets" || true
+      rm -f "$(mcp_registry_path "$name")"
       ;;
     *) die "Unknown action: $action" ;;
   esac
+  mcp_lock_release
+  trap - EXIT
 }
 
 ls_cmd() {
@@ -6639,6 +9402,7 @@ case "$cmd" in
   refresh) shift; refresh_cmd "$@" ;;
   doctor) shift; doctor_cmd "$@" ;;
   host-address) shift; host_address_cmd "$@" ;;
+  network) shift; network_cmd "$@" ;;
   system-manifest) shift; system_manifest_cmd "$@" ;;
   upgrade) shift; upgrade_cmd "$@" ;;
   rescue) shift; rescue_cmd "$@" ;;

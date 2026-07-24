@@ -856,6 +856,501 @@ test_feature_office_install_works_on_agent_python() {
   assert_status 0
 }
 
+test_ssh_feature_build_and_forwarding_lifecycle() {
+  begin_test "SSH forwarding feature preinstall survives upgrade and can be disabled"
+  local name workdir versioned_image
+
+  [ -n "${SSH_AUTH_SOCK:-}" ] || fail "SSH forwarding test requires SSH_AUTH_SOCK"
+  [ -S "$SSH_AUTH_SOCK" ] || fail "SSH forwarding test requires an existing SSH_AUTH_SOCK socket: $SSH_AUTH_SOCK"
+  name="$(unique_name ssh-forwarding)"
+  workdir="$(new_workdir)"
+  register_container_cleanup "$name"
+
+  run_capture "$AGENTCTL" build --image agent-plain --features ssh --rebuild
+  assert_status 0
+  versioned_image="$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^Building image tags: agent-plain, \(agent-plain:[^[:space:]]*\)$/\1/p' | tail -n 1)"
+  [ -n "$versioned_image" ] || fail "Could not parse versioned SSH build image from output: $RUN_OUTPUT"
+  register_image_cleanup "$versioned_image"
+
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --ssh --cmd true
+  assert_status 0
+  assert_not_contains "Installing requested feature"
+
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '(if type == "array" then .[0] else . end) | .configuration.ssh == true' >/dev/null \
+    || fail "Expected SSH forwarding in container inspect"
+
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '
+set -u
+command -v ssh >/dev/null
+command -v ssh-add >/dev/null
+test -S "${SSH_AUTH_SOCK:-/var/host-services/ssh-auth.sock}"
+output="$(ssh-add -l 2>&1)"
+status=$?
+[ "$status" -le 1 ]
+case "$output" in *"Could not open a connection"*) exit 1 ;; esac
+  '
+  assert_status 0
+
+  # Rebuild the target without preinstalled SSH to verify that a normal upgrade
+  # preserves the source feature instead of relying on the target image layer.
+  run_capture "$AGENTCTL" build --image agent-plain --rebuild
+  assert_status 0
+  versioned_image="$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^Building image tags: agent-plain, \(agent-plain:[^[:space:]]*\)$/\1/p' | tail -n 1)"
+  [ -n "$versioned_image" ] || fail "Could not parse versioned plain build image from output: $RUN_OUTPUT"
+  register_image_cleanup "$versioned_image"
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '(if type == "array" then .[0] else . end) | .configuration.ssh == true' >/dev/null \
+    || fail "Expected upgrade to preserve SSH forwarding"
+  run_capture "$AGENTCTL" feature --name "$name" info ssh
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.installed == true' >/dev/null \
+    || fail "Expected upgrade to reinstall the preserved SSH client feature"
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --no-ssh
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '(if type == "array" then .[0] else . end) | (.configuration.ssh // false) == false' >/dev/null \
+    || fail "Expected --no-ssh to disable forwarding"
+  run_capture "$AGENTCTL" feature --name "$name" info ssh
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.installed == true' >/dev/null || fail "Expected SSH client feature to remain installed"
+}
+
+test_host_socket_mount_lifecycle() {
+  begin_test "host Unix socket mount survives restart, upgrade, replacement, copy, and removal"
+  local name copy_name workdir socket_dir socket_one socket_two guest_socket server_script
+
+  command -v python3 >/dev/null 2>&1 || fail "socket-mount integration test requires host python3"
+  name="$(unique_name socket-mount)"
+  copy_name="${name}-copy"
+  workdir="$(new_workdir)"
+  socket_dir="$(mktemp -d /tmp/agentctl-sock.XXXXXX)"
+  register_dir_cleanup "$socket_dir"
+  socket_one="$socket_dir/one.sock"
+  socket_two="$socket_dir/two.sock"
+  guest_socket="/tmp/agentctl-test.sock"
+  server_script="$socket_dir/server.py"
+  register_container_cleanup "$name"
+  register_container_cleanup "$copy_name"
+
+  cat >"$server_script" <<'PY'
+import os
+import socket
+import sys
+
+path, response = sys.argv[1:]
+server = socket.socket(socket.AF_UNIX)
+server.bind(path)
+os.chmod(path, 0o666)
+server.listen()
+while True:
+    connection, _ = server.accept()
+    with connection:
+        request = connection.recv(1024)
+        connection.sendall(response.encode() + b":" + request)
+PY
+  python3 "$server_script" "$socket_one" one &
+  register_pid_cleanup "$!"
+  python3 "$server_script" "$socket_two" two &
+  register_pid_cleanup "$!"
+  for _ in 1 2 3 4 5; do
+    [ -S "$socket_one" ] && [ -S "$socket_two" ] && break
+    sleep 1
+  done
+  [ -S "$socket_one" ] && [ -S "$socket_two" ] || fail "host socket servers did not start"
+
+  if ! image_exists agent-python; then
+    run_capture "$AGENTCTL" build --image agent-python
+    assert_status 0
+  fi
+
+  assert_guest_socket_response() {
+    local target_name="$1"
+    local expected="$2"
+    run_capture "$AGENTCTL" exec --name "$target_name" --no-tty -- python3 -c \
+      'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b"ping"); print(s.recv(1024).decode())' \
+      "$guest_socket"
+    assert_status 0
+    assert_contains "$expected:ping"
+  }
+
+  run_capture "$AGENTCTL" run --name "$name" --image agent-python --workdir "$workdir" \
+    --mount-socket "$socket_one:$guest_socket" --cmd python3 -c \
+    'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b"ping"); print(s.recv(1024).decode())' \
+    "$guest_socket"
+  assert_status 0
+  assert_contains "one:ping"
+
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  assert_guest_socket_response "$name" one
+  run_capture "$AGENTCTL" restart --name "$name"
+  assert_status 0
+  assert_guest_socket_response "$name" one
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  assert_guest_socket_response "$name" one
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --mount-socket "$socket_two:$guest_socket"
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  assert_guest_socket_response "$name" two
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --new-name "$copy_name" --copy
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$copy_name"
+  assert_status 0
+  assert_guest_socket_response "$copy_name" two
+  run_capture "$AGENTCTL" stop --name "$copy_name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --unmount-socket "$guest_socket"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e --arg destination "$guest_socket" '
+    (if type == "array" then .[0] else . end)
+    | [(.configuration.mounts // .mounts // [])[]
+       | (.destination // .dst // .target // .containerPath // "")]
+    | index($destination) == null
+  ' >/dev/null || fail "Expected socket mapping removal in inspect: $RUN_OUTPUT"
+}
+
+test_managed_mcp_bridge_lifecycle() {
+  begin_test "managed MCP bridge exchanges traffic and survives start, restart, upgrade, and disable"
+  local name workdir marker node_path definition registry port debug_dir
+
+  command -v node >/dev/null 2>&1 || fail "managed MCP integration test requires host Node.js"
+  name="$(unique_name managed-mcp)"
+  workdir="$(new_workdir)"
+  marker="$workdir/mcp-started"
+  node_path="$(command -v node)"
+  registry="$HOME/Library/Application Support/agentctl/mcp/$name.json"
+  port=47123
+  debug_dir="$TEST_ROOT/tmp/mcp/$name"
+  mkdir -p "$debug_dir"
+  chmod 700 "$TEST_ROOT/tmp" "$debug_dir" 2>/dev/null || true
+  export AGENTCTL_MCP_LOG_DIR="$debug_dir"
+  register_container_cleanup "$name"
+
+  # Reuse the current image on iterative runs. Set AGENTCTL_MCP_TEST_REBUILD=1
+  # when validating image assembly itself or after changing feature assets.
+  if ! image_exists agent-python || [ "${AGENTCTL_MCP_TEST_REBUILD:-0}" = 1 ]; then
+    run_capture "$AGENTCTL" build --image agent-python --features mcp-bridge --rebuild
+    assert_status 0
+  fi
+
+  definition="$(jq -cn \
+    --arg command "$node_path" \
+    --arg server "$TEST_ROOT/tests/fixtures/fake-mcp-server.mjs" \
+    --arg marker "$marker" \
+    '{name:"fake",command:$command,args:[$server],env:{AGENTCTL_FAKE_MCP_STARTED:$marker},shared:true}')"
+
+  log "managed-mcp: creating bridge and checking lazy child startup"
+  run_capture "$AGENTCTL" run --name "$name" --image agent-python --workdir "$workdir" \
+    --mcp "$definition" --cmd sh -lc '
+set -eu
+test ! -e /workdir/mcp-started
+codex mcp get fake --json | jq -e ".transport.type == \"streamable_http\" and .transport.url == \"http://127.0.0.1:47123/mcp/fake\"" >/dev/null
+response=""
+curl_error=/tmp/agentctl-mcp-curl-error
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  response="$(curl -fsS -X POST -H "content-type: application/json" \
+    --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}" \
+    http://127.0.0.1:47123/mcp/fake 2>"$curl_error")" && break
+  sleep 1
+done
+if [ -s "$curl_error" ]; then cat "$curl_error" >&2; fi
+printf "MCP response: %s\n" "$response" >&2
+printf "%s" "$response" | jq -e ".result.serverInfo.name == \"fake\"" >/dev/null
+second="$(curl -fsS -X POST -H "content-type: application/json" \
+  --data "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}" \
+  http://127.0.0.1:47123/mcp/fake)"
+printf "%s" "$second" | jq -e ".result.serverInfo.name == \"fake\"" >/dev/null
+test -s /workdir/mcp-started
+test "$(wc -l </workdir/mcp-started | tr -d " ")" = 1
+  '
+  if [ "$RUN_STATUS" -ne 0 ]; then
+    printf '%s\n' '--- managed MCP run output ---' >&2
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    printf '%s\n' '--- host MCP relay logs ---' >&2
+    find "$debug_dir" -maxdepth 1 -name 'mcp-*.log' -type f -print -exec sed -n '1,200p' {} \; >&2 || true
+    printf '%s\n' '--- guest MCP proxy logs ---' >&2
+    find "$debug_dir" -maxdepth 1 -name 'guest-*.log' -type f -print -exec sed -n '1,200p' {} \; >&2 || true
+  fi
+  assert_status 0
+  if [ ! -s "$marker" ]; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    ls -la "$workdir" >&2 || true
+    fail "Expected fake MCP child to start on the first request"
+  fi
+  [ "$(wc -l <"$marker" | tr -d ' ')" = 1 ] || fail "Expected repeated sessionless requests to reuse one MCP child"
+  [ -f "$registry" ] || fail "Expected private MCP registry: $registry"
+  [ "$(stat -f '%Lp' "$registry")" = 600 ] || fail "Expected MCP registry mode 0600"
+  if grep -Fq -- "$marker" "$registry"; then
+    fail "Literal MCP environment value was persisted in the registry"
+  fi
+
+  log "managed-mcp: reusing the same named container through run --mcp"
+  run_capture "$AGENTCTL" run --name "$name" --image agent-python --workdir "$workdir" \
+    --mcp "$definition" --cmd true
+  assert_status 0
+
+  assert_mcp_initialize() {
+    run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '
+curl -fsS -X POST -H "content-type: application/json" \
+  --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}" \
+  http://127.0.0.1:'"$port"'/mcp/fake | jq -e ".result.serverInfo.name == \"fake\"" >/dev/null
+    '
+    assert_status 0
+  }
+
+  log "managed-mcp: checking start and restart supervision"
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  assert_mcp_initialize
+  run_capture "$AGENTCTL" restart --name "$name"
+  assert_status 0
+  assert_mcp_initialize
+
+  run_capture "$AGENTCTL" doctor --name "$name"
+  assert_status 0
+  assert_contains "Doctor managed MCP bridge"
+  assert_contains "definitions: fake"
+  assert_contains "guest-to-host MCP route healthy"
+
+  run_capture "$AGENTCTL" doctor --host
+  assert_contains "Managed MCP relays"
+  assert_contains "Container $name"
+  assert_contains "container-scoped relays normally have parent PID 1"
+  assert_contains "process agentctl-mcp-relay:$name"
+
+  log "managed-mcp: checking stopped-container doctor supervision"
+  local starts_before_doctor
+  starts_before_doctor="$(wc -l <"$marker" | tr -d ' ')"
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" doctor --name "$name"
+  assert_status 0
+  assert_contains "host relay inactive because the container is stopped"
+  assert_contains "Doctor confirmed managed MCP health after temporarily starting $name"
+  assert_not_contains "host source unavailable or not a Unix socket"
+  assert_not_contains "stopped-container published-socket problem"
+  [ "$(wc -l <"$marker" | tr -d ' ')" = "$starts_before_doctor" ] || fail "Doctor health checks unexpectedly started the MCP child"
+  run_capture "$CONTAINER_CMD" ls --quiet
+  if printf '%s\n' "$RUN_OUTPUT" | grep -Fqx -- "$name"; then fail "Doctor did not restore the stopped container state"; fi
+  run_capture "$AGENTCTL" doctor --host
+  assert_contains "Container $name"
+  assert_contains "host relay inactive because the container is stopped"
+  log "managed-mcp: checking stopped-container upgrade preservation"
+  starts_before_doctor="$(wc -l <"$marker" | tr -d ' ')"
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
+  assert_status 0
+  [ "$(wc -l <"$marker" | tr -d ' ')" = "$starts_before_doctor" ] || fail "Stopped MCP upgrade preflight unexpectedly started the MCP child"
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  assert_mcp_initialize
+
+  log "managed-mcp: disabling bridge"
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --disable-mcp
+  assert_status 0
+  [ ! -e "$registry" ] || fail "Expected --disable-mcp to remove the registry"
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '
+    (if type == "array" then .[0] else . end)
+    | [(.configuration.mounts // [])[] | (.destination // .dst // "")]
+    | index("/run/agentctl/mcp-host.sock") == null
+  ' >/dev/null || fail "Expected --disable-mcp to remove managed socket wiring"
+}
+
+test_published_socket_lifecycle() {
+  begin_test "container Unix socket publishing survives lifecycle and upgrade changes"
+  local name copy_name running_copy_name collision_name workdir socket_dir host_one host_two guest_socket
+
+  name="$(unique_name published-socket)"
+  copy_name="${name}-copy"
+  running_copy_name="${name}-running-copy"
+  collision_name="${name}-collision"
+  workdir="$(new_workdir)"
+  socket_dir="$(mktemp -d /tmp/agentctl-published.XXXXXX)"
+  socket_dir="$(CDPATH= cd -- "$socket_dir" && pwd -P)"
+  chmod 700 "$socket_dir"
+  register_dir_cleanup "$socket_dir"
+  host_one="$socket_dir/one.sock"
+  host_two="$socket_dir/two.sock"
+  guest_socket="/tmp/agentctl-published-test.sock"
+  register_container_cleanup "$name"
+  register_container_cleanup "$copy_name"
+  register_container_cleanup "$running_copy_name"
+  register_container_cleanup "$collision_name"
+
+  if ! image_exists agent-python; then
+    run_capture "$AGENTCTL" build --image agent-python
+    assert_status 0
+  fi
+
+  chmod 750 "$socket_dir"
+  run_capture "$AGENTCTL" run --name "$collision_name" --image agent-python --workdir "$workdir" \
+    --publish-socket "$host_one:$guest_socket" --cmd true
+  assert_status 1
+  assert_contains "inaccessible to group and other users"
+  chmod 700 "$socket_dir"
+
+  assert_collision_refused() {
+    local collision_path="$1"
+    run_capture "$AGENTCTL" run --name "$collision_name" --image agent-python --workdir "$workdir" \
+      --publish-socket "$collision_path:$guest_socket" --cmd true
+    assert_status 1
+    assert_contains "already exists"
+    [ -e "$collision_path" ] || [ -L "$collision_path" ] \
+      || fail "agentctl removed the colliding host entry: $collision_path"
+  }
+
+  : >"$host_one"
+  assert_collision_refused "$host_one"
+  rm -f "$host_one"
+  mkdir "$host_one"
+  assert_collision_refused "$host_one"
+  rmdir "$host_one"
+  ln -s "$host_two" "$host_one"
+  assert_collision_refused "$host_one"
+  rm -f "$host_one"
+  python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' "$host_one"
+  assert_collision_refused "$host_one"
+  rm -f "$host_one"
+
+  host_exchange() {
+    local host_path="$1"
+    log "published-socket: exchanging data through $host_path"
+    run_capture python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b"ping"); print(s.recv(1024).decode())' "$host_path"
+    assert_status 0
+    assert_contains "container:ping"
+  }
+
+  start_guest_server() {
+    log "published-socket: starting non-root guest server in $1"
+    run_capture "$AGENTCTL" exec --name "$1" --no-tty -- python3 -c \
+      'import os,socket,sys; p=sys.argv[1]; os.path.exists(p) and os.unlink(p); s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(); c,_=s.accept(); c.sendall(b"container:"+c.recv(1024)); c.close()' \
+      "$guest_socket" &
+    register_pid_cleanup "$!"
+    sleep 1
+  }
+
+  log "published-socket: creating $name"
+  run_capture "$AGENTCTL" run --name "$name" --image agent-python --workdir "$workdir" \
+    --publish-socket "$host_one:$guest_socket" --cmd true
+  assert_status 0
+  [ ! -e "$host_one" ] || fail "Published listener remained after run stopped the container"
+
+  log "published-socket: starting $name"
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  [ -S "$host_one" ] || fail "Published listener was not created on start"
+  start_guest_server "$name"
+  host_exchange "$host_one"
+  log "published-socket: restarting $name"
+  run_capture "$AGENTCTL" restart --name "$name"
+  assert_status 0
+  [ -S "$host_one" ] || fail "Published listener was not recreated on restart"
+  log "published-socket: stopping $name"
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+  [ ! -e "$host_one" ] || fail "Published listener remained after stop"
+  : >"$host_one"
+  run_capture "$AGENTCTL" doctor --name "$name"
+  assert_status 1
+  assert_contains "stopped container left a published host entry behind"
+  [ -f "$host_one" ] || fail "Doctor deleted a stopped-container host collision"
+  rm -f "$host_one"
+
+  log "published-socket: upgrading $name with an additional listener"
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --publish-socket "$host_two:$guest_socket"
+  assert_status 0
+  [ ! -e "$host_one" ] && [ ! -e "$host_two" ] \
+    || fail "Stopped-container upgrade left published listeners behind"
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e --arg one "$host_one" --arg two "$host_two" '
+    (if type == "array" then .[0] else . end)
+    | [(.configuration.publishedSockets // [])[] | .hostPath]
+    | index($one) != null and index($two) != null
+  ' >/dev/null || fail "Upgrade did not preserve and add published mappings: $RUN_OUTPUT"
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  [ -S "$host_one" ] && [ -S "$host_two" ] \
+    || fail "Starting the upgraded container did not create both published listeners"
+  run_capture "$AGENTCTL" upgrade --name "$name" --new-name "$running_copy_name" --copy
+  assert_status 1
+  assert_contains "Cannot copy running container"
+  container_exists "$name" || fail "Running-copy refusal removed the source container"
+  [ -S "$host_one" ] && [ -S "$host_two" ] \
+    || fail "Running-copy refusal disrupted source listeners"
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+
+  log "published-socket: copying stopped $name to $copy_name"
+  run_capture "$AGENTCTL" upgrade --name "$name" --new-name "$copy_name" --copy
+  assert_status 0
+  [ ! -e "$host_one" ] && [ ! -e "$host_two" ] \
+    || fail "Stopped-source copy left published listeners behind"
+  run_capture "$CONTAINER_CMD" inspect "$copy_name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e --arg one "$host_one" --arg two "$host_two" '
+    (if type == "array" then .[0] else . end)
+    | [(.configuration.publishedSockets // [])[] | .hostPath]
+    | index($one) != null and index($two) != null
+  ' >/dev/null || fail "Stopped-source copy did not preserve published mappings: $RUN_OUTPUT"
+  run_capture "$AGENTCTL" start --name "$copy_name"
+  assert_status 0
+  [ -S "$host_one" ] && [ -S "$host_two" ] \
+    || fail "Starting the stopped-source copy did not create both published listeners"
+  run_capture "$AGENTCTL" stop --name "$copy_name"
+  assert_status 0
+
+  log "published-socket: removing one listener from $name"
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --unpublish-socket "$host_one"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e --arg removed "$host_one" --arg kept "$host_two" '
+    (if type == "array" then .[0] else . end)
+    | [(.configuration.publishedSockets // [])[] | .hostPath]
+    | index($removed) == null and index($kept) != null
+  ' >/dev/null || fail "Expected targeted published socket removal in inspect: $RUN_OUTPUT"
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup \
+    --publish-socket "$host_two:/tmp/agentctl-published-replacement.sock"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$name"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e --arg host "$host_two" '
+    (if type == "array" then .[0] else . end)
+    | [(.configuration.publishedSockets // [])[]
+       | select(.hostPath == $host and .containerPath == "/tmp/agentctl-published-replacement.sock")]
+    | length == 1
+  ' >/dev/null || fail "Expected host-path replacement in inspect: $RUN_OUTPUT"
+}
+
 test_bootstrap_works_on_existing_alpine_container() {
   begin_test "bootstrap works on an existing Alpine container"
   local name
@@ -959,6 +1454,167 @@ test_bootstrap_works_on_existing_debian_container() {
   assert_status 0
 }
 
+test_host_only_network_lifecycle_isolation_and_upgrade() {
+  begin_test "host-only networks isolate external and cross-network traffic and survive upgrade"
+
+  local network
+  local other_network
+  local server
+  local peer
+  local outsider
+  local workdir
+  local gateway
+  local server_address
+  local host_server_dir
+  local host_server_log
+  local host_server_pid
+  local host_server_port
+  local host_server_port_file
+  local host_server_script
+  network="$(unique_name internal-net)"
+  other_network="$(unique_name other-net)"
+  server="$(unique_name internal-server)"
+  peer="$(unique_name internal-peer)"
+  outsider="$(unique_name internal-outsider)"
+  workdir="$(new_workdir)"
+  register_network_cleanup "$network"
+  register_network_cleanup "$other_network"
+  register_container_cleanup "$server"
+  register_container_cleanup "$peer"
+  register_container_cleanup "$outsider"
+
+  ensure_agent_plain_image
+
+  run_capture "$AGENTCTL" network create --internal "$network"
+  assert_status 0
+  run_capture "$AGENTCTL" network create --internal "$other_network"
+  assert_status 0
+  run_capture "$AGENTCTL" network list
+  assert_status 0
+  assert_contains "$network"
+  assert_contains "yes"
+
+  run_capture "$AGENTCTL" run --name "$server" --image agent-plain --workdir "$workdir" --network "$network" --cmd true
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$server"
+  assert_status 0
+  log "host-only: checking same-network connectivity"
+  run_capture "$AGENTCTL" exec --name "$server" --no-tty -- sh -lc 'nohup node -e '\''require("http").createServer((_request, response) => response.end("ok")).listen(18080, "0.0.0.0")'\'' >/tmp/agentctl-network-server.log 2>&1 &'
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$server"
+  assert_status 0
+  if ! server_address="$(printf '%s' "$RUN_OUTPUT" | jq -er --arg network "$network" '
+    (if type == "array" then .[0] else . end)
+    | first(
+        (.networks // .status.networks // [])[]
+        | select((.network // .name // .id) == $network)
+        | (.address // .ipv4Address // empty)
+        | split("/")[0]
+      )
+  ')"; then
+    fail "Unable to parse server address on network $network from container inspect: $RUN_OUTPUT"
+  fi
+  [ -n "$server_address" ] || fail "Unable to determine server address on network $network"
+  sleep 1
+  run_capture "$AGENTCTL" exec --name "$server" --no-tty -- curl -fsS --connect-timeout 3 --max-time 5 http://127.0.0.1:18080
+  if [ "$RUN_STATUS" -ne 0 ]; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    "$AGENTCTL" exec --name "$server" --no-tty -- sh -lc 'ps -ef; cat /tmp/agentctl-network-server.log 2>/dev/null || true' >&2 || true
+    fail "Expected the network test server to answer inside its own container"
+  fi
+
+  # Apple container's own host-only test attaches the client after the server
+  # and network are running. Preserve that ordering because vmnet attachment
+  # initialization can otherwise race peer reachability.
+  run_capture "$AGENTCTL" run --name "$peer" --image agent-plain --workdir "$workdir" --network "$network" --cmd true
+  assert_status 0
+  run_capture "$AGENTCTL" run --name "$outsider" --image agent-plain --workdir "$workdir" --network "$other_network" --cmd true
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$peer"
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$outsider"
+  assert_status 0
+  run_capture "$AGENTCTL" exec --name "$peer" --no-tty -- curl -fsS --retry 10 --retry-connrefused --retry-delay 1 --connect-timeout 3 --max-time 20 "http://$server_address:18080"
+  if [ "$RUN_STATUS" -ne 0 ]; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    "$AGENTCTL" exec --name "$server" --no-tty -- sh -lc 'ps -ef; printf "\n--- server log ---\n"; cat /tmp/agentctl-network-server.log 2>/dev/null || true' >&2 || true
+    "$CONTAINER_CMD" inspect "$server" "$peer" >&2 || true
+    fail "Expected same-network connection to $server_address:18080 to succeed"
+  fi
+
+  log "host-only: checking cross-network and external isolation"
+  run_capture "$AGENTCTL" exec --name "$outsider" --no-tty -- curl -fsS --connect-timeout 3 --max-time 5 "http://$server_address:18080"
+  [ "$RUN_STATUS" -ne 0 ] || fail "Expected distinct host-only networks to be isolated"
+  run_capture "$AGENTCTL" exec --name "$peer" --no-tty -- curl -fsS --connect-timeout 3 --max-time 5 https://example.com/
+  [ "$RUN_STATUS" -ne 0 ] || fail "Expected a host-only network to have no external route"
+  log "host-only: checking online-mode rejection and host alias"
+  run_capture "$AGENTCTL" run --name "$peer" --online --cmd true
+  assert_status 1
+  assert_contains "Online mode cannot use a host-only network"
+
+  run_capture "$AGENTCTL" host-address --network "$network"
+  assert_status 0
+  gateway="$RUN_OUTPUT"
+  [ -n "$gateway" ] || fail "Expected a host gateway for network $network"
+  run_capture "$AGENTCTL" exec --name "$peer" --no-tty -- awk -v gateway="$gateway" '$1 == gateway && $2 == "host.container.internal" { found=1 } END { exit !found }' /etc/hosts
+  assert_status 0
+
+  log "host-only: checking connectivity to a host service"
+  command -v python3 >/dev/null 2>&1 || fail "The host-only host-service test requires python3 on the macOS host"
+  host_server_dir="$(new_workdir)"
+  host_server_script="$host_server_dir/server.py"
+  host_server_port_file="$host_server_dir/port"
+  host_server_log="$host_server_dir/server.log"
+  printf 'host-only gateway reached\n' >"$host_server_dir/index.html"
+  cat >"$host_server_script" <<'PY'
+import http.server
+import pathlib
+import sys
+
+address, port_file, directory = sys.argv[1:]
+handler = lambda *args, **kwargs: http.server.SimpleHTTPRequestHandler(
+    *args, directory=directory, **kwargs
+)
+server = http.server.ThreadingHTTPServer((address, 0), handler)
+pathlib.Path(port_file).write_text(str(server.server_port), encoding="utf-8")
+server.serve_forever()
+PY
+  python3 "$host_server_script" "$gateway" "$host_server_port_file" "$host_server_dir" >"$host_server_log" 2>&1 &
+  host_server_pid=$!
+  register_pid_cleanup "$host_server_pid"
+  for _ in 1 2 3 4 5; do
+    [ -s "$host_server_port_file" ] && break
+    kill -0 "$host_server_pid" >/dev/null 2>&1 || break
+    sleep 1
+  done
+  if [ ! -s "$host_server_port_file" ]; then
+    cat "$host_server_log" >&2 || true
+    fail "Unable to start a host HTTP server on host-only gateway $gateway"
+  fi
+  host_server_port="$(cat "$host_server_port_file")"
+  run_capture "$AGENTCTL" exec --name "$peer" --no-tty -- curl -fsS --connect-timeout 3 --max-time 10 "http://host.container.internal:$host_server_port/"
+  if [ "$RUN_STATUS" -ne 0 ]; then
+    printf '%s\n' "$RUN_OUTPUT" >&2
+    cat "$host_server_log" >&2 || true
+    fail "Expected host-only container to reach the host service at $gateway:$host_server_port"
+  fi
+  assert_contains "host-only gateway reached"
+
+  log "host-only: checking upgrade preservation and deletion safety"
+  run_capture "$AGENTCTL" upgrade --name "$peer" --image agent-plain --no-backup
+  assert_status 0
+  run_capture "$CONTAINER_CMD" inspect "$peer"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e --arg network "$network" '
+    (if type == "array" then .[0] else . end)
+    | ((.configuration.networks // .status.networks // .networks // []) | tostring)
+    | contains($network)
+  ' >/dev/null || fail "Expected upgrade to preserve network $network"
+
+  run_capture "$AGENTCTL" network rm "$network"
+  [ "$RUN_STATUS" -ne 0 ] || fail "Expected deletion of an attached network to fail"
+}
+
 main() {
   require_host_prereqs
 
@@ -993,9 +1649,14 @@ main() {
   run_selected_test test_tool_home_smoke_codex_external_home "tool-home smoke keeps Codex tools outside mounted home" smoke
   run_selected_test test_tool_home_smoke_claude_external_home_when_installed "tool-home smoke keeps Claude tools outside mounted home when installed" smoke
   run_selected_test test_feature_office_install_works_on_agent_python "feature install office works on agent-python" full
+  run_selected_test test_ssh_feature_build_and_forwarding_lifecycle "SSH forwarding feature preinstall survives upgrade and can be disabled" full
+  run_selected_test test_host_socket_mount_lifecycle "host Unix socket mount survives restart, upgrade, replacement, copy, and removal" full
+  run_selected_test test_managed_mcp_bridge_lifecycle "managed MCP bridge exchanges traffic and survives start, restart, upgrade, and disable" full
+  run_selected_test test_published_socket_lifecycle "container Unix socket publishing survives lifecycle and upgrade changes" full
   run_selected_test test_bootstrap_works_on_existing_alpine_container "bootstrap works on an existing Alpine container" full
   run_selected_test test_bootstrap_can_create_and_bootstrap_new_alpine_container "bootstrap can create and bootstrap a new Alpine container" full
   run_selected_test test_bootstrap_works_on_existing_debian_container "bootstrap works on an existing Debian container" full
+  run_selected_test test_host_only_network_lifecycle_isolation_and_upgrade "host-only networks isolate external and cross-network traffic and survive upgrade" full
   assert_selected_tests_ran
 
   log "PASS: all host integration tests completed"

@@ -802,6 +802,19 @@ agent_runtime_update() {
   codex_repair_bundled_rg "$install_home"
 }
 
+agent_runtime_mcp_add() {
+  local runtime="$1"
+  local name="$2"
+  local url="$3"
+  local codex_command=""
+
+  [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
+  codex_command="$(runtime_command_path "$runtime")" || die "runtime not installed: $runtime"
+  export CODEX_HOME="$(codex_home_dir)"
+  "$codex_command" mcp remove "$name" >/dev/null 2>&1 || true
+  "$codex_command" mcp add "$name" --url "$url" >/dev/null
+}
+
 agent_runtime_reset_config() {
   local runtime="$1"
   local config_dir="$2"

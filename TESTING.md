@@ -19,6 +19,7 @@ dependencies:
 - named `run` keeps the container until explicit removal
 - `build --rebuild` stops the temporary `buildkit` support container after a successful build
 - `run` rejects `--cpu` and `--mem` for existing named containers
+- `run --shm-size` reuses an existing container only when the requested size matches
 - backup-enabled `refresh` requires a container runtime with `export --output`
 - `refresh --no-backup` preserves user state without creating a backup image
 - default `refresh` creates a recovery backup image
@@ -26,6 +27,9 @@ dependencies:
   packages installed through multiple tagged APK repositories
 - `refresh` accepts explicit `--cpu` and `--mem` overrides when recreating a container
 - refresh preflight failures do not remove the original container
+- managed host-only networks enforce same-network communication, cross-network
+  isolation, no external route, host-service access through the selected
+  gateway, host alias selection, and upgrade preservation
 - `run --reset-config` restores image-owned config, model metadata, and `AGENTS.md`
 - `refresh --overwrite-config` restores image-owned config, model metadata, and `AGENTS.md`
 
@@ -36,13 +40,101 @@ bash tests/run-tests.sh
 ```
 
 Before a release, runtime upgrade, or compatibility sign-off, run the full
-20-test host suite. The full tier includes the smoke tests plus build cleanup,
+host suite. The full tier includes the smoke tests plus build cleanup,
 upgrade/backup/rescue, package manifests, feature installation, and Alpine and
 Debian bootstrap coverage:
+
+Run the focused host Unix-socket lifecycle test on macOS first:
+
+```bash
+bash tests/run-tests.sh --tier full --filter socket-mount
+bash tests/run-tests.sh --tier full --filter published-socket
+```
+
+It uses temporary host socket servers and `agent-python` to verify non-root
+`coder` data exchange, restart, upgrade preservation, destination replacement,
+`--copy`, inspect-visible removal, and cleanup. Because it requires Apple's host
+runtime it cannot run in the Linux development container.
+
+The published-socket test uses an explicit mode-0700 host directory and a
+non-root `coder` Unix-socket server. It verifies host data exchange, listener
+removal and recreation across stop/start/restart, upgrade preservation and
+addition/replacement, stopped-source copy, running-copy refusal, targeted
+removal, inspect state, doctor diagnostics, unsafe permissions, and collisions
+with files, directories, sockets, and symlinks. agentctl must report but never
+delete a leftover or colliding host entry.
 
 ```bash
 bash tests/run-tests.sh --tier full
 ```
+
+The host-only network test creates two managed internal networks and three
+containers, checks same-network and cross-network connectivity, verifies that
+external and online access are rejected, starts a temporary host HTTP service
+bound to the selected gateway and reaches it through `host.container.internal`,
+and confirms upgrade preservation and attached-network deletion safety:
+
+```bash
+bash tests/run-tests.sh --tier full --filter host-only
+```
+
+The SSH forwarding test requires a working host `SSH_AUTH_SOCK`. It rebuilds
+`agent-plain` with the SSH feature preinstalled, verifies non-root agent access,
+checks upgrade preservation, and then disables the relay while retaining the
+client feature:
+
+```bash
+bash tests/run-tests.sh --tier full --filter ssh-forwarding
+```
+
+The transport itself has a Linux-compatible Node test using a fake stdio MCP
+server. It checks lazy initialization, session reuse, tool listing, deletion,
+and the nonce health endpoint without creating a TCP listener:
+
+```bash
+node tests/run-mcp-node-tests.mjs
+```
+
+The focused macOS MCP test writes redacted host-relay diagnostics beneath
+`./tmp/mcp/`. On failure it also prints the guest proxy log before cleanup.
+It covers lazy startup, automatic Codex registration, repeated named-container
+reuse, start/restart supervision, stopped-container doctor checks, upgrade from
+a stopped state, definition preservation, disablement, and cleanup:
+
+```bash
+bash tests/run-tests.sh --tier full --filter managed-mcp
+```
+
+On macOS, additionally create a container with `agentctl run --mcp` and point a
+client at `http://127.0.0.1:47123/mcp/<name>`. Use `lsof -nP -iTCP:47123` to
+confirm the host has no TCP listener; the only host listener is the private
+socket below `/tmp/agentctl-$(id -u)/`.
+
+For a focused Apple container 1.1 storage-accounting smoke check, run:
+
+```bash
+agentctl doctor --host
+```
+
+Expected output includes a `Container storage` section with Images,
+Containers, and Volumes rows. Values are global runtime accounting;
+`Reclaimable` is not a statement that stopped containers or volumes are safe
+to delete.
+
+For MCP-enabled containers, the same command includes `Managed MCP relays` and
+maps each `agentctl-mcp-relay:<container>` process to its registry, socket,
+definitions, leases, and health. A stopped container is expected to report an
+inactive relay. `agentctl doctor --name NAME` must treat the managed MCP mount
+separately from user socket mounts and published sockets; when it temporarily
+starts a stopped container, confirm it also starts and then removes the relay
+without launching the configured MCP child.
+
+Also stop a running MCP-enabled container once with the lower-level
+`container stop NAME`. Host doctor must prominently report that the managed
+relay remains and suggest `agentctl stop --name NAME`; running that suggested
+action must remove the verified relay and socket. For Xcode, open a project,
+start two `agentctl run --online` sessions against the same persisted container,
+and verify closing either session does not break MCP calls in the other.
 
 Focused integration filters are available for narrower validation. The tool-home smoke
 builds or requires `agent-plain`, creates a real container with host directories mounted
@@ -238,6 +330,24 @@ agentctl run --name agent-refresh-resources --image agent-plain --workdir testin
 agentctl refresh --name agent-refresh-resources --cpu 4 --mem 8G --no-backup
 agentctl rm --name agent-refresh-resources
 ```
+
+Shared-memory sizing requires Apple container 1.1 or newer. Verify creation,
+matching reuse, conflicting reuse, and upgrade preservation with a disposable
+container:
+
+```bash
+agentctl run --name agent-shm-smoke --image agent-plain --workdir testing/agent-plain --shm-size 1G --cmd sh -lc 'df -h /dev/shm && mount | grep /dev/shm'
+agentctl run --name agent-shm-smoke --image agent-plain --workdir testing/agent-plain --shm-size 1024MiB --cmd true
+agentctl run --name agent-shm-smoke --image agent-plain --workdir testing/agent-plain --shm-size 2G --cmd true
+agentctl upgrade --name agent-shm-smoke --no-backup --dry-run
+agentctl upgrade --name agent-shm-smoke --no-backup --shm-size 2G
+agentctl run --name agent-shm-smoke --image agent-plain --workdir testing/agent-plain --cmd sh -lc 'df -h /dev/shm && mount | grep /dev/shm'
+agentctl rm --name agent-shm-smoke
+```
+
+The matching `1024MiB` reuse should succeed, the conflicting `2G` reuse should
+fail with upgrade guidance, the dry run should report `1G -> 1G`, and the final
+container should report approximately 2 GiB for `/dev/shm`.
 
 Expected output includes:
 

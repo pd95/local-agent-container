@@ -46,8 +46,60 @@ http://host.container.internal:11434
 ```
 
 Agentctl refreshes this name in the managed container's `/etc/hosts` using the
-current gateway reported by Apple container. The underlying subnet may change
+gateway of the container's selected network. The underlying subnet may change
 without requiring Codex or MCP configuration edits.
+
+## Custom and host-only networks
+
+Apple container 1.1 supports reusable named networks. Agentctl exposes the
+standard vmnet lifecycle without exposing custom network plugins:
+
+```bash
+agentctl network list
+agentctl network create shared --subnet 10.40.0.0/24
+agentctl network create --internal isolated
+agentctl network inspect isolated
+agentctl network rm isolated
+```
+
+Every network created by `agentctl` receives an ownership label. Listings show
+all Apple container networks and whether each is managed. `agentctl network rm`
+only removes managed networks, so a user-created network is never deleted based
+on its name. Apple container will also reject removal while a container still
+references the network.
+
+Attach one or more NAT networks with repeated flags:
+
+```bash
+agentctl run --network frontend --network services
+agentctl bootstrap --name imported --image alpine --network services
+agentctl rescue --backup-image agent-backup --network services
+```
+
+A host-only (`--internal`) network cannot be combined with another network.
+This prevents a second attachment from restoring an external route. Containers
+on the same host-only network can communicate with one another and can address
+the Mac through that network's gateway and `host.container.internal`, but they
+cannot reach the internet. Consequently `agentctl run --online` is rejected for
+an existing or newly selected host-only network. The macOS integration suite
+verifies host access with a temporary HTTP server bound specifically to the
+selected network's gateway; a host service bound only to `127.0.0.1` remains
+unreachable without a separate proxy or localhost DNS forwarding.
+
+Upgrade preserves the ordered network attachments by default, including
+explicitly configured MAC addresses and MTU options. Runtime-assigned MAC
+addresses are not converted into persistent configuration. Copy mode preserves
+the networks and MTUs but requests fresh MAC addresses so the source and copy
+can coexist safely. Repeated `upgrade --network NAME` flags explicitly replace
+the preserved attachments. Changing an existing named container's network
+through `run` is rejected; use `upgrade` to recreate it.
+
+Host-only behavior depends on macOS and Apple container 1.1. Run the focused
+host integration test after upgrading the runtime:
+
+```bash
+bash tests/run-tests.sh --tier full --filter host-only
+```
 
 Ollama itself usually listens only on:
 - `http://localhost:11434`

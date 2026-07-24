@@ -1,6 +1,7 @@
 # For Python environment
 FROM agent-plain
 ARG BUILD_TIME=""
+ARG AGENT_FEATURES=""
 
 USER root
 
@@ -52,6 +53,10 @@ Programming environments:
 Prefer the default \`/opt/venv\` environment for Python package installs and script execution unless the user asks for a project-local virtualenv.
 EOF
 RUN ln -sf /etc/agentctl/image.md /home/coder/.codex/AGENTS.md
+
+RUN if [ -n "$AGENT_FEATURES" ]; then \
+      AGENT_FEATURES="$AGENT_FEATURES" bash -lc 'set -euo pipefail; IFS="," read -r -a features <<<"$AGENT_FEATURES"; for feature in "${features[@]}"; do bash /usr/local/bin/agent.sh feature install "$feature"; done'; \
+    fi
 
 USER coder
 WORKDIR /workdir
