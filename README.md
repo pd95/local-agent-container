@@ -85,7 +85,9 @@ Details and options are in [docs/networking.md](docs/networking.md).
 
 `run --mcp` exposes an explicitly authorized host stdio MCP server to the
 container through a private Unix socket and a guest proxy bound only to
-`127.0.0.1`. It does not open a host TCP port or edit runtime configuration.
+`127.0.0.1`. It never opens a host TCP port, and container requests cannot
+alter the authorized host command definitions. Codex endpoint registration is
+the only runtime configuration currently managed automatically.
 
 ```bash
 # Built-in Xcode preset (host command: xcrun mcpbridge)
@@ -100,8 +102,10 @@ agentctl run --mcp @"$HOME/.config/agentctl/private-mcp.json"
 
 For Codex, `agentctl` automatically registers every enabled server as a
 Streamable HTTP endpoint before launching the runtime. This also works in
-temporary containers. Other runtimes currently retain manual configuration
-using URLs such as `http://127.0.0.1:47123/mcp/xcode` or
+temporary containers. Persisted containers retain both the safe host
+definitions and Codex endpoint registration, so later `run --online` sessions
+do not need to repeat `--mcp`. Other runtimes currently retain manual
+configuration using URLs such as `http://127.0.0.1:47123/mcp/xcode` or
 `http://127.0.0.1:47123/mcp/example`. Existing containers created without MCP
 wiring need one explicit migration:
 
@@ -128,6 +132,14 @@ not initialize a server or invoke MCP tools. For a stopped MCP-enabled container
 `agentctl doctor --name agent-project` may temporarily start the persisted relay,
 container, and guest proxy for its existing live checks, then restore the stopped
 state.
+
+Use `agentctl start`, `stop`, and `restart` for MCP-enabled containers so host
+relay supervision follows the container lifecycle. If the lower-level
+`container stop` command is used, `agentctl doctor --host` highlights the relay
+left behind and prints `agentctl stop --name NAME` as the suggested safe cleanup.
+Upgrade can inspect and back up a stopped MCP-enabled container by temporarily
+starting only its lazy host relay; it preserves the container's original
+stopped state and does not initialize the configured MCP server.
 
 Apple container 1.1 custom networks can be managed and selected directly. For
 example, create a host-only network for an offline workload:

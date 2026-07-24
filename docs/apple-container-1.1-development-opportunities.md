@@ -64,7 +64,8 @@ The candidate tables use these labels:
 | Custom and host-only networks | implemented and host-verified | medium-high for isolation | complete | selected |
 | SSH agent forwarding | implemented and host-verified | medium for developer integrations | complete | selected |
 | Host-to-container Unix-socket mounting | implemented and host-verified | medium for MCP and developer integrations | complete | selected |
-| Container-to-host published sockets | detected | medium for local service integrations | medium | medium |
+| Container-to-host published sockets | implemented and host-verified | medium for local service integrations | complete | selected |
+| Managed host MCP bridge | implemented and host-verified | high for host developer-tool integrations | complete | selected |
 | Builder DNS controls | unused | medium in VPN/private-network environments | medium | medium |
 | Pull concurrency and progress | unused | low-medium | small-medium | medium-low |
 | Stop-signal support | unused | low with the current keepalive process | medium | low-medium |
@@ -425,29 +426,49 @@ directory-oriented `--mount` form. A focused macOS integration test verifies
 non-root data exchange, restart, upgrade preservation, replacement, copy mode,
 inspect-visible removal, and cleanup.
 
-Container-to-host `--publish-socket` forwarding is detected but is not yet
-exposed by normal `agentctl` commands. The structured MCP/Xcode adapter remains
-a separate deferred integration built on the completed incoming-socket
-primitive.
+Container-to-host forwarding is now implemented with repeatable
+`--publish-socket HOST_PATH:CONTAINER_PATH` on run, bootstrap, and upgrade plus
+targeted `--unpublish-socket HOST_PATH` during upgrade. Mappings are preserved
+from `configuration.publishedSockets`; lifecycle operations verify listener
+creation/removal without deleting host entries, and doctor diagnoses unsafe
+private parents and stale or missing listeners. Running copy mode refuses host
+paths still owned by the source.
 
-### Candidate interface
+Phase 2 intentionally requires explicit user-managed paths beneath an existing
+private directory. Generated `/tmp/agentctl-<uid>` paths and their managed
+cleanup are used by the completed structured MCP/Xcode integration in Phase 3.
+
+### Implemented interface
 
 ```bash
 agentctl run --publish-socket HOST_PATH:CONTAINER_PATH
 ```
 
-Published-socket support should preserve requested configuration where
-meaningful while distinguishing managed destinations from user-owned paths.
+The mapping is preserved through inspect state and upgrade while host paths
+remain explicitly user-owned. Path validation, lifecycle collision behavior,
+multiple mappings, and the trust consequences are covered by implementation,
+unit tests, the focused host test, README guidance, and socket research.
 
-### Investigation before implementation
+### Managed host MCP bridge
 
-- Test arbitrary published-socket access from host clients.
-- Verify behavior when an ephemeral host socket path changes.
-- Validate socket paths and avoid printing sensitive path or connection data.
-- Define lifecycle, upgrade-preservation, and collision behavior for multiple
-  published sockets.
-- Document the trust consequences of exposing a host daemon socket to code
-  inside the container.
+Phase 3 is implemented and host-verified. `run --mcp` accepts the built-in
+`xcode` preset, inline JSON, or private JSON files and exposes explicitly
+authorized host stdio MCP servers at guest loopback Streamable HTTP URLs. The
+host relay listens only on a generated private Unix socket; no TCP fallback is
+opened. Codex endpoints are registered automatically, including for temporary
+containers, while other runtimes remain manually configured.
+
+Safe definitions persist in a private host registry, while literal environment
+values remain invocation-scoped. Servers start lazily on their first MCP
+request. The Xcode preset shares one `xcrun mcpbridge` child across concurrent
+HTTP sessions, and closing one agent session does not tear down the relay used
+by another. Start, restart, stop, removal, copy, upgrade, disable, and stopped
+upgrade flows verify relay identity and clean only proven-owned state.
+
+`doctor --host` maps background relay PIDs to containers, definitions,
+registries, sockets, leases, and end-to-end route health without invoking MCP
+tools. It distinguishes a normally inactive stopped container from relay state
+left behind by a direct `container stop` and prints the safe cleanup command.
 
 ## Builder DNS controls
 

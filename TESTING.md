@@ -97,6 +97,13 @@ node tests/run-mcp-node-tests.mjs
 
 The focused macOS MCP test writes redacted host-relay diagnostics beneath
 `./tmp/mcp/`. On failure it also prints the guest proxy log before cleanup.
+It covers lazy startup, automatic Codex registration, repeated named-container
+reuse, start/restart supervision, stopped-container doctor checks, upgrade from
+a stopped state, definition preservation, disablement, and cleanup:
+
+```bash
+bash tests/run-tests.sh --tier full --filter managed-mcp
+```
 
 On macOS, additionally create a container with `agentctl run --mcp` and point a
 client at `http://127.0.0.1:47123/mcp/<name>`. Use `lsof -nP -iTCP:47123` to
@@ -121,6 +128,13 @@ inactive relay. `agentctl doctor --name NAME` must treat the managed MCP mount
 separately from user socket mounts and published sockets; when it temporarily
 starts a stopped container, confirm it also starts and then removes the relay
 without launching the configured MCP child.
+
+Also stop a running MCP-enabled container once with the lower-level
+`container stop NAME`. Host doctor must prominently report that the managed
+relay remains and suggest `agentctl stop --name NAME`; running that suggested
+action must remove the verified relay and socket. For Xcode, open a project,
+start two `agentctl run --online` sessions against the same persisted container,
+and verify closing either session does not break MCP calls in the other.
 
 Focused integration filters are available for narrower validation. The tool-home smoke
 builds or requires `agent-plain`, creates a real container with host directories mounted

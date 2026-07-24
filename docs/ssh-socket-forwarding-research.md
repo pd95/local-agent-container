@@ -34,20 +34,55 @@ by that service, so users should expose narrowly scoped sockets and permissions.
 Dry-run and doctor output deliberately show endpoint paths needed for repair,
 but agentctl never reads, logs, or proxies protocol payloads.
 
-## Deferred MCP integration
+## Managed MCP integration
 
-A later structured integration may use an interface such as:
+The completed structured integration uses:
 
 ```bash
-agentctl run --mcp 'xcode,cmd=xcbridge …'
+agentctl run --mcp xcode
+agentctl run --mcp '{"name":"example","command":"/absolute/path/to/server","args":[]}'
 ```
 
-It may install an MCP/Xcode adapter feature on demand, launch `xcrun mcpbridge`
-through the configured host command, mount a private host relay with the Phase 1
-primitive, and run a guest loopback HTTP adapter for clients that cannot use
-HTTP over a Unix socket. The existing TCP bridge can remain available during
-rollout. The exact `--mcp` grammar, feature identifier, process supervision, and
-adapter implementation are intentionally deferred.
+It installs the MCP bridge feature when needed, launches explicitly authorized
+host commands such as `xcrun mcpbridge`, mounts a private host Unix-socket relay
+with the Phase 1 primitive, and runs a guest loopback Streamable HTTP adapter.
+Codex registration is automatic. The production bridge has no host TCP
+listener or fallback.
+
+## Agreed Phase 2 design
+
+Phase 2 exposes repeatable container-to-host mappings as
+`--publish-socket HOST_PATH:CONTAINER_PATH` on `run`, `bootstrap`, and
+`upgrade`. Upgrade additionally accepts repeatable
+`--unpublish-socket HOST_PATH`. Apple container stores these mappings in
+`configuration.publishedSockets` and creates the host listener only while the
+container is running.
+
+Host paths are deliberately explicit and user-managed in this phase. Their
+parent directory must already exist, resolve canonically, be owned by the
+current user, be writable and searchable by that user, and grant no access to
+group or other users. The destination must be absent before Apple creates a
+listener. agentctl never creates the parent, removes a collision, or cleans up
+a leftover listener. Generated paths such as `/tmp/agentctl-<uid>` were deferred
+from Phase 2 and are now used only by the managed Phase 3 MCP integration, where
+ownership and cleanup are defined together with the adapter lifecycle.
+
+Existing-container reuse requires an order-independent exact mapping match.
+Upgrade preserves mappings by default, applies unpublishes first, and merges
+explicit mappings by unique host path. Distinct host paths may publish the same
+container service. Published container paths may not collide with agentctl's
+managed mounts, SSH relay, or a host-socket mount destination.
+Unpublishing validates the host path syntax but does not require its parent to
+still exist, so stale configuration remains removable.
+
+Start refuses occupied destinations. Restart and destructive upgrade stop the
+source and verify that Apple removed its listeners before continuing. Stop,
+remove, and failed cleanup paths only report leftovers. A running copy cannot
+retain any source host path because both containers cannot own the listener;
+the source must first be stopped or the target mappings must be unpublished or
+remapped. Doctor reports unsafe parents, missing/non-socket running listeners,
+and entries left behind by stopped containers without connecting to the
+published protocol.
 
 Related documents:
 
@@ -524,22 +559,30 @@ This slice is implemented and host-verified. It also includes targeted removal,
 destination-based replacement, copy-mode preservation, conservative refusal of
 unknown extra mounts, doctor diagnostics, and fail-safe missing-source checks.
 
-### Remaining Phase 2: published sockets
+### Completed Phase 2: published sockets
 
 - add repeatable `--publish-socket`
+- add targeted `--unpublish-socket` during upgrade
 - reject all pre-existing host destinations
-- introduce the private managed socket directory
+- require explicit paths in existing user-owned private directories
 - validate path byte lengths
 - preserve mappings and show them in dry-run
-- test stop, restart, crash recovery, and collisions
+- diagnose listener state without deleting stale or user-owned entries
+- test stop, start, restart, upgrade, copy, removal, data exchange, and collisions
 
-### Remaining Phase 3: MCP transport prototype
+This slice is implemented and host-verified. Phase 3 now uses generated managed
+paths with verified ownership and cleanup for its private MCP relay.
 
-- change the host relay to listen on a Unix socket
-- mount it into the Xcode project container
-- add a guest adapter presenting normal HTTP MCP locally
-- compare latency and reliability with the current TCP relay
-- retain a configuration switch for TCP fallback
+### Completed Phase 3: managed MCP transport
+
+- the host relay listens only on a generated private Unix socket
+- Apple container mounts that socket at the reserved managed guest path
+- a non-root guest adapter presents Streamable HTTP MCP on loopback
+- Codex endpoint registration is automatic; other runtimes remain manual
+- safe definitions persist on the host and literal environment values do not
+- stdio children start lazily; the Xcode preset shares one child across sessions
+- lifecycle, stopped upgrade, copy, disable, collision, and doctor behavior are
+  covered without retaining a TCP fallback
 
 ## Test status
 
@@ -554,6 +597,9 @@ unknown extra mounts, doctor diagnostics, and fail-safe missing-source checks.
 - rejection of missing sources, files, symlinks, invalid characters, reserved
   destinations, and overlong paths
 - stdin-dependent commands retain `container exec -i`
+- published-socket parsing, inspect shapes, exact matching, merge and removal
+- private-parent ownership and mode checks, listener collisions, path limits,
+  lifecycle safety, copy behavior, dry-run behavior, and doctor diagnostics
 
 Run shell checks under current Bash and macOS-compatible Bash 3.2 when
 implementation changes begin.
@@ -566,22 +612,22 @@ implementation changes begin.
 - generic incoming sockets carry data as non-root `coder`
 - restart and upgrade preserve generic mappings
 - replacement, copy mode, and targeted removal behave as configured
+- published sockets carry data as non-root `coder`
+- stop removes listeners and start and restart recreate them
+- upgrade preserves, adds, replaces, and removes selected mappings
+- stopped-source copy preserves mappings
+- file, directory, symlink, socket, and unsafe-parent collisions are rejected
+- collision diagnostics do not delete host entries
 
-### Deferred published-socket and MCP coverage
+### Additional optional MCP coverage
 
-- published socket carries bidirectional data
-- published socket disappears on stop and reappears on start
-- destination collisions never delete user data
-- upgrade preserves every selected published mapping
-- containers without requested published forwarding remain unchanged
 - Git SSH authentication reaches a disposable test remote or fails only at the
   expected authorization boundary
 - explicitly compare generic guest socket permissions with the host socket
 
-## Recommended next decision
+## Current decision
 
-Choose whether container-to-host published sockets provide enough immediate
-value to implement before the structured MCP/Xcode adapter. Keep both efforts
-separate: published sockets serve host clients consuming container services,
-while the Xcode MCP design uses the completed host-to-container mount primitive
-plus a protocol adapter. Retain the current TCP MCP bridge during rollout.
+The structured MCP/Xcode adapter is complete as a separate Phase 3 integration.
+Published sockets continue to serve host clients consuming container services;
+managed MCP uses the host-to-container mount primitive plus a guest loopback
+HTTP adapter. The production bridge is Unix-socket-only and has no TCP fallback.
