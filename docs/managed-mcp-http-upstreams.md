@@ -2,9 +2,10 @@
 
 ## Status
 
-Accepted for implementation. Phase 3 implements host stdio MCP servers over
+Implemented and host-validated. Phase 3 implements host stdio MCP servers over
 the private managed Unix-socket bridge. Phase 4 adds fixed HTTP upstreams and
 reuses agentctl's existing macOS Keychain adapter for host-managed credentials.
+The focused macOS `managed-mcp` lifecycle suite passed on 2026-07-24.
 
 ## Goal
 
