@@ -575,8 +575,10 @@ mcp_start_relay() {
   lease_prefix="mcp-$(mcp_identity_hash "$name").lease."
   mcp_prepare_log_file "$log"
   jq -n --argjson servers "$MCP_CONFIG_JSON" --arg lease_dir "$dir" --arg lease_prefix "$lease_prefix" \
-    '{schema_version:1,timeout_ms:30000,servers:$servers,lease_dir:$lease_dir,lease_prefix:$lease_prefix,ephemeral_env:any($servers[]; ((.env // {})|length)>0)}' >"$config"; chmod 600 "$config"
-  node "$SCRIPT_DIR/mcp/host-relay.mjs" "$MCP_RELAY_SOCKET" "$config" "$MCP_RELAY_NONCE" </dev/null >>"$log" 2>&1 & MCP_RELAY_PID=$!
+    --arg socket_path "$MCP_RELAY_SOCKET" --arg nonce "$MCP_RELAY_NONCE" --arg container "$name" \
+    '{schema_version:1,timeout_ms:30000,servers:$servers,lease_dir:$lease_dir,lease_prefix:$lease_prefix,ephemeral_env:any($servers[]; ((.env // {})|length)>0),socket_path:$socket_path,nonce:$nonce,container:$container}' >"$config"; chmod 600 "$config"
+  ( exec -a "agentctl-mcp-relay:$name" node "$SCRIPT_DIR/mcp/host-relay.mjs" "$config" ) \
+    </dev/null >>"$log" 2>&1 & MCP_RELAY_PID=$!
   local tries=0; while [ "$tries" -lt 50 ] && [ ! -S "$MCP_RELAY_SOCKET" ]; do sleep 0.02; tries=$((tries+1)); done
   if ! { [ -S "$MCP_RELAY_SOCKET" ] && kill -0 "$MCP_RELAY_PID" 2>/dev/null; }; then
     kill "$MCP_RELAY_PID" 2>/dev/null || true; wait "$MCP_RELAY_PID" 2>/dev/null || true

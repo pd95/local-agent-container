@@ -11,8 +11,8 @@ const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'agentctl-mcp-test-'));
 const socket = path.join(temporary, 'relay.sock');
 const config = path.join(temporary, 'config.json');
 const starts=path.join(temporary,'starts'); const clientResponses=path.join(temporary,'client-responses');
-fs.writeFileSync(config, JSON.stringify({servers:[{name:'fake',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_STARTED:starts,AGENTCTL_FAKE_MCP_CLIENT_RESPONSE:clientResponses}}]}), {mode:0o600});
-const relay = spawn(process.execPath, [path.join(root,'mcp/host-relay.mjs'),socket,config,'test-nonce'], {stdio:['ignore','ignore','inherit']});
+fs.writeFileSync(config, JSON.stringify({socket_path:socket,nonce:'test-nonce',container:'test-container',servers:[{name:'fake',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_STARTED:starts,AGENTCTL_FAKE_MCP_CLIENT_RESPONSE:clientResponses}}]}), {mode:0o600});
+const relay = spawn(process.execPath, [path.join(root,'mcp/host-relay.mjs'),config], {stdio:['ignore','ignore','inherit']});
 for (let count=0; count<100 && !fs.existsSync(socket); count++) await new Promise(resolve => setTimeout(resolve, 10));
 assert.ok(fs.statSync(socket).isSocket());
 function request(method, route, payload, headers={}) {
@@ -24,6 +24,7 @@ function request(method, route, payload, headers={}) {
 }
 const health=await request('GET','/.well-known/agentctl-mcp-health');
 assert.equal(JSON.parse(health.body).nonce,'test-nonce');
+assert.equal(JSON.parse(health.body).container,'test-container');
 relay.kill('SIGINT');
 await new Promise(resolve=>setTimeout(resolve,50));
 assert.equal(JSON.parse((await request('GET','/.well-known/agentctl-mcp-health')).body).nonce,'test-nonce');
