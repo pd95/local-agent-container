@@ -123,6 +123,10 @@ Literal `env` values live only for the active invocation. The private host
 registry persists resolved commands and inherited variable names, never literal
 values. A container request cannot add or change a host command.
 
+Phase 3 accepts host stdio MCP servers only. Authenticated host HTTP upstreams,
+including services bound to macOS loopback, are proposed separately in
+[Phase 4: Managed HTTP MCP upstreams](docs/managed-mcp-http-upstreams.md).
+
 Managed relays are container-scoped background services and therefore normally
 appear with parent PID 1 after `agentctl` exits. Their process label includes the
 container name, for example `agentctl-mcp-relay:agent-project`. Use

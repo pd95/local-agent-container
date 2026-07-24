@@ -631,3 +631,6 @@ The structured MCP/Xcode adapter is complete as a separate Phase 3 integration.
 Published sockets continue to serve host clients consuming container services;
 managed MCP uses the host-to-container mount primitive plus a guest loopback
 HTTP adapter. The production bridge is Unix-socket-only and has no TCP fallback.
+Authenticated HTTP MCP servers reachable from macOS are intentionally a
+separate [proposed Phase 4](managed-mcp-http-upstreams.md), not an expansion of
+the completed Phase 3 stdio authority model.
