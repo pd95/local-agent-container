@@ -1093,7 +1093,7 @@ fi
 http_response="$(curl -fsS -X POST -H "content-type: application/json" \
   --data "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/list\"}" \
   http://127.0.0.1:47123/mcp/http-fake)"
-printf "%s" "$http_response" | jq -e '.authorization_matches == true and .url == "/mcp?fixed=1"' >/dev/null
+printf "%s" "$http_response" | jq -e ".authorization_matches == true and .url == \"/mcp?fixed=1\"" >/dev/null
 response=""
 curl_error=/tmp/agentctl-mcp-curl-error
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
