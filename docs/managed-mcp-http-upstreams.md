@@ -1,9 +1,10 @@
-# Proposed Phase 4: Managed HTTP MCP upstreams
+# Phase 4: Managed HTTP MCP upstreams
 
 ## Status
 
-Proposed. Phase 3 implements host stdio MCP servers over the private managed
-Unix-socket bridge. There is no earlier Phase 4 plan in this repository.
+Accepted for implementation. Phase 3 implements host stdio MCP servers over
+the private managed Unix-socket bridge. Phase 4 adds fixed HTTP upstreams and
+reuses agentctl's existing macOS Keychain adapter for host-managed credentials.
 
 ## Goal
 
@@ -13,7 +14,9 @@ from macOS, including a service bound only to host `127.0.0.1`, without:
 - exposing the host service on a VM-facing TCP interface
 - creating Apple localhost DNS or packet-filter rules
 - opening a host TCP listener in `agentctl`
-- persisting bearer tokens or literal header values
+- persisting bearer tokens or literal header values in agentctl registries,
+  configuration, diagnostics, or logs (user-authorized macOS Keychain storage
+  is supported)
 - allowing a container request to select a different upstream
 
 The existing guest endpoint remains stable:
@@ -51,6 +54,17 @@ Add a discriminated HTTP definition:
 }
 ```
 
+For normal interactive macOS use, prefer a named Keychain credential:
+
+```json
+{
+  "name": "macos-ui-helper",
+  "type": "http",
+  "url": "http://127.0.0.1:9876/mcp",
+  "bearer_token_keychain": "macos-ui-helper-token"
+}
+```
+
 For non-bearer authentication or additional headers:
 
 ```json
@@ -68,6 +82,20 @@ For non-bearer authentication or additional headers:
 }
 ```
 
+Arbitrary header values may also reference separate named Keychain items:
+
+```json
+{
+  "name": "example",
+  "type": "http",
+  "url": "https://mcp.example.test/mcp",
+  "header_keychain_credentials": {
+    "Authorization": "example-authorization",
+    "X-Tenant": "example-tenant"
+  }
+}
+```
+
 Rules:
 
 - `url` is required for HTTP definitions.
@@ -76,6 +104,12 @@ Rules:
 - `bearer_token_env_var` and `header_env_vars` persist only host environment
   variable names. Their current values are resolved on the host when a relay
   lease is created or a persisted container is started.
+- `bearer_token_keychain` and `header_keychain_credentials` persist only safe,
+  explicit credential identifiers. Values live in separate macOS Keychain
+  generic-password items managed through the existing agentctl Keychain
+  adapter. A bearer item stores the raw token; the relay adds `Bearer `.
+- A header may have only one literal, environment, Keychain, or bearer source,
+  compared case-insensitively.
 - Configured authentication headers override same-named request headers from
   the container.
 - Unknown and mixed-transport fields are rejected.
@@ -95,8 +129,43 @@ invocation, with its literal authorization value treated as a transient secret:
 }
 ```
 
-The environment-backed form should be the documented default because it can be
-reconstructed safely after `start`, `restart`, or host login.
+The Keychain-backed form is the documented default for interactive macOS use.
+Environment-backed values remain supported for automation and external secret
+managers. Both forms can be reconstructed after `start` or `restart` without
+placing values in a registry or shell startup file.
+
+## Keychain credential lifecycle
+
+MCP credentials reuse `agentctl-keychain.sh` and its existing service/account
+override mechanism. Runtime authentication items for Codex and Claude remain
+unchanged. Each explicit MCP credential identifier uses its own slot:
+
+```text
+service: agentctl-mcp-credential-<id>
+account: mcp-credential-<id>
+```
+
+The management interface is:
+
+```text
+agentctl mcp credential set ID
+agentctl mcp credential set ID --stdin
+agentctl mcp credential status ID
+agentctl mcp credential delete ID
+agentctl mcp credential list
+```
+
+`set` prompts without echo when attached to a terminal; `--stdin` supports
+password-manager pipelines without placing values in shell history. Status,
+list, doctor, and dry-run never print or read values. Set/delete report affected
+running containers and exact restart commands but do not restart them.
+
+When relay startup encounters a missing referenced item and a terminal is
+available, agentctl offers to capture and store it. Empty or declined input, or
+a noninteractive invocation, leaves that route present but unavailable with a
+redacted `503`. Doctor reports the missing credential identifier. An existing
+relay retains its resolved value until restarted, so rotation takes effect on
+the next agentctl-managed restart.
 
 ## Transport behavior
 
@@ -121,7 +190,7 @@ For HTTP routes, the relay must:
   ownership to the upstream server
 - close the upstream request promptly when the container client disconnects
 - strip hop-by-hop headers and set the upstream `Host` header itself
-- add only configured literal or environment-derived headers
+- add only configured literal, environment-derived, or Keychain-derived headers
 - reject redirects by default so credentials cannot leak to another origin
 - use normal TLS certificate and hostname verification for HTTPS
 - impose connect, header, idle-stream, and total request limits separately
@@ -147,6 +216,9 @@ handling as stdio definitions:
 - reserve proxy-controlled and hop-by-hop headers from user configuration
 - redact all literal headers, inherited values, and URL query data in errors,
   dry-run output, doctor output, and logs
+- allow plaintext HTTP only for exact host-loopback targets (`localhost`,
+  `localhost.`, `127.0.0.0/8`, or `::1`); normally verified HTTPS may target a
+  local or remote host
 
 Explicit host configuration authorizes the destination, including localhost or
 private-network targets. A container request cannot add definitions, change a
@@ -161,6 +233,8 @@ version 1. Persist only:
 - normalized URL without user information
 - header names associated with host environment-variable names
 - bearer-token environment-variable name
+- named Keychain credential identifiers associated with bearer or arbitrary
+  headers
 - existing safe stdio fields
 
 Never persist literal `headers` values. Include normalized HTTP definitions in
@@ -168,9 +242,9 @@ the existing definition fingerprint so concurrent identical leases can share a
 relay and conflicting definitions for the same container are rejected.
 
 When the final transient lease exits, discard literal headers. A persisted HTTP
-route with a missing required host variable remains present but returns a clear,
-redacted configuration error. `doctor --host` reports the missing variable name,
-not its value.
+route with a missing required host variable or Keychain item remains present but
+returns a clear, redacted `503`. `doctor --host` reports the missing variable
+name or credential identifier, not its value.
 
 ## Runtime integration
 
@@ -192,7 +266,7 @@ upgrade, copy, rename, disable, lease, and verified cleanup behavior.
 
 - route name and transport (`stdio` or `http`)
 - redacted upstream origin, with path/query omitted or redacted
-- whether required host environment variables are present
+- whether required host environment variables and Keychain items are present
 - host relay identity and ownership
 - guest proxy and guest-to-host route health
 - optional TCP/TLS reachability only if implemented without HTTP requests;
@@ -205,8 +279,8 @@ cleanup remain unchanged.
 ## Upgrade and compatibility
 
 - Existing stdio registry files and definitions continue working unchanged.
-- Upgrade/copy/rename preserve safe HTTP definitions and environment-variable
-  names, never transient header values.
+- Upgrade/copy/rename preserve safe HTTP definitions, environment-variable
+  names, and Keychain credential identifiers, never transient header values.
 - `--disable-mcp` removes both stdio and HTTP definitions after successful
   recreation.
 - Dry-run reports route names, transport types, target MCP state, and redacted
@@ -354,7 +428,7 @@ Resolve any divergence in favor of the security invariants in this document and
 the current Phase 3 ownership checks. Update this document when implementation
 requires a material design change; do not silently let code and plan diverge.
 
-Recommended defaults for the four open decisions below are:
+Resolved defaults for implementation are:
 
 - accept literal `headers` with the same transient-secret semantics as stdio
   literal `env`, without another acknowledgement flag
@@ -363,9 +437,10 @@ Recommended defaults for the four open decisions below are:
 - never persist any literal header value, even if a caller considers it safe
 - support host loopback HTTP and normally verified HTTPS in the first release;
   do not support plaintext non-loopback HTTP until separately justified
+- prefer named macOS Keychain credentials for interactive use while retaining
+  environment-backed sources for automation
 
-These defaults are recommendations, not permission to weaken validation or
-secret handling.
+These decisions are not permission to weaken validation or secret handling.
 
 ### Suggested implementation order
 
@@ -455,17 +530,16 @@ fixtures, committed JSON, Codex configuration, or `./tmp/mcp/` logs.
 - Documentation states exactly which transports, credential sources, and
   persistence guarantees are supported.
 
-## Open decisions before implementation
+## Resolved implementation decisions
 
-1. Whether `headers` should be accepted at all or require an explicit
-   `--allow-session-secrets` acknowledgement. The Phase 3 precedent supports
-   transient literal `env`, so accepting transient literal headers is
-   consistent, but environment-backed credentials should remain preferred.
-2. Whether a missing environment-backed credential should make container start
-   fail or leave the route available with a clear `503`. The less disruptive
-   Phase 3 behavior favors a route-level error and a doctor warning.
-3. Whether safe, non-secret literal headers should be persistable through a
-   separate field. Treating all header values as secret is simpler and safer.
-4. Whether HTTP proxy support should initially be restricted to loopback
-   upstreams. Supporting HTTPS remote servers is little additional transport
-   work, but loopback-only scope reduces the first security review surface.
+1. Literal `headers` are accepted for one invocation without another flag and
+   are never persisted. Named Keychain credentials are the documented default.
+2. Missing environment or Keychain credentials leave the route present with a
+   redacted `503`; interactive lifecycle commands may securely capture a
+   missing Keychain value.
+3. No literal header value is persistable, regardless of whether a caller
+   considers it secret.
+4. Plaintext HTTP is restricted to exact loopback targets. Normally verified
+   HTTPS supports local or remote hosts.
+5. Credential rotation is explicit: credential commands update Keychain and
+   report affected running containers, but do not restart them automatically.

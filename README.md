@@ -83,7 +83,8 @@ Details and options are in [docs/networking.md](docs/networking.md).
 
 ## Managed host MCP bridge
 
-`run --mcp` exposes an explicitly authorized host stdio MCP server to the
+`run --mcp` exposes an explicitly authorized host stdio MCP server or fixed
+HTTP/HTTPS MCP upstream to the
 container through a private Unix socket and a guest proxy bound only to
 `127.0.0.1`. It never opens a host TCP port, and container requests cannot
 alter the authorized host command definitions. Codex endpoint registration is
@@ -95,6 +96,10 @@ agentctl run --mcp xcode
 
 # Generic inline definition
 agentctl run --mcp '{"name":"example","command":"/absolute/path/to/server","args":[]}'
+
+# Host-loopback HTTP upstream with a named macOS Keychain token
+agentctl mcp credential set macos-ui-helper-token
+agentctl run --mcp '{"name":"macos-ui-helper","type":"http","url":"http://127.0.0.1:9876/mcp","bearer_token_keychain":"macos-ui-helper-token"}'
 
 # Private file containing one definition or an array
 agentctl run --mcp @"$HOME/.config/agentctl/private-mcp.json"
@@ -115,17 +120,34 @@ agentctl upgrade --name agent-project --mcp-port 48123
 agentctl upgrade --name agent-project --disable-mcp
 ```
 
-Definitions accept `name`, `command`, `args`, `cwd`, `env`, `env_vars`, and
-`shared`. The Xcode preset enables `shared` so reconnecting HTTP sessions reuse
+Stdio definitions accept `name`, `command`, `args`, `cwd`, `env`, `env_vars`,
+and `shared`. The Xcode preset enables `shared` so reconnecting HTTP sessions reuse
 one `xcrun mcpbridge` process; generic definitions default to per-session
 process isolation.
-Literal `env` values live only for the active invocation. The private host
-registry persists resolved commands and inherited variable names, never literal
-values. A container request cannot add or change a host command.
+Literal `env` values live only for the active invocation. HTTP definitions use
+`type: "http"`, a fixed `url`, and optional literal, environment-backed, or
+Keychain-backed headers. Plaintext HTTP is limited to host loopback; HTTPS uses
+normal certificate and hostname verification. The private host registry
+persists safe definitions and credential references, never literal values or
+resolved credentials. A container request cannot change the authorized command,
+upstream URL, or configured authentication header.
 
-Phase 3 accepts host stdio MCP servers only. Authenticated host HTTP upstreams,
-including services bound to macOS loopback, are proposed separately in
-[Phase 4: Managed HTTP MCP upstreams](docs/managed-mcp-http-upstreams.md).
+Named MCP credentials use the existing macOS Keychain adapter but separate
+slots from Codex and Claude authentication:
+
+```bash
+agentctl mcp credential set macos-ui-helper-token
+op read 'op://Engineering/MCP/token' | agentctl mcp credential set macos-ui-helper-token --stdin
+agentctl mcp credential status macos-ui-helper-token
+agentctl mcp credential list
+agentctl mcp credential delete macos-ui-helper-token
+```
+
+An interactive start offers a hidden prompt for a missing item. A
+noninteractive start leaves that route available with a redacted `503`. Restart
+running containers after rotation so their relay resolves the new value. See
+[Phase 4: Managed HTTP MCP upstreams](docs/managed-mcp-http-upstreams.md) for
+the complete schema and security model.
 
 Managed relays are container-scoped background services and therefore normally
 appear with parent PID 1 after `agentctl` exits. Their process label includes the

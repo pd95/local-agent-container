@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { execFileSync } from 'node:child_process';
@@ -23,6 +24,8 @@ const sessions = new Map();
 const serverChildren = new Map();
 const childQueues = new WeakMap();
 const connections = new Set();
+const httpAgent = new http.Agent({keepAlive:true});
+const httpsAgent = new https.Agent({keepAlive:true});
 let shuttingDown = false;
 let leaseMissingSince = null;
 function log(message) { process.stderr.write(`[agentctl-mcp] ${message}\n`); }
@@ -41,6 +44,95 @@ function originAllowed(origin) {
   if (!origin) return true;
   try { return ['127.0.0.1','localhost','::1'].includes(new URL(origin).hostname); }
   catch { return false; }
+}
+
+const hopByHopHeaders = new Set(['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailer','transfer-encoding','upgrade']);
+function filteredHeaders(headers, replacements={}) {
+  const connectionTokens = String(headers.connection || '').split(',').map(value => value.trim().toLowerCase()).filter(Boolean);
+  const blocked = new Set([...hopByHopHeaders, ...connectionTokens, 'host']);
+  const replacementBlocked = new Set([...hopByHopHeaders, 'host', 'content-length']);
+  const output = {};
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase();
+    if (!blocked.has(lower) && replacements[lower] === undefined && value !== undefined) output[lower]=value;
+  }
+  for (const [name,value] of Object.entries(replacements)) {
+    if (!replacementBlocked.has(name.toLowerCase()) && value !== undefined) output[name.toLowerCase()]=value;
+  }
+  return output;
+}
+
+function proxyFailure(res, status, message) {
+  if (res.headersSent) return res.destroy();
+  return json(res, status, {error:message});
+}
+
+function proxyHttp(req, res, definition) {
+  if ((definition.missing_credentials || []).length || (definition.missing_env_vars || []).length ||
+      (definition.invalid_credentials || []).length || (definition.invalid_env_vars || []).length) {
+    return json(res, 503, {error:'MCP upstream credential is unavailable on the host'});
+  }
+  const target = new URL(definition.url);
+  const targetHostname=target.hostname.startsWith('[') && target.hostname.endsWith(']') ? target.hostname.slice(1,-1) : target.hostname;
+  const transport = target.protocol === 'https:' ? https : http;
+  const timeouts = {connect:10000,headers:30000,idle:300000,total:86400000,...(config.http_timeouts || {})};
+  const configured = definition.resolved_headers || {};
+  const headers = filteredHeaders(req.headers, configured);
+  headers.host=target.host;
+  let finished=false;
+  let timedOut=false;
+  let idleTimer;
+  let headerTimer;
+  const clearTimers = () => { clearTimeout(connectTimer); clearTimeout(headerTimer); clearTimeout(idleTimer); clearTimeout(totalTimer); };
+  const failTimeout = phase => {
+    if (finished) return;
+    timedOut=true; finished=true;
+    log(`HTTP upstream ${definition.name} ${phase} timeout`);
+    upstream.destroy(new Error('timeout'));
+    proxyFailure(res,504,'MCP upstream timed out');
+  };
+  const resetIdle = () => { clearTimeout(idleTimer); idleTimer=setTimeout(() => failTimeout('idle'),timeouts.idle); };
+  const upstream = transport.request({
+    protocol:target.protocol, hostname:targetHostname, port:target.port || undefined,
+    method:req.method, path:`${target.pathname}${target.search}`, headers,
+    agent:target.protocol === 'https:' ? httpsAgent : httpAgent
+  });
+  const connectTimer=setTimeout(() => failTimeout('connect'),timeouts.connect);
+  const totalTimer=setTimeout(() => failTimeout('total'),timeouts.total);
+  resetIdle();
+  upstream.once('finish',()=>{ if (!finished) headerTimer=setTimeout(() => failTimeout('header'),timeouts.headers); });
+  upstream.on('socket', socket => {
+    if (!socket.connecting) clearTimeout(connectTimer);
+    else socket.once(target.protocol === 'https:' ? 'secureConnect' : 'connect', () => clearTimeout(connectTimer));
+  });
+  upstream.on('response', upstreamResponse => {
+    clearTimeout(headerTimer);
+    resetIdle();
+    if (upstreamResponse.statusCode >= 300 && upstreamResponse.statusCode < 400) {
+      upstreamResponse.resume();
+      finished=true; clearTimers();
+      log(`HTTP upstream ${definition.name} redirect rejected`);
+      return json(res,502,{error:'MCP upstream redirect was rejected'});
+    }
+    const responseHeaders=filteredHeaders(upstreamResponse.headers);
+    res.writeHead(upstreamResponse.statusCode, upstreamResponse.statusMessage, responseHeaders);
+    upstreamResponse.on('data',resetIdle);
+    upstreamResponse.once('end',()=>{ finished=true; clearTimers(); });
+    upstreamResponse.once('error',()=>{ if (!finished) { finished=true; clearTimers(); res.destroy(); } });
+    upstreamResponse.pipe(res);
+  });
+  upstream.on('error', error => {
+    if (finished) return;
+    finished=true; clearTimers();
+    if (!timedOut) {
+      log(`HTTP upstream ${definition.name} connection failed`);
+      proxyFailure(res,502,'MCP upstream is unavailable');
+    }
+  });
+  req.on('data',resetIdle);
+  req.once('aborted',()=>{ if (!finished) { finished=true; clearTimers(); upstream.destroy(); } });
+  res.once('close',()=>{ if (!res.writableEnded && !finished) { finished=true; clearTimers(); upstream.destroy(); } });
+  req.pipe(upstream);
 }
 
 const protocolVersions=new Set(['2024-11-05','2025-03-26','2025-06-18']);
@@ -172,12 +264,20 @@ function queuedTransact(state, payload, timeoutMs) {
 const server = http.createServer(async (req, res) => {
   if (!originAllowed(req.headers.origin)) return rpcError(res,403,null,-32000,'origin is not allowed');
   if (req.url === '/.well-known/agentctl-mcp-health') {
-    return json(res, 200, {ok:true, bridge_version:bridgeVersion, nonce, pid:process.pid, container:containerName, socket_path:socketPath, definitions:[...definitions.keys()].sort()});
+    const unavailableDefinitions=[...definitions.values()].filter(definition =>
+      (definition.missing_credentials || []).length || (definition.missing_env_vars || []).length ||
+      (definition.invalid_credentials || []).length || (definition.invalid_env_vars || []).length
+    ).map(definition=>definition.name).sort();
+    return json(res, 200, {ok:true, bridge_version:bridgeVersion, nonce, pid:process.pid, container:containerName, socket_path:socketPath, definitions:[...definitions.keys()].sort(), unavailable_definitions:unavailableDefinitions});
   }
   const match = /^\/mcp\/([A-Za-z0-9][A-Za-z0-9._-]{0,62})$/.exec(new URL(req.url, 'http://localhost').pathname);
   if (!match) return json(res, 404, {error:'unknown MCP route'});
   const definition = definitions.get(match[1]);
   if (!definition) return json(res, 503, {error:`MCP server is not configured: ${match[1]}`});
+  if ((definition.transport || 'stdio') === 'http') {
+    log(`request ${req.method} /mcp/${match[1]} (http)`);
+    return proxyHttp(req,res,definition);
+  }
   const sessionId = req.headers['mcp-session-id'];
   if (req.method === 'DELETE') {
     if (sessionId && !sessions.has(sessionId)) return rpcError(res,404,null,-32001,'unknown or expired MCP session');
@@ -269,6 +369,8 @@ function shutdown(signal='supervisor') {
   log(`relay shutting down (${signal})`);
   server.close(() => { try { fs.unlinkSync(socketPath); } catch {} process.exit(0); });
   for (const child of children) child.kill('SIGTERM');
+  httpAgent.destroy();
+  httpsAgent.destroy();
   setTimeout(() => {
     for (const connection of connections) connection.destroy();
     try { fs.unlinkSync(socketPath); } catch {}

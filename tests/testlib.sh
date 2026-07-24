@@ -22,6 +22,7 @@ CLEANUP_IMAGES=""
 CLEANUP_BACKUP_IMAGES=""
 CLEANUP_NETWORKS=""
 CLEANUP_PIDS=""
+CLEANUP_MCP_CREDENTIALS=""
 CLEANUP_DIRS=""
 LEAK_TRACKING_DIR=""
 
@@ -101,6 +102,12 @@ register_pid_cleanup() {
     *" $pid "*) return 0 ;;
   esac
   CLEANUP_PIDS="$CLEANUP_PIDS $pid"
+}
+
+register_mcp_credential_cleanup() {
+  local credential="$1"
+  case " $CLEANUP_MCP_CREDENTIALS " in *" $credential "*) return 0 ;; esac
+  CLEANUP_MCP_CREDENTIALS="$CLEANUP_MCP_CREDENTIALS $credential"
 }
 
 register_dir_cleanup() {
@@ -233,6 +240,10 @@ cleanup() {
       kill "$name" >/dev/null 2>&1 || true
       wait "$name" >/dev/null 2>&1 || true
     fi
+  done
+
+  for name in $CLEANUP_MCP_CREDENTIALS; do
+    "$AGENTCTL" mcp credential delete "$name" >/dev/null 2>&1 || true
   done
 
   for name in $CLEANUP_CONTAINERS; do

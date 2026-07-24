@@ -368,6 +368,100 @@ mcp_identity_hash() { printf '%s' "$1" | cksum | awk '{printf "%08x%08x\n", $1, 
 mcp_socket_path() { printf '%s/mcp-%s.sock\n' "$(mcp_runtime_dir)" "$(mcp_identity_hash "$1")"; }
 mcp_registry_path() { printf '%s/%s.json\n' "$(mcp_registry_dir)" "$1"; }
 
+mcp_credential_service() { printf 'agentctl-mcp-credential-%s\n' "$1"; }
+mcp_credential_account() { printf 'mcp-credential-%s\n' "$1"; }
+mcp_validate_credential_id() {
+  printf '%s' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$' || die "Invalid MCP credential identifier: $1"
+}
+mcp_keychain_run() {
+  local credential="$1"; shift
+  mcp_validate_credential_id "$credential"
+  run_keychain_with_slot "$(mcp_credential_service "$credential")" "$(mcp_credential_account "$credential")" "$@"
+}
+mcp_keychain_read() { mcp_keychain_run "$1" read-raw; }
+mcp_keychain_exists() { mcp_keychain_run "$1" verify >/dev/null 2>&1; }
+mcp_header_value_valid() { printf '%s' "$2" | node "$SCRIPT_DIR/mcp/definition-helper.mjs" validate-header-value "$1" >/dev/null 2>&1; }
+
+mcp_prompt_keychain_credential() {
+  local credential="$1" route="$2" value=""
+  [ -t 0 ] && [ -t 2 ] && [ -r /dev/tty ] && [ -w /dev/tty ] || return 1
+  printf 'MCP credential %s for route %s is missing from macOS Keychain.\n' "$credential" "$route" >/dev/tty
+  printf 'Enter value (input hidden, empty leaves the route unavailable): ' >/dev/tty
+  IFS= read -r -s value </dev/tty || true
+  printf '\n' >/dev/tty
+  [ -n "$value" ] || return 1
+  printf '%s' "$value" | mcp_keychain_run "$credential" write >/dev/null
+}
+
+mcp_resolve_http_credentials() {
+  local entry="$1" route credential header variable value resolved missing_credentials='[]' missing_env='[]' invalid_credentials='[]' invalid_env='[]'
+  route="$(printf '%s' "$entry" | jq -r .name)"
+  resolved="$(printf '%s' "$entry" | jq -c '.headers // {}')"
+  while IFS=$'\t' read -r header variable; do
+    [ -n "$header" ] || continue
+    if [ "${!variable+x}" = x ]; then
+      if mcp_header_value_valid "$header" "${!variable}"; then resolved="$(printf '%s' "$resolved" | jq -c --arg k "$header" --arg v "${!variable}" '.+{($k):$v}')"
+      else invalid_env="$(printf '%s' "$invalid_env" | jq -c --arg v "$variable" '.+[$v]')"; fi
+    else
+      missing_env="$(printf '%s' "$missing_env" | jq -c --arg v "$variable" '.+[$v]')"
+    fi
+  done < <(printf '%s' "$entry" | jq -r '.header_env_vars|to_entries[]|[.key,.value]|@tsv')
+  while IFS=$'\t' read -r header credential; do
+    [ -n "$header" ] || continue
+    if ! mcp_keychain_exists "$credential"; then mcp_prompt_keychain_credential "$credential" "$route" || true; fi
+    if mcp_keychain_exists "$credential" && value="$(mcp_keychain_read "$credential" 2>/dev/null)" && [ -n "$value" ]; then
+      if mcp_header_value_valid "$header" "$value"; then resolved="$(printf '%s' "$resolved" | jq -c --arg k "$header" --arg v "$value" '.+{($k):$v}')"
+      else invalid_credentials="$(printf '%s' "$invalid_credentials" | jq -c --arg v "$credential" '.+[$v]')"; fi
+    else missing_credentials="$(printf '%s' "$missing_credentials" | jq -c --arg v "$credential" '.+[$v]')"; fi
+  done < <(printf '%s' "$entry" | jq -r '.header_keychain_credentials|to_entries[]|[.key,.value]|@tsv')
+  variable="$(printf '%s' "$entry" | jq -r '.bearer_token_env_var // empty')"
+  if [ -n "$variable" ]; then
+    if [ "${!variable+x}" = x ]; then
+      if mcp_header_value_valid authorization "Bearer ${!variable}"; then resolved="$(printf '%s' "$resolved" | jq -c --arg v "Bearer ${!variable}" '.+{authorization:$v}')"
+      else invalid_env="$(printf '%s' "$invalid_env" | jq -c --arg v "$variable" '.+[$v]')"; fi
+    else missing_env="$(printf '%s' "$missing_env" | jq -c --arg v "$variable" '.+[$v]')"; fi
+  fi
+  credential="$(printf '%s' "$entry" | jq -r '.bearer_token_keychain // empty')"
+  if [ -n "$credential" ]; then
+    if ! mcp_keychain_exists "$credential"; then mcp_prompt_keychain_credential "$credential" "$route" || true; fi
+    if mcp_keychain_exists "$credential" && value="$(mcp_keychain_read "$credential" 2>/dev/null)" && [ -n "$value" ]; then
+      if mcp_header_value_valid authorization "Bearer $value"; then resolved="$(printf '%s' "$resolved" | jq -c --arg v "Bearer $value" '.+{authorization:$v}')"
+      else invalid_credentials="$(printf '%s' "$invalid_credentials" | jq -c --arg v "$credential" '.+[$v]')"; fi
+    else missing_credentials="$(printf '%s' "$missing_credentials" | jq -c --arg v "$credential" '.+[$v]')"; fi
+  fi
+  printf '%s' "$entry" | jq -c --argjson resolved "$resolved" --argjson missing_credentials "$missing_credentials" --argjson missing_env "$missing_env" --argjson invalid_credentials "$invalid_credentials" --argjson invalid_env "$invalid_env" '.resolved_headers=$resolved|.missing_credentials=$missing_credentials|.missing_env_vars=$missing_env|.invalid_credentials=$invalid_credentials|.invalid_env_vars=$invalid_env'
+}
+
+mcp_resolve_config_credentials() {
+  local entry="" transport="" variable="" inherited='{}' resolved='[]'
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    transport="$(printf '%s' "$entry" | jq -r '.transport // "stdio"')"
+    if [ "$transport" = http ]; then
+      entry="$(mcp_resolve_http_credentials "$(printf '%s' "$entry" | jq -c '.headers=(.headers // {})')")"
+    else
+      inherited='{}'
+      while IFS= read -r variable; do
+        [ -n "$variable" ] || continue
+        if [ "${!variable+x}" = x ]; then inherited="$(printf '%s' "$inherited" | jq -c --arg k "$variable" --arg v "${!variable}" '.+{($k):$v}')"; fi
+      done < <(printf '%s' "$entry" | jq -r '(.env_vars // [])[]')
+      entry="$(printf '%s' "$entry" | jq -c --argjson inherited "$inherited" '.transport="stdio"|.env=(.env // {})|.inherited_env=$inherited')"
+    fi
+    resolved="$(printf '%s' "$resolved" | jq -c --argjson item "$entry" '.+[$item]')"
+  done < <(printf '%s' "$MCP_CONFIG_JSON" | jq -c '.[]')
+  MCP_CONFIG_JSON="$resolved"
+}
+
+mcp_load_registry_config() {
+  local registry="$1" schema
+  schema="$(jq -r '.schema_version // empty' "$registry")"
+  case "$schema" in
+    1) MCP_CONFIG_JSON="$(jq -c '[.servers[] | .transport="stdio" | .env={} | .inherited_env={}]' "$registry")" ;;
+    2) MCP_CONFIG_JSON="$(jq -c '[.servers[] | if (.transport // "stdio")=="stdio" then .transport="stdio"|.env={}|.inherited_env={} else .headers={}|.resolved_headers={}|.missing_credentials=[]|.missing_env_vars=[]|.invalid_credentials=[]|.invalid_env_vars=[] end]' "$registry")" ;;
+    *) die "Unsupported managed MCP registry schema: $schema" ;;
+  esac
+}
+
 mcp_definition_json() {
   local value="$1" raw="" base=""
   if [ "$value" = xcode ]; then
@@ -385,7 +479,10 @@ mcp_definition_json() {
   printf '%s' "$raw" | jq -ce --arg base "$base" '
     (if type == "array" then . else [.] end)[] |
     if type != "object" then error("server must be an object") else . end |
-    if ((keys - ["name","command","args","cwd","env","env_vars","shared"])|length)>0 then error("unknown field") else . end |
+    if (.type // "stdio") == "http" then .
+    else
+    if (.type // "stdio") != "stdio" then error("invalid type") else . end |
+    if ((keys - ["name","type","command","args","cwd","env","env_vars","shared"])|length)>0 then error("unknown field") else . end |
     if (.name|type)!="string" or (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")|not) then error("invalid name") else . end |
     if (.command|type)!="string" or (.command|length)==0 then error("invalid command") else . end |
     if ((.args // [])|type)!="array" or any((.args // [])[]; type!="string") then error("args must contain strings") else . end |
@@ -394,17 +491,24 @@ mcp_definition_json() {
     if ((.env_vars // [])|type)!="array" or any((.env_vars // [])[]; type!="string" or test("^[A-Za-z_][A-Za-z0-9_]*$")|not) then error("invalid env_vars") else . end |
     if ((.shared // false)|type)!="boolean" then error("shared must be boolean") else . end |
     .args=(.args // []) | .env=(.env // {}) | .env_vars=(.env_vars // []) |
-    if .cwd then .cwd=(if (.cwd|startswith("/")) then .cwd elif $base!="" then ($base+"/"+.cwd) else .cwd end) else . end
+    if .cwd then .cwd=(if (.cwd|startswith("/")) then .cwd elif $base!="" then ($base+"/"+.cwd) else .cwd end) else . end |
+    del(.type) | .transport="stdio"
+    end
   ' 2>/dev/null || die "Invalid MCP server definition"
 }
 
 mcp_add_definition() {
-  local entries="" entry="" name="" command="" resolved="" cwd="" inherited='{}'
+  local entries="" entry="" name="" command="" resolved="" cwd="" inherited='{}' transport=""
   entries="$(mcp_definition_json "$1")"
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     name="$(printf '%s' "$entry" | jq -r .name)"
     printf '%s' "$MCP_CONFIG_JSON" | jq -e --arg n "$name" 'any(.[]; .name==$n)' >/dev/null && die "Duplicate MCP server name: $name"
+    if [ "$(printf '%s' "$entry" | jq -r '.type // empty')" = http ]; then
+      entry="$(printf '%s' "$entry" | node "$SCRIPT_DIR/mcp/definition-helper.mjs" normalize-http 2>/dev/null)" || die "Invalid HTTP MCP server definition"
+      MCP_CONFIG_JSON="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --argjson item "$entry" '.+[$item]')"
+      continue
+    fi
     command="$(printf '%s' "$entry" | jq -r .command)"
     if [ "${command#/}" = "$command" ]; then resolved="$(command -v "$command" 2>/dev/null || true)"; else resolved="$command"; fi
     [ -n "$resolved" ] && [ -x "$resolved" ] || die "MCP command not found or not executable on the host: $command"
@@ -447,13 +551,30 @@ mcp_persist_registry() {
   local name="$1" path temp safe
   mcp_prepare_private_dir "$(mcp_registry_dir)"
   path="$(mcp_registry_path "$name")"; temp="${path}.tmp.$$"
-  safe="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c '[.[]|del(.env,.inherited_env)]')"
-  jq -n --arg name "$name" --argjson port "$MCP_PORT" --argjson servers "$safe" '{schema_version:1,container:$name,port:$port,servers:$servers}' >"$temp"
+  safe="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c '[.[]|del(.env,.inherited_env,.headers,.resolved_headers,.missing_credentials,.missing_env_vars,.invalid_credentials,.invalid_env_vars)]')"
+  jq -n --arg name "$name" --argjson port "$MCP_PORT" --argjson servers "$safe" '{schema_version:2,container:$name,port:$port,servers:$servers}' >"$temp"
   chmod 600 "$temp"; mv "$temp" "$path"
 }
 
 mcp_config_fingerprint() {
-  printf '%s' "$MCP_CONFIG_JSON" | jq -Sc 'sort_by(.name) | map(.env_vars = ((.env_vars // []) | sort))' | cksum | awk '{printf "%08x-%s\n", $1, $2}'
+  if printf '%s' "$MCP_CONFIG_JSON" | jq -e 'all(.[]; (.transport // "stdio")=="stdio")' >/dev/null; then
+    printf '%s' "$MCP_CONFIG_JSON" | jq -Sc 'sort_by(.name) | map(del(.transport) | .env_vars = ((.env_vars // []) | sort))' | cksum | awk '{printf "%08x-%s\n", $1, $2}'
+  else
+    printf '%s' "$MCP_CONFIG_JSON" | jq -Sc 'sort_by(.name)' | node -e 'const c=require("node:crypto");let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(`sha256:${c.createHash("sha256").update(s).digest("hex")}\n`))'
+  fi
+}
+
+mcp_dry_run_summary() {
+  local entry name transport url origin
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    name="$(printf '%s' "$entry" | jq -r .name)"; transport="$(printf '%s' "$entry" | jq -r '.transport // "stdio"')"
+    if [ "$transport" = http ]; then
+      url="$(printf '%s' "$entry" | jq -r .url)"
+      origin="$(node -e 'const u=new URL(process.argv[1]);process.stdout.write(u.origin)' "$url" 2>/dev/null || printf invalid)"
+      printf '%s:http:%s\n' "$name" "$origin"
+    else printf '%s:stdio\n' "$name"; fi
+  done < <(printf '%s' "$MCP_CONFIG_JSON" | jq -c 'sort_by(.name)[]')
 }
 
 mcp_process_token() {
@@ -567,6 +688,7 @@ mcp_release_lease() {
 mcp_start_relay() {
   local name="$1" dir log_dir config log lease_prefix metadata_temp
   command -v node >/dev/null 2>&1 || die "Managed MCP requires Node.js on the host"
+  mcp_resolve_config_credentials
   dir="$(mcp_runtime_dir)"; mcp_prepare_private_dir "$dir"
   log_dir="$(mcp_log_dir)"; mcp_prepare_private_dir "$log_dir"
   MCP_RELAY_SOCKET="$(mcp_socket_path "$name")"
@@ -578,7 +700,7 @@ mcp_start_relay() {
   mcp_prepare_log_file "$log"
   jq -n --argjson servers "$MCP_CONFIG_JSON" --arg lease_dir "$dir" --arg lease_prefix "$lease_prefix" \
     --arg socket_path "$MCP_RELAY_SOCKET" --arg nonce "$MCP_RELAY_NONCE" --arg container "$name" \
-    '{schema_version:1,timeout_ms:30000,servers:$servers,lease_dir:$lease_dir,lease_prefix:$lease_prefix,ephemeral_env:any($servers[]; ((.env // {})|length)>0),socket_path:$socket_path,nonce:$nonce,container:$container}' >"$config"; chmod 600 "$config"
+    '{schema_version:2,timeout_ms:30000,http_timeouts:{connect:10000,headers:30000,idle:300000,total:86400000},servers:$servers,lease_dir:$lease_dir,lease_prefix:$lease_prefix,ephemeral_env:any($servers[]; ((.env // {})|length)>0 or ((.headers // {})|length)>0),socket_path:$socket_path,nonce:$nonce,container:$container}' >"$config"; chmod 600 "$config"
   ( exec -a "agentctl-mcp-relay:$name" node "$SCRIPT_DIR/mcp/host-relay.mjs" "$config" ) \
     </dev/null >>"$log" 2>&1 & MCP_RELAY_PID=$!
   local tries=0; while [ "$tries" -lt 50 ] && [ ! -S "$MCP_RELAY_SOCKET" ]; do sleep 0.02; tries=$((tries+1)); done
@@ -601,6 +723,7 @@ mcp_start_relay() {
 mcp_acquire_relay() {
   local name="$1" metadata fingerprint existing_fingerprint pid nonce socket response
   mcp_prepare_private_dir "$(mcp_runtime_dir)"
+  mcp_resolve_config_credentials
   mcp_lock_acquire "$name"
   mcp_lease_count "$name" >/dev/null
   metadata="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").process.json"
@@ -662,17 +785,11 @@ mcp_stop_managed() {
 }
 
 mcp_start_from_registry() {
-  local name="$1" registry variable inherited='{}'
+  local name="$1" registry
   registry="$(mcp_registry_path "$name")"; [ -f "$registry" ] && [ ! -L "$registry" ] || return 1
   mcp_validate_private_file "$registry" "Managed MCP registry"
   MCP_PORT="$(jq -r '.port // 47123' "$registry")"; mcp_validate_port "$MCP_PORT"
-  MCP_CONFIG_JSON="$(jq -c '[.servers[] | .env={} | .inherited_env={}]' "$registry")"
-  while IFS= read -r variable; do
-    [ -n "$variable" ] || continue
-    if [ "${!variable+x}" = x ]; then
-      MCP_CONFIG_JSON="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --arg k "$variable" --arg v "${!variable}" 'map(if (.env_vars|index($k)) then .inherited_env[$k]=$v else . end)')"
-    fi
-  done < <(printf '%s' "$MCP_CONFIG_JSON" | jq -r '.[].env_vars[]' | LC_ALL=C sort -u)
+  mcp_load_registry_config "$registry"
   MCP_REQUESTED=1; mcp_start_relay "$name"
 }
 
@@ -1508,6 +1625,7 @@ Commands:
   doctor     Check an existing container for common agentctl state problems
   host-address  Print the current host gateway for an Apple container network
   network    Manage Apple container networks used by agentctl
+  mcp        Manage host MCP credentials
   system-manifest  Print a container package manifest
   upgrade    Recreate a container from the latest image while preserving config
   rescue     Temporarily run a shell or command in a backup image
@@ -1584,7 +1702,7 @@ Options:
   --home PATH     Host directory to mount at /home/coder (requires new container)
   --mount-socket HOST_PATH:CONTAINER_PATH  Mount a host Unix socket (repeatable)
   --publish-socket HOST_PATH:CONTAINER_PATH  Publish a container Unix socket on the host (repeatable)
-  --mcp VALUE         Expose host stdio MCP (xcode, inline JSON, or @private-file; repeatable)
+  --mcp VALUE         Expose a host stdio or fixed HTTP MCP upstream (repeatable)
   --runtime NAME  Preferred runtime to launch in the container (e.g. codex, claude)
   --install-runtime  Install the selected runtime before launch
   -c, --config KEY=VALUE  Pass runtime-specific launch config (repeatable)
@@ -1812,6 +1930,19 @@ Options:
   --name NAME      Auth container name (default: agent-auth-<dir>)
   --image NAME     Image to use (default: agent-plain)
   --runtime NAME   Runtime to authenticate (default: $DEFAULT_RUNTIME)
+EOF
+}
+
+usage_mcp() {
+  cat <<EOF
+Usage:
+  $CLI_NAME mcp credential set ID [--stdin]
+  $CLI_NAME mcp credential status ID
+  $CLI_NAME mcp credential delete ID
+  $CLI_NAME mcp credential list
+
+Named MCP credentials are stored in macOS Keychain. Values are never printed.
+Use --stdin to pipe a value from a password manager without placing it in shell history.
 EOF
 }
 
@@ -5600,7 +5731,7 @@ doctor_published_socket_status() {
 }
 
 doctor_mcp_status() {
-  local name="$1" registry metadata socket nonce response status=0 missing="" variable="" port="" definitions="" proxy_response=""
+  local name="$1" registry metadata socket nonce response status=0 missing="" variable="" credential="" port="" definitions="" proxy_response="" route="" transport="" url="" origin="" unavailable=""
   registry="$(mcp_registry_path "$name")"
   if [ ! -f "$registry" ]; then
     if container_has_mcp_wiring "$name"; then
@@ -5616,9 +5747,10 @@ doctor_mcp_status() {
     printf '%s\n' "unsafe MCP registry ownership or permissions: $registry"; return 1
   fi
   if ! jq -e --arg name "$name" '
-    .schema_version==1 and .container==$name and (.port|type)=="number" and (.port>=1024 and .port<=65535) and
+    (.schema_version==1 or .schema_version==2) and .container==$name and (.port|type)=="number" and (.port>=1024 and .port<=65535) and
     (.servers|type)=="array" and
     all(.servers[]; (.name|type)=="string" and (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")) and
+      ((.transport // "stdio")=="stdio" or .transport=="http") and
       ((.env_vars // [])|type)=="array" and all((.env_vars // [])[]; type=="string"))
   ' "$registry" >/dev/null 2>&1; then
     printf '%s\n' "invalid MCP registry schema or container identity: $registry"; return 1
@@ -5629,8 +5761,21 @@ doctor_mcp_status() {
   fi
   port="$(jq -r '.port' "$registry")"; definitions="$(jq -r '[.servers[].name]|sort|join(", ")' "$registry")"
   printf '%s\n' "enabled on 127.0.0.1:$port; definitions: ${definitions:-none}"
-  while IFS= read -r variable; do [ -z "$variable" ] || [ "${!variable+x}" = x ] || missing="${missing}${missing:+, }${variable}"; done < <(jq -r '.servers[].env_vars[]' "$registry")
+  while IFS=$'\t' read -r route transport url; do
+    [ -n "$route" ] || continue
+    if [ "$transport" = http ]; then
+      origin="$(node -e 'const u=new URL(process.argv[1]);process.stdout.write(u.origin)' "$url" 2>/dev/null || printf invalid)"
+      printf '%s\n' "route $route: http; upstream $origin; upstream not probed"
+    else printf '%s\n' "route $route: stdio"; fi
+  done < <(jq -r '.servers[]|[.name,(.transport // "stdio"),(.url // "")]|@tsv' "$registry")
+  while IFS= read -r variable; do [ -z "$variable" ] || [ "${!variable+x}" = x ] || missing="${missing}${missing:+, }${variable}"; done < <(jq -r '.servers[] | (.env_vars // [])[], ((.header_env_vars // {})[]?), (.bearer_token_env_var // empty)' "$registry" | LC_ALL=C sort -u)
   [ -z "$missing" ] || { printf '%s\n' "missing inherited host variables: $missing"; status=1; }
+  missing=""
+  while IFS= read -r credential; do
+    [ -n "$credential" ] || continue
+    mcp_keychain_exists "$credential" || missing="${missing}${missing:+, }${credential}"
+  done < <(jq -r '.servers[] | (.bearer_token_keychain // empty), ((.header_keychain_credentials // {})[]?)' "$registry" | LC_ALL=C sort -u)
+  [ -z "$missing" ] || { printf '%s\n' "missing MCP Keychain credentials: $missing"; status=1; }
   metadata="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").process.json"
   if container_running "$name"; then
     if [ ! -f "$metadata" ]; then printf '%s\n' 'host relay metadata is missing'; status=1
@@ -5658,6 +5803,8 @@ doctor_mcp_status() {
       if printf '%s' "$response" | jq -e --arg n "$nonce" --arg name "$name" --arg socket "$socket" --argjson pid "$relay_pid" \
         --arg defs "$definitions" '.ok and .bridge_version==1 and .nonce==$n and .pid==$pid and .container==$name and .socket_path==$socket and ((.definitions|sort|join(", "))==$defs)' >/dev/null 2>&1; then
         printf '%s\n' "host relay healthy; PID $(printf '%s' "$response" | jq -r .pid); process agentctl-mcp-relay:$name"
+        unavailable="$(printf '%s' "$response" | jq -r '(.unavailable_definitions // [])|join(", ")')"
+        [ -z "$unavailable" ] || { printf '%s\n' "host relay has unavailable credential-backed routes: $unavailable"; status=1; }
       else
         printf '%s\n' 'host relay identity, version, or health check failed'; status=1
       fi
@@ -8300,6 +8447,80 @@ auth_cmd() {
   fi
 }
 
+mcp_credential_references() {
+  local wanted="${1:-}" registry_dir file container credential
+  registry_dir="$(mcp_registry_dir)"
+  [ -d "$registry_dir" ] && [ ! -L "$registry_dir" ] || return 0
+  for file in "$registry_dir"/*.json; do
+    [ -f "$file" ] && [ ! -L "$file" ] || continue
+    container="$(jq -r '.container // empty' "$file" 2>/dev/null || true)"
+    while IFS= read -r credential; do
+      [ -n "$credential" ] || continue
+      if [ -z "$wanted" ] || [ "$credential" = "$wanted" ]; then printf '%s\t%s\n' "$credential" "$container"; fi
+    done < <(jq -r '.servers[]? | (.bearer_token_keychain // empty), ((.header_keychain_credentials // {})[]?)' "$file" 2>/dev/null | LC_ALL=C sort -u)
+  done
+}
+
+mcp_report_credential_restarts() {
+  local credential="$1" container="" found=0
+  while IFS=$'\t' read -r _ container; do
+    [ -n "$container" ] || continue
+    if container_running "$container" 2>/dev/null; then
+      [ "$found" -eq 1 ] || printf '%s\n' 'Restart running containers to apply the changed credential:' >&2
+      printf '  %s restart --name %s\n' "$CLI_NAME" "$container" >&2
+      found=1
+    fi
+  done < <(mcp_credential_references "$credential" | LC_ALL=C sort -u)
+}
+
+mcp_cmd() {
+  local group="${1:-}" action="${2:-}" credential="${3:-}" stdin_mode=0 value="" status=0 refs="" container=""
+  require_jq
+  [ "$group" = credential ] || { usage_mcp; [ "$group" = --help ] || [ "$group" = -h ] || [ -z "$group" ] || return 1; return 0; }
+  shift 2
+  case "$action" in
+    set)
+      credential="${1:-}"; [ -n "$credential" ] || die "Missing MCP credential identifier"; shift
+      while [ $# -gt 0 ]; do case "$1" in --stdin) stdin_mode=1 ;; --help|-h) usage_mcp; return 0 ;; *) die "Unknown MCP credential option: $1" ;; esac; shift; done
+      mcp_validate_credential_id "$credential"
+      if [ "$stdin_mode" -eq 1 ]; then value="$(cat)"
+      else
+        [ -r /dev/tty ] && [ -w /dev/tty ] || die "MCP credential set requires a terminal or --stdin"
+        printf 'Enter value for MCP credential %s (input hidden): ' "$credential" >/dev/tty
+        IFS= read -r -s value </dev/tty || true; printf '\n' >/dev/tty
+      fi
+      [ -n "$value" ] || die "MCP credential value must not be empty"
+      printf '%s' "$value" | mcp_keychain_run "$credential" write >/dev/null
+      printf 'Stored MCP credential: %s\n' "$credential"
+      mcp_report_credential_restarts "$credential"
+      ;;
+    status)
+      credential="${1:-}"; [ -n "$credential" ] && [ "$#" -eq 1 ] || die "Usage: $CLI_NAME mcp credential status ID"
+      mcp_validate_credential_id "$credential"
+      if mcp_keychain_exists "$credential"; then printf 'MCP credential %s: present\n' "$credential"
+      else printf 'MCP credential %s: missing\n' "$credential"; return 1; fi
+      ;;
+    delete)
+      credential="${1:-}"; [ -n "$credential" ] && [ "$#" -eq 1 ] || die "Usage: $CLI_NAME mcp credential delete ID"
+      mcp_validate_credential_id "$credential"
+      mcp_keychain_run "$credential" delete >/dev/null
+      printf 'Deleted MCP credential: %s\n' "$credential"
+      mcp_report_credential_restarts "$credential"
+      ;;
+    list)
+      [ "$#" -eq 0 ] || die "Usage: $CLI_NAME mcp credential list"
+      refs="$(mcp_credential_references | LC_ALL=C sort -u)"
+      if [ -z "$refs" ]; then printf '%s\n' 'No persisted MCP credential references.'; return 0; fi
+      while IFS=$'\t' read -r credential container; do
+        if mcp_keychain_exists "$credential"; then status=0; else status=1; fi
+        printf '%s\t%s\t%s\n' "$credential" "$(if [ "$status" -eq 0 ]; then printf present; else printf missing; fi)" "$container"
+      done <<<"$refs"
+      ;;
+    --help|-h|"") usage_mcp ;;
+    *) die "Unknown MCP credential action: $action" ;;
+  esac
+}
+
 upgrade_cmd() {
   local name=""
   local new_name=""
@@ -8486,7 +8707,7 @@ upgrade_cmd() {
     mcp_validate_private_file "$mcp_registry" "Managed MCP registry"
     mcp_current_enabled=1
     if [ "$mcp_port_requested" -eq 0 ]; then MCP_PORT="$(jq -r '.port // 47123' "$mcp_registry")"; fi
-    MCP_CONFIG_JSON="$(jq -c '[.servers[] | .env={} | .inherited_env={}]' "$mcp_registry")"
+    mcp_load_registry_config "$mcp_registry"
   fi
   mcp_target_enabled="$mcp_current_enabled"
   [ "$mcp_enable_requested" -eq 0 ] || mcp_target_enabled=1
@@ -8695,7 +8916,7 @@ upgrade_cmd() {
     ensure_ssh_feature=1
   fi
   if [ "$dry_run" -eq 1 ]; then
-    echo "  MCP bridge: current=$mcp_current_enabled target=$mcp_target_enabled port=$MCP_PORT socket=$(mcp_socket_path "$target_name") definitions=$(printf '%s' "$MCP_CONFIG_JSON" | jq -r '[.[].name]|join(",")')" >&2
+    echo "  MCP bridge: current=$mcp_current_enabled target=$mcp_target_enabled port=$MCP_PORT socket=$(mcp_socket_path "$target_name") definitions=$(mcp_dry_run_summary | paste -sd, -)" >&2
     print_upgrade_dry_run_summary \
       "$name" "$target_name" "$current_image" "$image" "$current_workdir" "$workdir" \
       "$mount_mode" "$current_cpu" "$cpu" "$current_mem" "$mem" "$current_shm_size" "$shm_size" "$was_running" \
@@ -9403,6 +9624,7 @@ case "$cmd" in
   doctor) shift; doctor_cmd "$@" ;;
   host-address) shift; host_address_cmd "$@" ;;
   network) shift; network_cmd "$@" ;;
+  mcp) shift; mcp_cmd "$@" ;;
   system-manifest) shift; system_manifest_cmd "$@" ;;
   upgrade) shift; upgrade_cmd "$@" ;;
   rescue) shift; rescue_cmd "$@" ;;

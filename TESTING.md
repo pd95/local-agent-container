@@ -87,9 +87,10 @@ client feature:
 bash tests/run-tests.sh --tier full --filter ssh-forwarding
 ```
 
-The transport itself has a Linux-compatible Node test using a fake stdio MCP
-server. It checks lazy initialization, session reuse, tool listing, deletion,
-and the nonce health endpoint without creating a TCP listener:
+The transport itself has a Linux-compatible Node test using fake stdio and HTTP
+MCP servers. It checks lazy initialization, session reuse, streaming/SSE,
+fixed paths, header injection, redirects, timeouts, failures, redaction, and the
+nonce health endpoint without making the relay a TCP listener:
 
 ```bash
 node tests/run-mcp-node-tests.mjs
@@ -97,9 +98,10 @@ node tests/run-mcp-node-tests.mjs
 
 The focused macOS MCP test writes redacted host-relay diagnostics beneath
 `./tmp/mcp/`. On failure it also prints the guest proxy log before cleanup.
-It covers lazy startup, automatic Codex registration, repeated named-container
-reuse, start/restart supervision, stopped-container doctor checks, upgrade from
-a stopped state, definition preservation, disablement, and cleanup:
+It covers lazy startup, a loopback-only authenticated HTTP upstream, automatic
+Codex registration, a temporary Keychain credential, direct-gateway rejection,
+repeated named-container reuse, start/restart supervision, stopped-container
+doctor checks, upgrade preservation, disablement, and cleanup:
 
 ```bash
 bash tests/run-tests.sh --tier full --filter managed-mcp
@@ -109,6 +111,12 @@ On macOS, additionally create a container with `agentctl run --mcp` and point a
 client at `http://127.0.0.1:47123/mcp/<name>`. Use `lsof -nP -iTCP:47123` to
 confirm the host has no TCP listener; the only host listener is the private
 socket below `/tmp/agentctl-$(id -u)/`.
+
+For a real authenticated HTTP MCP smoke, create a dedicated named credential
+with `agentctl mcp credential set ID`, reference it through
+`bearer_token_keychain` or `header_keychain_credentials`, and restart the
+container after rotating it. Never place the value in JSON definitions, test
+logs, shell history, Codex configuration, or `./tmp/mcp/`.
 
 For a focused Apple container 1.1 storage-accounting smoke check, run:
 
