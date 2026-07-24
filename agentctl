@@ -5671,7 +5671,9 @@ doctor_mcp_status() {
         || { printf '%s\n' 'guest-to-host MCP route health check failed'; status=1; }
     fi
   elif [ -f "$metadata" ] || [ -S "$(mcp_socket_path "$name")" ]; then
-    printf '%s\n' "managed host relay state remains while the container is stopped; clean it safely with: ${CLI_NAME} stop --name $name"; status=1
+    printf '%s\n' 'WARNING: managed host relay is still running although the container is stopped'
+    printf '%s\n' "Suggested action: ${CLI_NAME} stop --name $name"
+    status=1
   else
     printf '%s\n' 'host relay inactive because the container is stopped'
   fi
@@ -8475,7 +8477,8 @@ upgrade_cmd() {
   fi
   mcp_lock_acquire "$name"
   local mcp_upgrade_relay_started=0
-  trap '[ "$mcp_upgrade_relay_started" -eq 0 ] || mcp_stop_managed "$target_name" >/dev/null 2>&1 || true; mcp_lock_release' EXIT
+  local mcp_upgrade_relay_name=""
+  trap '[ "$mcp_upgrade_relay_started" -eq 0 ] || mcp_stop_managed "$mcp_upgrade_relay_name" >/dev/null 2>&1 || true; mcp_lock_release' EXIT
   mcp_require_no_active_leases "$name" upgrade
 
   mcp_registry="$(mcp_registry_path "$name")"
@@ -8626,6 +8629,15 @@ upgrade_cmd() {
       "$added_features_json"
     backup_mode="start"
   else
+    if [ "$was_running" -eq 0 ] && container_has_mcp_wiring "$name"; then
+      if [ "$mcp_current_enabled" -ne 1 ]; then
+        die "Container $name has managed MCP wiring but its private host registry is unavailable. Reconfigure it with: ${CLI_NAME} run --name $name --mcp VALUE"
+      fi
+      mcp_start_from_registry "$name" \
+        || die "Unable to start the managed MCP relay required to inspect stopped container $name"
+      mcp_upgrade_relay_started=1
+      mcp_upgrade_relay_name="$name"
+    fi
     collect_upgrade_container_preflight "$name" || true
     if [ "$was_running" -eq 0 ]; then
       validate_published_host_paths_for_start "$current_published_sockets"
@@ -8817,9 +8829,16 @@ upgrade_cmd() {
     echo "Creating copy: $target_name" >&2
   fi
   if [ "$mcp_target_enabled" -eq 1 ]; then
-    if [ "$target_name" = "$name" ]; then mcp_stop_managed "$name"; fi
+    if [ "$mcp_upgrade_relay_started" -eq 1 ]; then
+      mcp_stop_managed "$mcp_upgrade_relay_name"
+      mcp_upgrade_relay_started=0
+      mcp_upgrade_relay_name=""
+    elif [ "$target_name" = "$name" ]; then
+      mcp_stop_managed "$name"
+    fi
     mcp_start_relay "$target_name"
     mcp_upgrade_relay_started=1
+    mcp_upgrade_relay_name="$target_name"
   fi
   local create_cmd=("$CONTAINER_CMD" create -t)
   if [ -n "$cpu" ]; then
@@ -8909,6 +8928,7 @@ upgrade_cmd() {
   if [ "$mcp_disable_requested" -eq 1 ]; then rm -f "$(mcp_registry_path "$target_name")"; fi
   if [ "$copy_mode" -eq 0 ] && [ "$target_name" != "$name" ]; then rm -f "$(mcp_registry_path "$name")"; fi
   mcp_upgrade_relay_started=0
+  mcp_upgrade_relay_name=""
   mcp_lock_release
   trap - EXIT
   echo >&2

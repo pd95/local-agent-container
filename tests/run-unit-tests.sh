@@ -10722,6 +10722,32 @@ test_host_doctor_reports_mcp_inventory_and_orphans() {
   [ -e "$orphan" ] || fail "Host doctor unexpectedly removed an orphan MCP artifact"
 }
 
+test_doctor_highlights_relay_left_by_external_container_stop() {
+  begin_test "doctor highlights managed MCP relay state left by an external container stop"
+
+  load_agentctl_functions
+  local test_root test_registry test_metadata
+  test_root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-external-stop.XXXXXX")"
+  register_dir_cleanup "$test_root"
+  test_registry="$test_root/agent-unit.json"
+  test_metadata="$test_root/mcp-unit.process.json"
+  printf '%s\n' '{"schema_version":1,"container":"agent-unit","port":47123,"servers":[{"name":"xcode","command":"/usr/bin/xcrun","args":["mcpbridge"],"env_vars":[]}]}' >"$test_registry"
+  : >"$test_metadata"
+  chmod 600 "$test_registry" "$test_metadata"
+  mcp_registry_path() { printf '%s\n' "$test_registry"; }
+  mcp_runtime_dir() { printf '%s\n' "$test_root"; }
+  mcp_identity_hash() { printf '%s\n' unit; }
+  mcp_socket_path() { printf '%s\n' "$test_root/mcp-unit.sock"; }
+  container_has_mcp_wiring() { return 0; }
+  container_running() { return 1; }
+
+  run_capture doctor_mcp_status agent-unit
+  assert_status 1
+  assert_contains "WARNING: managed host relay is still running although the container is stopped"
+  assert_contains "Suggested action:"
+  assert_contains "stop --name agent-unit"
+}
+
 test_doctor_reports_container_startup_problem() {
   begin_test "doctor reports containers that do not stay running"
 
@@ -12318,6 +12344,7 @@ main() {
   run_selected_test test_mcp_runtime_paths_normalize_trailing_tmpdir_separator "test_mcp_runtime_paths_normalize_trailing_tmpdir_separator"
   run_selected_test test_doctor_temporarily_supervises_stopped_mcp_container "test_doctor_temporarily_supervises_stopped_mcp_container"
   run_selected_test test_host_doctor_reports_mcp_inventory_and_orphans "test_host_doctor_reports_mcp_inventory_and_orphans"
+  run_selected_test test_doctor_highlights_relay_left_by_external_container_stop "test_doctor_highlights_relay_left_by_external_container_stop"
   run_selected_test test_doctor_reports_container_startup_problem "test_doctor_reports_container_startup_problem"
   run_selected_test test_doctor_state_backup_readability_runs_real_export "test_doctor_state_backup_readability_runs_real_export"
   run_selected_test test_doctor_state_permission_script_attaches_stdin "test_doctor_state_permission_script_attaches_stdin"

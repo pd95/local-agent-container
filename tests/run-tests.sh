@@ -1161,11 +1161,12 @@ curl -fsS -X POST -H "content-type: application/json" \
   run_capture "$AGENTCTL" doctor --host
   assert_contains "Container $name"
   assert_contains "host relay inactive because the container is stopped"
-  run_capture "$AGENTCTL" start --name "$name"
-  assert_status 0
-
-  log "managed-mcp: checking upgrade preservation"
+  log "managed-mcp: checking stopped-container upgrade preservation"
+  starts_before_doctor="$(wc -l <"$marker" | tr -d ' ')"
   run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
+  assert_status 0
+  [ "$(wc -l <"$marker" | tr -d ' ')" = "$starts_before_doctor" ] || fail "Stopped MCP upgrade preflight unexpectedly started the MCP child"
+  run_capture "$AGENTCTL" start --name "$name"
   assert_status 0
   assert_mcp_initialize
 
