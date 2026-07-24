@@ -10646,6 +10646,138 @@ test_mcp_runtime_paths_normalize_trailing_tmpdir_separator() {
     || fail "Expected legacy double-slash MCP paths to compare equal"
 }
 
+test_mcp_definition_parses_stdio_and_http_transports() {
+  begin_test "managed MCP definitions discriminate stdio and HTTP transports"
+  load_agentctl_functions
+  local executable http_definition
+  executable="$(command -v sh)"
+  MCP_CONFIG_JSON='[]'; MCP_REQUESTED=0
+  mcp_add_definition "{\"name\":\"stdio-explicit\",\"type\":\"stdio\",\"command\":\"$executable\"}"
+  printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[0].transport=="stdio" and .[0].name=="stdio-explicit"' >/dev/null || fail "Explicit stdio definition was not normalized: $MCP_CONFIG_JSON"
+  mcp_keychain_exists() { return 1; }
+  mcp_prompt_keychain_credential() { fail "definition normalization must not prompt for Keychain credentials"; }
+  mcp_keychain_read() { fail "definition normalization must not read Keychain credentials"; }
+  http_definition='{"name":"web","type":"http","url":"http://127.0.0.1:9876/mcp?fixed=1","bearer_token_keychain":"web-token"}'
+  mcp_add_definition "$http_definition"
+  printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[1].transport=="http" and .[1].url=="http://127.0.0.1:9876/mcp?fixed=1" and .[1].bearer_token_keychain=="web-token" and (.[1]|has("resolved_headers")|not)' >/dev/null \
+    || fail "HTTP definition was not normalized safely: $MCP_CONFIG_JSON"
+}
+
+test_mcp_http_definition_rejects_unsafe_urls_and_headers() {
+  begin_test "managed HTTP MCP validation rejects non-loopback plaintext and reserved headers"
+  load_agentctl_functions
+  run_capture sh -c 'printf "%s" "$1" | node "$2/mcp/definition-helper.mjs" normalize-http' sh '{"name":"remote","type":"http","url":"http://example.test/mcp"}' "$TEST_ROOT"
+  assert_status 1
+  assert_contains "plaintext HTTP upstreams must use host loopback"
+  run_capture sh -c 'printf "%s" "$1" | node "$2/mcp/definition-helper.mjs" normalize-http' sh '{"name":"reserved","type":"http","url":"https://example.test/mcp","headers":{"Host":"wrong.example"}}' "$TEST_ROOT"
+  assert_status 1
+  assert_contains "reserved header name"
+  run_capture sh -c 'printf "%s" "$1" | node "$2/mcp/definition-helper.mjs" normalize-http' sh '{"name":"mixed","type":"http","url":"https://example.test/mcp","command":"bad"}' "$TEST_ROOT"
+  assert_status 1
+  assert_contains "unknown HTTP definition field"
+}
+
+test_mcp_registry_v2_filters_secrets_and_reads_v1() {
+  begin_test "managed MCP registry v2 filters secrets and retains schema v1 compatibility"
+  load_agentctl_functions
+  local root test_registry
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-schema.XXXXXX")"; register_dir_cleanup "$root"
+  mcp_registry_dir() { printf '%s\n' "$root"; }
+  MCP_PORT=47123
+  MCP_CONFIG_JSON='[{"name":"web","transport":"http","url":"https://example.test/mcp?private=query","headers":{"authorization":"literal-secret"},"resolved_headers":{"authorization":"Bearer resolved-secret"},"header_keychain_credentials":{"authorization":"web-token"},"missing_credentials":[],"missing_env_vars":[]}]'
+  mcp_persist_registry agent-unit
+  registry="$root/agent-unit.json"
+  jq -e '.schema_version==2 and .servers[0].header_keychain_credentials.authorization=="web-token" and (.servers[0]|has("headers")|not) and (.servers[0]|has("resolved_headers")|not)' "$registry" >/dev/null \
+    || fail "Unexpected registry v2 content: $(cat "$registry")"
+  grep -Fq 'literal-secret' "$registry" && fail "Literal header leaked into registry"
+  grep -Fq 'resolved-secret' "$registry" && fail "Resolved header leaked into registry"
+  printf '%s\n' '{"schema_version":1,"container":"legacy","port":47123,"servers":[{"name":"old","command":"/bin/sh","args":[],"env_vars":[]}]}' >"$root/legacy.json"
+  mcp_load_registry_config "$root/legacy.json"
+  printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[0].transport=="stdio" and .[0].name=="old"' >/dev/null || fail "Schema v1 registry did not normalize to stdio"
+}
+
+test_mcp_fingerprints_preserve_stdio_compatibility_and_detect_http_rotation() {
+  begin_test "managed MCP fingerprints preserve stdio compatibility and detect HTTP credential rotation"
+  load_agentctl_functions
+  local legacy normalized legacy_fingerprint normalized_fingerprint first second
+  legacy='[{"name":"old","command":"/bin/sh","args":[],"env":{},"env_vars":[],"inherited_env":{},"shared_process":false}]'
+  normalized='[{"name":"old","transport":"stdio","command":"/bin/sh","args":[],"env":{},"env_vars":[],"inherited_env":{},"shared_process":false}]'
+  MCP_CONFIG_JSON="$legacy"; legacy_fingerprint="$(mcp_config_fingerprint)"
+  MCP_CONFIG_JSON="$normalized"; normalized_fingerprint="$(mcp_config_fingerprint)"
+  [ "$legacy_fingerprint" = "$normalized_fingerprint" ] || fail "Explicit stdio transport changed the Phase 3 fingerprint"
+  MCP_CONFIG_JSON='[{"name":"web","transport":"http","url":"https://example.test/mcp","resolved_headers":{"authorization":"Bearer first-secret"}}]'; first="$(mcp_config_fingerprint)"
+  MCP_CONFIG_JSON='[{"name":"web","transport":"http","url":"https://example.test/mcp","resolved_headers":{"authorization":"Bearer second-secret"}}]'; second="$(mcp_config_fingerprint)"
+  [ "$first" != "$second" ] || fail "HTTP credential rotation did not change the relay fingerprint"
+  case "$first$second" in *first-secret*|*second-secret*) fail "HTTP fingerprint exposed a credential value" ;; esac
+}
+
+test_mcp_keychain_slots_are_separate_from_runtime_auth() {
+  begin_test "managed MCP credentials use dedicated Keychain slots"
+  load_agentctl_functions
+  [ "$(mcp_credential_service ui-helper-token)" = agentctl-mcp-credential-ui-helper-token ] || fail "Unexpected MCP Keychain service"
+  [ "$(mcp_credential_account ui-helper-token)" = mcp-credential-ui-helper-token ] || fail "Unexpected MCP Keychain account"
+  [ "$(runtime_keychain_service codex json_refresh_token)" = agentctl-codex-json_refresh_token-auth ] || fail "Runtime auth Keychain slot changed"
+}
+
+test_mcp_credential_commands_use_keychain_without_printing_values() {
+  begin_test "managed MCP credential commands use named Keychain slots without printing values"
+  load_agentctl_functions
+  local root fake_keychain calls values
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-keychain.XXXXXX")"; register_dir_cleanup "$root"
+  fake_keychain="$root/keychain"; calls="$root/calls"; values="$root/values"
+  printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'printf "%s\t%s\t%s\n" "$KEYCHAIN_SERVICE_NAME" "$KEYCHAIN_ACCOUNT_NAME" "$1" >>"$MCP_TEST_CALLS"' 'case "$1" in write) cat >>"$MCP_TEST_VALUES" ;; read|read-raw) printf "${MCP_TEST_READ_VALUE:-stored-secret}" ;; verify) exit 0 ;; delete) : ;; esac' >"$fake_keychain"
+  chmod +x "$fake_keychain"
+  KEYCHAIN_SCRIPT="$fake_keychain"; export MCP_TEST_CALLS="$calls" MCP_TEST_VALUES="$values"
+  mcp_registry_dir() { printf '%s\n' "$root/registry"; }
+  run_capture mcp_cmd credential set ui-helper --stdin <<<"stored-secret"
+  assert_status 0; assert_contains "Stored MCP credential: ui-helper"; assert_not_contains "stored-secret"
+  [ "$(cat "$values")" = stored-secret ] || fail "Credential set did not send the exact value through stdin"
+  grep -Fq $'agentctl-mcp-credential-ui-helper\tmcp-credential-ui-helper\twrite' "$calls" || fail "Credential set used the wrong Keychain slot"
+  run_capture mcp_cmd credential status ui-helper
+  assert_status 0; assert_contains "present"; assert_not_contains "stored-secret"
+  run_capture mcp_cmd credential delete ui-helper
+  assert_status 0; assert_contains "Deleted MCP credential: ui-helper"; assert_not_contains "stored-secret"
+  MCP_TEST_READ_VALUE=abcdef12; export MCP_TEST_READ_VALUE
+  [ "$(mcp_keychain_read ui-helper)" = abcdef12 ] || fail "Hex-only MCP credential was decoded or corrupted"
+  MCP_TEST_READ_VALUE=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789; export MCP_TEST_READ_VALUE
+  [ "$(mcp_keychain_read ui-helper)" = "$MCP_TEST_READ_VALUE" ] || fail "64-character hex MCP credential was decoded or corrupted"
+}
+
+test_mcp_http_doctor_and_dry_run_redact_upstream_details() {
+  begin_test "managed HTTP MCP doctor and dry-run output redact paths, queries, and values"
+  load_agentctl_functions
+  local root registry
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-redaction.XXXXXX")"; register_dir_cleanup "$root"
+  test_registry="$root/agent-unit.json"
+  printf '%s\n' '{"schema_version":2,"container":"agent-unit","port":47123,"servers":[{"name":"web","transport":"http","url":"https://mcp.example.test/private/path?token=query-secret","header_keychain_credentials":{"authorization":"web-token"}}]}' >"$test_registry"; chmod 600 "$test_registry"
+  mcp_registry_path() { printf '%s\n' "$test_registry"; }
+  mcp_runtime_dir() { printf '%s\n' "$root/runtime"; }
+  container_has_mcp_wiring() { return 0; }
+  container_running() { return 1; }
+  mcp_keychain_exists() { return 1; }
+  run_capture doctor_mcp_status agent-unit
+  assert_status 1
+  assert_contains "route web: http; upstream https://mcp.example.test; upstream not probed"
+  assert_contains "missing MCP Keychain credentials: web-token"
+  assert_not_contains "private/path"; assert_not_contains "query-secret"
+  MCP_CONFIG_JSON='[{"name":"web","transport":"http","url":"https://mcp.example.test/private/path?token=query-secret","resolved_headers":{"authorization":"value-secret"}}]'
+  run_capture mcp_dry_run_summary
+  assert_status 0; assert_contains "web:http:https://mcp.example.test"
+  assert_not_contains "private/path"; assert_not_contains "query-secret"; assert_not_contains "value-secret"
+}
+
+test_mcp_http_resolution_marks_invalid_header_values_unavailable() {
+  begin_test "managed HTTP MCP resolution rejects invalid environment and Keychain header values"
+  load_agentctl_functions
+  local BAD_MCP_HEADER=$'bad\nvalue' resolved
+  export BAD_MCP_HEADER
+  mcp_keychain_exists() { return 0; }
+  mcp_keychain_read() { printf $'bad\rvalue'; }
+  resolved="$(mcp_resolve_http_credentials '{"name":"web","transport":"http","url":"https://example.test/mcp","headers":{},"header_env_vars":{"x-env":"BAD_MCP_HEADER"},"header_keychain_credentials":{"x-key":"bad-keychain"},"bearer_token_env_var":null,"bearer_token_keychain":null}')"
+  printf '%s' "$resolved" | jq -e '.invalid_env_vars==["BAD_MCP_HEADER"] and .invalid_credentials==["bad-keychain"] and (.resolved_headers|length)==0' >/dev/null \
+    || fail "Invalid header values were not classified safely: $resolved"
+}
+
 test_doctor_temporarily_supervises_stopped_mcp_container() {
   begin_test "doctor temporarily supervises MCP while checking a stopped container"
 
@@ -12342,6 +12474,14 @@ main() {
   run_selected_test test_doctor_reports_state_permission_problems "test_doctor_reports_state_permission_problems"
   run_selected_test test_doctor_excludes_managed_mcp_from_user_socket_failures "test_doctor_excludes_managed_mcp_from_user_socket_failures"
   run_selected_test test_mcp_runtime_paths_normalize_trailing_tmpdir_separator "test_mcp_runtime_paths_normalize_trailing_tmpdir_separator"
+  run_selected_test test_mcp_definition_parses_stdio_and_http_transports "test_mcp_definition_parses_stdio_and_http_transports"
+  run_selected_test test_mcp_http_definition_rejects_unsafe_urls_and_headers "test_mcp_http_definition_rejects_unsafe_urls_and_headers"
+  run_selected_test test_mcp_registry_v2_filters_secrets_and_reads_v1 "test_mcp_registry_v2_filters_secrets_and_reads_v1"
+  run_selected_test test_mcp_fingerprints_preserve_stdio_compatibility_and_detect_http_rotation "test_mcp_fingerprints_preserve_stdio_compatibility_and_detect_http_rotation"
+  run_selected_test test_mcp_keychain_slots_are_separate_from_runtime_auth "test_mcp_keychain_slots_are_separate_from_runtime_auth"
+  run_selected_test test_mcp_credential_commands_use_keychain_without_printing_values "test_mcp_credential_commands_use_keychain_without_printing_values"
+  run_selected_test test_mcp_http_doctor_and_dry_run_redact_upstream_details "test_mcp_http_doctor_and_dry_run_redact_upstream_details"
+  run_selected_test test_mcp_http_resolution_marks_invalid_header_values_unavailable "test_mcp_http_resolution_marks_invalid_header_values_unavailable"
   run_selected_test test_doctor_temporarily_supervises_stopped_mcp_container "test_doctor_temporarily_supervises_stopped_mcp_container"
   run_selected_test test_host_doctor_reports_mcp_inventory_and_orphans "test_host_doctor_reports_mcp_inventory_and_orphans"
   run_selected_test test_doctor_highlights_relay_left_by_external_container_stop "test_doctor_highlights_relay_left_by_external_container_stop"

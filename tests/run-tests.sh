@@ -1037,7 +1037,7 @@ PY
 
 test_managed_mcp_bridge_lifecycle() {
   begin_test "managed MCP bridge exchanges traffic and survives start, restart, upgrade, and disable"
-  local name workdir marker node_path definition registry port debug_dir
+  local name workdir marker node_path definition registry port debug_dir http_pid http_port_file http_port credential token rotated_token expected_auth_file
 
   command -v node >/dev/null 2>&1 || fail "managed MCP integration test requires host Node.js"
   name="$(unique_name managed-mcp)"
@@ -1051,6 +1051,18 @@ test_managed_mcp_bridge_lifecycle() {
   chmod 700 "$TEST_ROOT/tmp" "$debug_dir" 2>/dev/null || true
   export AGENTCTL_MCP_LOG_DIR="$debug_dir"
   register_container_cleanup "$name"
+  credential="${name}-http-token"
+  token="phase4-test-token-${name}"
+  rotated_token="${token}-rotated"
+  register_mcp_credential_cleanup "$credential"
+  printf '%s' "$token" | "$AGENTCTL" mcp credential set "$credential" --stdin >/dev/null
+  http_port_file="$debug_dir/http-port"
+  expected_auth_file="$debug_dir/expected-authorization.sha256"; printf 'Bearer %s' "$token" | shasum -a 256 | awk '{print $1}' >"$expected_auth_file"
+  AGENTCTL_FAKE_HTTP_ABORTED="$debug_dir/http-aborted" AGENTCTL_FAKE_HTTP_EXPECTED_AUTH_HASH_FILE="$expected_auth_file" node "$TEST_ROOT/tests/fixtures/fake-http-mcp-server.mjs" >"$http_port_file" 2>"$debug_dir/http-upstream.log" &
+  http_pid=$!; register_pid_cleanup "$http_pid"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$http_port_file" ] && break; sleep 0.1; done
+  [ -s "$http_port_file" ] || fail "fake HTTP MCP upstream did not report its port"
+  http_port="$(sed -n '1p' "$http_port_file")"
 
   # Reuse the current image on iterative runs. Set AGENTCTL_MCP_TEST_REBUILD=1
   # when validating image assembly itself or after changing feature assets.
@@ -1063,7 +1075,9 @@ test_managed_mcp_bridge_lifecycle() {
     --arg command "$node_path" \
     --arg server "$TEST_ROOT/tests/fixtures/fake-mcp-server.mjs" \
     --arg marker "$marker" \
-    '{name:"fake",command:$command,args:[$server],env:{AGENTCTL_FAKE_MCP_STARTED:$marker},shared:true}')"
+    --arg url "http://127.0.0.1:${http_port}/mcp?fixed=1" \
+    --arg credential "$credential" \
+    '[{name:"fake",command:$command,args:[$server],env:{AGENTCTL_FAKE_MCP_STARTED:$marker},shared:true},{name:"http-fake",type:"http",url:$url,bearer_token_keychain:$credential}]')"
 
   log "managed-mcp: creating bridge and checking lazy child startup"
   run_capture "$AGENTCTL" run --name "$name" --image agent-python --workdir "$workdir" \
@@ -1071,6 +1085,15 @@ test_managed_mcp_bridge_lifecycle() {
 set -eu
 test ! -e /workdir/mcp-started
 codex mcp get fake --json | jq -e ".transport.type == \"streamable_http\" and .transport.url == \"http://127.0.0.1:47123/mcp/fake\"" >/dev/null
+codex mcp get http-fake --json | jq -e ".transport.type == \"streamable_http\" and .transport.url == \"http://127.0.0.1:47123/mcp/http-fake\"" >/dev/null
+if curl -fsS --max-time 1 "http://host.container.internal:'"$http_port"'/mcp?fixed=1" >/dev/null 2>&1; then
+  echo "loopback-only host MCP unexpectedly reachable through the VM gateway" >&2
+  exit 1
+fi
+http_response="$(curl -fsS -X POST -H "content-type: application/json" \
+  --data "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/list\"}" \
+  http://127.0.0.1:47123/mcp/http-fake)"
+printf "%s" "$http_response" | jq -e ".authorization_matches == true and .url == \"/mcp?fixed=1\"" >/dev/null
 response=""
 curl_error=/tmp/agentctl-mcp-curl-error
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
@@ -1109,6 +1132,10 @@ test "$(wc -l </workdir/mcp-started | tr -d " ")" = 1
   if grep -Fq -- "$marker" "$registry"; then
     fail "Literal MCP environment value was persisted in the registry"
   fi
+  jq -e --arg credential "$credential" '.schema_version==2 and any(.servers[]; .name=="http-fake" and .bearer_token_keychain==$credential and (has("resolved_headers")|not))' "$registry" >/dev/null \
+    || fail "Expected safe HTTP credential reference in registry"
+  grep -Fq -- "$token" "$registry" && fail "HTTP MCP Keychain value was persisted in the registry"
+  if lsof -nP -iTCP:47123 -sTCP:LISTEN 2>/dev/null | grep -q agentctl; then fail "agentctl unexpectedly opened a host TCP listener on the guest MCP port"; fi
 
   log "managed-mcp: reusing the same named container through run --mcp"
   run_capture "$AGENTCTL" run --name "$name" --image agent-python --workdir "$workdir" \
@@ -1128,6 +1155,23 @@ curl -fsS -X POST -H "content-type: application/json" \
   run_capture "$AGENTCTL" start --name "$name"
   assert_status 0
   assert_mcp_initialize
+
+  log "managed-mcp: rotating and removing Keychain-backed HTTP credentials"
+  printf '%s' "$rotated_token" | "$AGENTCTL" mcp credential set "$credential" --stdin >/dev/null
+  printf 'Bearer %s' "$rotated_token" | shasum -a 256 | awk '{print $1}' >"$expected_auth_file"
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc 'curl -fsS -X POST --data "{}" http://127.0.0.1:'"$port"'/mcp/http-fake | jq -e ".authorization_matches == false" >/dev/null'
+  assert_status 0
+  run_capture "$AGENTCTL" restart --name "$name"; assert_status 0
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc 'curl -fsS -X POST --data "{}" http://127.0.0.1:'"$port"'/mcp/http-fake | jq -e ".authorization_matches == true" >/dev/null'
+  assert_status 0
+  "$AGENTCTL" mcp credential delete "$credential" >/dev/null
+  run_capture "$AGENTCTL" restart --name "$name"; assert_status 0
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc 'test "$(curl -sS -o /tmp/mcp-missing.json -w "%{http_code}" -X POST --data "{}" http://127.0.0.1:'"$port"'/mcp/http-fake)" = 503'
+  assert_status 0
+  run_capture "$AGENTCTL" doctor --name "$name"
+  assert_status 1; assert_contains "missing MCP Keychain credentials: $credential"
+  printf '%s' "$rotated_token" | "$AGENTCTL" mcp credential set "$credential" --stdin >/dev/null
+  run_capture "$AGENTCTL" restart --name "$name"; assert_status 0
   run_capture "$AGENTCTL" restart --name "$name"
   assert_status 0
   assert_mcp_initialize
