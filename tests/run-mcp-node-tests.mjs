@@ -24,6 +24,9 @@ function request(method, route, payload, headers={}) {
 }
 const health=await request('GET','/.well-known/agentctl-mcp-health');
 assert.equal(JSON.parse(health.body).nonce,'test-nonce');
+relay.kill('SIGINT');
+await new Promise(resolve=>setTimeout(resolve,50));
+assert.equal(JSON.parse((await request('GET','/.well-known/agentctl-mcp-health')).body).nonce,'test-nonce');
 const [initialized, concurrentInitialized]=await Promise.all([
   request('POST','/mcp/fake',{jsonrpc:'2.0',id:1,method:'initialize',params:{}}),
   request('POST','/mcp/fake',{jsonrpc:'2.0',id:101,method:'initialize',params:{}})

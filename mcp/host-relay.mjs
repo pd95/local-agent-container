@@ -16,6 +16,7 @@ const children = new Set();
 const sessions = new Map();
 const serverChildren = new Map();
 const childQueues = new WeakMap();
+const connections = new Set();
 let shuttingDown = false;
 let leaseMissingSince = null;
 function log(message) { process.stderr.write(`[agentctl-mcp] ${message}\n`); }
@@ -256,13 +257,24 @@ const server = http.createServer(async (req, res) => {
   } catch (error) { state.initializePromise=null; log(`server ${definition.name} request failed: ${error.message}`); state.child.kill('SIGTERM'); sessions.delete(nextSession); return json(res, 502, {error:error.message}); }
 });
 
-function shutdown() {
+function shutdown(signal='supervisor') {
+  if (shuttingDown) return;
   shuttingDown = true;
+  log(`relay shutting down (${signal})`);
   server.close(() => { try { fs.unlinkSync(socketPath); } catch {} process.exit(0); });
   for (const child of children) child.kill('SIGTERM');
-  setTimeout(() => process.exit(1), 2000).unref();
+  setTimeout(() => {
+    for (const connection of connections) connection.destroy();
+    try { fs.unlinkSync(socketPath); } catch {}
+    process.exit(1);
+  }, 2000);
 }
-process.on('SIGTERM', shutdown); process.on('SIGINT', shutdown);
+// The relay is container-scoped, not attached to an interactive agent session.
+// Only the verified supervisor terminates it with SIGTERM. In particular, do
+// not turn a terminal SIGINT from one client into an outage for other clients.
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => log('ignoring interactive SIGINT'));
+process.on('SIGHUP', () => log('ignoring terminal SIGHUP'));
 if (config.ephemeral_env) {
   setInterval(() => {
     let live=false;
@@ -283,6 +295,10 @@ if (config.ephemeral_env) {
   }, 1000).unref();
 }
 server.on('error', error => { console.error(`MCP relay: ${error.message}`); process.exit(1); });
+server.on('connection', connection => {
+  connections.add(connection);
+  connection.once('close', () => connections.delete(connection));
+});
 // The containing host directory is owner-only (0700). The socket itself must
 // permit the explicitly mounted guest UID, which is not the macOS host UID.
 server.listen(socketPath, () => { fs.chmodSync(socketPath, 0o666); log('relay ready'); });

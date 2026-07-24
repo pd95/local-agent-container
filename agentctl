@@ -456,20 +456,21 @@ mcp_config_fingerprint() {
 
 mcp_process_token() {
   local pid="$1"
-  ps -p "$pid" -o lstart= 2>/dev/null | cksum | awk 'NF {printf "%08x-%s\n", $1, $2}'
+  { ps -p "$pid" -o lstart= 2>/dev/null || true; } | cksum | awk 'NF {printf "%08x-%s\n", $1, $2}'
 }
 
 mcp_process_started() {
-  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+  { ps -p "$1" -o lstart= 2>/dev/null || true; } | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
 mcp_lock_acquire() {
-  local name="$1" base lock file owner owner_pid owner_token current_token candidate stage winner tries=0 stale=0
+  local name="$1" base lock file owner owner_pid owner_token current_token candidate stage winner self_pid tries=0 stale=0
   base="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lock."
   lock="${base%.}"
-  MCP_LOCK_TOKEN="$$:$(mcp_process_token "$$"):${RANDOM:-0}"
-  candidate="${base}$$-${RANDOM:-0}"
-  stage="$(mcp_runtime_dir)/.mcp-lock-stage.$$-${RANDOM:-0}"
+  self_pid="$$"
+  MCP_LOCK_TOKEN="${self_pid}:$(mcp_process_token "$self_pid"):${RANDOM:-0}"
+  candidate="${base}${self_pid}-${RANDOM:-0}"
+  stage="$(mcp_runtime_dir)/.mcp-lock-stage.${self_pid}-${RANDOM:-0}"
   [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || die "Managed MCP lock path collision: $candidate"
   [ ! -e "$stage" ] && [ ! -L "$stage" ] || die "Managed MCP lock staging collision: $stage"
   printf '%s\n' "$MCP_LOCK_TOKEN" >"$stage"; chmod 600 "$stage"
@@ -483,7 +484,9 @@ mcp_lock_acquire() {
       owner_pid="${owner%%:*}"; owner_token="${owner#*:}"; owner_token="${owner_token%:*}"
       case "$owner_pid" in ''|*[!0-9]*) rm -f "$candidate"; die "Invalid managed MCP lock owner: $lock" ;; esac
       current_token="$(mcp_process_token "$owner_pid")"
-      if ! kill -0 "$owner_pid" 2>/dev/null || { [ -n "$current_token" ] && [ "$current_token" != "$owner_token" ]; }; then
+      if [ "$owner_pid" = "$self_pid" ] && [ "$owner" != "$MCP_LOCK_TOKEN" ]; then
+        stale=1
+      elif ! kill -0 "$owner_pid" 2>/dev/null || { [ -n "$current_token" ] && [ "$current_token" != "$owner_token" ]; }; then
         stale=1
       elif [ "$owner" = "$MCP_LOCK_TOKEN" ]; then
         MCP_LOCK_DIR="$lock"; rm -f "$candidate"; return 0
@@ -545,11 +548,12 @@ mcp_require_no_active_leases() {
 }
 
 mcp_create_lease() {
-  local name="$1" fingerprint temp
+  local name="$1" fingerprint temp self_pid
   fingerprint="$(mcp_config_fingerprint)"
-  temp="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lease.$$-${RANDOM:-0}.json"
+  self_pid="$$"
+  temp="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lease.${self_pid}-${RANDOM:-0}.json"
   [ ! -e "$temp" ] && [ ! -L "$temp" ] || die "Managed MCP lease path collision: $temp"
-  jq -n --argjson owner_pid "$$" --arg owner_token "$(mcp_process_token "$$")" --arg owner_started "$(mcp_process_started "$$")" --arg fingerprint "$fingerprint" '{schema_version:1,owner_pid:$owner_pid,owner_token:$owner_token,owner_started:$owner_started,fingerprint:$fingerprint}' >"$temp"
+  jq -n --argjson owner_pid "$self_pid" --arg owner_token "$(mcp_process_token "$self_pid")" --arg owner_started "$(mcp_process_started "$self_pid")" --arg fingerprint "$fingerprint" '{schema_version:1,owner_pid:$owner_pid,owner_token:$owner_token,owner_started:$owner_started,fingerprint:$fingerprint}' >"$temp"
   chmod 600 "$temp"; MCP_LEASE_FILE="$temp"
 }
 
@@ -644,6 +648,11 @@ mcp_stop_managed() {
     || die "Refusing to signal unverified managed MCP process for $name"
   kill "$pid" 2>/dev/null || true
   local tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do sleep 0.05; tries=$((tries+1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -KILL "$pid" 2>/dev/null || true
+    tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do sleep 0.05; tries=$((tries+1)); done
+  fi
+  kill -0 "$pid" 2>/dev/null && die "Managed MCP process did not stop for $name; preserving ownership metadata"
   [ ! -S "$socket" ] || rm -f "$socket"
   rm -f "$metadata"
 }
@@ -8423,6 +8432,8 @@ upgrade_cmd() {
       "$current_ssh" "$target_ssh" "$ensure_ssh_feature" \
       "$current_socket_mappings" "$target_socket_mappings" \
       "$current_published_sockets" "$target_published_sockets"
+    mcp_lock_release
+    trap - EXIT
     return 0
   fi
 
