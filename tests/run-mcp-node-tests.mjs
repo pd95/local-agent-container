@@ -13,7 +13,9 @@ const config = path.join(temporary, 'config.json');
 const starts=path.join(temporary,'starts'); const clientResponses=path.join(temporary,'client-responses');
 const aborted=path.join(temporary,'http-aborted');
 const redirected=path.join(temporary,'http-redirected');
-const fakeHttp=spawn(process.execPath,[path.join(root,'tests/fixtures/fake-http-mcp-server.mjs')],{env:{...process.env,AGENTCTL_FAKE_HTTP_ABORTED:aborted,AGENTCTL_FAKE_HTTP_REDIRECTED:redirected,AGENTCTL_FAKE_HTTP_EXPECTED_AUTH:'Bearer configured-secret',AGENTCTL_FAKE_HTTP_EXPECTED_TENANT:'configured-tenant'},stdio:['ignore','pipe','inherit']});
+const expectedAuthorizationHash=path.join(temporary,'expected-authorization.sha256');
+fs.writeFileSync(expectedAuthorizationHash,`${(await import('node:crypto')).createHash('sha256').update('Bearer configured-secret').digest('hex')}\n`);
+const fakeHttp=spawn(process.execPath,[path.join(root,'tests/fixtures/fake-http-mcp-server.mjs')],{env:{...process.env,AGENTCTL_FAKE_HTTP_ABORTED:aborted,AGENTCTL_FAKE_HTTP_REDIRECTED:redirected,AGENTCTL_FAKE_HTTP_EXPECTED_AUTH_HASH_FILE:expectedAuthorizationHash,AGENTCTL_FAKE_HTTP_EXPECTED_TENANT:'configured-tenant'},stdio:['ignore','pipe','inherit']});
 const httpPort=Number(await new Promise((resolve,reject)=>{let text='';fakeHttp.stdout.on('data',chunk=>{text+=chunk;if(text.includes('\n'))resolve(text.trim());});fakeHttp.once('error',reject);}));
 const unusedServer=http.createServer(); await new Promise(resolve=>unusedServer.listen(0,'127.0.0.1',resolve)); const unusedPort=unusedServer.address().port; await new Promise(resolve=>unusedServer.close(resolve));
 const servers=[

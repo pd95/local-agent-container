@@ -30,7 +30,7 @@ const server=http.createServer(async (req,res) => {
   }
   res.writeHead(207,{'content-type':'application/json','mcp-session-id':req.headers['mcp-session-id'] || 'fake-http-session','x-upstream':'preserved'});
   const authorizationMatches=expectedAuthorizationHashFile
-    ? createHash('sha256').update(req.headers.authorization || '').digest('hex')===fs.readFileSync(expectedAuthorizationHashFile,'utf8')
+    ? createHash('sha256').update(req.headers.authorization || '').digest('hex')===fs.readFileSync(expectedAuthorizationHashFile,'utf8').trim()
     : req.headers.authorization===configuredExpectedAuthorization;
   res.end(JSON.stringify({method:req.method,url:req.url,last_event_id:req.headers['last-event-id'] || null,authorization_matches:authorizationMatches,tenant_matches:expectedTenant ? req.headers['x-tenant']===expectedTenant : null,body}));
 });
