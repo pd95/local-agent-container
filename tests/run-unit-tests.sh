@@ -8501,6 +8501,7 @@ test_ls_raw_filters_non_codex_containers() {
   load_agentctl_functions
 
   require_container() { return 0; }
+  require_container_service() { return 0; }
   container_list_all() {
     cat <<'EOF'
 ID                               IMAGE                                                OS     ARCH   STATE    ADDR              CPUS  MEMORY   STARTED
@@ -8522,12 +8523,41 @@ EOF
   assert_not_contains "converter"
 }
 
+test_ls_reports_stopped_container_service() {
+  begin_test "ls reports when the Apple container service is stopped"
+
+  local harness script
+  harness="$(mktemp "${TMPDIR:-/tmp}/agentctl-unit.XXXXXX")"
+  register_dir_cleanup "$harness"
+  sed -e "s#^SCRIPT_DIR=.*#SCRIPT_DIR=\"$TEST_ROOT\"#" \
+    -e '/^cmd="${1:-}"/,$d' \
+    "$AGENTCTL_IMPL" >"$harness"
+  script="$(mktemp "${TMPDIR:-/tmp}/agentctl-unit-script.XXXXXX")"
+  register_dir_cleanup "$script"
+  cat >"$script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+. "$harness"
+require_jq() { return 0; }
+container() { return 1; }
+CONTAINER_CMD=container
+ls_cmd
+EOF
+  chmod +x "$script"
+
+  run_capture bash "$script"
+  assert_status 1
+  assert_contains "Cannot communicate with the Apple container service"
+  assert_contains "container system start"
+}
+
 test_ls_reports_matching_snapshot_ref_by_default() {
   begin_test "ls reports matching timestamp snapshot by image digest by default"
 
   load_agentctl_functions
 
   require_container() { return 0; }
+  require_container_service() { return 0; }
   CONTAINER_CMD=container
   container() {
     case "$*" in
@@ -8572,6 +8602,7 @@ test_ls_reports_unknown_snapshot_when_timestamp_missing() {
   load_agentctl_functions
 
   require_container() { return 0; }
+  require_container_service() { return 0; }
   CONTAINER_CMD=container
   container() {
     case "$*" in
@@ -8609,6 +8640,7 @@ test_ls_keeps_row_when_inspect_fails() {
   load_agentctl_functions
 
   require_container() { return 0; }
+  require_container_service() { return 0; }
   CONTAINER_CMD=container
   container() {
     case "$*" in
@@ -8639,6 +8671,7 @@ test_ls_handles_malformed_image_list_json() {
   load_agentctl_functions
 
   require_container() { return 0; }
+  require_container_service() { return 0; }
   CONTAINER_CMD=container
   container() {
     case "$*" in
@@ -10646,6 +10679,41 @@ test_mcp_runtime_paths_normalize_trailing_tmpdir_separator() {
     || fail "Expected legacy double-slash MCP paths to compare equal"
 }
 
+test_mcp_lock_recreates_missing_runtime_directory() {
+  begin_test "managed MCP locking recreates its reboot-volatile runtime directory"
+
+  load_agentctl_functions
+  local temp_root runtime_dir
+  temp_root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-runtime.XXXXXX")"
+  register_dir_cleanup "$temp_root"
+  local TMPDIR="$temp_root/temporary"
+  mkdir -p "$TMPDIR"
+  runtime_dir="$(mcp_runtime_dir)"
+  [ ! -e "$runtime_dir" ] || fail "Expected managed MCP runtime directory to start absent"
+
+  mcp_lock_acquire unit-test-container
+  [ -d "$runtime_dir" ] || fail "Expected managed MCP runtime directory to be recreated"
+  [ "$(host_path_mode "$runtime_dir")" = "700" ] || fail "Expected private runtime directory permissions"
+  mcp_lock_release
+}
+
+test_mcp_lock_secures_existing_runtime_directory() {
+  begin_test "managed MCP locking secures an existing permissive runtime directory"
+
+  load_agentctl_functions
+  local temp_root runtime_dir
+  temp_root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-runtime.XXXXXX")"
+  register_dir_cleanup "$temp_root"
+  local TMPDIR="$temp_root/temporary"
+  mkdir -p "$TMPDIR"
+  runtime_dir="$(mcp_runtime_dir)"
+  mkdir -m 755 "$runtime_dir"
+
+  mcp_lock_acquire unit-test-container
+  [ "$(host_path_mode "$runtime_dir")" = "700" ] || fail "Expected existing runtime directory to be secured"
+  mcp_lock_release
+}
+
 test_mcp_definition_parses_stdio_and_http_transports() {
   begin_test "managed MCP definitions discriminate stdio and HTTP transports"
   load_agentctl_functions
@@ -12436,6 +12504,7 @@ main() {
   run_selected_test test_rescue_keep_leaves_container_running "test_rescue_keep_leaves_container_running"
   run_selected_test test_image_ref_for_runtime_falls_back_to_legacy_when_present "test_image_ref_for_runtime_falls_back_to_legacy_when_present"
   run_selected_test test_ls_raw_filters_non_codex_containers "test_ls_raw_filters_non_codex_containers"
+  run_selected_test test_ls_reports_stopped_container_service "test_ls_reports_stopped_container_service"
   run_selected_test test_ls_reports_matching_snapshot_ref_by_default "test_ls_reports_matching_snapshot_ref_by_default"
   run_selected_test test_ls_reports_unknown_snapshot_when_timestamp_missing "test_ls_reports_unknown_snapshot_when_timestamp_missing"
   run_selected_test test_ls_keeps_row_when_inspect_fails "test_ls_keeps_row_when_inspect_fails"
@@ -12474,6 +12543,8 @@ main() {
   run_selected_test test_doctor_reports_state_permission_problems "test_doctor_reports_state_permission_problems"
   run_selected_test test_doctor_excludes_managed_mcp_from_user_socket_failures "test_doctor_excludes_managed_mcp_from_user_socket_failures"
   run_selected_test test_mcp_runtime_paths_normalize_trailing_tmpdir_separator "test_mcp_runtime_paths_normalize_trailing_tmpdir_separator"
+  run_selected_test test_mcp_lock_recreates_missing_runtime_directory "test_mcp_lock_recreates_missing_runtime_directory"
+  run_selected_test test_mcp_lock_secures_existing_runtime_directory "test_mcp_lock_secures_existing_runtime_directory"
   run_selected_test test_mcp_definition_parses_stdio_and_http_transports "test_mcp_definition_parses_stdio_and_http_transports"
   run_selected_test test_mcp_http_definition_rejects_unsafe_urls_and_headers "test_mcp_http_definition_rejects_unsafe_urls_and_headers"
   run_selected_test test_mcp_registry_v2_filters_secrets_and_reads_v1 "test_mcp_registry_v2_filters_secrets_and_reads_v1"

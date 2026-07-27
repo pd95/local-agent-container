@@ -65,6 +65,12 @@ require_container() {
   command -v "$CONTAINER_CMD" >/dev/null 2>&1 || die "Missing '$CONTAINER_CMD' command"
 }
 
+require_container_service() {
+  if ! "$CONTAINER_CMD" ls -a >/dev/null 2>&1; then
+    die "Cannot communicate with the Apple container service; run: container system start"
+  fi
+}
+
 JQ_MIN_VERSION="1.6"
 
 jq_version() {
@@ -534,6 +540,20 @@ mcp_prepare_private_dir() {
   else mkdir -m 700 -p "$dir"; fi
 }
 
+mcp_prepare_runtime_dir() {
+  local dir
+  dir="$(mcp_runtime_dir)"
+  if [ -e "$dir" ] || [ -L "$dir" ]; then
+    [ -d "$dir" ] && [ ! -L "$dir" ] && [ "$(host_path_uid "$dir")" = "$(id -u)" ] \
+      || die "Unsafe managed MCP directory collision: $dir"
+    chmod 700 "$dir" || die "Could not secure managed MCP runtime directory: $dir"
+  else
+    mkdir -m 700 -p "$dir"
+  fi
+  [ "$((8#$(host_path_mode "$dir") & 077))" -eq 0 ] \
+    || die "Unsafe managed MCP directory permissions: $dir"
+}
+
 mcp_validate_private_file() {
   local path="$1" label="$2"
   [ -f "$path" ] && [ ! -L "$path" ] || die "$label must be a regular, non-symlink file: $path"
@@ -588,6 +608,7 @@ mcp_process_started() {
 
 mcp_lock_acquire() {
   local name="$1" base lock file owner owner_pid owner_token current_token candidate stage winner self_pid tries=0 stale=0
+  mcp_prepare_runtime_dir
   base="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").lock."
   lock="${base%.}"
   self_pid="$$"
@@ -9480,6 +9501,7 @@ EOF
   done
 
   require_container
+  require_container_service
   if [ "$raw" -eq 1 ]; then
     ls_raw_cmd
     return 0
