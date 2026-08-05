@@ -469,6 +469,7 @@ test_host_address_reads_container_1_1_gateway() {
   container() {
     case "$*" in
       "--version") return 0 ;;
+      "ls -a") return 0 ;;
       "network inspect default")
         printf '%s\n' '[{"id":"default","configuration":{},"status":{"ipv4Subnet":"192.168.65.0/24","ipv4Gateway":"192.168.65.1"}}]'
         ;;
@@ -491,6 +492,7 @@ test_host_address_supports_custom_network_subnet_fallback() {
   container() {
     case "$*" in
       "--version") return 0 ;;
+      "ls -a") return 0 ;;
       "network inspect mcp")
         printf '%s\n' '{"id":"mcp","status":{"ipv4Subnet":"10.42.7.0/24"}}'
         ;;
@@ -8551,6 +8553,28 @@ EOF
   assert_contains "container system start"
 }
 
+test_container_requirement_reports_stopped_service() {
+  begin_test "container commands stop when the Apple container service is unavailable"
+
+  load_agentctl_functions
+
+  require_jq() { return 0; }
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "ls -a") return 1 ;;
+      *) fail "Container command continued after the service check: $*" ;;
+    esac
+  }
+  require_container_wrapper() { ( require_container ); }
+
+  run_capture require_container_wrapper
+  assert_status 1
+  assert_contains "Cannot communicate with the Apple container service"
+  assert_contains "container system start"
+  unset -f container require_container_wrapper
+}
+
 test_ls_reports_matching_snapshot_ref_by_default() {
   begin_test "ls reports matching timestamp snapshot by image digest by default"
 
@@ -12505,6 +12529,7 @@ main() {
   run_selected_test test_image_ref_for_runtime_falls_back_to_legacy_when_present "test_image_ref_for_runtime_falls_back_to_legacy_when_present"
   run_selected_test test_ls_raw_filters_non_codex_containers "test_ls_raw_filters_non_codex_containers"
   run_selected_test test_ls_reports_stopped_container_service "test_ls_reports_stopped_container_service"
+  run_selected_test test_container_requirement_reports_stopped_service "test_container_requirement_reports_stopped_service"
   run_selected_test test_ls_reports_matching_snapshot_ref_by_default "test_ls_reports_matching_snapshot_ref_by_default"
   run_selected_test test_ls_reports_unknown_snapshot_when_timestamp_missing "test_ls_reports_unknown_snapshot_when_timestamp_missing"
   run_selected_test test_ls_keeps_row_when_inspect_fails "test_ls_keeps_row_when_inspect_fails"

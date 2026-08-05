@@ -63,6 +63,7 @@ warn() {
 require_container() {
   require_jq
   command -v "$CONTAINER_CMD" >/dev/null 2>&1 || die "Missing '$CONTAINER_CMD' command"
+  require_container_service
 }
 
 require_container_service() {
