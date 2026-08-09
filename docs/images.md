@@ -253,7 +253,7 @@ agentctl images rm --image agent-custom --dry-run
 - `agentctl images prune`: remove old timestamp tags while keeping stable tags
 - `agentctl images rm --image <name>`: remove an image family entirely
 
-## Image-Owned Defaults
+## Image-Owned and Active Configuration
 
 The curated images carry image-owned defaults used by `refresh`,
 `reset-config`, and runtime adapters, including:
@@ -296,6 +296,41 @@ Additional Codex `*.config.toml` profiles placed in
 tokens or other secrets in either defaults directory: image layers and
 container defaults are not secret storage.
 
+Image-owned defaults and active runtime configuration are separate layers:
+
+- `defaults/<runtime>/` contains the repository's tracked baseline.
+- `defaults.local/<runtime>/` contains ignored host-local overrides of that
+  baseline.
+- `/etc/agentctl/<runtime>/` contains the resulting image-owned baseline inside
+  a container.
+- Runtime home directories such as `/home/coder/.codex/` contain the active
+  user configuration read by the runtime.
+
+`agentctl refresh` updates the image-owned baseline in `/etc/agentctl`, but
+deliberately preserves existing active configuration under `/home/coder`. For
+example, after changing `defaults.local/codex/gemma.config.toml` and refreshing
+an existing container, Codex continues to read the existing
+`~/.codex/gemma.config.toml` until the Codex configuration is reset or that
+single file is replaced manually.
+
+To replace the active configuration with the refreshed defaults, use one of:
+
+```bash
+agentctl run --name <container> --reset-config --cmd true
+agentctl runtime reset-config codex
+```
+
+For Codex, resetting replaces the managed `config.toml`, default
+`*.config.toml` profiles, `local_models.json`, and `AGENTS.md`. It may remove
+custom profiles, MCP servers, providers, local model metadata, and the runtime
+preference, so use it deliberately. If only one profile changed, copying that
+file from `/etc/agentctl/codex/` to `~/.codex/` avoids resetting unrelated
+configuration.
+
+The related `upgrade --overwrite-config` option performs this reset while
+recreating a container from another image. It is not an option for the
+in-place `refresh` command.
+
 OpenCode, Qwen Code, and Pi normally generate their Ollama provider settings at
 runtime because the endpoint and selected model can vary. Their tracked folders
 are therefore intentionally empty. Optional local defaults use these filenames:
@@ -305,7 +340,8 @@ are therefore intentionally empty. Optional local defaults use these filenames:
 - `defaults.local/pi/models.json`
 
 Builds place supplied files in the matching `/etc/agentctl/<runtime>` directory;
-refresh deploys them to existing containers. Qwen Code and Pi merge their
+refresh deploys them to that image-owned baseline in existing containers. Qwen
+Code and Pi merge their
 launch-time model and endpoint into user configuration. OpenCode uses an
 existing configuration unchanged, so a local OpenCode default should use a
 portable endpoint such as `http://host.container.internal:11434/v1` unless a

@@ -157,18 +157,27 @@ agentctl refresh
 
 This is the normal non-destructive update path.
 
-Tracked image defaults live in `defaults/<runtime>/`. To customize them without
-creating Git changes, copy the relevant file to the ignored
-`defaults.local/<runtime>/` directory and edit that copy. Local files override
-tracked files during builds and refreshes.
+Tracked image defaults live in `defaults/<runtime>/`. To maintain personal
+defaults without creating Git changes, copy the relevant file to the ignored
+`defaults.local/<runtime>/` directory and edit that copy. During builds and
+refreshes, a local file replaces the tracked file with the same name in the
+image-owned baseline under `/etc/agentctl/<runtime>`.
 
-To restore image-owned defaults such as `config.toml`, `local_models.json`, or
-the `AGENTS.md` symlink:
+A normal refresh does not overwrite active runtime configuration under
+`/home/coder`. This preserves changes made inside an existing container. To
+apply the refreshed baseline to the active configuration, reset that runtime:
 
 ```bash
 agentctl run --name <container> --reset-config --cmd true
 agentctl runtime reset-config codex
 ```
+
+This is a broad reset rather than an update of one file. For Codex it replaces
+the managed `config.toml`, default `*.config.toml` profiles,
+`local_models.json`, and `AGENTS.md`, and may remove custom providers, MCP
+servers, profiles, model metadata, or the runtime preference. See
+[Image-owned and active configuration](images.md#image-owned-and-active-configuration)
+before using it on a customized container.
 
 ## Next guides
 
