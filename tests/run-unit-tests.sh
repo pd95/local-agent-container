@@ -107,6 +107,7 @@ run_agent_sh_capture_env() {
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes"
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d"
     "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features"
+    "AGENTCTL_FEATURE_STATE_DIR=$temp_home/state"
   )
   if [ "${#env_args[@]}" -gt 0 ]; then
     run_cmd_args+=("${env_args[@]}")
@@ -9354,6 +9355,10 @@ test_upgrade_export_failure_restarts_running_source() {
   sanitize_image_name() { printf '%s\n' "$1"; }
   report_backup_storage_diagnostics() { echo "storage diagnostic marker" >&2; return 1; }
   date() { printf '20260406120000\n'; }
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
   trap() { :; }
 
   CONTAINER_CMD=container
@@ -9441,6 +9446,10 @@ test_upgrade_copy_keeps_running_source_container() {
   image_system_manifest_json() { return 1; }
   sanitize_image_name() { printf '%s\n' "$1"; }
   build_backup_image_from_export() { fail "copy mode should not build a backup image"; }
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
   trap() { :; }
 
   CONTAINER_CMD=container
