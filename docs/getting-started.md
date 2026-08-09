@@ -72,10 +72,11 @@ In the default case:
 - this is why you normally start `agentctl` from the project or document folder
   you want the agent to work on
 
-If you want to target a different directory, use:
+If you want to target a different directory, give the container an explicit
+name so later lifecycle commands do not depend on your current directory:
 
 ```bash
-agentctl run --workdir /path/to/project
+agentctl run --name agent-my-project --workdir /path/to/project
 ```
 
 ## First build

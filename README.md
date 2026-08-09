@@ -81,187 +81,6 @@ version is:
 
 Details and options are in [docs/networking.md](docs/networking.md).
 
-## Managed host MCP bridge
-
-`run --mcp` exposes an explicitly authorized host stdio MCP server or fixed
-HTTP/HTTPS MCP upstream to the
-container through a private Unix socket and a guest proxy bound only to
-`127.0.0.1`. It never opens a host TCP port, and container requests cannot
-alter the authorized host command definitions. Codex endpoint registration is
-the only runtime configuration currently managed automatically.
-
-```bash
-# Built-in Xcode preset (host command: xcrun mcpbridge)
-agentctl run --mcp xcode
-
-# Generic inline definition
-agentctl run --mcp '{"name":"example","command":"/absolute/path/to/server","args":[]}'
-
-# Host-loopback HTTP upstream with a named macOS Keychain token
-agentctl mcp credential set macos-ui-helper-token
-agentctl run --mcp '{"name":"macos-ui-helper","type":"http","url":"http://127.0.0.1:9876/mcp","bearer_token_keychain":"macos-ui-helper-token"}'
-
-# Private file containing one definition or an array
-agentctl run --mcp @"$HOME/.config/agentctl/private-mcp.json"
-```
-
-For Codex, `agentctl` automatically registers every enabled server as a
-Streamable HTTP endpoint before launching the runtime. This also works in
-temporary containers. Persisted containers retain both the safe host
-definitions and Codex endpoint registration, so later `run --online` sessions
-do not need to repeat `--mcp`. Other runtimes currently retain manual
-configuration using URLs such as `http://127.0.0.1:47123/mcp/xcode` or
-`http://127.0.0.1:47123/mcp/example`. Existing containers created without MCP
-wiring need one explicit migration:
-
-```bash
-agentctl upgrade --name agent-project --enable-mcp
-agentctl upgrade --name agent-project --mcp-port 48123
-agentctl upgrade --name agent-project --disable-mcp
-```
-
-Stdio definitions accept `name`, `command`, `args`, `cwd`, `env`, `env_vars`,
-and `shared`. The Xcode preset enables `shared` so reconnecting HTTP sessions reuse
-one `xcrun mcpbridge` process; generic definitions default to per-session
-process isolation.
-Literal `env` values live only for the active invocation. HTTP definitions use
-`type: "http"`, a fixed `url`, and optional literal, environment-backed, or
-Keychain-backed headers. Plaintext HTTP is limited to host loopback; HTTPS uses
-normal certificate and hostname verification. The private host registry
-persists safe definitions and credential references, never literal values or
-resolved credentials. A container request cannot change the authorized command,
-upstream URL, or configured authentication header.
-
-Named MCP credentials use the existing macOS Keychain adapter but separate
-slots from Codex and Claude authentication:
-
-```bash
-agentctl mcp credential set macos-ui-helper-token
-op read 'op://Engineering/MCP/token' | agentctl mcp credential set macos-ui-helper-token --stdin
-agentctl mcp credential status macos-ui-helper-token
-agentctl mcp credential list
-agentctl mcp credential delete macos-ui-helper-token
-```
-
-An interactive start offers a hidden prompt for a missing item. A
-noninteractive start leaves that route available with a redacted `503`. Restart
-running containers after rotation so their relay resolves the new value. See
-[Phase 4: Managed HTTP MCP upstreams](docs/managed-mcp-http-upstreams.md) for
-the complete schema and security model.
-
-Managed relays are container-scoped background services and therefore normally
-appear with parent PID 1 after `agentctl` exits. Their process label includes the
-container name, for example `agentctl-mcp-relay:agent-project`. Use
-`agentctl doctor --host` for the authoritative mapping of relay PIDs, containers,
-definitions, leases, sockets, and host/guest route health. The health checks do
-not initialize a server or invoke MCP tools. For a stopped MCP-enabled container,
-`agentctl doctor --name agent-project` may temporarily start the persisted relay,
-container, and guest proxy for its existing live checks, then restore the stopped
-state.
-
-Use `agentctl start`, `stop`, and `restart` for MCP-enabled containers so host
-relay supervision follows the container lifecycle. If the lower-level
-`container stop` command is used, `agentctl doctor --host` highlights the relay
-left behind and prints `agentctl stop --name NAME` as the suggested safe cleanup.
-Upgrade can inspect and back up a stopped MCP-enabled container by temporarily
-starting only its lazy host relay; it preserves the container's original
-stopped state and does not initialize the configured MCP server.
-
-Apple container 1.1 custom networks can be managed and selected directly. For
-example, create a host-only network for an offline workload:
-
-```bash
-agentctl network create --internal agent-isolated
-agentctl run --network agent-isolated
-```
-
-`--network` is also available on `bootstrap`, `upgrade`, and `rescue`. Host-only
-networks deliberately reject `--online`; see [docs/networking.md](docs/networking.md)
-for lifecycle, isolation, and upgrade behavior.
-
-For isolated Ollama listeners or non-default ports, pass the container-reachable
-base URL explicitly:
-
-```bash
-OLLAMA_HOST=http://host.container.internal:11439 agentctl run ...
-# or
-agentctl run -c ollama_host=http://host.container.internal:11439 ...
-```
-
-## Workspace model
-
-`agentctl run` starts an agent inside a container, but it mounts a host
-directory into that container at `/workdir`.
-
-In the normal case:
-- the directory you run `agentctl run` from becomes the mounted work directory
-- everything under that directory is visible to the agent
-- the agent can read and write files in that mounted directory tree
-- the agent does **not** get unrestricted access to the rest of your host
-  filesystem through `agentctl`
-
-Host Unix sockets can also be mounted at creation time:
-
-```bash
-agentctl run --mount-socket /tmp/my-service.sock:/run/host-services/my-service.sock
-```
-
-The option is repeatable and is also available to `bootstrap` and `upgrade`.
-Use stable, absolute socket paths: generic socket mounts store the literal host
-path and do not rediscover a moved socket. An existing container must exactly
-match mappings requested by `run` or `bootstrap`; use `upgrade` to add, replace,
-or remove mappings:
-
-```bash
-agentctl upgrade --name agent-my-project \
-  --mount-socket /tmp/new.sock:/run/host-services/service.sock
-agentctl upgrade --name agent-my-project \
-  --unmount-socket /run/host-services/service.sock
-```
-
-Upgrade preserves mappings by default, including in `--copy` mode. A missing
-preserved source is fatal until restored, replaced, or explicitly unmounted.
-Access to a socket grants the container the service's effective authority; only
-mount narrowly scoped sockets whose permissions are appropriate for `coder`.
-
-Services running inside a container can be published as host Unix sockets:
-
-```bash
-mkdir -m 700 "$HOME/.agentctl-sockets"
-agentctl run \
-  --publish-socket "$HOME/.agentctl-sockets/service.sock:/run/service.sock"
-```
-
-`--publish-socket` is repeatable and is also available to `bootstrap` and
-`upgrade`. The parent directory must already be canonical, owned by you,
-writable/searchable by you, and inaccessible to group and other users. The host
-destination must not already exist. agentctl never creates the directory or
-deletes socket paths, including stale listeners left by the container runtime.
-
-Existing containers must exactly match mappings requested by `run` or
-`bootstrap`. Upgrade preserves mappings and merges replacements by host path:
-
-```bash
-agentctl upgrade --name agent-my-project \
-  --publish-socket "$HOME/.agentctl-sockets/second.sock:/run/service.sock"
-agentctl upgrade --name agent-my-project \
-  --unpublish-socket "$HOME/.agentctl-sockets/service.sock"
-```
-
-Multiple private host paths may intentionally publish the same container
-service. Published services and authentication are the user's responsibility.
-
-So the normal workflow is:
-1. `cd` into the project or document folder you want the agent to work on
-2. run `agentctl run`
-3. let the agent work inside that mounted directory tree
-
-If you want a different directory than the current one, use:
-
-```bash
-agentctl run --workdir /path/to/project
-```
-
 ## Quick start
 
 Build the curated images once:
@@ -307,7 +126,50 @@ agentctl run --runtime claude --model qwen3:14b
 agentctl refresh
 ```
 
+## Workspace model
+
+`agentctl run` starts an agent inside a container, but it mounts a host
+directory into that container at `/workdir`.
+
+The mounted host directory supplies the files the agent works on, while the
+selected image supplies its development tools. By default, agentctl creates or
+reuses a named container for the current directory, so container-local runtime
+state and history remain available between runs. Use `--temp` when you want a
+disposable container.
+
+In the normal case:
+- the directory you run `agentctl run` from becomes the mounted work directory
+- everything under that directory is visible to the agent
+- the agent can read and write files in that mounted directory tree
+- the agent does **not** get unrestricted access to the rest of your host
+  filesystem through `agentctl`
+
+So the normal workflow is:
+1. `cd` into the project or document folder you want the agent to work on
+2. run `agentctl run`
+3. let the agent work inside that mounted directory tree
+
+If you want a different directory than the current one, give the container an
+explicit name so later lifecycle commands do not depend on your current
+directory:
+
+```bash
+agentctl run --name agent-my-project --workdir /path/to/project
+```
+
 ## Common workflows
+
+You can tailor the container environment along three independent axes:
+
+- **Image**: choose the base toolchain with `agent-plain`, `agent-python`,
+  `agent-swift`, or a custom image.
+- **Runtime**: choose the agent CLI, such as Codex or Claude.
+- **Features**: add optional tooling to a compatible image; for example, the
+  `office` feature adds document and report tooling to `agent-python`.
+
+See [Choosing an image](#choosing-an-image),
+[docs/images.md](docs/images.md), and [docs/runtimes.md](docs/runtimes.md) for
+the available choices and build-time configuration.
 
 Choose a toolchain image when needed:
 
@@ -466,15 +328,18 @@ validation.
 
 ## Documentation
 
-Deeper documentation now lives under `docs/`:
+Start here, then move into the more specialized guides as needed:
 
 - [docs/getting-started.md](docs/getting-started.md)
-- [docs/rescue.md](docs/rescue.md)
-- [docs/networking.md](docs/networking.md)
-- [docs/runtimes.md](docs/runtimes.md)
 - [docs/local-vs-online.md](docs/local-vs-online.md)
+- [docs/runtimes.md](docs/runtimes.md)
 - [docs/images.md](docs/images.md)
-- [docs/bootstrap.md](docs/bootstrap.md)
 - [docs/auth.md](docs/auth.md)
+- [docs/networking.md](docs/networking.md)
+- [docs/bootstrap.md](docs/bootstrap.md)
+- [docs/rescue.md](docs/rescue.md)
+- [docs/managed-mcp.md](docs/managed-mcp.md)
+- [docs/unix-sockets.md](docs/unix-sockets.md)
+- [docs/remote-control.md](docs/remote-control.md)
 - [docs/advanced-container-usage.md](docs/advanced-container-usage.md)
 - [TESTING.md](TESTING.md)
