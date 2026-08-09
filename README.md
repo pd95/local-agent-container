@@ -382,6 +382,42 @@ agentctl bootstrap --name existing-devbox
 agentctl bootstrap --name my-alpine-devbox --image docker.io/library/alpine:latest
 ```
 
+### Experimental Codex Remote Control
+
+Remote Control lets an eligible ChatGPT desktop or mobile client work with a
+Codex environment running inside an existing agentctl container. Agentctl starts
+the Codex App Server in the container using the same `~/.codex` state as local
+Codex sessions. The App Server establishes the provider connection itself, so
+agentctl does not publish an inbound App Server port or socket on the host.
+
+```bash
+agentctl remote-control start
+agentctl remote-control pair
+agentctl remote-control stop
+```
+
+`start` prepares the existing container, synchronizes online authentication,
+and starts the App Server. It also starts the container itself when necessary.
+Remote Control is provider-backed and therefore implies online operation; it
+does not use the local Ollama profile.
+
+Pairing is the explicit authorization step for a new ChatGPT controller. The
+`pair` command asks Codex for a short-lived code; enter that code only in the
+intended ChatGPT client to allow it to discover and connect to this running
+environment. Agentctl never pairs automatically, stores the code, or writes it
+to logs. Existing enrollment state under `~/.codex` is reused across normal
+container stop/start cycles, so pairing is not part of every startup.
+
+`remote-control stop` disables the service until it is explicitly started
+again. In contrast, an ordinary `agentctl stop` preserves Remote Control intent,
+and the next `agentctl start` restores the App Server automatically.
+
+This integration wraps experimental Codex CLI behavior. Availability depends on
+the ChatGPT account, workspace policy, and client rollout. Agentctl keeps the
+App Server on its local Unix socket and does not expose it on the network.
+See [docs/remote-control.md](docs/remote-control.md) for lifecycle behavior,
+authentication synchronization, status semantics, diagnostics, and testing.
+
 ## Choosing an image
 
 Use these curated images for most workflows:

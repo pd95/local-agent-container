@@ -224,6 +224,284 @@ test_exec_help_reports_stdio_option() {
   assert_contains "With --stdio, provide an explicit command after --"
 }
 
+test_remote_control_help_reports_experimental_commands() {
+  begin_test "remote-control help reports the detached experimental workflow"
+
+  run_capture "$AGENTCTL" remote-control --help
+  assert_status 0
+  assert_contains "remote-control <start|status|pair|stop>"
+  assert_contains "--json"
+  assert_contains "experimental"
+}
+
+test_remote_control_status_json_reports_missing_container() {
+  begin_test "remote-control status JSON has a stable missing-container state"
+
+  load_agentctl_functions
+  container_exists() { return 1; }
+
+  local result
+  result="$(remote_control_status_json unit-remote)"
+  [ "$(printf '%s' "$result" | jq -r .schema_version)" = 1 ] || fail "Expected schema version 1: $result"
+  [ "$(printf '%s' "$result" | jq -r .state)" = missing_container ] || fail "Expected missing_container: $result"
+  [ "$(printf '%s' "$result" | jq -r .codex_home)" = /home/coder/.codex ] || fail "Expected user Codex home: $result"
+}
+
+test_remote_control_status_json_normalizes_connected_protocol_state() {
+  begin_test "remote-control status JSON normalizes App Server connection metadata"
+
+  load_agentctl_functions
+  local temp_home
+  local result
+  temp_home="$(new_workdir)"
+  HOME="$temp_home"
+  container_exists() { return 0; }
+  container_running() { return 0; }
+  remote_control_local_healthy() { return 0; }
+  remote_control_direct_owned() { return 0; }
+  remote_control_boot_owned() { return 0; }
+  remote_control_guest_status() {
+    printf '%s\n' '{"remote_status":"connected","installation_id":"install-1","server_name":"devbox","environment_id":"env-1"}'
+  }
+  remote_control_prepare_registry_dir
+  printf '%s\n' '{"schema_version":1,"container":"unit-remote","backend":"direct","desired":true,"container_started_by_remote":false,"boot_token":"1","installation_id":"install-1"}' >"$(remote_control_registry_path unit-remote)"
+  chmod 600 "$(remote_control_registry_path unit-remote)"
+
+  result="$(remote_control_status_json unit-remote)"
+  [ "$(printf '%s' "$result" | jq -r .state)" = connected ] || fail "Expected connected: $result"
+  [ "$(printf '%s' "$result" | jq -r .backend)" = direct ] || fail "Expected direct backend: $result"
+  [ "$(printf '%s' "$result" | jq -r .installation_id)" = install-1 ] || fail "Expected installation identity: $result"
+  [ "$(printf '%s' "$result" | jq -r .log_path)" = /tmp/agentctl-remote-control/service.log ] || fail "Expected direct log path: $result"
+}
+
+test_remote_control_status_json_reports_healthy_server_as_running() {
+  begin_test "remote-control separates healthy local service from unavailable remote status"
+
+  load_agentctl_functions
+  local temp_home
+  local result
+  temp_home="$(new_workdir)"
+  HOME="$temp_home"
+  container_exists() { return 0; }
+  container_running() { return 0; }
+  remote_control_local_healthy() { return 0; }
+  remote_control_direct_owned() { return 0; }
+  remote_control_boot_owned() { return 0; }
+  remote_control_guest_status() { printf '%s\n' '{"remote_status":"unknown"}'; }
+  remote_control_prepare_registry_dir
+  printf '%s\n' '{"schema_version":1,"container":"unit-remote","backend":"direct","desired":true,"container_started_by_remote":false,"boot_token":"1","installation_id":"install-1"}' >"$(remote_control_registry_path unit-remote)"
+  chmod 600 "$(remote_control_registry_path unit-remote)"
+
+  result="$(remote_control_status_json unit-remote)"
+  [ "$(printf '%s' "$result" | jq -r .state)" = running ] || fail "Expected running local service: $result"
+  [ "$(printf '%s' "$result" | jq -r '.remote_status == null')" = true ] || fail "Expected unavailable remote status: $result"
+  run_capture remote_control_print_status "$result" 0
+  assert_status 0
+  assert_contains "Remote Control for unit-remote: running"
+  if printf '%s' "$RUN_OUTPUT" | grep -Fq "Remote connection status:"; then
+    fail "Absent remote telemetry should be omitted from human output: $RUN_OUTPUT"
+  fi
+}
+
+test_remote_control_lock_recovers_abandoned_owner() {
+  begin_test "remote-control lock recovers an abandoned owner"
+
+  load_agentctl_functions
+  local temp_runtime
+  local lock
+  temp_runtime="$(new_workdir)"
+  TMPDIR="$temp_runtime"
+  mcp_process_token() { return 0; }
+  lock="$(remote_control_lock_path unit-remote)"
+  mkdir -p "$lock"
+  printf '%s %s\n' 999999 stale-token >"$lock/owner"
+
+  remote_control_lock_acquire unit-remote
+  [ -f "$lock/owner" ] || fail "Expected replacement lock owner metadata"
+  [ "$(awk '{print $1}' "$lock/owner")" = "$$" ] || fail "Expected current process to own recovered lock"
+  remote_control_lock_release
+  [ ! -e "$lock" ] || fail "Expected recovered lock to be released"
+}
+
+test_remote_control_quiesce_stops_before_auth_sync() {
+  begin_test "remote-control quiesce stops App Server before syncing auth to Keychain"
+
+  load_agentctl_functions
+  local temp_home
+  local events_file
+  temp_home="$(new_workdir)"
+  HOME="$temp_home"
+  events_file="$temp_home/events"
+  remote_control_prepare_registry_dir
+  printf '%s\n' '{"schema_version":1,"container":"unit-remote","backend":"direct","desired":true,"container_started_by_remote":false,"boot_token":"1","installation_id":"install-1"}' >"$(remote_control_registry_path unit-remote)"
+  chmod 600 "$(remote_control_registry_path unit-remote)"
+  container_running() { return 0; }
+  remote_control_stop_backend() {
+    [ "$1" = unit-remote ] || fail "Unexpected stop container: $1"
+    [ "$2" = direct ] || fail "Unexpected stop backend: $2"
+    printf '%s\n' stop >>"$events_file"
+  }
+  sync_runtime_auth_from_container() {
+    [ "$1" = unit-remote ] || fail "Unexpected sync container: $1"
+    [ "$2" = codex ] || fail "Unexpected sync runtime: $2"
+    [ "$3" = json_refresh_token ] || fail "Unexpected sync format: $3"
+    printf '%s\n' sync >>"$events_file"
+  }
+
+  remote_control_quiesce_preserving_desired unit-remote
+  [ "$(cat "$events_file")" = $'stop\nsync' ] || fail "Expected stop before auth sync, got: $(cat "$events_file")"
+
+  sync_runtime_auth_from_container() { return 1; }
+  quiesce_wrapper() { ( remote_control_quiesce_preserving_desired "$@" ); }
+  run_capture quiesce_wrapper unit-remote
+  assert_status 1
+}
+
+test_remote_control_registry_rejects_traversal_and_unsafe_files() {
+  begin_test "remote-control registry rejects path traversal and unsafe records"
+
+  load_agentctl_functions
+  local temp_home
+  temp_home="$(new_workdir)"
+  HOME="$temp_home"
+  registry_path_wrapper() { ( remote_control_registry_path "$1" ); }
+  run_capture registry_path_wrapper ../victim
+  assert_status 1
+  assert_contains "Invalid Remote Control container name"
+
+  remote_control_prepare_registry_dir
+  printf '%s\n' '{"schema_version":1,"container":"unit-remote","backend":"direct","desired":true,"container_started_by_remote":false,"boot_token":"1","installation_id":"install-1"}' >"$(remote_control_registry_path unit-remote)"
+  chmod 644 "$(remote_control_registry_path unit-remote)"
+  registry_available_wrapper() { ( remote_control_registry_available "$1" ); }
+  run_capture registry_available_wrapper unit-remote
+  assert_status 1
+  assert_contains "must be inaccessible to group and other users"
+}
+
+test_remote_control_modern_stop_propagates_and_verifies_failures() {
+  begin_test "remote-control modern stop propagates command and health failures"
+
+  load_agentctl_functions
+  local calls_file
+  calls_file="$(new_workdir)/calls"
+  remote_control_runtime_exec() {
+    printf '%s\n' "$*" >>"$calls_file"
+    return 1
+  }
+  remote_control_local_healthy() { return 0; }
+  modern_stop_wrapper() { ( remote_control_stop_backend unit-remote modern ); }
+  run_capture modern_stop_wrapper
+  assert_status 1
+  [ "$(wc -l <"$calls_file" | tr -d ' ')" -eq 1 ] || fail "Expected stop to abort after disable failure"
+
+  : >"$calls_file"
+  remote_control_runtime_exec() { printf '%s\n' "$*" >>"$calls_file"; return 0; }
+  sleep() { :; }
+  run_capture modern_stop_wrapper
+  assert_status 1
+  [ "$(wc -l <"$calls_file" | tr -d ' ')" -eq 2 ] || fail "Expected both modern stop commands before failed health verification"
+}
+
+test_remote_control_direct_stop_uses_owned_pid_when_health_is_down() {
+  begin_test "remote-control direct stop uses owned PID when local health is down"
+
+  load_agentctl_functions
+  local calls_file
+  calls_file="$(new_workdir)/calls"
+  remote_control_local_healthy() { return 1; }
+  remote_control_runtime_exec() { printf '%s\n' "$*" >>"$calls_file"; return 0; }
+
+  remote_control_stop_backend unit-remote direct
+  grep -F 'unit-remote sh -c' "$calls_file" >/dev/null || fail "Expected verified in-container direct shutdown: $(cat "$calls_file")"
+  grep -F 'kill "$p"' "$calls_file" >/dev/null || fail "Expected PID termination script despite failed health probe: $(cat "$calls_file")"
+}
+
+test_remote_control_modern_capture_filters_candidates_and_rolls_back_failure() {
+  begin_test "remote-control modern ownership filters candidates and rolls back capture failure"
+
+  load_agentctl_functions
+  local capture_script=""
+  local calls_file
+  calls_file="$(new_workdir)/calls"
+  remote_control_runtime_exec() { capture_script="$*"; return 0; }
+  remote_control_capture_owned_process unit-remote
+  printf '%s' "$capture_script" | grep -F 'test "$p" != "$$"' >/dev/null || fail "Expected scanner self-exclusion"
+  printf '%s' "$capture_script" | grep -F 'codex app-server proxy' >/dev/null || fail "Expected proxy exclusion"
+  printf '%s' "$capture_script" | grep -F 'codex app-server daemon' >/dev/null || fail "Expected diagnostic-client exclusion"
+  printf '%s' "$capture_script" | grep -F 'codex app-server --remote-control' >/dev/null || fail "Expected strict server candidate"
+
+  remote_control_capture_owned_process() { return 1; }
+  remote_control_runtime_exec() { printf '%s\n' "$*" >>"$calls_file"; return 0; }
+  capture_wrapper() { ( remote_control_capture_modern_or_rollback unit-remote ); }
+  run_capture capture_wrapper
+  assert_status 1
+  grep -F 'codex app-server daemon disable-remote-control' "$calls_file" >/dev/null || fail "Expected disable rollback: $(cat "$calls_file")"
+  grep -F 'codex remote-control stop' "$calls_file" >/dev/null || fail "Expected native stop rollback: $(cat "$calls_file")"
+}
+
+test_remote_control_start_rolls_back_auto_started_container() {
+  begin_test "remote-control start rolls back an auto-started container after preflight failure"
+
+  load_agentctl_functions
+  local temp_home
+  local stopped_marker
+  temp_home="$(new_workdir)"
+  HOME="$temp_home"
+  TMPDIR="$temp_home"
+  stopped_marker="$temp_home/stopped"
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { [ -f "$stopped_marker.running" ]; }
+  remote_control_registry_available() { return 1; }
+  start_existing_container_safely() { : >"$stopped_marker.running"; }
+  stop_existing_container_safely() { : >"$stopped_marker"; }
+  runtime_info_in_container() { printf '%s\n' '{"installed":false}'; }
+  start_wrapper() { ( remote_control_cmd start --name unit-remote ); }
+
+  run_capture start_wrapper
+  assert_status 1
+  assert_contains "Codex runtime is not installed"
+  [ -f "$stopped_marker" ] || fail "Expected auto-started container rollback"
+}
+
+test_remote_control_stop_refuses_unowned_direct_server() {
+  begin_test "remote-control stop refuses an unowned direct App Server"
+
+  load_agentctl_functions
+  local temp_home
+  temp_home="$(new_workdir)"
+  HOME="$temp_home"
+  TMPDIR="$temp_home"
+  remote_control_prepare_registry_dir
+  printf '%s\n' '{"schema_version":1,"container":"unit-remote","backend":"direct","desired":true,"container_started_by_remote":false,"boot_token":"1","installation_id":"install-1"}' >"$(remote_control_registry_path unit-remote)"
+  chmod 600 "$(remote_control_registry_path unit-remote)"
+  require_container() { :; }
+  container_running() { return 0; }
+  remote_control_local_healthy() { return 0; }
+  remote_control_boot_owned() { return 0; }
+  remote_control_direct_owned() { return 1; }
+  stop_wrapper() { ( remote_control_cmd stop --name unit-remote ); }
+
+  run_capture stop_wrapper
+  assert_status 1
+  assert_contains "not verifiably owned by agentctl"
+  [ -f "$(remote_control_registry_path unit-remote)" ] || fail "Expected ownership registry to remain after refused stop"
+}
+
+test_remote_control_pair_json_normalizes_codex_response() {
+  begin_test "remote-control pair JSON normalizes the Codex pairing response"
+
+  load_agentctl_functions
+  require_container() { :; }
+  remote_control_status_json() { printf '%s\n' '{"state":"running"}'; }
+  remote_control_runtime_exec() { printf '%s\n' '{"manual_code":"ABCD-EFGH","expires_at":"tomorrow"}'; }
+
+  run_capture remote_control_cmd pair --name unit-remote --json
+  assert_status 0
+  [ "$(printf '%s' "$RUN_OUTPUT" | jq -r .pairing.code)" = ABCD-EFGH ] || fail "Expected normalized pairing code: $RUN_OUTPUT"
+  [ "$(printf '%s' "$RUN_OUTPUT" | jq -r .container)" = unit-remote ] || fail "Expected container in pairing JSON: $RUN_OUTPUT"
+}
+
 test_run_cmd_wires_home_mount() {
   begin_test "run_cmd wires --home into container creation"
 
@@ -802,7 +1080,9 @@ test_run_container_passes_socket_mount_as_one_exact_argument() {
 
   load_agentctl_functions
   local temp_dir socket_path create_args_file expected_mount
-  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl socket args.XXXXXX")"
+  # Darwin limits AF_UNIX paths to 104 bytes and its per-user TMPDIR is long.
+  # Keep this fixture under /tmp while retaining spaces in both path components.
+  temp_dir="$(mktemp -d "/tmp/agentctl socket.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   socket_path="$temp_dir/service socket.sock"
   python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()' "$socket_path"
@@ -12296,6 +12576,19 @@ main() {
   run_selected_test test_run_help_reports_generic_runtime_config "test_run_help_reports_generic_runtime_config"
   run_selected_test test_run_help_reports_runtime_options "test_run_help_reports_runtime_options"
   run_selected_test test_exec_help_reports_stdio_option "test_exec_help_reports_stdio_option"
+  run_selected_test test_remote_control_help_reports_experimental_commands "test_remote_control_help_reports_experimental_commands"
+  run_selected_test test_remote_control_status_json_reports_missing_container "test_remote_control_status_json_reports_missing_container"
+  run_selected_test test_remote_control_status_json_normalizes_connected_protocol_state "test_remote_control_status_json_normalizes_connected_protocol_state"
+  run_selected_test test_remote_control_status_json_reports_healthy_server_as_running "test_remote_control_status_json_reports_healthy_server_as_running"
+  run_selected_test test_remote_control_lock_recovers_abandoned_owner "test_remote_control_lock_recovers_abandoned_owner"
+  run_selected_test test_remote_control_quiesce_stops_before_auth_sync "test_remote_control_quiesce_stops_before_auth_sync"
+  run_selected_test test_remote_control_registry_rejects_traversal_and_unsafe_files "test_remote_control_registry_rejects_traversal_and_unsafe_files"
+  run_selected_test test_remote_control_modern_stop_propagates_and_verifies_failures "test_remote_control_modern_stop_propagates_and_verifies_failures"
+  run_selected_test test_remote_control_direct_stop_uses_owned_pid_when_health_is_down "test_remote_control_direct_stop_uses_owned_pid_when_health_is_down"
+  run_selected_test test_remote_control_modern_capture_filters_candidates_and_rolls_back_failure "test_remote_control_modern_capture_filters_candidates_and_rolls_back_failure"
+  run_selected_test test_remote_control_start_rolls_back_auto_started_container "test_remote_control_start_rolls_back_auto_started_container"
+  run_selected_test test_remote_control_stop_refuses_unowned_direct_server "test_remote_control_stop_refuses_unowned_direct_server"
+  run_selected_test test_remote_control_pair_json_normalizes_codex_response "test_remote_control_pair_json_normalizes_codex_response"
   run_selected_test test_run_cmd_wires_home_mount "test_run_cmd_wires_home_mount"
   run_selected_test test_doctor_help_reports_fix_option "test_doctor_help_reports_fix_option"
   run_selected_test test_agentctl_version_matches_version_file "test_agentctl_version_matches_version_file"

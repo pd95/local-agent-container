@@ -9,6 +9,7 @@ For user-facing setup and product docs, start with:
 - [docs/getting-started.md](docs/getting-started.md)
 - [docs/runtimes.md](docs/runtimes.md)
 - [docs/local-vs-online.md](docs/local-vs-online.md)
+- [docs/remote-control.md](docs/remote-control.md)
 
 ## Automated host tests
 
@@ -182,6 +183,86 @@ You can point the harness at another `agentctl` binary or container runtime comm
 AGENTCTL=/path/to/agentctl CONTAINER_CMD=container \
   bash tests/run-tests.sh --tier full
 ```
+
+## Manual Remote Control smoke test
+
+Remote Control requires a real ChatGPT account, an eligible ChatGPT client, and
+an interactive pairing action. It is intentionally not exercised by the
+automated host suite. Automated unit tests cover the isolated parsing,
+ownership, locking, authentication freshness, and stop-ordering rules without
+reading or replacing real user credentials. The complete Apple-container
+lifecycle remains part of this manual smoke test.
+
+Run this smoke test on the macOS host with an existing Codex container. Do not
+paste pairing codes, authentication payloads, or Keychain output into test logs
+or issues.
+
+Start the service and verify local health:
+
+```bash
+agentctl remote-control start --name NAME
+agentctl remote-control status --name NAME
+agentctl remote-control status --name NAME --json
+agentctl exec --name NAME --no-tty -- ps -o pid,ppid,stat,args
+```
+
+Expected results:
+
+- Start returns after reporting `running`, `connecting`, or `connected`.
+- A `codex app-server --remote-control --listen unix://` process is present for
+  the Alpine direct backend.
+- `state` is `running` when local health is confirmed but Codex did not replay
+  its current provider connection notification.
+- `remote_status: null` is allowed and does not mean disconnected.
+
+Pair explicitly, enter the short-lived code only in the intended ChatGPT
+client, and confirm that the container environment and threads are reachable:
+
+```bash
+agentctl remote-control pair --name NAME
+```
+
+For local/remote coexistence, start Remote Control first, then open a new local
+Codex session. Confirm that local and remote interactions both work. If the App
+Server log reports `thread-store conflict`, close the older local-only session
+that was active before Remote Control and open a new one:
+
+```bash
+agentctl exec --name NAME --no-tty -- \
+  tail -n 100 /tmp/agentctl-remote-control/service.log
+```
+
+Verify persistence across ordinary lifecycle commands:
+
+```bash
+agentctl stop --name NAME
+agentctl remote-control status --name NAME
+# Expected: container_stopped
+
+agentctl start --name NAME
+agentctl remote-control status --name NAME
+# Expected: running, connecting, or connected
+```
+
+The stop and subsequent start should print Keychain-auth synchronization
+messages when comparison is required. Authentication token refresh timing is
+controlled by Codex and cannot be forced deterministically. Validate the result
+without inspecting secrets by confirming that a subsequent online Codex session
+authenticates normally.
+
+Finally, explicitly disable the service and verify that ordinary container
+startup no longer restores it:
+
+```bash
+agentctl remote-control stop --name NAME
+agentctl stop --name NAME
+agentctl start --name NAME
+agentctl remote-control status --name NAME
+# Expected: stopped
+```
+
+An empty direct-backend service log is normal. It is an error log, not an
+activity, pairing, or connected-client log.
 
 ## Automated shell unit tests
 

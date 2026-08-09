@@ -29,6 +29,9 @@ MCP_GUEST_EXEC_PID=""
 MCP_LEASE_FILE=""
 MCP_LOCK_DIR=""
 MCP_LOCK_TOKEN=""
+REMOTE_CONTROL_CODEX_HOME="/home/coder/.codex"
+REMOTE_CONTROL_LOCK_DEPTH=0
+REMOTE_CONTROL_LOCK_NAME=""
 
 resolve_script_path() {
   local path="$1"
@@ -1648,6 +1651,7 @@ Commands:
   host-address  Print the current host gateway for an Apple container network
   network    Manage Apple container networks used by agentctl
   mcp        Manage host MCP credentials
+  remote-control  Manage experimental Codex Remote Control
   system-manifest  Print a container package manifest
   upgrade    Recreate a container from the latest image while preserving config
   rescue     Temporarily run a shell or command in a backup image
@@ -1965,6 +1969,19 @@ Usage:
 
 Named MCP credentials are stored in macOS Keychain. Values are never printed.
 Use --stdin to pipe a value from a password manager without placing it in shell history.
+EOF
+}
+
+usage_remote_control() {
+  cat <<EOF
+Usage: $CLI_NAME remote-control <start|status|pair|stop> [options]
+
+Options:
+  --name NAME  Existing Codex container (default: agent-<dir>)
+  --json       Print stable machine-readable JSON
+
+Remote Control is experimental and requires online Codex authentication.
+Start is detached and pairing remains an explicit action.
 EOF
 }
 
@@ -7882,6 +7899,22 @@ run_container() {
   local created=0
   local actual_name="$name"
   local socket_mount_arg=""
+  local run_complete=0
+
+  run_container_cleanup() {
+    if [ "$run_complete" -eq 0 ] && [ "$started" -eq 1 ] && [ "$already_running" -eq 0 ]; then
+      if [ -n "$actual_name" ] && container_running "$actual_name"; then
+        ( remote_control_quiesce_preserving_desired "$actual_name" ) >/dev/null 2>&1 || true
+        if [ "$(mcp_lease_count "$actual_name")" -le 1 ]; then
+          "$CONTAINER_CMD" stop "$actual_name" >/dev/null 2>&1 || true
+        fi
+      fi
+      if [ "$temp" -eq 1 ] && [ -n "$actual_name" ] && container_exists "$actual_name"; then
+        "$CONTAINER_CMD" rm "$actual_name" >/dev/null 2>&1 || true
+      fi
+    fi
+  }
+  trap 'run_container_cleanup' EXIT
 
   # Execute command inside the container and preserve the exit code.
   run_exec() {
@@ -7998,6 +8031,7 @@ run_container() {
 
   configure_container_host_alias "$actual_name"
   warn_if_container_agentctl_versions_differ "$actual_name"
+  remote_control_restore_if_desired "$actual_name"
 
   if [ "$reset_config" -eq 1 ]; then
     local reset_runtime="${RUN_SELECTED_RUNTIME:-}"
@@ -8032,10 +8066,15 @@ run_container() {
     "$CONTAINER_CMD" exec "$actual_name" sh -c 'cat /tmp/agentctl-mcp-proxy.log 2>/dev/null || printf "%s\n" "guest proxy log is empty"' >&2 || true
   fi
   if [ "$already_running" -eq 1 ]; then
+    run_complete=1
+    trap - EXIT
     return "$exit_code"
   fi
   if [ "$started" -eq 1 ]; then
-    if [ "$MCP_REQUESTED" -eq 1 ] && [ "$(mcp_lease_count "$actual_name")" -gt 1 ]; then
+    if remote_control_registry_available "$actual_name" \
+      && [ "$(jq -r '.desired // false' "$(remote_control_registry_path "$actual_name")")" = true ]; then
+      echo "Leaving container running for Remote Control: $actual_name" >&2
+    elif [ "$MCP_REQUESTED" -eq 1 ] && [ "$(mcp_lease_count "$actual_name")" -gt 1 ]; then
       echo "Leaving container running for another active managed MCP lease: $actual_name" >&2
     else
       echo "Stopping container: $actual_name" >&2
@@ -8047,6 +8086,8 @@ run_container() {
     echo "Removing container: $actual_name" >&2
     "$CONTAINER_CMD" rm "$actual_name" >/dev/null 2>&1
   fi
+  run_complete=1
+  trap - EXIT
   return "$exit_code"
 }
 
@@ -8614,6 +8655,24 @@ upgrade_cmd() {
   local mcp_current_enabled=0
   local mcp_target_enabled=0
   local mcp_registry=""
+  local remote_control_quiesced=0
+  local remote_control_owner=""
+  local upgrade_complete=0
+  local mcp_upgrade_relay_started=0
+  local mcp_upgrade_relay_name=""
+
+  upgrade_cleanup() {
+    if [ "$upgrade_complete" -eq 0 ] && [ "$remote_control_quiesced" -eq 1 ] \
+      && [ -n "$remote_control_owner" ] && container_exists "$remote_control_owner" \
+      && container_running "$remote_control_owner"; then
+      if ! ( remote_control_restore_if_desired "$remote_control_owner" ); then
+        warn "Failed to restore Remote Control after interrupted upgrade: $remote_control_owner"
+      fi
+    fi
+    [ "$mcp_upgrade_relay_started" -eq 0 ] || mcp_stop_managed "$mcp_upgrade_relay_name" >/dev/null 2>&1 || true
+    mcp_lock_release
+    remote_control_lock_release
+  }
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -8718,10 +8777,10 @@ upgrade_cmd() {
   if [ "$target_name" != "$name" ] && container_exists "$target_name"; then
     die "Target container name already exists: $target_name"
   fi
+  remote_control_lock_acquire "$name"
+  remote_control_owner="$name"
   mcp_lock_acquire "$name"
-  local mcp_upgrade_relay_started=0
-  local mcp_upgrade_relay_name=""
-  trap '[ "$mcp_upgrade_relay_started" -eq 0 ] || mcp_stop_managed "$mcp_upgrade_relay_name" >/dev/null 2>&1 || true; mcp_lock_release' EXIT
+  trap 'upgrade_cleanup' EXIT
   mcp_require_no_active_leases "$name" upgrade
 
   mcp_registry="$(mcp_registry_path "$name")"
@@ -8948,8 +9007,14 @@ upgrade_cmd() {
       "$current_socket_mappings" "$target_socket_mappings" \
       "$current_published_sockets" "$target_published_sockets"
     mcp_lock_release
+    remote_control_lock_release
     trap - EXIT
     return 0
+  fi
+
+  if [ "$copy_mode" -eq 0 ] && [ "$was_running" -eq 1 ]; then
+    if remote_control_registry_available "$name"; then remote_control_quiesced=1; fi
+    remote_control_quiesce_preserving_desired "$name"
   fi
 
   local backup_dir
@@ -9151,6 +9216,19 @@ upgrade_cmd() {
     reset_runtime_config_in_container "$target_name" codex
   fi
 
+  if [ "$copy_mode" -eq 0 ]; then
+    remote_control_migrate_registry "$name" "$target_name"
+    remote_control_owner="$target_name"
+    if [ "$target_name" != "$name" ]; then
+      remote_control_lock_release
+      remote_control_lock_acquire "$target_name"
+    fi
+    if [ "$was_running" -eq 1 ]; then
+      remote_control_restore_if_desired "$target_name"
+      remote_control_quiesced=0
+    fi
+  fi
+
   if [ "$was_running" -eq 0 ]; then
     echo "Stopping container: $target_name" >&2
     "$CONTAINER_CMD" stop "$target_name" >/dev/null
@@ -9172,7 +9250,9 @@ upgrade_cmd() {
   if [ "$copy_mode" -eq 0 ] && [ "$target_name" != "$name" ]; then rm -f "$(mcp_registry_path "$name")"; fi
   mcp_upgrade_relay_started=0
   mcp_upgrade_relay_name=""
+  upgrade_complete=1
   mcp_lock_release
+  remote_control_lock_release
   trap - EXIT
   echo >&2
   if [ -n "$upgrade_package_reinstall_commands" ]; then
@@ -9409,6 +9489,473 @@ su_exec_cmd() {
   "$CONTAINER_CMD" exec -u 0 -it "$name" "${cmd[@]}"
 }
 
+remote_control_validate_name() {
+  case "$1" in ''|.|..|*[!A-Za-z0-9_.-]*) die "Invalid Remote Control container name: $1" ;; esac
+}
+
+remote_control_registry_dir() { printf '%s/Library/Application Support/agentctl/remote-control\n' "$HOME"; }
+remote_control_registry_path() {
+  remote_control_validate_name "$1"
+  printf '%s/%s.json\n' "$(remote_control_registry_dir)" "$1"
+}
+remote_control_lock_path() { printf '%s/remote-control-%s.lock\n' "$(mcp_runtime_dir)" "$(mcp_identity_hash "$1")"; }
+
+remote_control_registry_validate() {
+  local name="$1" path="$2"
+  mcp_validate_private_file "$path" "Remote Control registry"
+  jq -e --arg container "$name" '
+    .schema_version == 1 and .container == $container and .desired == true and
+    (.backend == "direct" or .backend == "modern") and
+    ((.container_started_by_remote | type == "boolean") or .container_started_by_remote == 0 or .container_started_by_remote == 1) and
+    (.boot_token | type == "string") and (.installation_id | type == "string")
+  ' "$path" >/dev/null 2>&1 || die "Invalid Remote Control registry: $path"
+}
+
+remote_control_registry_available() {
+  local name="$1" dir="$(remote_control_registry_dir)" path="$(remote_control_registry_path "$1")"
+  if [ -e "$dir" ] || [ -L "$dir" ]; then
+    mcp_prepare_private_dir "$dir"
+  else
+    return 1
+  fi
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    remote_control_registry_validate "$name" "$path"
+    return 0
+  fi
+  return 1
+}
+
+remote_control_lock_acquire() {
+  local lock=""
+  local attempts=0
+  local owner_file=""
+  local owner_pid=""
+  local owner_token=""
+  local current_token=""
+  remote_control_validate_name "$1"
+  if [ "$REMOTE_CONTROL_LOCK_DEPTH" -gt 0 ]; then
+    [ "$REMOTE_CONTROL_LOCK_NAME" = "$1" ] || die "Cannot nest Remote Control locks for different containers"
+    REMOTE_CONTROL_LOCK_DEPTH=$((REMOTE_CONTROL_LOCK_DEPTH + 1))
+    return 0
+  fi
+  mcp_prepare_runtime_dir
+  lock="$(remote_control_lock_path "$1")"
+  while ! mkdir "$lock" 2>/dev/null; do
+    owner_file="$lock/owner"
+    if [ -f "$owner_file" ] && [ ! -L "$owner_file" ]; then
+      IFS=' ' read -r owner_pid owner_token <"$owner_file" || true
+      case "$owner_pid" in
+        ''|*[!0-9]*) current_token="" ;;
+        *) current_token="$(mcp_process_token "$owner_pid")" ;;
+      esac
+      if ! kill -0 "$owner_pid" 2>/dev/null || [ -z "$current_token" ] || [ "$current_token" != "$owner_token" ]; then
+        rm -f "$owner_file"
+        if rmdir "$lock" 2>/dev/null; then continue; fi
+      fi
+    elif [ "$attempts" -ge 5 ]; then
+      if rmdir "$lock" 2>/dev/null; then continue; fi
+    fi
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 200 ] || die "Timed out waiting for Remote Control operation on $1"
+    sleep 0.1
+  done
+  printf '%s %s\n' "$$" "$(mcp_process_token "$$")" >"$lock/owner"
+  REMOTE_CONTROL_LOCK_DIR="$lock"
+  REMOTE_CONTROL_LOCK_NAME="$1"
+  REMOTE_CONTROL_LOCK_DEPTH=1
+}
+
+remote_control_lock_release() {
+  if [ "$REMOTE_CONTROL_LOCK_DEPTH" -gt 1 ]; then
+    REMOTE_CONTROL_LOCK_DEPTH=$((REMOTE_CONTROL_LOCK_DEPTH - 1))
+    return 0
+  fi
+  if [ -n "${REMOTE_CONTROL_LOCK_DIR:-}" ]; then
+    rm -f "$REMOTE_CONTROL_LOCK_DIR/owner"
+    rmdir "$REMOTE_CONTROL_LOCK_DIR" 2>/dev/null || true
+  fi
+  REMOTE_CONTROL_LOCK_DIR=""
+  REMOTE_CONTROL_LOCK_NAME=""
+  REMOTE_CONTROL_LOCK_DEPTH=0
+}
+
+remote_control_prepare_registry_dir() {
+  local dir="$(remote_control_registry_dir)"
+  mcp_prepare_private_dir "$dir"
+}
+
+remote_control_runtime_exec() {
+  local name="$1"
+  shift
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" env CODEX_HOME="$REMOTE_CONTROL_CODEX_HOME" "$@"
+}
+
+remote_control_install_helper() {
+  refresh_container_file "$1" "$SCRIPT_DIR/remote-control/status-helper.mjs" \
+    "/usr/local/lib/agentctl/remote-control-status.mjs" "root:root" "755"
+}
+
+remote_control_local_healthy() {
+  remote_control_runtime_exec "$1" codex app-server daemon version >/dev/null 2>&1
+}
+
+remote_control_direct_owned() {
+  remote_control_runtime_exec "$1" sh -c '
+    f=/tmp/agentctl-remote-control/process; test -f "$f" || exit 1
+    read p s <"$f"; case "$p:$s" in *[!0-9:]*|:*) exit 1;; esac
+    test -r "/proc/$p/stat" || exit 1
+    test "$(awk "{print \$22}" "/proc/$p/stat")" = "$s" || exit 1
+    tr "\000" " " <"/proc/$p/cmdline" | grep -F "codex app-server" >/dev/null' >/dev/null 2>&1
+}
+
+remote_control_capture_owned_process() {
+  remote_control_runtime_exec "$1" sh -c '
+    set -eu; d=/tmp/agentctl-remote-control; mkdir -p "$d"; chmod 700 "$d"
+    found=""; for f in /proc/[0-9]*/cmdline; do
+      test -r "$f" || continue
+      p=${f#/proc/}; p=${p%/cmdline}; test "$p" != "$$" || continue
+      cmd=$(tr "\000" " " <"$f")
+      case "$cmd" in
+        *"codex app-server proxy"*|*"codex app-server daemon"*) continue ;;
+        *"codex app-server --remote-control"*) test -z "$found" || exit 1; found=$p ;;
+      esac
+    done
+    test -n "$found"; s=$(awk "{print \$22}" "/proc/$found/stat")
+    printf "%s %s\n" "$found" "$s" >"$d/process"; chmod 600 "$d/process"'
+}
+
+remote_control_capture_modern_or_rollback() {
+  local name="$1"
+  if remote_control_capture_owned_process "$name"; then return 0; fi
+  remote_control_runtime_exec "$name" codex app-server daemon disable-remote-control >/dev/null 2>&1 || true
+  remote_control_runtime_exec "$name" codex remote-control stop >/dev/null 2>&1 || true
+  return 1
+}
+
+remote_control_guest_status() {
+  local name="$1"
+  local timeout_ms="${2:-5000}"
+  remote_control_runtime_exec "$name" node /usr/local/lib/agentctl/remote-control-status.mjs "$timeout_ms"
+}
+
+remote_control_installation_id() {
+  "$CONTAINER_CMD" exec "$1" "${SETPRIV_ARGS[@]}" sh -c \
+    'test -f /home/coder/.codex/installation_id && cat /home/coder/.codex/installation_id' 2>/dev/null || true
+}
+
+remote_control_boot_token() {
+  "$CONTAINER_CMD" exec "$1" sh -c "awk '{print \$22}' /proc/1/stat" 2>/dev/null || true
+}
+
+remote_control_registry_write() {
+  local name="$1" backend="$2" auto_started="$3" boot_token="$4" installation_id="$5"
+  local path="" temp=""
+  remote_control_prepare_registry_dir
+  path="$(remote_control_registry_path "$name")"
+  temp="${path}.tmp.$$"
+  case "$auto_started" in 1|true) auto_started=true ;; *) auto_started=false ;; esac
+  jq -n --arg container "$name" --arg backend "$backend" \
+    --argjson auto_started "$auto_started" --arg boot_token "$boot_token" \
+    --arg installation_id "$installation_id" \
+    '{schema_version:1,container:$container,backend:$backend,desired:true,container_started_by_remote:$auto_started,boot_token:$boot_token,installation_id:$installation_id}' >"$temp"
+  chmod 600 "$temp"
+  mv "$temp" "$path"
+  remote_control_registry_validate "$name" "$path"
+}
+
+remote_control_duplicate_active() {
+  local name="$1" installation_id="$2" file="" other=""
+  [ -n "$installation_id" ] || return 1
+  [ -e "$(remote_control_registry_dir)" ] || return 1
+  mcp_prepare_private_dir "$(remote_control_registry_dir)"
+  for file in "$(remote_control_registry_dir)"/*.json; do
+    [ -e "$file" ] || [ -L "$file" ] || continue
+    other="$(jq -r '.container // empty' "$file" 2>/dev/null)"
+    [ -n "$other" ] || die "Invalid Remote Control registry: $file"
+    remote_control_registry_validate "$other" "$file"
+    [ "$other" != "$name" ] || continue
+    if [ "$(jq -r '.desired // false' "$file" 2>/dev/null)" = true ] \
+      && [ "$(jq -r '.installation_id // empty' "$file" 2>/dev/null)" = "$installation_id" ] \
+      && container_running "$other"; then
+      printf '%s\n' "$other"
+      return 0
+    fi
+  done
+  return 1
+}
+
+remote_control_start_backend() {
+  local name="$1" output=""
+  if "$CONTAINER_CMD" exec "$name" sh -c 'test -f /etc/alpine-release'; then
+    printf '%s\n' direct
+    remote_control_runtime_exec "$name" sh -c \
+      'set -eu; umask 077; d=/tmp/agentctl-remote-control; mkdir -p "$d"; chmod 700 "$d"; rm -f "$d/process"; : >"$d/service.log"; chmod 600 "$d/service.log"; nohup setsid -f sh -c '\''p=$$; s=$(awk "{print \$22}" "/proc/$p/stat"); printf "%s %s\n" "$p" "$s" >"$1/process"; exec codex app-server --remote-control --listen unix://'\'' sh "$d" >"$d/service.log" 2>&1 </dev/null; i=0; while test ! -s "$d/process" && test "$i" -lt 20; do sleep .1; i=$((i+1)); done; test -s "$d/process"'
+    return
+  fi
+  if remote_control_runtime_exec "$name" codex remote-control start --help >/dev/null 2>&1; then
+    if output="$(remote_control_runtime_exec "$name" codex remote-control start 2>&1)"; then
+      remote_control_capture_modern_or_rollback "$name" || return 1
+      printf '%s\n' modern
+      return
+    fi
+    if printf '%s' "$output" | grep -Fq 'failed to read start time for pid-managed app server' \
+      && remote_control_local_healthy "$name"; then
+      remote_control_capture_modern_or_rollback "$name" || return 1
+      printf '%s\n' modern
+      return
+    fi
+    printf '%s\n' "$output" >&2
+    return 1
+  fi
+  printf '%s\n' direct
+  remote_control_runtime_exec "$name" sh -c \
+    'set -eu; umask 077; d=/tmp/agentctl-remote-control; mkdir -p "$d"; chmod 700 "$d"; rm -f "$d/process"; : >"$d/service.log"; chmod 600 "$d/service.log"; nohup setsid -f sh -c '\''p=$$; s=$(awk "{print \$22}" "/proc/$p/stat"); printf "%s %s\n" "$p" "$s" >"$1/process"; exec codex app-server --remote-control --listen unix://'\'' sh "$d" >"$d/service.log" 2>&1 </dev/null; i=0; while test ! -s "$d/process" && test "$i" -lt 20; do sleep .1; i=$((i+1)); done; test -s "$d/process"'
+}
+
+remote_control_stop_backend() {
+  local name="$1" backend="$2"
+  case "$backend" in
+    modern)
+      if ! remote_control_local_healthy "$name"; then
+        remote_control_direct_owned "$name" || return 0
+        remote_control_runtime_exec "$name" sh -c '
+          f=/tmp/agentctl-remote-control/process; read p s <"$f"
+          test "$(awk "{print \$22}" "/proc/$p/stat")" = "$s" || exit 1
+          kill "$p"; i=0; while kill -0 "$p" 2>/dev/null && test "$(awk "{print \$3}" "/proc/$p/stat" 2>/dev/null)" != Z && test "$i" -lt 50; do sleep .1; i=$((i+1)); done
+          test ! -r "/proc/$p/stat" || test "$(awk "{print \$3}" "/proc/$p/stat")" = Z || exit 1
+          rm -f "$f"' || return 1
+        return 0
+      fi
+      remote_control_runtime_exec "$name" codex app-server daemon disable-remote-control >/dev/null \
+        || return 1
+      remote_control_runtime_exec "$name" codex remote-control stop >/dev/null \
+        || return 1
+      local attempts=0
+      while remote_control_local_healthy "$name"; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 50 ] || return 1
+        sleep 0.1
+      done
+      remote_control_runtime_exec "$name" rm -f /tmp/agentctl-remote-control/process || return 1
+      ;;
+    direct)
+      remote_control_runtime_exec "$name" sh -c '
+        f=/tmp/agentctl-remote-control/process; test -f "$f" || exit 0
+        read p s <"$f"; case "$p:$s" in *[!0-9:]*|:*) exit 1;; esac
+        test -r "/proc/$p/stat" || { rm -f "$f"; exit 0; }
+        test "$(awk "{print \$22}" "/proc/$p/stat")" = "$s" || exit 1
+        tr "\000" " " <"/proc/$p/cmdline" | grep -F "codex app-server" >/dev/null || exit 1
+        kill "$p"; i=0; while kill -0 "$p" 2>/dev/null && test "$(awk "{print \$3}" "/proc/$p/stat" 2>/dev/null)" != Z && test "$i" -lt 50; do sleep .1; i=$((i+1)); done
+        if kill -0 "$p" 2>/dev/null && test "$(awk "{print \$3}" "/proc/$p/stat" 2>/dev/null)" != Z; then kill -9 "$p"; fi
+        rm -f "$f"' || return 1
+      ;;
+  esac
+}
+
+remote_control_boot_owned() {
+  local name="$1" registry="$(remote_control_registry_path "$1")" recorded="" current=""
+  remote_control_registry_available "$name" || return 1
+  recorded="$(jq -r '.boot_token // empty' "$registry")"
+  current="$(remote_control_boot_token "$name")"
+  [ -n "$recorded" ] && [ "$recorded" = "$current" ]
+}
+
+remote_control_service_owned() {
+  local name="$1" backend="$2"
+  remote_control_boot_owned "$name" || return 1
+  remote_control_direct_owned "$name"
+}
+
+remote_control_quiesce_preserving_desired() {
+  local name="$1" registry="$(remote_control_registry_path "$1")" backend=""
+  remote_control_lock_acquire "$name"
+  if ! remote_control_registry_available "$name" || ! container_running "$name"; then
+    remote_control_lock_release
+    return 0
+  fi
+  backend="$(jq -r '.backend // empty' "$registry")"
+  if remote_control_local_healthy "$name" && ! remote_control_service_owned "$name" "$backend"; then
+    die "Refusing to stop an App Server that is not verifiably owned by agentctl: $name"
+  fi
+  remote_control_stop_backend "$name" "$backend" || die "Failed to stop Remote Control cleanly in $name"
+  if ! sync_runtime_auth_from_container "$name" codex json_refresh_token; then
+    remote_control_lock_release
+    return 1
+  fi
+  remote_control_lock_release
+}
+
+remote_control_restore_if_desired() {
+  local name="$1" registry="$(remote_control_registry_path "$1")" backend="" boot="" installation_id="" duplicate=""
+  remote_control_lock_acquire "$name"
+  if ! remote_control_registry_available "$name"; then remote_control_lock_release; return 0; fi
+  if ! container_running "$name"; then remote_control_lock_release; return 0; fi
+  if remote_control_local_healthy "$name"; then remote_control_lock_release; return 0; fi
+  installation_id="$(remote_control_installation_id "$name")"
+  duplicate="$(remote_control_duplicate_active "$name" "$installation_id" || true)"
+  [ -z "$duplicate" ] || die "Codex installation identity is already active for Remote Control in container: $duplicate"
+  sync_runtime_auth_to_container "$name" codex json_refresh_token
+  remote_control_install_helper "$name"
+  backend="$(remote_control_start_backend "$name")" || die "Failed to restore Remote Control in $name"
+  boot="$(remote_control_boot_token "$name")"
+  remote_control_registry_write "$name" "$backend" false "$boot" "$installation_id"
+  remote_control_lock_release
+}
+
+remote_control_migrate_registry() {
+  local source="$1" target="$2" source_path="$(remote_control_registry_path "$1")" target_path="$(remote_control_registry_path "$2")" temp=""
+  remote_control_lock_acquire "$source"
+  if ! remote_control_registry_available "$source"; then remote_control_lock_release; return 0; fi
+  if [ "$source" = "$target" ]; then remote_control_lock_release; return 0; fi
+  remote_control_prepare_registry_dir
+  temp="${target_path}.tmp.$$"
+  jq --arg container "$target" '.container=$container | .container_started_by_remote=false | .boot_token=""' "$source_path" >"$temp"
+  chmod 600 "$temp"
+  mv "$temp" "$target_path"
+  rm -f "$source_path"
+  remote_control_registry_validate "$target" "$target_path"
+  remote_control_lock_release
+}
+
+remote_control_status_json() {
+  local name="$1" registry="$(remote_control_registry_path "$1")"
+  local state="" container_state="stopped" desired=false backend=null remote_status=null
+  local status_json='{}' observed_status="" installation_id=null server_name=null environment_id=null auto_started=false log_path=null
+  if ! container_exists "$name"; then state=missing_container
+  elif ! container_running "$name"; then
+    state=container_stopped
+    if remote_control_registry_available "$name"; then desired="$(jq -r '.desired // false' "$registry")"; fi
+  else
+    container_state=running
+    if remote_control_registry_available "$name"; then
+      desired="$(jq -r '.desired // false' "$registry")"
+      backend="$(jq -c '.backend // null' "$registry")"
+      auto_started="$(jq -r '.container_started_by_remote // false' "$registry")"
+      case "$auto_started" in 1|true) auto_started=true ;; *) auto_started=false ;; esac
+    fi
+    if remote_control_local_healthy "$name"; then
+      if ! remote_control_registry_available "$name" || ! remote_control_boot_owned "$name" \
+        || { [ "$backend" = '"direct"' ] && ! remote_control_direct_owned "$name"; }; then state=unmanaged
+      else
+        status_json="$(remote_control_guest_status "$name" 5000 2>/dev/null || printf '{"remote_status":"unknown"}')"
+        observed_status="$(printf '%s' "$status_json" | jq -r '.remote_status // "unknown"')"
+        installation_id="$(printf '%s' "$status_json" | jq -c '.installation_id // null')"
+        server_name="$(printf '%s' "$status_json" | jq -c '.server_name // null')"
+        environment_id="$(printf '%s' "$status_json" | jq -c '.environment_id // null')"
+        case "$observed_status" in
+          connected|connecting|errored) state="$observed_status"; remote_status="$(printf '%s' "$observed_status" | jq -R .)" ;;
+          disabled) state=errored; remote_status='"disabled"' ;;
+          *) state=running; remote_status=null ;;
+        esac
+      fi
+    else state=stopped
+    fi
+  fi
+  [ "$backend" != '"direct"' ] || log_path='"/tmp/agentctl-remote-control/service.log"'
+  jq -n --arg container "$name" --arg container_state "$container_state" --arg state "$state" \
+    --argjson desired "$desired" --argjson remote_status "$remote_status" --argjson backend "$backend" \
+    --argjson installation_id "$installation_id" --argjson server_name "$server_name" \
+    --argjson environment_id "$environment_id" --argjson auto_started "$auto_started" --argjson log_path "$log_path" \
+    '{schema_version:1,container:$container,container_state:$container_state,desired:$desired,state:$state,remote_status:$remote_status,backend:$backend,codex_home:"/home/coder/.codex",server_name:$server_name,environment_id:$environment_id,installation_id:$installation_id,container_started_by_remote:$auto_started,log_path:$log_path}'
+}
+
+remote_control_print_status() {
+  local json="$1" machine="$2" state=""
+  if [ "$machine" -eq 1 ]; then printf '%s\n' "$json"; return; fi
+  state="$(printf '%s' "$json" | jq -r .state)"
+  printf 'Remote Control for %s: %s\n' "$(printf '%s' "$json" | jq -r .container)" "$state"
+  [ "$state" != connecting ] || warn "Remote Control is still connecting and will keep retrying"
+  [ "$state" != unmanaged ] || warn "An App Server not managed by agentctl is running; stop it before using this command"
+}
+
+remote_control_cmd() {
+  local action="${1:-}" name="" machine=0 registry="" started=0 backend="" boot="" installation_id="" duplicate="" json="" state="" i=0
+  local registry_existed=0 start_committed=0
+  remote_control_command_cleanup() {
+    if [ "$action" = start ] && [ "$started" -eq 1 ] && [ "$start_committed" -eq 0 ]; then
+      if [ -n "$backend" ]; then remote_control_stop_backend "$name" "$backend" >/dev/null 2>&1 || true; fi
+      if [ "$registry_existed" -eq 0 ]; then rm -f "$(remote_control_registry_path "$name")"; fi
+      if container_running "$name"; then stop_existing_container_safely "$name" >/dev/null 2>&1 || true; fi
+    fi
+    remote_control_lock_release
+  }
+  [ -n "$action" ] || { usage_remote_control; return 1; }; shift || true
+  case "$action" in --help|-h|help) usage_remote_control; return 0 ;; esac
+  while [ $# -gt 0 ]; do case "$1" in
+    --name) [ $# -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
+    --json) machine=1; shift ;;
+    --help|-h) usage_remote_control; return 0 ;;
+    *) die "Unknown option for remote-control: $1" ;;
+  esac; done
+  case "$action" in start|status|pair|stop) ;; *) die "Unknown remote-control command: $action" ;; esac
+  require_container
+  name="${name:-$(default_name "$DEFAULT_NAME_PREFIX")}"; registry="$(remote_control_registry_path "$name")"
+  if [ "$action" = start ] || [ "$action" = stop ]; then
+    remote_control_lock_acquire "$name"
+    trap 'remote_control_command_cleanup' EXIT
+  fi
+  case "$action" in
+    status)
+      json="$(remote_control_status_json "$name")"; remote_control_print_status "$json" "$machine"
+      state="$(printf '%s' "$json" | jq -r .state)"; case "$state" in connected|connecting|running) ;; *) return 1 ;; esac
+      ;;
+    start)
+      container_exists "$name" || die "Container not found: $name"
+      if remote_control_registry_available "$name"; then registry_existed=1; fi
+      if ! container_running "$name"; then start_existing_container_safely "$name" >/dev/null; started=1; fi
+      if ! runtime_info_in_container "$name" codex | jq -e '.installed == true' >/dev/null; then die "Codex runtime is not installed in $name"; fi
+      sync_runtime_auth_to_container "$name" codex json_refresh_token
+      remote_control_install_helper "$name"
+      json="$(remote_control_status_json "$name")"; state="$(printf '%s' "$json" | jq -r .state)"
+      [ "$state" != unmanaged ] || die "An unmanaged Codex App Server is already running in $name; stop it before retrying"
+      if [ "$state" != connected ] && [ "$state" != connecting ] && [ "$state" != running ]; then
+        installation_id="$(remote_control_installation_id "$name")"
+        duplicate="$(remote_control_duplicate_active "$name" "$installation_id" || true)"
+        [ -z "$duplicate" ] || die "Codex installation identity is already active for Remote Control in container: $duplicate"
+        backend="$(remote_control_start_backend "$name")" || { [ "$started" -eq 0 ] || stop_existing_container_safely "$name" >/dev/null; die "Failed to start Codex Remote Control"; }
+        boot="$(remote_control_boot_token "$name")"
+        remote_control_registry_write "$name" "$backend" "$started" "$boot" "$installation_id"
+        while [ "$i" -lt 3 ]; do
+          json="$(remote_control_status_json "$name")"; state="$(printf '%s' "$json" | jq -r .state)"
+          case "$state" in connected|running|errored) break ;; esac
+          i=$((i + 1)); sleep 1
+        done
+      fi
+      json="$(remote_control_status_json "$name")"; state="$(printf '%s' "$json" | jq -r .state)"
+      case "$state" in connected|connecting|running) start_committed=1; remote_control_print_status "$json" "$machine" ;; *) remote_control_stop_backend "$name" "$(jq -r '.backend // empty' "$registry" 2>/dev/null)" || true; [ "$registry_existed" -eq 1 ] || rm -f "$registry"; die "Remote Control failed with state: $state" ;; esac
+      ;;
+    pair)
+      json="$(remote_control_status_json "$name")"; state="$(printf '%s' "$json" | jq -r .state)"
+      case "$state" in connected|connecting|running) ;; *) die "Remote Control App Server is not running (state: $state)" ;; esac
+      if [ "$machine" -eq 1 ]; then
+        json="$(remote_control_runtime_exec "$name" codex remote-control pair --json)"
+        printf '%s' "$json" | jq -ec --arg container "$name" '{schema_version:1,container:$container,pairing:{code:(.manual_code // .pairing_code // .manual_pairing_code // .code),expires_at:(.expires_at // null)}} | select(.pairing.code != null and .pairing.code != "")' \
+          || die "Codex pairing response did not contain a pairing code"
+      else "$CONTAINER_CMD" exec -it "$name" "${SETPRIV_ARGS[@]}" env CODEX_HOME="$REMOTE_CONTROL_CODEX_HOME" codex remote-control pair; fi
+      ;;
+    stop)
+      if remote_control_registry_available "$name" && container_running "$name"; then
+        backend="$(jq -r '.backend // empty' "$registry")"
+        if remote_control_local_healthy "$name" && ! remote_control_service_owned "$name" "$backend"; then
+          die "Refusing to stop an App Server that is not verifiably owned by agentctl: $name"
+        fi
+        remote_control_stop_backend "$name" "$backend" || die "Refusing to stop an unverified Remote Control process"
+        sync_runtime_auth_from_container "$name" codex json_refresh_token \
+          || die "Failed to synchronize refreshed Codex authentication from $name"
+        started="$(jq -r '.container_started_by_remote // false' "$registry")"; boot="$(jq -r '.boot_token // empty' "$registry")"
+        case "$started" in 1|true) started=true ;; *) started=false ;; esac
+        rm -f "$registry"
+        if [ "$started" = true ] && [ "$boot" = "$(remote_control_boot_token "$name")" ] && [ "$(mcp_lease_count "$name")" -eq 0 ]; then stop_existing_container_safely "$name" >/dev/null; fi
+      elif remote_control_registry_available "$name"; then rm -f "$registry"; fi
+      json="$(remote_control_status_json "$name")"; if [ "$machine" -eq 1 ]; then printf '%s\n' "$json"; else printf 'Remote Control stopped for %s\n' "$name"; fi
+      ;;
+  esac
+  if [ "$action" = start ] || [ "$action" = stop ]; then
+    remote_control_lock_release
+    trap - EXIT
+  fi
+}
+
 simple_name_cmd() {
   local action="$1"
   shift
@@ -9431,8 +9978,9 @@ simple_name_cmd() {
     name="$(default_name "$DEFAULT_NAME_PREFIX")"
   fi
   published_sockets="$(container_published_sockets "$name")"
+  remote_control_lock_acquire "$name"
   mcp_lock_acquire "$name"
-  trap 'mcp_lock_release' EXIT
+  trap 'mcp_lock_release; remote_control_lock_release' EXIT
   mcp_require_no_active_leases "$name" "$action"
 
   case "$action" in
@@ -9444,8 +9992,10 @@ simple_name_cmd() {
       "$CONTAINER_CMD" start "$name"
       configure_container_host_alias "$name"
       if [ "$MCP_REQUESTED" -eq 1 ]; then mcp_configure_guest "$name"; fi
+      remote_control_restore_if_desired "$name"
       ;;
     stop)
+      remote_control_quiesce_preserving_desired "$name"
       "$CONTAINER_CMD" stop "$name"
       report_leftover_published_sockets "$published_sockets" || true
       mcp_stop_managed "$name"
@@ -9453,6 +10003,7 @@ simple_name_cmd() {
     restart)
       warn_if_ssh_forwarding_unavailable_on_start "$name"
       validate_container_socket_sources "$name"
+      remote_control_quiesce_preserving_desired "$name"
       "$CONTAINER_CMD" stop "$name" >/dev/null
       mcp_stop_managed "$name"
       if ! report_leftover_published_sockets "$published_sockets"; then
@@ -9463,8 +10014,10 @@ simple_name_cmd() {
       "$CONTAINER_CMD" start "$name"
       configure_container_host_alias "$name"
       if [ "$MCP_REQUESTED" -eq 1 ]; then mcp_configure_guest "$name"; fi
+      remote_control_restore_if_desired "$name"
       ;;
     rm)
+      remote_control_quiesce_preserving_desired "$name"
       mcp_stop_managed "$name"
       if [ "$force" -eq 1 ] && container_running "$name"; then
         "$CONTAINER_CMD" stop "$name" >/dev/null
@@ -9473,10 +10026,12 @@ simple_name_cmd() {
       "$CONTAINER_CMD" rm "$name"
       report_leftover_published_sockets "$published_sockets" || true
       rm -f "$(mcp_registry_path "$name")"
+      rm -f "$(remote_control_registry_path "$name")"
       ;;
     *) die "Unknown action: $action" ;;
   esac
   mcp_lock_release
+  remote_control_lock_release
   trap - EXIT
 }
 
@@ -9648,6 +10203,7 @@ case "$cmd" in
   host-address) shift; host_address_cmd "$@" ;;
   network) shift; network_cmd "$@" ;;
   mcp) shift; mcp_cmd "$@" ;;
+  remote-control) shift; remote_control_cmd "$@" ;;
   system-manifest) shift; system_manifest_cmd "$@" ;;
   upgrade) shift; upgrade_cmd "$@" ;;
   rescue) shift; rescue_cmd "$@" ;;
