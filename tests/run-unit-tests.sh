@@ -304,6 +304,66 @@ test_remote_control_status_json_reports_healthy_server_as_running() {
   fi
 }
 
+test_remote_control_login_exec_preserves_arguments_and_codex_home() (
+  begin_test "Remote Control login exec safely loads the configured login environment"
+
+  load_agentctl_functions
+  local captured_args=()
+  DEFAULT_LOGIN_SHELL=zsh
+  SETPRIV_ARGS=(setpriv-test)
+  CONTAINER_CMD=container
+  container() { captured_args=("$@"); }
+
+  remote_control_runtime_login_exec unit-remote codex app-server 'argument with spaces' '$(not-a-command)'
+
+  [ "${captured_args[0]}" = exec ] || fail "Expected container exec: ${captured_args[*]}"
+  [ "${captured_args[1]}" = unit-remote ] || fail "Expected target container: ${captured_args[*]}"
+  [ "${captured_args[2]}" = setpriv-test ] || fail "Expected privilege wrapper: ${captured_args[*]}"
+  [ "${captured_args[3]}" = zsh ] || fail "Expected configured login shell: ${captured_args[*]}"
+  [ "${captured_args[4]}" = -lc ] || fail "Expected login command mode: ${captured_args[*]}"
+  [ "${captured_args[5]}" = 'export CODEX_HOME="$1"; shift; exec "$@"' ] || fail "Expected parameter-safe launch script: ${captured_args[*]}"
+  [ "${captured_args[6]}" = sh ] || fail "Expected login shell argv placeholder: ${captured_args[*]}"
+  [ "${captured_args[7]}" = /home/coder/.codex ] || fail "Expected managed CODEX_HOME: ${captured_args[*]}"
+  [ "${captured_args[8]}" = codex ] || fail "Expected Codex command: ${captured_args[*]}"
+  [ "${captured_args[9]}" = app-server ] || fail "Expected Codex subcommand: ${captured_args[*]}"
+  [ "${captured_args[10]}" = 'argument with spaces' ] || fail "Expected spaced argument to remain intact: ${captured_args[*]}"
+  [ "${captured_args[11]}" = '$(not-a-command)' ] || fail "Expected shell syntax to remain data: ${captured_args[*]}"
+)
+
+test_remote_control_start_uses_login_environment_for_all_backends() (
+  begin_test "Remote Control starts native and direct backends with the login environment"
+
+  load_agentctl_functions
+  local backend=""
+  local calls_file=""
+  local login_calls=""
+  local platform=alpine
+  calls_file="$(new_workdir)/login-calls"
+  CONTAINER_CMD=container
+  container() {
+    if [ "$platform" = alpine ]; then return 0; fi
+    return 1
+  }
+  remote_control_runtime_login_exec() {
+    printf '%s\n' "$*" >>"$calls_file"
+    return 0
+  }
+  remote_control_capture_modern_or_rollback() { return 0; }
+
+  backend="$(remote_control_start_backend unit-remote)"
+  [ "$backend" = direct ] || fail "Expected direct backend, got: $backend"
+  login_calls="$(<"$calls_file")"
+  printf '%s' "$login_calls" | grep -Fq 'unit-remote sh -c' || fail "Expected direct backend to use login exec: $login_calls"
+
+  platform=modern
+  : >"$calls_file"
+  backend="$(remote_control_start_backend unit-remote)"
+  [ "$backend" = modern ] || fail "Expected modern backend, got: $backend"
+  login_calls="$(<"$calls_file")"
+  printf '%s' "$login_calls" | grep -Fq 'unit-remote codex remote-control start --help' || fail "Expected native probe to use login exec: $login_calls"
+  printf '%s' "$login_calls" | grep -Fq 'unit-remote codex remote-control start' || fail "Expected native start to use login exec: $login_calls"
+)
+
 test_remote_control_lock_recovers_abandoned_owner() {
   begin_test "remote-control lock recovers an abandoned owner"
 
@@ -12589,6 +12649,8 @@ main() {
   run_selected_test test_remote_control_status_json_reports_missing_container "test_remote_control_status_json_reports_missing_container"
   run_selected_test test_remote_control_status_json_normalizes_connected_protocol_state "test_remote_control_status_json_normalizes_connected_protocol_state"
   run_selected_test test_remote_control_status_json_reports_healthy_server_as_running "test_remote_control_status_json_reports_healthy_server_as_running"
+  run_selected_test test_remote_control_login_exec_preserves_arguments_and_codex_home "test_remote_control_login_exec_preserves_arguments_and_codex_home"
+  run_selected_test test_remote_control_start_uses_login_environment_for_all_backends "test_remote_control_start_uses_login_environment_for_all_backends"
   run_selected_test test_remote_control_lock_recovers_abandoned_owner "test_remote_control_lock_recovers_abandoned_owner"
   run_selected_test test_remote_control_quiesce_stops_before_auth_sync "test_remote_control_quiesce_stops_before_auth_sync"
   run_selected_test test_remote_control_registry_rejects_traversal_and_unsafe_files "test_remote_control_registry_rejects_traversal_and_unsafe_files"

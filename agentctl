@@ -9590,6 +9590,13 @@ remote_control_runtime_exec() {
   "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" env CODEX_HOME="$REMOTE_CONTROL_CODEX_HOME" "$@"
 }
 
+remote_control_runtime_login_exec() {
+  local name="$1"
+  shift
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" "$DEFAULT_LOGIN_SHELL" -lc \
+    'export CODEX_HOME="$1"; shift; exec "$@"' sh "$REMOTE_CONTROL_CODEX_HOME" "$@"
+}
+
 remote_control_install_helper() {
   refresh_container_file "$1" "$SCRIPT_DIR/remote-control/status-helper.mjs" \
     "/usr/local/lib/agentctl/remote-control-status.mjs" "root:root" "755"
@@ -9688,12 +9695,13 @@ remote_control_start_backend() {
   local name="$1" output=""
   if "$CONTAINER_CMD" exec "$name" sh -c 'test -f /etc/alpine-release'; then
     printf '%s\n' direct
-    remote_control_runtime_exec "$name" sh -c \
-      'set -eu; umask 077; d=/tmp/agentctl-remote-control; mkdir -p "$d"; chmod 700 "$d"; rm -f "$d/process"; : >"$d/service.log"; chmod 600 "$d/service.log"; nohup setsid -f sh -c '\''p=$$; s=$(awk "{print \$22}" "/proc/$p/stat"); printf "%s %s\n" "$p" "$s" >"$1/process"; exec codex app-server --remote-control --listen unix://'\'' sh "$d" >"$d/service.log" 2>&1 </dev/null; i=0; while test ! -s "$d/process" && test "$i" -lt 20; do sleep .1; i=$((i+1)); done; test -s "$d/process"'
+    remote_control_runtime_login_exec "$name" sh -c \
+      'set -eu; umask 077; d=/tmp/agentctl-remote-control; mkdir -p "$d"; chmod 700 "$d"; rm -f "$d/process"; : >"$d/service.log"; chmod 600 "$d/service.log"; nohup setsid -f sh -c '\''p=$$; s=$(awk "{print \$22}" "/proc/$p/stat"); printf "%s %s\n" "$p" "$s" >"$1/process"; exec codex app-server --remote-control --listen unix://'\'' sh "$d" >"$d/service.log" 2>&1 </dev/null; i=0; while test ! -s "$d/process" && test "$i" -lt 20; do sleep .1; i=$((i+1)); done; test -s "$d/process"' \
+      >/dev/null
     return
   fi
-  if remote_control_runtime_exec "$name" codex remote-control start --help >/dev/null 2>&1; then
-    if output="$(remote_control_runtime_exec "$name" codex remote-control start 2>&1)"; then
+  if remote_control_runtime_login_exec "$name" codex remote-control start --help >/dev/null 2>&1; then
+    if output="$(remote_control_runtime_login_exec "$name" codex remote-control start 2>&1)"; then
       remote_control_capture_modern_or_rollback "$name" || return 1
       printf '%s\n' modern
       return
@@ -9708,8 +9716,9 @@ remote_control_start_backend() {
     return 1
   fi
   printf '%s\n' direct
-  remote_control_runtime_exec "$name" sh -c \
-    'set -eu; umask 077; d=/tmp/agentctl-remote-control; mkdir -p "$d"; chmod 700 "$d"; rm -f "$d/process"; : >"$d/service.log"; chmod 600 "$d/service.log"; nohup setsid -f sh -c '\''p=$$; s=$(awk "{print \$22}" "/proc/$p/stat"); printf "%s %s\n" "$p" "$s" >"$1/process"; exec codex app-server --remote-control --listen unix://'\'' sh "$d" >"$d/service.log" 2>&1 </dev/null; i=0; while test ! -s "$d/process" && test "$i" -lt 20; do sleep .1; i=$((i+1)); done; test -s "$d/process"'
+  remote_control_runtime_login_exec "$name" sh -c \
+    'set -eu; umask 077; d=/tmp/agentctl-remote-control; mkdir -p "$d"; chmod 700 "$d"; rm -f "$d/process"; : >"$d/service.log"; chmod 600 "$d/service.log"; nohup setsid -f sh -c '\''p=$$; s=$(awk "{print \$22}" "/proc/$p/stat"); printf "%s %s\n" "$p" "$s" >"$1/process"; exec codex app-server --remote-control --listen unix://'\'' sh "$d" >"$d/service.log" 2>&1 </dev/null; i=0; while test ! -s "$d/process" && test "$i" -lt 20; do sleep .1; i=$((i+1)); done; test -s "$d/process"' \
+    >/dev/null
 }
 
 remote_control_stop_backend() {
