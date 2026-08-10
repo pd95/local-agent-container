@@ -215,6 +215,22 @@ Expected results:
   its current provider connection notification.
 - `remote_status: null` is allowed and does not mean disconnected.
 
+To verify login-environment propagation without exposing a credential, temporarily
+export a marker such as `AGENTCTL_REMOTE_CONTROL_PROFILE_TEST=available` from the
+container user's login profile before starting Remote Control. Confirm that the
+detached App Server inherited it:
+
+```bash
+agentctl exec --name NAME --no-tty -- sh -c '
+  read pid started </tmp/agentctl-remote-control/process
+  tr "\000" "\n" <"/proc/$pid/environ" |
+    grep -qx "AGENTCTL_REMOTE_CONTROL_PROFILE_TEST=available"
+'
+```
+
+Remove the temporary marker after the test. Use the same non-printing check for
+credential variables; never print their values into test logs.
+
 Pair explicitly, enter the short-lived code only in the intended ChatGPT
 client, and confirm that the container environment and threads are reachable:
 

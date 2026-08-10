@@ -55,7 +55,10 @@ required step on every startup.
 necessary, synchronizes online authentication, and returns after the App Server
 is locally healthy. The App Server runs detached with
 `CODEX_HOME=/home/coder/.codex`, so existing conversations, configuration,
-authentication, and enrollment remain available.
+authentication, and enrollment remain available. Its startup uses the configured
+login shell, matching `agentctl run --online`, so environment variables exported
+by login startup files such as `~/.profile` are available to Codex and its MCP
+clients. Restart Remote Control after changing those files.
 
 For the most reliable transition from a local-only Codex session, start Remote
 Control before opening a new local Codex session. A session that was already an
