@@ -119,6 +119,10 @@ The `-c ollama_host=...` value takes precedence over `OLLAMA_HOST`. Use the
 container-reachable address, not the macOS listener value such as
 `http://0.0.0.0:11439`.
 
+For `agentctl run`, `OLLAMA_HOST` is a client base URL and must include an
+`http://` or `https://` scheme. This differs from `ollama serve`, which also
+accepts bind-style values such as `192.168.64.1:11434` in `OLLAMA_HOST`.
+
 ## Quick verification
 
 With the container running, run this on the macOS host:
@@ -160,7 +164,7 @@ with that exposure.
 
 ```bash
 AGENTCTL_HOST_ADDRESS="$(agentctl host-address)"
-OLLAMA_HOST="${AGENTCTL_HOST_ADDRESS}:11434" ollama serve
+OLLAMA_HOST="http://${AGENTCTL_HOST_ADDRESS}:11434" ollama serve
 ```
 
 Run that on the macOS host.
