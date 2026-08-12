@@ -1865,6 +1865,67 @@ test_run_model_wires_selected_model() {
   printf '%s\n' "$captured_cmd" | grep -Fq 'qwen3:14b' || fail "Expected selected model in launch wrapper, got: $captured_cmd"
 }
 
+test_run_rejects_non_url_ollama_host() {
+  begin_test "run rejects a bind-style OLLAMA_HOST without a URL scheme"
+
+  load_agentctl_functions
+
+  local output_file
+  local reject_expected=1
+  local workdir
+
+  workdir="$(new_workdir)"
+  output_file="$workdir/output"
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { return 1; }
+  container_network_host_address() { printf '192.168.64.1\n'; }
+  run_container() {
+    [ "$reject_expected" -eq 0 ] || fail "Invalid OLLAMA_HOST must fail before launching the container"
+  }
+
+  if (OLLAMA_HOST=192.168.64.1:11434 run_cmd --name unit-test-container --workdir "$workdir") >"$output_file" 2>&1; then
+    fail "Expected bind-style OLLAMA_HOST to be rejected"
+  fi
+
+  grep -Fq 'OLLAMA_HOST must be an HTTP(S) base URL' "$output_file" \
+    || fail "Expected an actionable OLLAMA_HOST validation error, got: $(cat "$output_file")"
+  grep -Fq 'http://192.168.64.1:11434' "$output_file" \
+    || fail "Expected the validation error to include the detected host address, got: $(cat "$output_file")"
+
+  : >"$output_file"
+  if (OLLAMA_HOST=http://:11434 run_cmd --name unit-test-container --workdir "$workdir") >"$output_file" 2>&1; then
+    fail "Expected OLLAMA_HOST without a host to be rejected"
+  fi
+  grep -Fq 'OLLAMA_HOST must be an HTTP(S) base URL' "$output_file" \
+    || fail "Expected malformed OLLAMA_HOST to report a base URL error, got: $(cat "$output_file")"
+
+  : >"$output_file"
+  if (OLLAMA_HOST=http://host:65536 run_cmd --name unit-test-container --workdir "$workdir") >"$output_file" 2>&1; then
+    fail "Expected OLLAMA_HOST with an out-of-range port to be rejected"
+  fi
+  grep -Fq 'OLLAMA_HOST port must be between 1 and 65535' "$output_file" \
+    || fail "Expected invalid OLLAMA_HOST port to report its range, got: $(cat "$output_file")"
+
+  : >"$output_file"
+  if (OLLAMA_HOST=http://host:999999999999999999999999 run_cmd --name unit-test-container --workdir "$workdir") >"$output_file" 2>&1; then
+    fail "Expected oversized OLLAMA_HOST port to be rejected"
+  fi
+  grep -Fq 'OLLAMA_HOST port must be between 1 and 65535' "$output_file" \
+    || fail "Expected oversized OLLAMA_HOST port to report its range, got: $(cat "$output_file")"
+  if grep -Fq 'integer expression expected' "$output_file"; then
+    fail "Oversized OLLAMA_HOST port must not reach shell integer parsing: $(cat "$output_file")"
+  fi
+
+  reject_expected=0
+  OLLAMA_HOST=192.168.64.1:11434 run_cmd \
+    --name unit-test-container --workdir "$workdir" \
+    -c ollama_host=http://192.168.64.1:11439
+  OLLAMA_HOST=192.168.64.1:11434 run_cmd \
+    --name unit-test-container --workdir "$workdir" --online
+}
+
 test_build_help_reports_primary_base_images() {
   begin_test "build help reports the primary base images"
 
@@ -12702,6 +12763,7 @@ main() {
   run_selected_test test_start_and_restart_refresh_host_alias "test_start_and_restart_refresh_host_alias"
   run_selected_test test_rescue_help_reports_backup_image_options "test_rescue_help_reports_backup_image_options"
   run_selected_test test_run_model_wires_selected_model "test_run_model_wires_selected_model"
+  run_selected_test test_run_rejects_non_url_ollama_host "test_run_rejects_non_url_ollama_host"
   run_selected_test test_build_help_reports_primary_base_images "test_build_help_reports_primary_base_images"
   run_selected_test test_build_cmd_passes_feature_list_only_to_requested_image "test_build_cmd_passes_feature_list_only_to_requested_image"
   run_selected_test test_build_cmd_rejects_incompatible_feature "test_build_cmd_rejects_incompatible_feature"

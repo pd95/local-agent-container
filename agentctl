@@ -63,6 +63,45 @@ warn() {
   echo "Warning: $*" >&2
 }
 
+validate_ollama_host_url() {
+  local value="$1"
+  local example="${2:-http://host.container.internal:11434}"
+  local port=""
+
+  if ! [[ "$value" =~ ^https?://(\[[0-9A-Fa-f:.%_-]+\]|[A-Za-z0-9][A-Za-z0-9._-]*)(:([0-9]+))?/?$ ]]; then
+    die "OLLAMA_HOST must be an HTTP(S) base URL, for example: $example (got: $value)"
+  fi
+  port="${BASH_REMATCH[3]:-}"
+  if [ -n "$port" ]; then
+    case "$port" in
+      0|0[0-9]*|??????*) die "OLLAMA_HOST port must be between 1 and 65535, for example: $example (got: $value)" ;;
+    esac
+    [ "$port" -le 65535 ] \
+      || die "OLLAMA_HOST port must be between 1 and 65535, for example: $example (got: $value)"
+  fi
+}
+
+ollama_host_url_example() {
+  local container_name="$1"
+  local network_text="$2"
+  local network=""
+  local networks=""
+  local host_address=""
+
+  network="$(network_text_names "$network_text" | head -n 1)"
+  if [ -z "$network" ] && [ -n "$container_name" ] && container_exists "$container_name"; then
+    networks="$(container_network_names "$container_name" 2>/dev/null || true)"
+    network="$(printf '%s\n' "$networks" | sed '/^$/d' | head -n 1)"
+  fi
+  network="${network:-default}"
+  host_address="$(container_network_host_address "$network" 2>/dev/null || true)"
+  if [ -n "$host_address" ]; then
+    printf 'http://%s:11434\n' "$host_address"
+  else
+    printf 'http://%s:11434\n' "$CONTAINER_HOST_NAME"
+  fi
+}
+
 require_container() {
   require_jq
   command -v "$CONTAINER_CMD" >/dev/null 2>&1 || die "Missing '$CONTAINER_CMD' command"
@@ -8117,9 +8156,20 @@ run_mode() {
   local post_exec=""
   local runtime_mode="local"
   local ollama_host="${OLLAMA_HOST:-}"
+  local ollama_host_example=""
+  local configured_ollama_host=""
   local launch_env="AGENTCTL_RUN_MODE=\$1 AGENTCTL_RUNTIME_CONFIG_JSON=\$2 AGENTCTL_MODEL_OVERRIDE=\$3"
   local -a cmd_env=("AGENTCTL_RUN_MODE=$runtime_mode" "AGENTCTL_RUNTIME_CONFIG_JSON=$runtime_config_json" "AGENTCTL_MODEL_OVERRIDE=$model_override")
   local cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "$launch_env exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override")
+  if [ "$online" -eq 0 ] && [ -n "$ollama_host" ]; then
+    configured_ollama_host="$(printf '%s\n' "$runtime_config_json" | jq -r '.ollama_host // empty')"
+    if [ -z "$configured_ollama_host" ]; then
+      if ! [[ "$ollama_host" =~ ^https?://(\[[0-9A-Fa-f:.%_-]+\]|[A-Za-z0-9][A-Za-z0-9._-]*)(:([0-9]+))?/?$ ]]; then
+        ollama_host_example="$(ollama_host_url_example "$name" "$network_text")"
+      fi
+      validate_ollama_host_url "$ollama_host" "$ollama_host_example"
+    fi
+  fi
   if [ -n "$ollama_host" ]; then
     launch_env="$launch_env OLLAMA_HOST=\$4"
     cmd_env+=("OLLAMA_HOST=$ollama_host")

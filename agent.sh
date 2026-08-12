@@ -537,11 +537,11 @@ Tried:
 - Detected host gateway: $api_url
 
 Expose or proxy Ollama onto the container network.
-See README.md 'Local model connectivity'.
+See docs/networking.md.
 
 Host-side fixes:
 - Start a second Ollama listener:
-  OLLAMA_HOST=${gateway} ollama serve
+  OLLAMA_HOST=http://${gateway}:${ollama_port} ollama serve
 
 - Proxy localhost with socat (needs \`brew install socat\`):
   socat TCP-LISTEN:${ollama_port},fork,bind=${gateway} TCP:127.0.0.1:${ollama_port}"
