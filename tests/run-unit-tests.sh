@@ -1070,6 +1070,7 @@ test_doctor_host_reports_runtime_and_capabilities() {
 
   load_agentctl_functions
   host_doctor_mcp_status() { printf '%s\n' 'Managed MCP relays' '  state                    none configured'; }
+  host_doctor_ollama_status() { printf '%s\n' 'Managed Ollama listeners' '  state                    none configured'; }
 
   require_container() { return 0; }
   command() {
@@ -1127,6 +1128,12 @@ test_doctor_host_reports_runtime_and_capabilities() {
   assert_contains "Images              31       4"
   assert_contains "Containers          12       1"
   assert_contains "Reclaimable does not mean safe to delete"
+  assert_contains "Managed Ollama listeners"
+  host_doctor_ollama_status() { printf '%s\n' 'Managed Ollama listeners' '  state                    unhealthy'; return 1; }
+  run_capture doctor_cmd --host
+  assert_status 1
+  assert_contains "Managed Ollama listeners"
+  assert_contains "unhealthy"
   CONTAINER_CMD=container
   unset -f command
 }
@@ -1164,6 +1171,7 @@ test_doctor_host_tolerates_unsupported_storage_accounting() {
 
   load_agentctl_functions
   host_doctor_mcp_status() { printf '%s\n' 'Managed MCP relays' '  state                    none configured'; }
+  host_doctor_ollama_status() { printf '%s\n' 'Managed Ollama listeners' '  state                    none configured'; }
 
   command() {
     if [ "$1" = "-v" ] && [ "$2" = "mock_container" ]; then
@@ -1194,6 +1202,7 @@ test_doctor_host_rejects_malformed_supported_storage_data() {
 
   load_agentctl_functions
   host_doctor_mcp_status() { printf '%s\n' 'Managed MCP relays' '  state                    none configured'; }
+  host_doctor_ollama_status() { printf '%s\n' 'Managed Ollama listeners' '  state                    none configured'; }
 
   command() {
     if [ "$1" = "-v" ] && [ "$2" = "mock_container" ]; then
@@ -11804,6 +11813,76 @@ test_host_doctor_reports_mcp_inventory_and_orphans() {
   [ -e "$orphan" ] || fail "Host doctor unexpectedly removed an orphan MCP artifact"
 }
 
+test_host_doctor_reports_managed_ollama_listeners() {
+  begin_test "host doctor reports managed Ollama listener health"
+
+  load_agentctl_functions
+
+  local root doctor_ollama_runtime metadata
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-doctor.XXXXXX")"
+  register_dir_cleanup "$root"
+  doctor_ollama_runtime="$root/runtime"
+  mkdir -m 700 "$doctor_ollama_runtime"
+  mcp_runtime_dir() { printf '%s\n' "$doctor_ollama_runtime"; }
+  metadata="$(ollama_listener_metadata_path 192.168.64.1)"
+  printf '%s\n' '{"schema_version":1,"gateway":"192.168.64.1","base_url":"http://192.168.64.1:11434","pid":123,"process_token":"token","process_marker":"agentctl-ollama-1-1-1","log_path":"/tmp/ollama.log"}' >"$metadata"
+  chmod 600 "$metadata"
+  ollama_listener_process_owned() { return 0; }
+  ollama_listener_healthy() { return 0; }
+
+  run_capture host_doctor_ollama_status
+  assert_status 0
+  assert_contains "Managed Ollama listeners"
+  assert_contains "192.168.64.1             healthy; PID 123"
+
+  ollama_listener_healthy() { return 1; }
+  run_capture host_doctor_ollama_status
+  assert_status 1
+  assert_contains "unhealthy; run: $CLI_NAME ollama stop --gateway 192.168.64.1"
+
+  ollama_listener_process_owned() { return 1; }
+  run_capture host_doctor_ollama_status
+  assert_status 1
+  assert_contains "stale ownership record; run: $CLI_NAME ollama status"
+  [ -f "$metadata" ] || fail "Host doctor must not remove stale listener metadata"
+
+  ollama_listener_process_owned() { return 0; }
+
+  ollama_listener_healthy() { fail "Did not expect health probe without curl"; }
+  command() {
+    if [ "$1" = -v ] && [ "$2" = curl ]; then return 1; fi
+    builtin command "$@"
+  }
+  run_capture host_doctor_ollama_status
+  assert_status 1
+  assert_contains "health check unavailable: curl is missing"
+  [ -f "$metadata" ] || fail "Host doctor must not remove listener metadata"
+  unset -f command
+
+  printf '%s\n' '{"schema_version":1,"gateway":"192.168.64.1"}' >"$metadata"
+  chmod 600 "$metadata"
+  run_capture host_doctor_ollama_status
+  assert_status 1
+  assert_contains "invalid metadata:"
+  [ -f "$metadata" ] || fail "Host doctor must not remove invalid listener metadata"
+}
+
+test_host_doctor_ollama_reports_no_configured_listeners() {
+  begin_test "host doctor reports when no managed Ollama listeners exist"
+
+  load_agentctl_functions
+  local root absent_runtime
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-doctor-empty.XXXXXX")"
+  register_dir_cleanup "$root"
+  absent_runtime="$root/missing-runtime"
+  mcp_runtime_dir() { printf '%s\n' "$absent_runtime"; }
+
+  run_capture host_doctor_ollama_status
+  assert_status 0
+  assert_contains "Managed Ollama listeners"
+  assert_contains "state                    none configured"
+}
+
 test_doctor_highlights_relay_left_by_external_container_stop() {
   begin_test "doctor highlights managed MCP relay state left by an external container stop"
 
@@ -13471,6 +13550,8 @@ main() {
   run_selected_test test_mcp_http_resolution_marks_invalid_header_values_unavailable "test_mcp_http_resolution_marks_invalid_header_values_unavailable"
   run_selected_test test_doctor_temporarily_supervises_stopped_mcp_container "test_doctor_temporarily_supervises_stopped_mcp_container"
   run_selected_test test_host_doctor_reports_mcp_inventory_and_orphans "test_host_doctor_reports_mcp_inventory_and_orphans"
+  run_selected_test test_host_doctor_reports_managed_ollama_listeners "test_host_doctor_reports_managed_ollama_listeners"
+  run_selected_test test_host_doctor_ollama_reports_no_configured_listeners "test_host_doctor_ollama_reports_no_configured_listeners"
   run_selected_test test_doctor_highlights_relay_left_by_external_container_stop "test_doctor_highlights_relay_left_by_external_container_stop"
   run_selected_test test_doctor_reports_container_startup_problem "test_doctor_reports_container_startup_problem"
   run_selected_test test_doctor_state_backup_readability_runs_real_export "test_doctor_state_backup_readability_runs_real_export"

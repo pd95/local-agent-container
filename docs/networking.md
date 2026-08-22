@@ -28,6 +28,10 @@ that did not record ownership.
 If `status` reports multiple listeners, target one endpoint with `agentctl
 ollama stop --gateway <IP>`.
 
+`agentctl doctor --host` includes a read-only **Managed Ollama listeners**
+section. Healthy listeners are informational; stale records and unhealthy
+listeners include the corresponding `ollama` command to resolve them.
+
 To create the listener without starting an agent session, use `agentctl ollama
 start` after creating the container. It briefly starts a stopped container to
 derive its default route, then restores that container's stopped state.
