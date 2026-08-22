@@ -29,6 +29,9 @@ MCP_GUEST_EXEC_PID=""
 MCP_LEASE_FILE=""
 MCP_LOCK_DIR=""
 MCP_LOCK_TOKEN=""
+OLLAMA_LISTENER_LOCK_DIR=""
+OLLAMA_LISTENER_STARTED_BASE_URL=""
+OLLAMA_LISTENER_REMINDER_REPORTED=0
 REMOTE_CONTROL_CODEX_HOME="/home/coder/.codex"
 REMOTE_CONTROL_LOCK_DEPTH=0
 REMOTE_CONTROL_LOCK_NAME=""
@@ -99,6 +102,471 @@ ollama_host_url_example() {
     printf 'http://%s:11434\n' "$host_address"
   else
     printf 'http://%s:11434\n' "$CONTAINER_HOST_NAME"
+  fi
+}
+
+ollama_listener_gateway_for_container() {
+  local name="$1"
+
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" awk '
+    function hex2dec(hex,   i, c, n, v) {
+      n = 0
+      hex = toupper(hex)
+      for (i = 1; i <= length(hex); i++) {
+        c = substr(hex, i, 1)
+        v = index("0123456789ABCDEF", c) - 1
+        if (v < 0) exit 1
+        n = (n * 16) + v
+      }
+      return n
+    }
+    $2 == "00000000" && length($3) == 8 {
+      printf "%s.%s.%s.%s\n", hex2dec(substr($3, 7, 2)), hex2dec(substr($3, 5, 2)), hex2dec(substr($3, 3, 2)), hex2dec(substr($3, 1, 2))
+      exit
+    }
+  ' /proc/net/route \
+    || die "Unable to determine the container default gateway for Ollama listener: $name"
+}
+
+ollama_listener_healthy() {
+  local base_url="$1"
+
+  command -v curl >/dev/null 2>&1 || die "Missing curl required for host Ollama checks"
+  curl -fsS --connect-timeout 1 --max-time 1 "${base_url%/}/api/version" >/dev/null 2>&1
+}
+
+ollama_listener_deadline_expired() {
+  [ "$SECONDS" -ge "$1" ]
+}
+
+ollama_listener_lock_path() {
+  local gateway="$1"
+
+  printf '%s/ollama-%s.start.lock\n' "$(mcp_runtime_dir)" "$(mcp_identity_hash "$gateway")"
+}
+
+ollama_listener_metadata_path() {
+  local gateway="$1"
+
+  printf '%s/ollama-%s.process.json\n' "$(mcp_runtime_dir)" "$(mcp_identity_hash "$gateway")"
+}
+
+validate_ollama_listener_gateway() {
+  local gateway="$1"
+
+  case "$gateway" in ''|*[!0-9.]*) die "Invalid Ollama gateway address: $gateway" ;; esac
+  printf '%s\n' "$gateway" | awk -F. '
+    NF == 4 {
+      for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i > 255) exit 1
+      exit 0
+    }
+    { exit 1 }
+  ' >/dev/null || die "Invalid Ollama gateway address: $gateway"
+}
+
+ollama_listener_process_marker() {
+  printf 'agentctl-ollama-%s-%s-%s\n' "$$" "$(date +%s)" "${RANDOM:-0}"
+}
+
+ollama_listener_metadata_validate() {
+  local path="$1"
+  local gateway=""
+
+  mcp_validate_private_file "$path" "Managed Ollama listener metadata"
+  gateway="$(jq -r '.gateway // empty' "$path" 2>/dev/null)"
+  validate_ollama_listener_gateway "$gateway"
+  [ "$path" = "$(ollama_listener_metadata_path "$gateway")" ] \
+    || die "Managed Ollama listener metadata does not match its gateway: $path"
+  jq -e --arg gateway "$gateway" '
+    .schema_version == 1 and .gateway == $gateway and
+    .base_url == ("http://" + $gateway + ":11434") and
+    (.pid | type == "number" and . > 0 and floor == .) and
+    (.process_token | type == "string" and length > 0) and
+    (.process_marker | type == "string" and test("^agentctl-ollama-[0-9]+-[0-9]+-[0-9]+$")) and
+    (.log_path | type == "string" and length > 0)
+  ' "$path" >/dev/null 2>&1 || die "Invalid managed Ollama listener metadata: $path"
+}
+
+ollama_listener_process_owned() {
+  local pid="$1"
+  local token="$2"
+  local marker="$3"
+  local command_line=""
+
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -n "$token" ] || return 1
+  [ -n "$marker" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ "$(mcp_process_token "$pid")" = "$token" ] || return 1
+  command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  case "$command_line" in *"$marker"*serve*) return 0 ;; esac
+  return 1
+}
+
+ollama_listener_write_metadata() {
+  local gateway="$1"
+  local base_url="$2"
+  local pid="$3"
+  local log="$4"
+  local marker="$5"
+  local path=""
+  local temp=""
+
+  path="$(ollama_listener_metadata_path "$gateway")"
+  [ -n "$marker" ] || return 1
+  temp="${path}.tmp.$$"
+  [ ! -e "$temp" ] && [ ! -L "$temp" ] || return 1
+  jq -n --arg gateway "$gateway" --arg base_url "$base_url" --argjson pid "$pid" \
+    --arg process_token "$(mcp_process_token "$pid")" --arg process_marker "$marker" --arg log_path "$log" \
+    '{schema_version:1,gateway:$gateway,base_url:$base_url,pid:$pid,process_token:$process_token,process_marker:$process_marker,log_path:$log_path}' >"$temp" \
+    || { rm -f "$temp"; return 1; }
+  chmod 600 "$temp" || { rm -f "$temp"; return 1; }
+  mv "$temp" "$path" || { rm -f "$temp"; return 1; }
+  ollama_listener_metadata_validate "$path"
+}
+
+ollama_listener_remove_stale_metadata() {
+  local gateway="$1"
+  local path="$(ollama_listener_metadata_path "$gateway")"
+  local pid=""
+  local token=""
+  local marker=""
+
+  [ -e "$path" ] || [ -L "$path" ] || return 0
+  ollama_listener_metadata_validate "$path"
+  pid="$(jq -r '.pid' "$path")"
+  token="$(jq -r '.process_token' "$path")"
+  marker="$(jq -r '.process_marker' "$path")"
+  if ollama_listener_process_owned "$pid" "$token" "$marker"; then
+    return 1
+  fi
+  rm -f "$path"
+}
+
+ollama_listener_lock_release() {
+  [ -n "$OLLAMA_LISTENER_LOCK_DIR" ] || return 0
+  rm -f "$OLLAMA_LISTENER_LOCK_DIR/pid"
+  rmdir "$OLLAMA_LISTENER_LOCK_DIR" 2>/dev/null || true
+  OLLAMA_LISTENER_LOCK_DIR=""
+}
+
+ollama_listener_lock_acquire() {
+  local gateway="$1"
+  local base_url="$2"
+  local wait_for_healthy="${3:-0}"
+  local lock=""
+  local owner_pid=""
+  local owner_token=""
+  local current_token=""
+  local deadline=0
+
+  mcp_prepare_private_dir "$(mcp_runtime_dir)"
+  lock="$(ollama_listener_lock_path "$gateway")"
+  deadline=$((SECONDS + 30))
+  while ! mkdir "$lock" 2>/dev/null; do
+    if [ "$wait_for_healthy" -eq 0 ] && ollama_listener_healthy "$base_url"; then
+      return 1
+    fi
+    if [ -f "$lock/pid" ] && [ ! -L "$lock/pid" ]; then
+      IFS=' ' read -r owner_pid owner_token <"$lock/pid" || true
+      case "$owner_pid" in
+        ''|*[!0-9]*) ;;
+        *)
+          current_token="$(mcp_process_token "$owner_pid")"
+          if ! kill -0 "$owner_pid" 2>/dev/null || [ -z "$current_token" ] || [ "$current_token" != "$owner_token" ]; then
+            rm -f "$lock/pid"
+            rmdir "$lock" 2>/dev/null || true
+            continue
+          fi
+          ;;
+      esac
+    fi
+    ollama_listener_deadline_expired "$deadline" \
+      && die "Timed out waiting for Ollama listener startup at $base_url"
+    sleep 0.1
+  done
+  printf '%s %s\n' "$$" "$(mcp_process_token "$$")" >"$lock/pid"
+  chmod 600 "$lock/pid"
+  OLLAMA_LISTENER_LOCK_DIR="$lock"
+}
+
+ollama_listener_wait_for_health() {
+  local base_url="$1"
+  local pid="$2"
+  local deadline=0
+
+  deadline=$((SECONDS + 30))
+  while :; do
+    if ollama_listener_healthy "$base_url"; then
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || return 1
+    ollama_listener_deadline_expired "$deadline" && return 1
+    sleep 0.25
+  done
+}
+
+ollama_ensure_listener() {
+  local name="$1"
+  local gateway=""
+  local base_url=""
+  local log=""
+  local pid=""
+  local marker=""
+  local ollama_binary=""
+
+  OLLAMA_LISTENER_STARTED_BASE_URL=""
+
+  gateway="$(ollama_listener_gateway_for_container "$name")"
+  base_url="http://${gateway}:11434"
+  if ollama_listener_healthy "$base_url"; then
+    return 0
+  fi
+  if ! ollama_listener_lock_acquire "$gateway" "$base_url"; then
+    return 0
+  fi
+  if ollama_listener_healthy "$base_url"; then
+    ollama_listener_lock_release
+    return 0
+  fi
+  if ! ollama_listener_remove_stale_metadata "$gateway"; then
+    ollama_listener_lock_release
+    die "Managed Ollama listener is not healthy at $base_url. Stop it with: ${CLI_NAME} ollama stop"
+  fi
+  ollama_binary="$(command -v ollama 2>/dev/null || true)"
+  [ -n "$ollama_binary" ] || {
+    ollama_listener_lock_release
+    die "Missing host Ollama CLI required by --start-ollama. Install Ollama, then retry or run manually:
+  OLLAMA_HOST=${base_url} ollama serve"
+  }
+  log="$(mcp_runtime_dir)/ollama-$(mcp_identity_hash "$gateway").log"
+  marker="$(ollama_listener_process_marker)"
+  mcp_prepare_log_file "$log"
+  printf 'Starting Ollama listener at %s\n' "$base_url" >&2
+  OLLAMA_HOST="$base_url" nohup bash -c 'exec -a "$1" "$2" serve' bash "$marker" "$ollama_binary" </dev/null >>"$log" 2>&1 &
+  pid=$!
+  if ollama_listener_wait_for_health "$base_url" "$pid"; then
+    if ! ollama_listener_write_metadata "$gateway" "$base_url" "$pid" "$log" "$marker"; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      ollama_listener_lock_release
+      die "Could not record ownership of Ollama listener at $base_url"
+    fi
+    OLLAMA_LISTENER_STARTED_BASE_URL="$base_url"
+    ollama_listener_lock_release
+    return 0
+  fi
+  ollama_listener_lock_release
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    die "Ollama listener did not become ready at $base_url within 30 seconds (log: $log). Try manually:
+  OLLAMA_HOST=${base_url} ollama serve"
+  fi
+  die "Ollama listener exited before becoming ready at $base_url (log: $log). Try manually:
+  OLLAMA_HOST=${base_url} ollama serve"
+}
+
+ollama_listener_status_cmd() {
+  local requested_gateway="${1:-}"
+  local runtime_dir=""
+  local path=""
+  local gateway=""
+  local base_url=""
+  local pid=""
+  local token=""
+  local marker=""
+  local found=0
+
+  require_jq
+  [ -z "$requested_gateway" ] || validate_ollama_listener_gateway "$requested_gateway"
+  runtime_dir="$(mcp_runtime_dir)"
+  if [ ! -e "$runtime_dir" ] && [ ! -L "$runtime_dir" ]; then
+    printf '%s\n' 'No agentctl-managed Ollama listeners.'
+    return 0
+  fi
+  mcp_prepare_private_dir "$runtime_dir"
+  for path in "$runtime_dir"/ollama-*.process.json; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    ollama_listener_metadata_validate "$path"
+    gateway="$(jq -r '.gateway' "$path")"
+    [ -z "$requested_gateway" ] || [ "$gateway" = "$requested_gateway" ] || continue
+    base_url="$(jq -r '.base_url' "$path")"
+    pid="$(jq -r '.pid' "$path")"
+    token="$(jq -r '.process_token' "$path")"
+    marker="$(jq -r '.process_marker' "$path")"
+    if ! ollama_listener_process_owned "$pid" "$token" "$marker"; then
+      rm -f "$path"
+      printf 'Removed stale agentctl Ollama listener record: %s\n' "$base_url"
+      continue
+    fi
+    found=1
+    if ollama_listener_healthy "$base_url"; then
+      printf 'Ollama listener: %s (PID %s, running)\n' "$base_url" "$pid"
+    else
+      printf 'Ollama listener: %s (PID %s, unhealthy)\n' "$base_url" "$pid"
+    fi
+  done
+  [ "$found" -eq 1 ] || printf '%s\n' 'No agentctl-managed Ollama listeners.'
+}
+
+ollama_listener_stop_one() {
+  local path="$1"
+  local gateway=""
+  local base_url=""
+  local pid=""
+  local token=""
+  local marker=""
+  local tries=0
+
+  ollama_listener_metadata_validate "$path"
+  gateway="$(jq -r '.gateway' "$path")"
+  base_url="$(jq -r '.base_url' "$path")"
+  ollama_listener_lock_acquire "$gateway" "$base_url" 1
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    ollama_listener_lock_release
+    return 0
+  fi
+  ollama_listener_metadata_validate "$path"
+  pid="$(jq -r '.pid' "$path")"
+  token="$(jq -r '.process_token' "$path")"
+  marker="$(jq -r '.process_marker' "$path")"
+  if ! ollama_listener_process_owned "$pid" "$token" "$marker"; then
+    rm -f "$path"
+    ollama_listener_lock_release
+    printf 'Removed stale agentctl Ollama listener record: %s\n' "$base_url"
+    return 0
+  fi
+  kill "$pid" 2>/dev/null || true
+  while ollama_listener_process_owned "$pid" "$token" "$marker" && [ "$tries" -lt 50 ]; do
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  if ollama_listener_process_owned "$pid" "$token" "$marker"; then
+    kill -KILL "$pid" 2>/dev/null || true
+    tries=0
+    while ollama_listener_process_owned "$pid" "$token" "$marker" && [ "$tries" -lt 20 ]; do
+      sleep 0.1
+      tries=$((tries + 1))
+    done
+  fi
+  if ollama_listener_process_owned "$pid" "$token" "$marker"; then
+    ollama_listener_lock_release
+    die "Managed Ollama listener did not stop at $base_url; preserving ownership record"
+  fi
+  rm -f "$path"
+  ollama_listener_lock_release
+  printf 'Stopped agentctl Ollama listener: %s\n' "$base_url"
+}
+
+usage_ollama() {
+  cat <<EOF
+Usage: $CLI_NAME ollama <start|status|stop> [options]
+
+Commands:
+  start   Start a listener for an existing container's default-route gateway
+  status  List Ollama listeners started and tracked by agentctl
+  stop    Stop every Ollama listener started and tracked by agentctl
+
+Options for start:
+  --name NAME  Existing container (default: agent-<dir>)
+
+Options for status and stop:
+  --gateway IP  Limit the command to one container gateway
+
+Listeners started outside agentctl, including listeners created before this
+command was available, are never stopped by this command.
+EOF
+}
+
+ollama_start_cmd() {
+  local name="$1"
+  local was_running=0
+  local started=0
+
+  ollama_start_cleanup() {
+    if [ "$started" -eq 1 ] && [ "$was_running" -eq 0 ] && container_running "$name"; then
+      stop_existing_container_safely "$name" >/dev/null 2>&1 || true
+    fi
+  }
+  trap 'ollama_start_cleanup' EXIT INT TERM HUP
+  container_exists "$name" || die "Container not found: $name"
+  if container_running "$name"; then
+    was_running=1
+  else
+    start_existing_container_safely "$name" >/dev/null
+    started=1
+  fi
+  ollama_ensure_listener "$name"
+  if [ -n "$OLLAMA_LISTENER_STARTED_BASE_URL" ]; then
+    printf 'Started agentctl Ollama listener: %s\n' "$OLLAMA_LISTENER_STARTED_BASE_URL"
+  else
+    printf '%s\n' 'An Ollama listener is already available for this container gateway.'
+  fi
+  ollama_start_cleanup
+  trap - EXIT INT TERM HUP
+}
+
+ollama_cmd() {
+  local action="${1:-status}"
+  local name=""
+  local gateway=""
+  local gateway_set=0
+  local runtime_dir=""
+  local path=""
+  local found=0
+
+  [ "$#" -eq 0 ] || shift
+  case "$action" in --help|-h|help) usage_ollama; return 0 ;; esac
+  case "$action" in start|status|stop) ;; *) die "Unknown ollama command: $action" ;; esac
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
+      --gateway)
+        [ "$#" -ge 2 ] || die "Missing value for --gateway"
+        [ "$gateway_set" -eq 0 ] || die "--gateway may only be specified once"
+        gateway="$2"; gateway_set=1; shift 2
+        ;;
+      --help|-h) usage_ollama; return 0 ;;
+      *) die "Unknown option for ollama: $1" ;;
+    esac
+  done
+  if [ "$action" = start ]; then
+    [ -z "$gateway" ] || die "--gateway is only supported by ollama status and stop"
+    require_container
+    name="${name:-$(default_name "$DEFAULT_NAME_PREFIX")}"
+    ollama_start_cmd "$name"
+    return 0
+  fi
+  [ -z "$name" ] || die "--name is only supported by ollama start"
+  [ -z "$gateway" ] || validate_ollama_listener_gateway "$gateway"
+  if [ "$action" = status ]; then
+    ollama_listener_status_cmd "$gateway"
+    return 0
+  fi
+  require_jq
+  runtime_dir="$(mcp_runtime_dir)"
+  if [ ! -e "$runtime_dir" ] && [ ! -L "$runtime_dir" ]; then
+    printf '%s\n' 'No agentctl-managed Ollama listeners.'
+    return 0
+  fi
+  mcp_prepare_private_dir "$runtime_dir"
+  for path in "$runtime_dir"/ollama-*.process.json; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    ollama_listener_metadata_validate "$path"
+    if [ -n "$gateway" ] && [ "$(jq -r '.gateway' "$path")" != "$gateway" ]; then
+      continue
+    fi
+    found=1
+    ollama_listener_stop_one "$path"
+  done
+  [ "$found" -eq 1 ] || printf '%s\n' 'No agentctl-managed Ollama listeners.'
+}
+
+ollama_listener_report_dangling() {
+  if [ "$RUN_START_OLLAMA" -eq 1 ] && [ "$OLLAMA_LISTENER_REMINDER_REPORTED" -eq 0 ] && [ -n "$OLLAMA_LISTENER_STARTED_BASE_URL" ]; then
+    warn "Ollama listener remains running at $OLLAMA_LISTENER_STARTED_BASE_URL after this session. Stop it with: ${CLI_NAME} ollama stop"
+    OLLAMA_LISTENER_REMINDER_REPORTED=1
   fi
 }
 
@@ -1688,6 +2156,7 @@ Commands:
   refresh    Refresh agentctl-managed files in an existing container
   doctor     Check an existing container for common agentctl state problems
   host-address  Print the current host gateway for an Apple container network
+  ollama     Manage Ollama listeners started by agentctl
   network    Manage Apple container networks used by agentctl
   mcp        Manage host MCP credentials
   remote-control  Manage experimental Codex Remote Control
@@ -1772,6 +2241,7 @@ Options:
   --install-runtime  Install the selected runtime before launch
   -c, --config KEY=VALUE  Pass runtime-specific launch config (repeatable)
   --model NAME    Override the launch model for the selected runtime
+  --start-ollama  Start a host Ollama listener for this local runtime launch when needed
   --online        Use the runtime's online/provider-backed mode
   --auth          Force an online login flow before launch
   --reset-config  Replace the selected/preferred runtime's managed default configuration
@@ -5311,6 +5781,7 @@ host_doctor() {
   fi
 
   host_doctor_mcp_status || status=1
+  host_doctor_ollama_status || status=1
 
   return "$status"
 }
@@ -6046,6 +6517,60 @@ host_doctor_mcp_status() {
     [ -e "$file" ] || [ -L "$file" ] || continue
     if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
       printf '  %-24s %s\n' logs "permissions too broad or ownership unsafe (expected owner-only 0600): $file"
+      status=1
+    fi
+  done
+  [ "$found" -eq 1 ] || printf '  %-24s %s\n' state 'none configured'
+  return "$status"
+}
+
+host_doctor_ollama_status() {
+  local runtime_dir=""
+  local path=""
+  local validation=""
+  local gateway=""
+  local base_url=""
+  local pid=""
+  local token=""
+  local marker=""
+  local found=0
+  local status=0
+  local curl_available=0
+
+  runtime_dir="$(mcp_runtime_dir)"
+  command -v curl >/dev/null 2>&1 && curl_available=1
+  printf 'Managed Ollama listeners\n'
+  if [ ! -e "$runtime_dir" ] && [ ! -L "$runtime_dir" ]; then
+    printf '  %-24s %s\n' state 'none configured'
+    return 0
+  fi
+  if [ ! -d "$runtime_dir" ] || [ -L "$runtime_dir" ] || [ "$(host_path_uid "$runtime_dir")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$runtime_dir") & 077))" -ne 0 ]; then
+    printf '  %-24s %s\n' state 'unsafe managed runtime directory'
+    return 1
+  fi
+  for path in "$runtime_dir"/ollama-*.process.json; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    found=1
+    if ! validation="$( ( ollama_listener_metadata_validate "$path" ) 2>&1)"; then
+      printf '  %-24s %s\n' state "invalid metadata: ${validation#Error: }"
+      status=1
+      continue
+    fi
+    gateway="$(jq -r '.gateway' "$path")"
+    base_url="$(jq -r '.base_url' "$path")"
+    pid="$(jq -r '.pid' "$path")"
+    token="$(jq -r '.process_token' "$path")"
+    marker="$(jq -r '.process_marker' "$path")"
+    if ! ollama_listener_process_owned "$pid" "$token" "$marker"; then
+      printf '  %-24s %s\n' "$gateway" "stale ownership record; run: ${CLI_NAME} ollama status"
+      status=1
+    elif [ "$curl_available" -eq 0 ]; then
+      printf '  %-24s %s\n' "$gateway" 'health check unavailable: curl is missing'
+      status=1
+    elif ollama_listener_healthy "$base_url"; then
+      printf '  %-24s %s\n' "$gateway" "healthy; PID $pid"
+    else
+      printf '  %-24s %s\n' "$gateway" "unhealthy; run: ${CLI_NAME} ollama stop --gateway $gateway"
       status=1
     fi
   done
@@ -7941,6 +8466,7 @@ run_container() {
   local run_complete=0
 
   run_container_cleanup() {
+    ollama_listener_report_dangling
     if [ "$run_complete" -eq 0 ] && [ "$started" -eq 1 ] && [ "$already_running" -eq 0 ]; then
       if [ -n "$actual_name" ] && container_running "$actual_name"; then
         ( remote_control_quiesce_preserving_desired "$actual_name" ) >/dev/null 2>&1 || true
@@ -8091,6 +8617,7 @@ run_container() {
     fi
   fi
   run_exec
+  ollama_listener_report_dangling
   if [ -n "$post_exec" ]; then
     if [ "$stdio" -eq 1 ]; then
       if ! "$post_exec" "$actual_name" </dev/null; then
@@ -8188,7 +8715,7 @@ run_mode() {
       cmd=("$DEFAULT_LOGIN_SHELL" "-lc" "$launch_env exec bash /usr/local/bin/agent.sh run" sh "$runtime_mode" "$runtime_config_json" "$model_override" "$ollama_host")
     fi
   fi
-  if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_ENSURE_SSH_FEATURE" -eq 1 ] || [ "$MCP_REQUESTED" -eq 1 ]; then
+  if [ "$RUN_UPDATE_CODEX" -eq 1 ] || [ -n "$RUN_SELECTED_RUNTIME" ] || [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_ENSURE_SSH_FEATURE" -eq 1 ] || [ "$MCP_REQUESTED" -eq 1 ] || [ "$RUN_START_OLLAMA" -eq 1 ]; then
     pre_exec="run_pre_exec"
   fi
 
@@ -8212,6 +8739,7 @@ RUN_REQUESTED_IMAGE=""
 RUN_RUNTIME_CONFIG_JSON='{}'
 RUN_ENSURE_SSH_FEATURE=0
 RUN_MCP_CONFIG_JSON='[]'
+RUN_START_OLLAMA=0
 
 run_post_exec() {
   local name="$1"
@@ -8238,6 +8766,10 @@ run_pre_exec() {
   local keychain_info=""
   local keychain_token=""
   local keychain_refresh=""
+
+  if [ "$RUN_START_OLLAMA" -eq 1 ]; then
+    ollama_ensure_listener "$name"
+  fi
 
   if [ "$RUN_ENSURE_SSH_FEATURE" -eq 1 ]; then
     ensure_requested_feature_installed "$name" ssh
@@ -8322,6 +8854,7 @@ run_cmd() {
   local online=0
   local auth=0
   local update=0
+  local start_ollama=0
   local temp=0
   local shell=0
   local reset_config=0
@@ -8355,6 +8888,7 @@ run_cmd() {
       --runtime) runtime="$2"; shift 2 ;;
       --install-runtime) install_runtime=1; shift ;;
       --model) model_override="$2"; shift 2 ;;
+      --start-ollama) start_ollama=1; shift ;;
       --online) online=1; shift ;;
       --auth) auth=1; shift ;;
       --reset-config) reset_config=1; shift ;;
@@ -8426,6 +8960,18 @@ run_cmd() {
   if [ "$auth" -eq 1 ] && [ "$online" -eq 0 ]; then
     die "--auth requires --online"
   fi
+  if [ "$start_ollama" -eq 1 ] && [ "$online" -eq 1 ]; then
+    die "--start-ollama cannot be combined with --online"
+  fi
+  if [ "$start_ollama" -eq 1 ] && [ "$shell_set" -eq 1 ]; then
+    die "--start-ollama cannot be combined with --shell"
+  fi
+  if [ "$start_ollama" -eq 1 ] && [ "$cmd_override_set" -eq 1 ]; then
+    die "--start-ollama cannot be combined with --cmd"
+  fi
+  if [ "$start_ollama" -eq 1 ] && [ -n "${OLLAMA_HOST:-}" ]; then
+    die "--start-ollama cannot be combined with OLLAMA_HOST; unset OLLAMA_HOST to use the container gateway listener"
+  fi
   if [ "$install_runtime" -eq 1 ] && [ -z "$runtime" ]; then
     die "--install-runtime requires --runtime"
   fi
@@ -8491,6 +9037,9 @@ run_cmd() {
   else
     runtime_config_json='{}'
   fi
+  if [ "$start_ollama" -eq 1 ] && [ "$(printf '%s\n' "$runtime_config_json" | jq -r '.ollama_host // empty')" != "" ]; then
+    die "--start-ollama cannot be combined with -c ollama_host=..."
+  fi
 
   RUN_SELECTED_RUNTIME="$runtime"
   RUN_INSTALL_RUNTIME="$install_runtime"
@@ -8504,6 +9053,8 @@ run_cmd() {
   RUN_RUNTIME_CONFIG_JSON="$runtime_config_json"
   RUN_ENSURE_SSH_FEATURE="$ssh_requested"
   RUN_MCP_CONFIG_JSON="$MCP_CONFIG_JSON"
+  RUN_START_OLLAMA="$start_ollama"
+  OLLAMA_LISTENER_REMINDER_REPORTED=0
   if [ "$online" -eq 1 ]; then
     RUN_EFFECTIVE_MODE="online"
     RUN_SYNC_RUNTIME_AUTH=1
@@ -10261,6 +10812,7 @@ case "$cmd" in
   doctor) shift; doctor_cmd "$@" ;;
   host-address) shift; host_address_cmd "$@" ;;
   network) shift; network_cmd "$@" ;;
+  ollama) shift; ollama_cmd "$@" ;;
   mcp) shift; mcp_cmd "$@" ;;
   remote-control) shift; remote_control_cmd "$@" ;;
   system-manifest) shift; system_manifest_cmd "$@" ;;

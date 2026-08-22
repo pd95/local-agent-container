@@ -9,6 +9,22 @@
 
 Local mode is runtime-specific.
 
+For the usual Ollama installation, start the first local session with:
+
+```bash
+agentctl run --start-ollama
+```
+
+This starts an Ollama listener on the container's default-route gateway without
+changing the normal localhost listener. Add the flag again if that listener is
+not already running. For custom endpoints, remote servers, and proxy setups,
+see [networking.md](networking.md).
+
+An automatically started listener remains running after the agent session. Use
+`agentctl ollama status` to check it or `agentctl ollama stop` to stop all
+listeners that agentctl started. Use `agentctl ollama start` to start one for
+an existing container without launching an agent session.
+
 ### Codex local mode
 
 Codex local runs use profiles from `config.toml`.

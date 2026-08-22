@@ -55,8 +55,16 @@ ollama pull qwen3.5:9b-nvfp4
 container system start
 ```
 
-If local runtime launches cannot reach Ollama, follow
-[networking.md](networking.md).
+For the standard local endpoint, `agentctl run --start-ollama` starts a
+container-gateway listener automatically while leaving Ollama's normal
+localhost listener unchanged. Use it for the first local run, or again after
+restarting Ollama or the Mac. See [networking.md](networking.md) for custom
+endpoints, remote Ollama servers, and proxy setups.
+
+The listener stays running after the agent session. Use `agentctl ollama
+status` to inspect it and `agentctl ollama stop` when it is no longer needed.
+For an existing container, `agentctl ollama start` starts its default-route
+gateway listener without launching a runtime.
 
 ## Workspace model
 
@@ -99,13 +107,13 @@ Start the default container for the current directory. That directory is mounted
 into the container as `/workdir`:
 
 ```bash
-agentctl run
+agentctl run --start-ollama
 ```
 
 Common alternatives:
 
 ```bash
-# Run Codex with a specific local profile
+# Run Codex with a specific local profile (add --start-ollama if needed)
 agentctl run -c profile=gemma
 
 # Test a specific model directly
