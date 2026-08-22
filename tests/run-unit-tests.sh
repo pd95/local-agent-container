@@ -211,9 +211,457 @@ test_run_help_reports_runtime_options() {
   assert_contains "--home PATH     Host directory to mount at /home/coder"
   assert_contains "--install-runtime  Install the selected runtime before launch"
   assert_contains "--model NAME    Override the launch model for the selected runtime"
+  assert_contains "--start-ollama  Start a host Ollama listener"
   assert_contains "--online        Use the runtime's online/provider-backed mode"
   assert_contains "--stdio         With --cmd, keep stdin open without a TTY"
   assert_contains "--shm-size SIZE Size of /dev/shm"
+}
+
+test_ollama_help_reports_lifecycle_commands() {
+  begin_test "ollama help reports managed listener lifecycle commands"
+
+  run_capture "$AGENTCTL" ollama --help
+  assert_status 0
+  assert_contains "Usage: agentctl ollama <start|status|stop>"
+  assert_contains "start   Start a listener for an existing container's default-route gateway"
+  assert_contains "stop    Stop every Ollama listener started and tracked by agentctl"
+  assert_contains "--gateway IP  Limit the command to one container gateway"
+}
+
+test_run_start_ollama_wires_host_pre_exec() {
+  begin_test "run_cmd wires --start-ollama into host pre-exec"
+
+  load_agentctl_functions
+
+  local captured_pre_exec=""
+  local workdir
+
+  workdir="$(new_workdir)"
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  run_container() { captured_pre_exec="${10}"; }
+
+  run_cmd --name unit-test-container --workdir "$workdir" --start-ollama
+
+  [ "$captured_pre_exec" = run_pre_exec ] || fail "Expected --start-ollama to request host pre-exec, got: $captured_pre_exec"
+  [ "$RUN_START_OLLAMA" -eq 1 ] || fail "Expected --start-ollama run state to be enabled"
+}
+
+test_run_start_ollama_rejects_incompatible_options() {
+  begin_test "run_cmd rejects incompatible --start-ollama options"
+
+  load_agentctl_functions
+
+  local workdir
+  workdir="$(new_workdir)"
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  start_ollama_wrapper() { ( run_cmd --name unit-test-container --workdir "$workdir" "$@" ); }
+
+  run_capture start_ollama_wrapper --start-ollama --online
+  assert_status 1
+  assert_contains "--start-ollama cannot be combined with --online"
+
+  run_capture start_ollama_wrapper --start-ollama --shell
+  assert_status 1
+  assert_contains "--start-ollama cannot be combined with --shell"
+
+  run_capture start_ollama_wrapper --start-ollama --cmd true
+  assert_status 1
+  assert_contains "--start-ollama cannot be combined with --cmd"
+
+  OLLAMA_HOST=http://127.0.0.1:11434 run_capture start_ollama_wrapper --start-ollama
+  assert_status 1
+  assert_contains "--start-ollama cannot be combined with OLLAMA_HOST"
+
+  run_capture start_ollama_wrapper --start-ollama -c ollama_host=http://127.0.0.1:11434
+  assert_status 1
+  assert_contains "--start-ollama cannot be combined with -c ollama_host"
+}
+
+test_ollama_listener_starts_gateway_bound_server() {
+  begin_test "Ollama listener starts a gateway-bound detached server when unavailable"
+
+  load_agentctl_functions
+
+  local temp_dir fake_bin capture_file health=0
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-listener.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  fake_bin="$temp_dir/bin"
+  capture_file="$temp_dir/ollama-host"
+  mkdir -p "$fake_bin"
+  apply_fake_ollama_listener() {
+    cat >"$fake_bin/ollama" <<EOF
+#!/bin/sh
+printf '%s\n' "\$OLLAMA_HOST" >"$capture_file"
+EOF
+    chmod +x "$fake_bin/ollama"
+  }
+  apply_fake_ollama_listener
+
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = exec ] || fail "Expected container exec, got: $*"
+    printf '192.168.64.1\n'
+  }
+  mcp_runtime_dir() { printf '%s\n' "$temp_dir/runtime"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  mcp_prepare_log_file() { : >"$1"; chmod 600 "$1"; }
+  mcp_identity_hash() { printf 'listener\n'; }
+  ollama_listener_healthy() { [ "$health" -eq 1 ]; }
+  ollama_listener_write_metadata() { :; }
+  ollama_listener_wait_for_health() {
+    local tries=0
+    while [ "$tries" -lt 20 ] && [ ! -f "$capture_file" ]; do sleep 0.05; tries=$((tries + 1)); done
+    [ -f "$capture_file" ] || return 1
+    health=1
+  }
+
+  PATH="$fake_bin:$PATH" ollama_ensure_listener unit-test-container
+
+  [ "$(cat "$capture_file")" = "http://192.168.64.1:11434" ] \
+    || fail "Expected gateway-bound OLLAMA_HOST, got: $(cat "$capture_file" 2>/dev/null || true)"
+  [ -z "$OLLAMA_LISTENER_LOCK_DIR" ] || fail "Expected listener startup lock to be released"
+  unset -f container
+}
+
+test_ollama_listener_uses_container_default_route_gateway() {
+  begin_test "Ollama listener derives the container default-route gateway"
+
+  load_agentctl_functions
+
+  local temp_dir container_args
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-route.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  container_args="$temp_dir/container-args"
+  CONTAINER_CMD=container
+  container() {
+    printf '%s\n' "$*" >"$container_args"
+    [ "$1" = exec ] || fail "Expected container exec, got: $*"
+    printf '10.42.0.1\n'
+  }
+  container_network_names() { fail "Ollama listener must not use the first attached network"; }
+
+  [ "$(ollama_listener_gateway_for_container unit-test-container)" = "10.42.0.1" ] \
+    || fail "Expected container default gateway for Ollama listener"
+  grep -Fq 'awk' "$container_args" \
+    || fail "Expected default gateway lookup to run awk inside the container"
+  grep -Fq '/proc/net/route' "$container_args" \
+    || fail "Expected default gateway lookup to inspect /proc/net/route"
+  unset -f container container_network_names
+}
+
+test_ollama_listener_skips_healthy_gateway() {
+  begin_test "Ollama listener skips startup when the gateway is already healthy"
+
+  load_agentctl_functions
+
+  local started=0
+  ollama_listener_gateway_for_container() { printf '192.168.64.1\n'; }
+  ollama_listener_healthy() { return 0; }
+  ollama_listener_lock_acquire() { started=1; return 0; }
+
+  ollama_ensure_listener unit-test-container
+
+  [ "$started" -eq 0 ] || fail "Did not expect a listener lock or launch for a healthy gateway"
+}
+
+test_ollama_listener_reports_missing_host_cli() {
+  begin_test "Ollama listener reports a missing host CLI before launch"
+
+  load_agentctl_functions
+
+  local temp_dir
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-missing.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = exec ] || fail "Expected container exec, got: $*"
+    printf '192.168.64.1\n'
+  }
+  mcp_runtime_dir() { printf '%s\n' "$temp_dir/runtime"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  mcp_identity_hash() { printf 'missing\n'; }
+  ollama_listener_healthy() { return 1; }
+  command() {
+    if [ "${1:-}" = -v ] && [ "${2:-}" = ollama ]; then return 1; fi
+    builtin command "$@"
+  }
+  missing_ollama_wrapper() { ( ollama_ensure_listener unit-test-container ); }
+
+  run_capture missing_ollama_wrapper
+  assert_status 1
+  assert_contains "Missing host Ollama CLI required by --start-ollama"
+  [ -z "$OLLAMA_LISTENER_LOCK_DIR" ] || fail "Expected missing CLI path to release the startup lock"
+  unset -f command container
+}
+
+test_ollama_listener_timeout_kills_unhealthy_process() {
+  begin_test "Ollama listener cleans up an unhealthy process after the readiness deadline"
+
+  load_agentctl_functions
+
+  local temp_dir fake_bin pid_file deadline_calls=0
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-timeout.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  fake_bin="$temp_dir/bin"
+  pid_file="$temp_dir/ollama.pid"
+  mkdir -p "$fake_bin"
+  cat >"$fake_bin/ollama" <<EOF
+#!/bin/sh
+printf '%s\n' "\$\$" >"$pid_file"
+while :; do sleep 1; done
+EOF
+  chmod +x "$fake_bin/ollama"
+
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = exec ] || fail "Expected container exec, got: $*"
+    printf 'Iface\tDestination\tGateway\neth0\t00000000\t0140A8C0\n'
+  }
+  mcp_runtime_dir() { printf '%s\n' "$temp_dir/runtime"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  mcp_prepare_log_file() { : >"$1"; chmod 600 "$1"; }
+  mcp_identity_hash() { printf 'timeout\n'; }
+  ollama_listener_healthy() { return 1; }
+  ollama_listener_deadline_expired() {
+    deadline_calls=$((deadline_calls + 1))
+    [ "$deadline_calls" -ge 2 ]
+  }
+  timeout_wrapper() { ( PATH="$fake_bin:$PATH" ollama_ensure_listener unit-test-container ); }
+
+  run_capture timeout_wrapper
+  assert_status 1
+  assert_contains "did not become ready"
+  [ -f "$pid_file" ] || fail "Expected fake Ollama process to record its PID"
+  ! kill -0 "$(cat "$pid_file")" 2>/dev/null || fail "Expected unhealthy Ollama process to be stopped"
+  unset -f container
+}
+
+test_ollama_listener_lock_recovers_stale_owner_and_observes_competing_health() {
+  begin_test "Ollama listener lock recovers stale owners and yields to a healthy competitor"
+
+  load_agentctl_functions
+
+  local temp_dir lock health_calls=0
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-lock.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  mcp_runtime_dir() { printf '%s\n' "$temp_dir/runtime"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  mcp_identity_hash() { printf 'lock\n'; }
+  ollama_listener_healthy() { return 1; }
+  lock="$(ollama_listener_lock_path 192.168.64.1)"
+  mkdir -p "$lock"
+  printf '999999\n' >"$lock/pid"
+
+  ollama_listener_lock_acquire 192.168.64.1 http://192.168.64.1:11434
+  [ "$OLLAMA_LISTENER_LOCK_DIR" = "$lock" ] || fail "Expected stale Ollama startup lock to be recovered"
+  ollama_listener_lock_release
+
+  mkdir -p "$lock"
+  printf '%s\n' "$$" >"$lock/pid"
+  ollama_listener_healthy() {
+    health_calls=$((health_calls + 1))
+    [ "$health_calls" -ge 1 ]
+  }
+  if ollama_listener_lock_acquire 192.168.64.1 http://192.168.64.1:11434; then
+    fail "Expected a healthy competing listener to win the startup race"
+  fi
+  [ -z "$OLLAMA_LISTENER_LOCK_DIR" ] || fail "Did not expect lock ownership after a healthy competitor"
+  rm -f "$lock/pid"
+  rmdir "$lock"
+}
+
+test_ollama_listener_status_and_stop_manage_owned_listener() {
+  begin_test "ollama status and stop manage an owned gateway listener"
+
+  load_agentctl_functions
+
+  local temp_dir ollama_test_runtime_dir listener_pid metadata log
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-control.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  ollama_test_runtime_dir="$temp_dir/runtime"
+  log="$temp_dir/ollama.log"
+  mcp_runtime_dir() { printf '%s\n' "$ollama_test_runtime_dir"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  mcp_process_token() { printf 'token-%s\n' "$1"; }
+  ollama_listener_healthy() { return 0; }
+  mcp_prepare_private_dir "$ollama_test_runtime_dir"
+  sleep 60 &
+  listener_pid=$!
+  register_pid_cleanup "$listener_pid"
+  ollama_listener_write_metadata 192.168.64.1 http://192.168.64.1:11434 "$listener_pid" "$log" agentctl-ollama-1-1-1
+  metadata="$(ollama_listener_metadata_path 192.168.64.1)"
+  [ -f "$metadata" ] || fail "Expected owned listener metadata"
+  ollama_listener_process_owned() { kill -0 "$1" 2>/dev/null; }
+
+  run_capture ollama_listener_status_cmd
+  assert_status 0
+  assert_contains "Ollama listener: http://192.168.64.1:11434 (PID $listener_pid, running)"
+
+  run_capture ollama_cmd stop
+  assert_status 0
+  assert_contains "Stopped agentctl Ollama listener: http://192.168.64.1:11434"
+  ! kill -0 "$listener_pid" 2>/dev/null || fail "Expected owned Ollama listener to stop"
+  [ ! -e "$metadata" ] || fail "Expected ownership metadata to be removed"
+  wait "$listener_pid" 2>/dev/null || true
+}
+
+test_ollama_listener_control_cleans_stale_and_preserves_unowned_processes() {
+  begin_test "ollama lifecycle control removes stale records without signaling unowned processes"
+
+  load_agentctl_functions
+
+  local temp_dir ollama_test_runtime_dir listener_pid metadata log
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-stale.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  ollama_test_runtime_dir="$temp_dir/runtime"
+  log="$temp_dir/ollama.log"
+  mcp_runtime_dir() { printf '%s\n' "$ollama_test_runtime_dir"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  mcp_process_token() { printf 'token-%s\n' "$1"; }
+  ollama_listener_healthy() { return 0; }
+  mcp_prepare_private_dir "$ollama_test_runtime_dir"
+  sleep 60 &
+  listener_pid=$!
+  register_pid_cleanup "$listener_pid"
+  ollama_listener_write_metadata 192.168.64.1 http://192.168.64.1:11434 "$listener_pid" "$log" agentctl-ollama-1-1-1
+  metadata="$(ollama_listener_metadata_path 192.168.64.1)"
+  ollama_listener_process_owned() { return 1; }
+
+  run_capture ollama_cmd stop
+  assert_status 0
+  assert_contains "Removed stale agentctl Ollama listener record"
+  kill -0 "$listener_pid" 2>/dev/null || fail "Did not expect an unverified process to be signaled"
+  [ ! -e "$metadata" ] || fail "Expected stale ownership metadata to be removed"
+  kill "$listener_pid" 2>/dev/null || true
+  wait "$listener_pid" 2>/dev/null || true
+}
+
+test_ollama_listener_reports_dangling_session() {
+  begin_test "ollama listener reports when a run leaves its started listener behind"
+
+  load_agentctl_functions
+
+  RUN_START_OLLAMA=1
+  OLLAMA_LISTENER_STARTED_BASE_URL=http://192.168.64.1:11434
+  run_capture ollama_listener_report_dangling
+  assert_status 0
+  assert_contains "Ollama listener remains running at http://192.168.64.1:11434 after this session"
+  assert_contains "$CLI_NAME ollama stop"
+}
+
+test_ollama_start_restores_a_stopped_container() {
+  begin_test "ollama start restores a container that it started for route discovery"
+
+  load_agentctl_functions
+
+  local running=0 starts=0 stops=0
+  container_exists() { return 0; }
+  container_running() { [ "$running" -eq 1 ]; }
+  start_existing_container_safely() { running=1; starts=$((starts + 1)); }
+  stop_existing_container_safely() { running=0; stops=$((stops + 1)); }
+  ollama_ensure_listener() { OLLAMA_LISTENER_STARTED_BASE_URL=http://192.168.64.1:11434; }
+
+  run_capture ollama_start_cmd unit-test-container
+  assert_status 0
+  assert_contains "Started agentctl Ollama listener: http://192.168.64.1:11434"
+  [ "$starts" -eq 1 ] || fail "Expected ollama start to start the stopped container"
+  [ "$stops" -eq 1 ] || fail "Expected ollama start to restore the stopped container"
+  [ "$running" -eq 0 ] || fail "Expected container to be stopped after route discovery"
+}
+
+test_ollama_cmd_dispatches_start_and_limits_name_option() {
+  begin_test "ollama command dispatches start with a selected container"
+
+  load_agentctl_functions
+
+  local selected_name=""
+  require_container() { return 0; }
+  ollama_start_cmd() { selected_name="$1"; }
+
+  ollama_cmd start --name named-container
+  [ "$selected_name" = named-container ] || fail "Expected ollama start to receive --name"
+
+  status_name_wrapper() { ( ollama_cmd status --name named-container ); }
+  run_capture status_name_wrapper
+  assert_status 1
+  assert_contains "--name is only supported by ollama start"
+
+  local selected_gateway=""
+  ollama_listener_status_cmd() { selected_gateway="$1"; }
+  ollama_cmd status --gateway 192.168.64.1
+  [ "$selected_gateway" = 192.168.64.1 ] || fail "Expected ollama status to receive --gateway"
+
+  invalid_gateway_wrapper() { ( ollama_cmd status --gateway $'192.168.64.1\n10.0.0.1' ); }
+  run_capture invalid_gateway_wrapper
+  assert_status 1
+  assert_contains "Invalid Ollama gateway address"
+
+  duplicate_gateway_wrapper() { ( ollama_cmd status --gateway 192.168.64.1 --gateway 10.0.0.1 ); }
+  run_capture duplicate_gateway_wrapper
+  assert_status 1
+  assert_contains "--gateway may only be specified once"
+}
+
+test_ollama_stop_gateway_filter_leaves_other_listener_untouched() {
+  begin_test "ollama stop gateway filter leaves other listener records untouched"
+
+  load_agentctl_functions
+
+  local temp_dir stopped_path=""
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-filter.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  mcp_runtime_dir() { printf '%s\n' "$temp_dir/runtime"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  ollama_listener_metadata_validate() { :; }
+  ollama_listener_stop_one() { stopped_path="$1"; }
+  mkdir -p "$temp_dir/runtime"
+  printf '%s\n' '{"gateway":"192.168.64.1"}' >"$temp_dir/runtime/ollama-first.process.json"
+  printf '%s\n' '{"gateway":"10.42.0.1"}' >"$temp_dir/runtime/ollama-second.process.json"
+
+  ollama_cmd stop --gateway 10.42.0.1
+  [ "$stopped_path" = "$temp_dir/runtime/ollama-second.process.json" ] \
+    || fail "Expected only the requested gateway listener to be stopped"
+}
+
+test_ollama_listener_lock_recovers_pid_token_mismatch() {
+  begin_test "ollama lifecycle lock recovers a reused PID with a mismatched token"
+
+  load_agentctl_functions
+
+  local temp_dir lock
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-lock-token.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  mcp_runtime_dir() { printf '%s\n' "$temp_dir/runtime"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  mcp_identity_hash() { printf 'lock-token\n'; }
+  mcp_process_token() { printf 'current-token\n'; }
+  ollama_listener_healthy() { return 1; }
+  lock="$(ollama_listener_lock_path 192.168.64.1)"
+  mkdir -p "$lock"
+  printf '%s stale-token\n' "$$" >"$lock/pid"
+
+  ollama_listener_lock_acquire 192.168.64.1 http://192.168.64.1:11434
+  [ "$OLLAMA_LISTENER_LOCK_DIR" = "$lock" ] || fail "Expected token-mismatched lock to be recovered"
+  ollama_listener_lock_release
+}
+
+test_ollama_listener_requires_its_unique_process_marker() {
+  begin_test "ollama listener ownership requires the agentctl process marker"
+
+  load_agentctl_functions
+
+  mcp_process_token() { printf 'start-token\n'; }
+  ps() { printf 'agentctl-ollama-marker serve\n'; }
+  kill() { [ "$1" = -0 ] && return 0; return 0; }
+
+  ollama_listener_process_owned 123 start-token agentctl-ollama-marker \
+    || fail "Expected matching marker and token to identify the owned process"
+  if ollama_listener_process_owned 123 start-token different-marker; then
+    fail "Expected a mismatched marker to reject process ownership"
+  fi
+  unset -f ps kill
 }
 
 test_exec_help_reports_stdio_option() {
@@ -12705,6 +13153,23 @@ main() {
   run_selected_test test_run_cmd_wires_ollama_host_to_custom_command "test_run_cmd_wires_ollama_host_to_custom_command"
   run_selected_test test_run_help_reports_generic_runtime_config "test_run_help_reports_generic_runtime_config"
   run_selected_test test_run_help_reports_runtime_options "test_run_help_reports_runtime_options"
+  run_selected_test test_ollama_help_reports_lifecycle_commands "test_ollama_help_reports_lifecycle_commands"
+  run_selected_test test_run_start_ollama_wires_host_pre_exec "test_run_start_ollama_wires_host_pre_exec"
+  run_selected_test test_run_start_ollama_rejects_incompatible_options "test_run_start_ollama_rejects_incompatible_options"
+  run_selected_test test_ollama_listener_starts_gateway_bound_server "test_ollama_listener_starts_gateway_bound_server"
+  run_selected_test test_ollama_listener_uses_container_default_route_gateway "test_ollama_listener_uses_container_default_route_gateway"
+  run_selected_test test_ollama_listener_skips_healthy_gateway "test_ollama_listener_skips_healthy_gateway"
+  run_selected_test test_ollama_listener_reports_missing_host_cli "test_ollama_listener_reports_missing_host_cli"
+  run_selected_test test_ollama_listener_timeout_kills_unhealthy_process "test_ollama_listener_timeout_kills_unhealthy_process"
+  run_selected_test test_ollama_listener_lock_recovers_stale_owner_and_observes_competing_health "test_ollama_listener_lock_recovers_stale_owner_and_observes_competing_health"
+  run_selected_test test_ollama_listener_status_and_stop_manage_owned_listener "test_ollama_listener_status_and_stop_manage_owned_listener"
+  run_selected_test test_ollama_listener_control_cleans_stale_and_preserves_unowned_processes "test_ollama_listener_control_cleans_stale_and_preserves_unowned_processes"
+  run_selected_test test_ollama_listener_reports_dangling_session "test_ollama_listener_reports_dangling_session"
+  run_selected_test test_ollama_start_restores_a_stopped_container "test_ollama_start_restores_a_stopped_container"
+  run_selected_test test_ollama_cmd_dispatches_start_and_limits_name_option "test_ollama_cmd_dispatches_start_and_limits_name_option"
+  run_selected_test test_ollama_stop_gateway_filter_leaves_other_listener_untouched "test_ollama_stop_gateway_filter_leaves_other_listener_untouched"
+  run_selected_test test_ollama_listener_lock_recovers_pid_token_mismatch "test_ollama_listener_lock_recovers_pid_token_mismatch"
+  run_selected_test test_ollama_listener_requires_its_unique_process_marker "test_ollama_listener_requires_its_unique_process_marker"
   run_selected_test test_exec_help_reports_stdio_option "test_exec_help_reports_stdio_option"
   run_selected_test test_remote_control_help_reports_experimental_commands "test_remote_control_help_reports_experimental_commands"
   run_selected_test test_remote_control_status_json_reports_missing_container "test_remote_control_status_json_reports_missing_container"

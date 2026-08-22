@@ -7,34 +7,34 @@ Run the commands in this guide on the **macOS host**, not inside a container.
 
 ## Recommended first-success setup
 
-If you just want local mode to work with the least amount of debugging:
+For the normal local Ollama installation, use:
 
-> [!WARNING]
-> **This is the easiest setup, not the safest setup.**
->
-> Enabling **Expose Ollama to the network** makes Ollama reachable beyond
-> `localhost`. Only use this when your Mac is connected to a **private, trusted
-> network**. If you are on a public, shared, or otherwise untrusted network,
-> prefer one of the more controlled [options below](#options) instead.
+```bash
+agentctl run --start-ollama
+```
 
-1. In the Ollama app, enable **Expose Ollama to the network**.
-2. With an agent container running, verify that its stable host alias can reach
-   Ollama:
+`agentctl` starts the container, derives its default-route gateway, and starts
+a detached Ollama listener only if nothing already answers at that gateway on
+port `11434`. It leaves Ollama's ordinary localhost listener unchanged. The
+gateway listener remains after the agent session, so later sessions can reuse
+it; use `--start-ollama` again after restarting Ollama or the Mac.
 
-   ```bash
-   agentctl exec --no-tty -- curl -fsS \
-     http://host.container.internal:11434/api/version
-   ```
+When the agent session ends, agentctl prints a reminder if it started this
+listener. Inspect active agentctl-managed listeners with `agentctl ollama
+status`; stop them with `agentctl ollama stop`. These commands never stop a
+listener that was started manually, by a proxy, or by an older agentctl version
+that did not record ownership.
 
-3. If that prints a small JSON response, try:
+If `status` reports multiple listeners, target one endpoint with `agentctl
+ollama stop --gateway <IP>`.
 
-   ```bash
-   agentctl run
-   ```
+To create the listener without starting an agent session, use `agentctl ollama
+start` after creating the container. It briefly starts a stopped container to
+derive its default route, then restores that container's stopped state.
 
-This is the easiest path to first success. The tradeoff is that exposing Ollama
-to the network is the broadest and least restrictive option. Safer alternatives
-are documented below.
+This avoids enabling Ollama's broad **Expose Ollama to the network** setting.
+Use one of the [options below](#options) for a custom endpoint, a remote Ollama
+server, a proxy, or a manually managed listener.
 
 ## What this means
 
@@ -105,7 +105,8 @@ Ollama itself usually listens only on:
 - `http://localhost:11434`
 - `http://127.0.0.1:11434`
 
-So the container often cannot reach it until you expose or proxy it.
+So the container often cannot reach it until you start a gateway listener,
+expose it, or proxy it.
 
 For an isolated Ollama server or a non-default port, pass the base URL that is
 reachable from inside the container:
@@ -132,7 +133,9 @@ agentctl exec --no-tty -- curl -fsS \
   http://host.container.internal:11434/api/version
 ```
 
-If that fails, fix networking before expecting local runtime launches to work.
+If that fails for the default local endpoint, start the session with
+`agentctl run --start-ollama`. For a custom endpoint, use the matching option
+below.
 
 ## What agentctl checks
 
@@ -147,20 +150,40 @@ default entrypoint:
   - uses the same explicit-host or detected-gateway Ollama resolution and sets
     the Anthropic-compatible endpoint
 
+With `--start-ollama`, agentctl performs the gateway listener check and startup
+before this preflight. It waits up to 30 seconds for a listener it starts to
+become healthy. The flag deliberately uses the default gateway and therefore
+cannot be combined with `--online`, `--shell`, `--cmd`, `OLLAMA_HOST`, or
+`-c ollama_host=...`.
+
 `--shell` skips this preflight. `--cmd` only performs it when the command runs
 through `agent.sh run`.
 
 ## Options
 
-### Option 1: expose Ollama on the network
+### Option 1: let agentctl start a gateway listener
 
-This is the easiest option and the one recommended above for first success. It
-is also the broadest and least safe option.
+```bash
+agentctl run --start-ollama
+```
 
-Enable Ollama's "Expose to network" setting in the GUI if you are comfortable
-with that exposure.
+It creates and starts the container first, derives its default-route gateway,
+then starts a detached Ollama listener only when that gateway does not already
+answer on port `11434`. The listener remains available after the agent session
+ends so later local sessions can reuse it. `--start-ollama` intentionally uses
+the default gateway endpoint and cannot be combined with `--online`, `--shell`,
+`--cmd`, `OLLAMA_HOST`, or `-c ollama_host=...`.
 
-### Option 2: run a second Ollama listener on the host-visible address
+Use `agentctl ollama status` to list the listeners agentctl started and
+`agentctl ollama stop` to stop all of them. A listener started before this
+metadata-based lifecycle support is not managed; stop it manually by targeting
+its gateway-bound process.
+
+### Option 2: run a gateway listener yourself
+
+Use this when you want to manage the listener outside `agentctl`.
+
+To start the listener yourself, run:
 
 ```bash
 AGENTCTL_HOST_ADDRESS="$(agentctl host-address)"
@@ -172,9 +195,18 @@ Run that on the macOS host.
 This only works when the container-visible address exists, which usually means a
 container is already running.
 
-### Option 3: proxy the host-visible address back to localhost
+### Option 3: expose Ollama on the network
 
-#### 3.1 `socat`
+> [!WARNING]
+> Enabling **Expose Ollama to the network** makes Ollama reachable beyond
+> `localhost`. Only use this on a private, trusted network.
+
+Enable Ollama's **Expose to network** setting in the GUI if you accept that
+broader exposure.
+
+### Option 4: proxy the host-visible address back to localhost
+
+#### 4.1 `socat`
 
 ```bash
 AGENTCTL_HOST_ADDRESS="$(agentctl host-address)"
@@ -187,7 +219,7 @@ Install with:
 brew install socat
 ```
 
-#### 3.2 OllamaProxy
+#### 4.2 OllamaProxy
 
 If you want a transparent proxy with logging, see:
 

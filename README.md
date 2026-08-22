@@ -73,13 +73,19 @@ ollama pull qwen3.5:9b-nvfp4
 container system start
 ```
 
-Before your first local run, make sure containers can reach Ollama. The short
-version is:
-- agentctl maps `host.container.internal` to the current Apple container gateway
-- default Ollama only listens on `localhost`
-- you may need to expose or proxy Ollama onto the container-visible host address
+For a standard local run, no Ollama network reconfiguration is needed: add
+`--start-ollama` to `agentctl run`. It starts a second listener only on the
+container's default-route gateway while leaving Ollama's normal localhost
+listener unchanged. Use it again after restarting Ollama or the Mac. For a
+custom endpoint, a remote Ollama server, or a proxy setup, see
+[docs/networking.md](docs/networking.md).
 
-Details and options are in [docs/networking.md](docs/networking.md).
+When `--start-ollama` starts a listener, it remains running after the agent
+session. Check it with `agentctl ollama status` and stop agentctl-managed
+listeners with `agentctl ollama stop`. To start the listener before launching
+an agent session, use `agentctl ollama start` (optionally `--name NAME`).
+When several gateways are listed, target one with `agentctl ollama stop
+--gateway IP`.
 
 ## Quick start
 
@@ -93,13 +99,13 @@ Then start the agent against the current directory, which will be mounted into
 the container as `/workdir`:
 
 ```bash
-agentctl run
+agentctl run --start-ollama
 ```
 
 Common first-run workflows:
 
 ```bash
-# Run Codex with a specific local profile
+# Run Codex with a specific local profile (add --start-ollama if needed)
 agentctl run -c profile=gemma
 
 # Test a specific model directly

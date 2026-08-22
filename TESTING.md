@@ -723,7 +723,43 @@ refs and never stable tags.
 ## Codex CLI sanity checks
 
 These steps confirm Codex itself can connect to the local model, execute shell commands,
-and write to the mounted workdir. You need the local model endpoint (Ollama) running.
+and write to the mounted workdir. Use `--start-ollama` for the first standard
+local run when no gateway listener is already running.
+
+To exercise agentctl's opt-in gateway listener startup on the macOS host, leave
+the normal Ollama instance bound to `127.0.0.1`, make sure no listener is bound
+to the container gateway on port `11434`, then run:
+
+```bash
+agentctl run --start-ollama --image agent-plain --temp --workdir testing/agent-plain
+```
+
+Before starting the runtime, expected output includes `Starting Ollama listener at`.
+From a second host terminal while the container is running, verify the container
+can reach that listener:
+
+```bash
+agentctl exec --no-tty -- curl -fsS \
+  http://host.container.internal:11434/api/version
+```
+
+The gateway-bound listener remains running after the session; a subsequent
+`agentctl run --start-ollama` should not print another startup line.
+
+Confirm agentctl reports and stops only its managed listener:
+
+```bash
+agentctl ollama status
+agentctl ollama stop
+agentctl ollama start
+```
+
+If status lists more than one listener, stop one explicitly with
+`agentctl ollama stop --gateway <IP>`.
+
+The gateway version check should then fail, while Ollama on `127.0.0.1:11434`
+continues to respond. Start another `agentctl run --start-ollama` session to
+verify the listener can be recreated.
 
 Base image:
 
