@@ -57,6 +57,9 @@ Stdio definitions accept:
 The Xcode preset enables `shared`, allowing reconnecting HTTP sessions to reuse
 one `xcrun mcpbridge` process. Generic definitions default to per-session
 process isolation. Literal `env` values live only for the active invocation.
+`env_vars` persists only selected host environment-variable names and resolves
+their current values whenever the host relay starts. Use it for host toolchain
+selection, for example `DEVELOPER_DIR` when running Xcode beta.
 
 HTTP definitions use `type: "http"`, a fixed `url`, and optional literal,
 environment-backed, or Keychain-backed headers. Plaintext HTTP is limited to
@@ -94,6 +97,22 @@ Containers created without MCP wiring need an explicit migration:
 ```bash
 agentctl upgrade --name agent-project --enable-mcp
 ```
+
+Enabling MCP adds bridge wiring only; it does not configure an MCP server. A
+running managed relay retains its current definitions and cannot be
+reconfigured in place. To configure the first server after an upgrade, or to
+replace existing definitions, stop the container and relay, then rerun the
+desired `run --mcp` command:
+
+```bash
+agentctl stop --name agent-project
+agentctl run --name agent-project --mcp xcode
+```
+
+For an Xcode beta definition, export `DEVELOPER_DIR` before the `run` command
+and include it in the definition's `env_vars`. Export the variable again before
+later `agentctl start` or `agentctl restart` commands so the host relay can
+resolve it.
 
 The MCP port can be changed during an upgrade, or MCP support can be removed:
 
