@@ -1267,7 +1267,10 @@ mcp_acquire_relay() {
     mcp_paths_equal "$socket" "$(mcp_socket_path "$name")" || die "Managed MCP metadata socket does not match expected path for $name"
     response="$(curl --silent --max-time 2 --unix-socket "$socket" http://localhost/.well-known/agentctl-mcp-health 2>/dev/null || true)"
     if printf '%s' "$response" | jq -e --arg nonce "$nonce" --argjson pid "$pid" '.ok and .nonce==$nonce and .pid==$pid' >/dev/null 2>&1; then
-      if [ "$existing_fingerprint" != "$fingerprint" ]; then mcp_lock_release; die "Conflicting managed MCP definitions are already active for container $name"; fi
+      if [ "$existing_fingerprint" != "$fingerprint" ]; then
+        mcp_lock_release
+        die "Managed MCP relay is already running with different definitions for container $name; stop the container and its relay before changing definitions: ${CLI_NAME} stop --name $name"
+      fi
       MCP_RELAY_PID="$pid"; MCP_RELAY_NONCE="$nonce"; MCP_RELAY_SOCKET="$socket"; MCP_RELAY_METADATA="$metadata"
       mcp_create_lease "$name"; mcp_lock_release; return 0
     fi

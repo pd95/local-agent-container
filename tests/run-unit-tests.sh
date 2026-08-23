@@ -11670,6 +11670,38 @@ test_mcp_fingerprints_preserve_stdio_compatibility_and_detect_http_rotation() {
   case "$first$second" in *first-secret*|*second-secret*) fail "HTTP fingerprint exposed a credential value" ;; esac
 }
 
+test_mcp_conflicting_active_relay_explains_how_to_reconfigure() (
+  begin_test "managed MCP conflict identifies the active relay and stop command"
+  load_agentctl_functions
+  local root metadata
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-conflict.XXXXXX")"; register_dir_cleanup "$root"
+  metadata="$root/mcp-unit.process.json"
+  printf '%s\n' '{"fingerprint":"active-definitions","pid":123,"nonce":"unit-nonce","socket":"/tmp/unit.sock"}' >"$metadata"
+  chmod 600 "$metadata"
+  CLI_NAME=agentctl
+
+  mcp_runtime_dir() { printf '%s\n' "$root"; }
+  mcp_identity_hash() { printf '%s\n' unit; }
+  mcp_socket_path() { printf '%s\n' /tmp/unit.sock; }
+  mcp_prepare_private_dir() { :; }
+  mcp_resolve_config_credentials() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
+  mcp_lease_count() { :; }
+  mcp_config_fingerprint() { printf '%s\n' requested-definitions; }
+  mcp_validate_private_file() { :; }
+  mcp_paths_equal() { return 0; }
+  curl() { printf '%s\n' '{"ok":true,"nonce":"unit-nonce","pid":123}'; }
+  mcp_start_relay() { fail "Conflict must not replace the active relay"; }
+  attempt_conflict() ( mcp_acquire_relay agent-unit )
+
+  run_capture attempt_conflict
+  assert_status 1
+  assert_contains "Managed MCP relay is already running with different definitions for container agent-unit"
+  assert_contains "stop the container and its relay before changing definitions"
+  assert_contains "agentctl stop --name agent-unit"
+)
+
 test_mcp_keychain_slots_are_separate_from_runtime_auth() {
   begin_test "managed MCP credentials use dedicated Keychain slots"
   load_agentctl_functions
@@ -13544,6 +13576,7 @@ main() {
   run_selected_test test_mcp_http_definition_rejects_unsafe_urls_and_headers "test_mcp_http_definition_rejects_unsafe_urls_and_headers"
   run_selected_test test_mcp_registry_v2_filters_secrets_and_reads_v1 "test_mcp_registry_v2_filters_secrets_and_reads_v1"
   run_selected_test test_mcp_fingerprints_preserve_stdio_compatibility_and_detect_http_rotation "test_mcp_fingerprints_preserve_stdio_compatibility_and_detect_http_rotation"
+  run_selected_test test_mcp_conflicting_active_relay_explains_how_to_reconfigure "test_mcp_conflicting_active_relay_explains_how_to_reconfigure"
   run_selected_test test_mcp_keychain_slots_are_separate_from_runtime_auth "test_mcp_keychain_slots_are_separate_from_runtime_auth"
   run_selected_test test_mcp_credential_commands_use_keychain_without_printing_values "test_mcp_credential_commands_use_keychain_without_printing_values"
   run_selected_test test_mcp_http_doctor_and_dry_run_redact_upstream_details "test_mcp_http_doctor_and_dry_run_redact_upstream_details"
