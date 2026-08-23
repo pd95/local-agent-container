@@ -50,8 +50,36 @@ keeps the SSH configuration and identities on the Mac while carrying the
 remote `mcpbridge` standard input and output to the container.
 
 First, configure a host alias (for example `macos-beta-vm`) in the Mac user's
-`~/.ssh/config`, using a key that can authenticate without a prompt. Verify
-the connection and the Xcode bridge before configuring MCP:
+`~/.ssh/config`, using a key that can authenticate without a prompt. If a
+dedicated key is needed, create one on the Mac and add its public half to the
+VM account's `~/.ssh/authorized_keys` using the VM's normal provisioning or
+console-access procedure:
+
+```bash
+ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519_macos_beta_vm" \
+  -C "macos-beta-vm MCP relay"
+ssh-add --apple-use-keychain "$HOME/.ssh/id_ed25519_macos_beta_vm"
+```
+
+Do not copy the private key to the VM or to a container. Protect the VM's
+`~/.ssh` directory and `authorized_keys` with owner-only permissions.
+
+Add an alias to the Mac user's `~/.ssh/config`, replacing the placeholder host
+and user values:
+
+```sshconfig
+Host macos-beta-vm
+  HostName vm.example.internal
+  User developer
+  IdentityFile ~/.ssh/id_ed25519_macos_beta_vm
+  IdentitiesOnly yes
+  AddKeysToAgent yes
+  UseKeychain yes
+```
+
+`UseKeychain` and `--apple-use-keychain` are macOS-specific conveniences; omit
+them if the key is managed by another SSH agent. Verify the connection and the
+Xcode bridge before configuring MCP:
 
 ```bash
 ssh -T macos-beta-vm true
