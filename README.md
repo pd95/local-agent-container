@@ -220,6 +220,12 @@ container code can request signatures and authentication. Use it only with
 trusted images and projects. The `ssh` feature installs client tools only; it
 does not install an SSH server or weaken host-key checking.
 
+For an Xcode installation on a separate macOS VM, the managed MCP relay can
+instead run the Mac host's SSH client and bridge `xcrun mcpbridge` over the
+connection. This lets the relay use the Mac's SSH configuration and identities
+without exposing them to the container; see [Remote Xcode MCP bridge over
+SSH](docs/managed-mcp.md#remote-xcode-mcp-bridge-over-ssh).
+
 Run stdio-based protocol servers inside a container:
 
 ```bash

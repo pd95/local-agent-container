@@ -42,6 +42,70 @@ http://127.0.0.1:47123/mcp/xcode
 http://127.0.0.1:47123/mcp/example
 ```
 
+## Remote Xcode MCP bridge over SSH
+
+When Xcode is installed on a macOS VM rather than on the Mac that runs the
+container, the host relay can run `ssh` as its authorized stdio command. This
+keeps the SSH configuration and identities on the Mac while carrying the
+remote `mcpbridge` standard input and output to the container.
+
+First, configure a host alias (for example `macos-beta-vm`) in the Mac user's
+`~/.ssh/config`, using a key that can authenticate without a prompt. If a
+dedicated key is needed, create one on the Mac and add its public half to the
+VM account's `~/.ssh/authorized_keys` using the VM's normal provisioning or
+console-access procedure:
+
+```bash
+ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519_macos_beta_vm" \
+  -C "macos-beta-vm MCP relay"
+ssh-add --apple-use-keychain "$HOME/.ssh/id_ed25519_macos_beta_vm"
+```
+
+Do not copy the private key to the VM or to a container. Protect the VM's
+`~/.ssh` directory and `authorized_keys` with owner-only permissions.
+
+Add an alias to the Mac user's `~/.ssh/config`, replacing the placeholder host
+and user values:
+
+```sshconfig
+Host macos-beta-vm
+  HostName vm.example.internal
+  User developer
+  IdentityFile ~/.ssh/id_ed25519_macos_beta_vm
+  IdentitiesOnly yes
+  AddKeysToAgent yes
+  UseKeychain yes
+```
+
+`UseKeychain` and `--apple-use-keychain` are macOS-specific conveniences; omit
+them if the key is managed by another SSH agent. Verify the connection and the
+Xcode bridge before configuring MCP:
+
+```bash
+ssh -T macos-beta-vm true
+ssh -T macos-beta-vm \
+  'env DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer /usr/bin/xcrun --find mcpbridge'
+```
+
+Then start the container with a fixed SSH-based MCP definition:
+
+```bash
+agentctl run --name my-agent --mcp \
+  '{"name":"xcode-vm","command":"/usr/bin/ssh","args":["-T","macos-beta-vm","env","DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer","/usr/bin/xcrun","mcpbridge"],"shared":true}'
+```
+
+`-T` prevents SSH from allocating a pseudo-terminal, which would corrupt the
+stdio MCP protocol. `shared: true` allows reconnecting HTTP sessions to reuse
+one remote `mcpbridge` process. Put `DEVELOPER_DIR` in the remote `env`
+command arguments as shown: a definition's `env` field applies to the Mac
+host process, not to the VM.
+
+The relay starts `/usr/bin/ssh` on the Mac, so it uses the Mac's SSH alias,
+known-hosts file, and SSH agent or Keychain-backed identities; no private key
+is copied into the container. Password prompts and first-use host-key
+confirmation cannot be answered by the background relay, so complete those
+steps before starting the container.
+
 ## Definition fields
 
 Stdio definitions accept:
