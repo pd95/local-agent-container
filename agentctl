@@ -10298,10 +10298,7 @@ remote_control_duplicate_active() {
 remote_control_start_backend() {
   local name="$1" output=""
   if "$CONTAINER_CMD" exec "$name" sh -c 'test -f /etc/alpine-release'; then
-    printf '%s\n' direct
-    remote_control_runtime_login_exec "$name" sh -c \
-      'set -eu; umask 077; d=/tmp/agentctl-remote-control; mkdir -p "$d"; chmod 700 "$d"; rm -f "$d/process"; : >"$d/service.log"; chmod 600 "$d/service.log"; nohup setsid -f sh -c '\''p=$$; s=$(awk "{print \$22}" "/proc/$p/stat"); printf "%s %s\n" "$p" "$s" >"$1/process"; exec codex app-server --remote-control --listen unix://'\'' sh "$d" >"$d/service.log" 2>&1 </dev/null; i=0; while test ! -s "$d/process" && test "$i" -lt 20; do sleep .1; i=$((i+1)); done; test -s "$d/process"' \
-      >/dev/null
+    remote_control_start_direct_backend "$name"
     return
   fi
   if remote_control_runtime_login_exec "$name" codex remote-control start --help >/dev/null 2>&1; then
@@ -10316,13 +10313,28 @@ remote_control_start_backend() {
       printf '%s\n' modern
       return
     fi
+    if printf '%s' "$output" | grep -Fq 'managed standalone Codex install not found at '; then
+      # Codex's native launcher currently assumes standalone installs live below
+      # CODEX_HOME. agentctl-managed standalone installs live under /opt/agentctl.
+      # Clear any native partial state before using the managed direct launcher.
+      if remote_control_capture_modern_or_rollback "$name"; then
+        remote_control_stop_backend "$name" modern || return 1
+      fi
+      remote_control_start_direct_backend "$name"
+      return
+    fi
     printf '%s\n' "$output" >&2
     return 1
   fi
-  printf '%s\n' direct
+  remote_control_start_direct_backend "$name"
+}
+
+remote_control_start_direct_backend() {
+  local name="$1"
   remote_control_runtime_login_exec "$name" sh -c \
     'set -eu; umask 077; d=/tmp/agentctl-remote-control; mkdir -p "$d"; chmod 700 "$d"; rm -f "$d/process"; : >"$d/service.log"; chmod 600 "$d/service.log"; nohup setsid -f sh -c '\''p=$$; s=$(awk "{print \$22}" "/proc/$p/stat"); printf "%s %s\n" "$p" "$s" >"$1/process"; exec codex app-server --remote-control --listen unix://'\'' sh "$d" >"$d/service.log" 2>&1 </dev/null; i=0; while test ! -s "$d/process" && test "$i" -lt 20; do sleep .1; i=$((i+1)); done; test -s "$d/process"' \
-    >/dev/null
+    >/dev/null || return 1
+  printf '%s\n' direct
 }
 
 remote_control_stop_backend() {
@@ -10483,13 +10495,17 @@ remote_control_print_status() {
 
 remote_control_cmd() {
   local action="${1:-}" name="" machine=0 registry="" started=0 backend="" boot="" installation_id="" duplicate="" json="" state="" i=0
-  local registry_existed=0 start_committed=0
+  local registry_existed=0 start_committed=0 mcp_locked=0 mcp_relay_started=0
   remote_control_command_cleanup() {
     if [ "$action" = start ] && [ "$started" -eq 1 ] && [ "$start_committed" -eq 0 ]; then
       if [ -n "$backend" ]; then remote_control_stop_backend "$name" "$backend" >/dev/null 2>&1 || true; fi
       if [ "$registry_existed" -eq 0 ]; then rm -f "$(remote_control_registry_path "$name")"; fi
       if container_running "$name"; then stop_existing_container_safely "$name" >/dev/null 2>&1 || true; fi
     fi
+    if [ "$action" = start ] && [ "$start_committed" -eq 0 ] && [ "$mcp_relay_started" -eq 1 ]; then
+      mcp_stop_managed "$name" >/dev/null 2>&1 || true
+    fi
+    [ "$mcp_locked" -eq 0 ] || mcp_lock_release
     remote_control_lock_release
   }
   [ -n "$action" ] || { usage_remote_control; return 1; }; shift || true
@@ -10515,7 +10531,21 @@ remote_control_cmd() {
     start)
       container_exists "$name" || die "Container not found: $name"
       if remote_control_registry_available "$name"; then registry_existed=1; fi
-      if ! container_running "$name"; then start_existing_container_safely "$name" >/dev/null; started=1; fi
+      if ! container_running "$name"; then
+        if container_has_mcp_wiring "$name"; then
+          mcp_lock_acquire "$name"; mcp_locked=1
+          mcp_require_no_active_leases "$name" start
+          if [ ! -f "$(mcp_registry_path "$name")" ] || [ -L "$(mcp_registry_path "$name")" ]; then
+            die "Container $name has managed MCP wiring but its private host registry is unavailable. Reconfigure it with: ${CLI_NAME} run --name $name --mcp VALUE"
+          fi
+          mcp_stop_managed "$name"
+          mcp_start_from_registry "$name" \
+            || die "Unable to restore the managed MCP relay required to start stopped container $name"
+          mcp_relay_started=1
+        fi
+        start_existing_container_safely "$name" >/dev/null; started=1
+        if [ "$mcp_relay_started" -eq 1 ]; then mcp_configure_guest "$name"; fi
+      fi
       if ! runtime_info_in_container "$name" codex | jq -e '.installed == true' >/dev/null; then die "Codex runtime is not installed in $name"; fi
       sync_runtime_auth_to_container "$name" codex json_refresh_token
       remote_control_install_helper "$name"
@@ -10564,6 +10594,7 @@ remote_control_cmd() {
       ;;
   esac
   if [ "$action" = start ] || [ "$action" = stop ]; then
+    [ "$mcp_locked" -eq 0 ] || mcp_lock_release
     remote_control_lock_release
     trap - EXIT
   fi
