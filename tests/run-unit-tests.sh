@@ -215,7 +215,47 @@ test_run_help_reports_runtime_options() {
   assert_contains "--online        Use the runtime's online/provider-backed mode"
   assert_contains "--stdio         With --cmd, keep stdin open without a TTY"
   assert_contains "--shm-size SIZE Size of /dev/shm"
+  assert_contains "--yes           Confirm --reset-config without prompting"
 }
+
+test_run_reset_config_requires_confirmation_or_yes() (
+  begin_test "run --reset-config requires confirmation or --yes"
+
+  load_agentctl_functions
+
+  local run_mode_calls=0
+  require_container() { :; }
+  container_exists() { return 1; }
+  run_mode() { run_mode_calls=$((run_mode_calls + 1)); }
+  attempt_without_confirmation() ( run_cmd --name unit-test-container --workdir "$TEST_ROOT" --reset-config --cmd true )
+
+  run_capture attempt_without_confirmation
+  assert_status 1
+  assert_contains "Refusing to reset active configuration without confirmation"
+  assert_contains "Re-run with --yes to confirm."
+  [ "$run_mode_calls" -eq 0 ] || fail "Did not expect run mode after declined reset"
+
+  run_cmd --name unit-test-container --workdir "$TEST_ROOT" --reset-config --yes --cmd true
+  [ "$run_mode_calls" -eq 1 ] || fail "Expected --yes to allow reset-config run"
+)
+
+test_reset_config_yes_requires_reset_config() (
+  begin_test "--yes is rejected without --reset-config"
+
+  load_agentctl_functions
+
+  require_container() { :; }
+  container_exists() { return 1; }
+  attempt_run() ( run_cmd --name unit-test-container --workdir "$TEST_ROOT" --yes --cmd true )
+  attempt_refresh() ( refresh_cmd --name unit-test-container --yes )
+
+  run_capture attempt_run
+  assert_status 1
+  assert_contains "--yes requires --reset-config"
+  run_capture attempt_refresh
+  assert_status 1
+  assert_contains "--yes requires --reset-config"
+)
 
 test_ollama_help_reports_lifecycle_commands() {
   begin_test "ollama help reports managed listener lifecycle commands"
@@ -2386,6 +2426,7 @@ test_start_and_restart_refresh_host_alias() {
   local action_log=""
   local alias_log=""
   require_container() { :; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
   configure_container_host_alias() { alias_log="${alias_log}$1"$'\n'; }
   validate_container_socket_sources() { :; }
   container_published_sockets() { :; }
@@ -4245,7 +4286,9 @@ test_refresh_help_reports_new_command() {
 
   run_capture "$AGENTCTL" refresh --help
   assert_status 0
-  assert_contains "Usage: agentctl refresh [options]"
+  assert_contains "Usage: agentctl refresh [--name NAME] [--reset-config]"
+  assert_contains "--reset-config   Replace active Codex configuration with refreshed defaults (asks for confirmation)"
+  assert_contains "--yes            Confirm --reset-config without prompting"
 }
 
 test_bootstrap_help_reports_new_command() {
@@ -9340,7 +9383,7 @@ EOF
   grep -Fq 'account=runtime-claude-opaque_blob-auth' "$env_log_file" || fail "Expected runtime-specific keychain account name"
 }
 
-test_rm_force_stops_running_container_before_remove() {
+test_rm_force_stops_running_container_before_remove() (
   begin_test "rm --force stops a running container before remove"
 
   load_agentctl_functions
@@ -9350,6 +9393,7 @@ test_rm_force_stops_running_container_before_remove() {
 
   require_container() { return 0; }
   default_name() { printf 'unit-test-container\n'; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
   container_running() { [ "$1" = "unit-test-container" ]; }
   CONTAINER_CMD=container
   container() {
@@ -9370,7 +9414,23 @@ test_rm_force_stops_running_container_before_remove() {
   assert_status 0
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
   [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
-}
+)
+
+test_rm_missing_container_reports_not_found_before_inspect() (
+  begin_test "rm reports a missing container before inspecting published sockets"
+
+  load_agentctl_functions
+
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { return 1; }
+  container_published_sockets() { fail "rm must not inspect a missing container"; }
+  attempt_rm() ( simple_name_cmd rm --name unit-test-container )
+
+  run_capture attempt_rm
+  assert_status 1
+  assert_contains "Container not found: unit-test-container"
+)
 
 test_rescue_runs_command_in_temporary_backup_container() {
   begin_test "rescue runs a command in a temporary backup container"
@@ -11615,6 +11675,41 @@ test_refresh_updates_managed_files_without_recreate() {
   printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/runtimes.d" || fail "Expected refresh to update runtime registry"
   printf '%s\n' "$exec_log" | grep -Fq "/usr/local/lib/agentctl/features" || fail "Expected refresh to update feature adapters"
   printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/features.d" || fail "Expected refresh to update feature registry"
+  assert_contains "Active runtime configuration was preserved"
+  assert_contains "refresh --name unit-test-container --reset-config"
+}
+
+test_refresh_reset_config_applies_refreshed_codex_defaults() {
+  begin_test "refresh --reset-config applies refreshed Codex defaults after managed files update"
+
+  load_agentctl_functions
+
+  local lifecycle=""
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  container_exists() { [ "$1" = "unit-test-container" ]; }
+  container_running() { return 0; }
+  migrate_legacy_runtime_config_files() { lifecycle="${lifecycle}migrate\n"; }
+  refresh_container_file() { lifecycle="${lifecycle}file:$3\n"; }
+  refresh_codex_config_files() { lifecycle="${lifecycle}codex-defaults\n"; }
+  refresh_optional_runtime_default_files() { lifecycle="${lifecycle}optional-defaults\n"; }
+  refresh_container_tree() { lifecycle="${lifecycle}tree:$3\n"; }
+  reset_runtime_config_in_container() { lifecycle="${lifecycle}reset:$2\n"; }
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = exec ] || fail "Unexpected container invocation: $*"
+  }
+
+  confirm_config_reset() { [ "$1" -eq 1 ]; }
+
+  run_capture refresh_cmd --name unit-test-container --reset-config --yes
+  assert_status 0
+  assert_contains "Warning: refresh --reset-config will replace active Codex configuration"
+  assert_contains "Active Codex configuration reset from refreshed defaults."
+  case "$lifecycle" in
+    *'codex-defaults\n'*'reset:codex\n') ;;
+    *) fail "Expected refreshed defaults before reset-config, got: $lifecycle" ;;
+  esac
 }
 
 test_doctor_reports_state_permission_problems() {
@@ -13379,6 +13474,8 @@ main() {
   run_selected_test test_run_cmd_wires_ollama_host_to_custom_command "test_run_cmd_wires_ollama_host_to_custom_command"
   run_selected_test test_run_help_reports_generic_runtime_config "test_run_help_reports_generic_runtime_config"
   run_selected_test test_run_help_reports_runtime_options "test_run_help_reports_runtime_options"
+  run_selected_test test_run_reset_config_requires_confirmation_or_yes "test_run_reset_config_requires_confirmation_or_yes"
+  run_selected_test test_reset_config_yes_requires_reset_config "test_reset_config_yes_requires_reset_config"
   run_selected_test test_ollama_help_reports_lifecycle_commands "test_ollama_help_reports_lifecycle_commands"
   run_selected_test test_run_start_ollama_wires_host_pre_exec "test_run_start_ollama_wires_host_pre_exec"
   run_selected_test test_run_start_ollama_rejects_incompatible_options "test_run_start_ollama_rejects_incompatible_options"
@@ -13415,6 +13512,8 @@ main() {
   run_selected_test test_remote_control_start_cleans_mcp_after_proxy_failure "test_remote_control_start_cleans_mcp_after_proxy_failure"
   run_selected_test test_remote_control_stop_refuses_unowned_direct_server "test_remote_control_stop_refuses_unowned_direct_server"
   run_selected_test test_remote_control_pair_json_normalizes_codex_response "test_remote_control_pair_json_normalizes_codex_response"
+  run_selected_test test_rm_force_stops_running_container_before_remove "test_rm_force_stops_running_container_before_remove"
+  run_selected_test test_rm_missing_container_reports_not_found_before_inspect "test_rm_missing_container_reports_not_found_before_inspect"
   run_selected_test test_run_cmd_wires_home_mount "test_run_cmd_wires_home_mount"
   run_selected_test test_doctor_help_reports_fix_option "test_doctor_help_reports_fix_option"
   run_selected_test test_agentctl_version_matches_version_file "test_agentctl_version_matches_version_file"
@@ -13685,6 +13784,7 @@ main() {
   run_selected_test test_image_system_manifest_removes_temp_container_after_exec_failure "test_image_system_manifest_removes_temp_container_after_exec_failure"
   run_selected_test test_collect_upgrade_container_preflight_starts_stopped_container_once "test_collect_upgrade_container_preflight_starts_stopped_container_once"
   run_selected_test test_refresh_updates_managed_files_without_recreate "test_refresh_updates_managed_files_without_recreate"
+  run_selected_test test_refresh_reset_config_applies_refreshed_codex_defaults "test_refresh_reset_config_applies_refreshed_codex_defaults"
   run_selected_test test_doctor_reports_state_permission_problems "test_doctor_reports_state_permission_problems"
   run_selected_test test_doctor_excludes_managed_mcp_from_user_socket_failures "test_doctor_excludes_managed_mcp_from_user_socket_failures"
   run_selected_test test_mcp_runtime_paths_normalize_trailing_tmpdir_separator "test_mcp_runtime_paths_normalize_trailing_tmpdir_separator"
