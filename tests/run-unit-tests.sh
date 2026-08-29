@@ -812,6 +812,37 @@ test_remote_control_start_uses_login_environment_for_all_backends() (
   printf '%s' "$login_calls" | grep -Fq 'unit-remote codex remote-control start' || fail "Expected native start to use login exec: $login_calls"
 )
 
+test_remote_control_native_standalone_failure_falls_back_to_direct() (
+  begin_test "Remote Control falls back to the managed direct backend after the known native standalone failure"
+
+  load_agentctl_functions
+  local backend="" calls_file=""
+  calls_file="$(new_workdir)/remote-calls"
+  CONTAINER_CMD=container
+  container() { return 1; }
+  remote_control_runtime_login_exec() {
+    printf '%s\n' "$*" >>"$calls_file"
+    case "$*" in
+      *'codex remote-control start --help') return 0 ;;
+      *'codex remote-control start')
+        printf '%s\n' 'managed standalone Codex install not found at /home/coder/.codex/packages/standalone/current/codex' >&2
+        return 1
+        ;;
+      *'sh -c') return 0 ;;
+    esac
+    return 0
+  }
+  remote_control_capture_modern_or_rollback() { printf '%s\n' capture >>"$calls_file"; }
+  remote_control_stop_backend() { printf '%s\n' "stop:$*" >>"$calls_file"; }
+
+  backend="$(remote_control_start_backend unit-remote)"
+  [ "$backend" = direct ] || fail "Expected direct fallback backend, got: $backend"
+  grep -Fx capture "$calls_file" >/dev/null || fail "Expected native partial-state capture: $(cat "$calls_file")"
+  grep -Fx 'stop:unit-remote modern' "$calls_file" >/dev/null || fail "Expected native partial-state cleanup: $(cat "$calls_file")"
+  grep -F 'unit-remote sh -c' "$calls_file" >/dev/null || fail "Expected detached direct launcher: $(cat "$calls_file")"
+  grep -F -- '--listen unix://' "$calls_file" >/dev/null || fail "Expected direct launcher control socket: $(cat "$calls_file")"
+)
+
 test_remote_control_lock_recovers_abandoned_owner() {
   begin_test "remote-control lock recovers an abandoned owner"
 
@@ -971,6 +1002,90 @@ test_remote_control_start_rolls_back_auto_started_container() {
   assert_status 1
   assert_contains "Codex runtime is not installed"
   [ -f "$stopped_marker" ] || fail "Expected auto-started container rollback"
+}
+
+test_remote_control_start_restores_mcp_for_stopped_container() {
+  begin_test "remote-control start restores the managed MCP relay and guest proxy for a stopped container"
+
+  load_agentctl_functions
+  local temp_home mcp_test_registry backend_started_file lifecycle="" running=0
+  temp_home="$(new_workdir)"
+  HOME="$temp_home"
+  TMPDIR="$temp_home"
+  mcp_test_registry="$temp_home/mcp.json"
+  backend_started_file="$temp_home/backend-started"
+  printf '%s\n' '{"schema_version":1,"container":"unit-remote","port":47123,"servers":[]}' >"$mcp_test_registry"
+  chmod 600 "$mcp_test_registry"
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { [ "$running" -eq 1 ]; }
+  container_has_mcp_wiring() { return 0; }
+  mcp_registry_path() { printf '%s\n' "$mcp_test_registry"; }
+  remote_control_registry_available() { return 1; }
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { lifecycle="${lifecycle}mcp-lock\n"; }
+  mcp_lock_release() { lifecycle="${lifecycle}mcp-unlock\n"; }
+  mcp_require_no_active_leases() { :; }
+  mcp_stop_managed() { lifecycle="${lifecycle}relay-stop\n"; }
+  mcp_start_from_registry() { lifecycle="${lifecycle}relay-start\n"; }
+  start_existing_container_safely() { running=1; lifecycle="${lifecycle}container-start\n"; }
+  mcp_configure_guest() { lifecycle="${lifecycle}proxy-start\n"; }
+  runtime_info_in_container() { printf '%s\n' '{"installed":true}'; }
+  sync_runtime_auth_to_container() { :; }
+  remote_control_install_helper() { :; }
+  remote_control_status_json() {
+    if [ -f "$backend_started_file" ]; then printf '%s\n' '{"state":"running"}'; else printf '%s\n' '{"state":"stopped"}'; fi
+  }
+  remote_control_installation_id() { printf '%s\n' install-1; }
+  remote_control_duplicate_active() { return 1; }
+  remote_control_start_backend() { : >"$backend_started_file"; printf '%s\n' direct; }
+  remote_control_boot_token() { printf '%s\n' boot-1; }
+  remote_control_registry_write() { :; }
+  remote_control_print_status() { :; }
+
+  remote_control_cmd start --name unit-remote
+  [ "$lifecycle" = 'mcp-lock\nrelay-stop\nrelay-start\ncontainer-start\nproxy-start\nmcp-unlock\n' ] \
+    || fail "Unexpected Remote Control MCP lifecycle: $lifecycle"
+}
+
+test_remote_control_start_cleans_mcp_after_proxy_failure() {
+  begin_test "remote-control start cleans its MCP relay after guest proxy startup failure"
+
+  load_agentctl_functions
+  local temp_home mcp_test_registry lifecycle_file running_file lifecycle=""
+  temp_home="$(new_workdir)"
+  HOME="$temp_home"
+  TMPDIR="$temp_home"
+  mcp_test_registry="$temp_home/mcp.json"
+  lifecycle_file="$temp_home/lifecycle"
+  running_file="$temp_home/running"
+  printf '%s\n' '{"schema_version":1,"container":"unit-remote","port":47123,"servers":[]}' >"$mcp_test_registry"
+  chmod 600 "$mcp_test_registry"
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { [ -f "$running_file" ]; }
+  container_has_mcp_wiring() { return 0; }
+  mcp_registry_path() { printf '%s\n' "$mcp_test_registry"; }
+  remote_control_registry_available() { return 1; }
+  remote_control_lock_acquire() { printf '%s\n' remote-lock >>"$lifecycle_file"; }
+  remote_control_lock_release() { printf '%s\n' remote-unlock >>"$lifecycle_file"; }
+  mcp_lock_acquire() { printf '%s\n' mcp-lock >>"$lifecycle_file"; }
+  mcp_lock_release() { printf '%s\n' mcp-unlock >>"$lifecycle_file"; }
+  mcp_require_no_active_leases() { printf '%s\n' lease-check >>"$lifecycle_file"; }
+  mcp_stop_managed() { printf '%s\n' relay-stop >>"$lifecycle_file"; }
+  mcp_start_from_registry() { printf '%s\n' relay-start >>"$lifecycle_file"; }
+  start_existing_container_safely() { : >"$running_file"; printf '%s\n' container-start >>"$lifecycle_file"; }
+  stop_existing_container_safely() { rm -f "$running_file"; printf '%s\n' container-stop >>"$lifecycle_file"; }
+  mcp_configure_guest() { printf '%s\n' proxy-start >>"$lifecycle_file"; return 1; }
+  start_wrapper() { ( remote_control_cmd start --name unit-remote ); }
+
+  run_capture start_wrapper
+  assert_status 1
+  [ ! -f "$running_file" ] || fail "Expected failed Remote Control startup to stop its container"
+  lifecycle="$(cat "$lifecycle_file")"
+  [ "$lifecycle" = $'remote-lock\nmcp-lock\nlease-check\nrelay-stop\nrelay-start\ncontainer-start\nproxy-start\ncontainer-stop\nrelay-stop\nmcp-unlock\nremote-unlock' ] \
+    || fail "Unexpected Remote Control MCP failure cleanup: $lifecycle"
 }
 
 test_remote_control_stop_refuses_unowned_direct_server() {
@@ -13288,6 +13403,7 @@ main() {
   run_selected_test test_remote_control_status_json_reports_healthy_server_as_running "test_remote_control_status_json_reports_healthy_server_as_running"
   run_selected_test test_remote_control_login_exec_preserves_arguments_and_codex_home "test_remote_control_login_exec_preserves_arguments_and_codex_home"
   run_selected_test test_remote_control_start_uses_login_environment_for_all_backends "test_remote_control_start_uses_login_environment_for_all_backends"
+  run_selected_test test_remote_control_native_standalone_failure_falls_back_to_direct "test_remote_control_native_standalone_failure_falls_back_to_direct"
   run_selected_test test_remote_control_lock_recovers_abandoned_owner "test_remote_control_lock_recovers_abandoned_owner"
   run_selected_test test_remote_control_quiesce_stops_before_auth_sync "test_remote_control_quiesce_stops_before_auth_sync"
   run_selected_test test_remote_control_registry_rejects_traversal_and_unsafe_files "test_remote_control_registry_rejects_traversal_and_unsafe_files"
@@ -13295,6 +13411,8 @@ main() {
   run_selected_test test_remote_control_direct_stop_uses_owned_pid_when_health_is_down "test_remote_control_direct_stop_uses_owned_pid_when_health_is_down"
   run_selected_test test_remote_control_modern_capture_filters_candidates_and_rolls_back_failure "test_remote_control_modern_capture_filters_candidates_and_rolls_back_failure"
   run_selected_test test_remote_control_start_rolls_back_auto_started_container "test_remote_control_start_rolls_back_auto_started_container"
+  run_selected_test test_remote_control_start_restores_mcp_for_stopped_container "test_remote_control_start_restores_mcp_for_stopped_container"
+  run_selected_test test_remote_control_start_cleans_mcp_after_proxy_failure "test_remote_control_start_cleans_mcp_after_proxy_failure"
   run_selected_test test_remote_control_stop_refuses_unowned_direct_server "test_remote_control_stop_refuses_unowned_direct_server"
   run_selected_test test_remote_control_pair_json_normalizes_codex_response "test_remote_control_pair_json_normalizes_codex_response"
   run_selected_test test_run_cmd_wires_home_mount "test_run_cmd_wires_home_mount"
