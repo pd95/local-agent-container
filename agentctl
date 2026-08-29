@@ -62,6 +62,22 @@ die() {
   exit 1
 }
 
+confirm_config_reset() {
+  local assume_yes="$1"
+  local answer=""
+
+  [ "$assume_yes" -eq 1 ] && return 0
+  if [ ! -t 0 ] || [ ! -t 2 ] || [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    die "Refusing to reset active configuration without confirmation. Re-run with --yes to confirm."
+  fi
+  printf 'Reset active runtime configuration? This replaces managed configuration files. [y/N] ' >/dev/tty
+  IFS= read -r answer </dev/tty || true
+  case "$answer" in
+    y|Y|yes|YES) ;;
+    *) die "Configuration reset cancelled" ;;
+  esac
+}
+
 warn() {
   echo "Warning: $*" >&2
 }
@@ -2247,7 +2263,8 @@ Options:
   --start-ollama  Start a host Ollama listener for this local runtime launch when needed
   --online        Use the runtime's online/provider-backed mode
   --auth          Force an online login flow before launch
-  --reset-config  Replace the selected/preferred runtime's managed default configuration
+  --reset-config  Replace the selected/preferred runtime's managed default configuration (asks for confirmation)
+  --yes           Confirm --reset-config without prompting
   --update        Update the Codex CLI in the target container before launch
   --temp          Create a throwaway container (auto-removed after exit)
   --read-only     Mount workdir as read-only (requires new container)
@@ -2288,13 +2305,16 @@ EOF
 
 usage_refresh() {
   cat <<EOF
-Usage: $CLI_NAME refresh [options]
+Usage: $CLI_NAME refresh [--name NAME] [--reset-config] [--yes]
 
 Options:
-  --name NAME  Container name (default: agent-<dir>)
+  --name NAME      Container name (default: agent-<dir>)
+  --reset-config   Replace active Codex configuration with refreshed defaults (asks for confirmation)
+  --yes            Confirm --reset-config without prompting
 
 Refresh updates agentctl-managed files in an existing container without
-recreating it. It preserves user-installed packages and other mutable state.
+recreating it. It preserves user-installed packages and active runtime
+configuration unless --reset-config is supplied.
 EOF
 }
 
@@ -5555,21 +5575,31 @@ refresh_cmd() {
   local name=""
   local was_running=0
   local started_for_refresh=0
+  local reset_config=0
+  local assume_yes=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
+      --reset-config) reset_config=1; shift ;;
+      --yes) assume_yes=1; shift ;;
       --help) usage_refresh; return 0 ;;
       *) die "Unknown option for refresh: $1" ;;
     esac
   done
 
+  if [ "$assume_yes" -eq 1 ] && [ "$reset_config" -eq 0 ]; then
+    die "--yes requires --reset-config"
+  fi
   require_container
   if [ -z "$name" ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX")"
   fi
   if ! container_exists "$name"; then
     die "Container not found: $name"
+  fi
+  if [ "$reset_config" -eq 1 ]; then
+    confirm_config_reset "$assume_yes"
   fi
 
   if container_running "$name"; then
@@ -5595,12 +5625,21 @@ refresh_cmd() {
   if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -x /usr/local/bin/agent.sh; then
     "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh refresh >/dev/null 2>&1 || true
   fi
+  if [ "$reset_config" -eq 1 ]; then
+    warn "refresh --reset-config will replace active Codex configuration in ~/.codex with refreshed defaults"
+    reset_runtime_config_in_container "$name" codex
+  fi
 
   if [ "$started_for_refresh" -eq 1 ] && [ "$was_running" -eq 0 ]; then
     echo "Stopping container: $name" >&2
     stop_existing_container_safely "$name" >/dev/null
   fi
   echo "Refresh complete: $name" >&2
+  if [ "$reset_config" -eq 1 ]; then
+    echo "Active Codex configuration reset from refreshed defaults." >&2
+  else
+    echo "Active runtime configuration was preserved. To apply refreshed Codex defaults, run: ${CLI_NAME} refresh --name $name --reset-config" >&2
+  fi
 }
 
 host_capability() {
@@ -8861,6 +8900,7 @@ run_cmd() {
   local temp=0
   local shell=0
   local reset_config=0
+  local assume_yes=0
   local runtime_config_json='{}'
   local model_override=""
   local read_only=0
@@ -8895,6 +8935,7 @@ run_cmd() {
       --online) online=1; shift ;;
       --auth) auth=1; shift ;;
       --reset-config) reset_config=1; shift ;;
+      --yes) assume_yes=1; shift ;;
       --update) update=1; shift ;;
       --temp) temp=1; shift ;;
       --read-only) read_only=1; shift ;;
@@ -8978,6 +9019,9 @@ run_cmd() {
   if [ "$install_runtime" -eq 1 ] && [ -z "$runtime" ]; then
     die "--install-runtime requires --runtime"
   fi
+  if [ "$assume_yes" -eq 1 ] && [ "$reset_config" -eq 0 ]; then
+    die "--yes requires --reset-config"
+  fi
 
   if [ -z "$workdir" ]; then
     workdir="$PWD"
@@ -8996,6 +9040,9 @@ run_cmd() {
   warn_legacy_compat_image_usage "$image"
   if [ -z "$name" ] && [ "$temp" -eq 0 ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
+  fi
+  if [ "$reset_config" -eq 1 ]; then
+    confirm_config_reset "$assume_yes"
   fi
   if [ "$MCP_REQUESTED" -eq 1 ]; then
     mcp_validate_port "$MCP_PORT"
@@ -10621,6 +10668,7 @@ simple_name_cmd() {
   if [ -z "$name" ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX")"
   fi
+  container_exists "$name" || die "Container not found: $name"
   published_sockets="$(container_published_sockets "$name")"
   remote_control_lock_acquire "$name"
   mcp_lock_acquire "$name"

@@ -647,9 +647,38 @@ test_run_reset_config_restores_image_defaults() {
   run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# legacy-config\n" >/home/coder/.codex/config.toml && rm -f /home/coder/.codex/local_models.json && rm -f /home/coder/.codex/AGENTS.md && printf "legacy-agents\n" >/home/coder/.codex/AGENTS.md'
   assert_status 0
 
-  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --reset-config --cmd bash -lc 'if diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo reset-config-ok; else exit 1; fi'
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --reset-config --yes --cmd bash -lc 'if diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo reset-config-ok; else exit 1; fi'
   assert_status 0
   assert_contains "reset-config-ok"
+}
+
+test_refresh_reset_config_restores_defaults_and_stopped_state() {
+  begin_test "refresh --reset-config restores defaults and preserves stopped state"
+  local name
+  local workdir
+
+  name="$(unique_name refresh-reset-config)"
+  workdir="$(new_workdir)"
+  register_container_cleanup "$name"
+
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc 'mkdir -p /home/coder/.codex && printf "# legacy-config\\n" >/home/coder/.codex/config.toml && rm -f /home/coder/.codex/AGENTS.md && printf "legacy-agents\\n" >/home/coder/.codex/AGENTS.md'
+  assert_status 0
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+
+  run_capture "$AGENTCTL" refresh --name "$name" --reset-config --yes
+  assert_status 0
+  assert_contains "Active Codex configuration reset from refreshed defaults."
+  run_capture "$CONTAINER_CMD" ls --quiet
+  assert_status 0
+  if printf '%s\n' "$RUN_OUTPUT" | grep -Fqx -- "$name"; then fail "refresh --reset-config did not restore stopped state"; fi
+
+  run_capture "$CONTAINER_CMD" start "$name"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" exec "$name" sh -lc 'diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && test -L /home/coder/.codex/AGENTS.md && test "$(readlink /home/coder/.codex/AGENTS.md)" = /etc/agentctl/image.md'
+  assert_status 0
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
 }
 
 test_image_contains_runtime_defaults_and_version_markers() {
@@ -1683,6 +1712,7 @@ main() {
   run_selected_test test_upgrade_backup_restores_home_and_boots_rescue_image "upgrade backup restores home state and creates a bootable full-rootfs rescue image" full
   run_selected_test test_upgrade_preflight_failure_keeps_container "upgrade preflight failure leaves the original container intact" full
   run_selected_test test_run_reset_config_restores_image_defaults "run --reset-config restores config, models, and AGENTS symlink" smoke
+  run_selected_test test_refresh_reset_config_restores_defaults_and_stopped_state "refresh --reset-config restores defaults and preserves stopped state" smoke
   run_selected_test test_image_contains_runtime_defaults_and_version_markers "image contains normalized defaults and separate version markers" smoke
   run_selected_test test_upgrade_overwrite_config_restores_image_defaults "upgrade --overwrite-config restores config, models, and AGENTS symlink" full
   run_selected_test test_system_manifest_requested_packages_on_agent_plain_apk "system manifest reports requested apk packages on agent-plain" full
