@@ -11,6 +11,7 @@ CONTAINER_HOST_NAME="host.container.internal"
 AGENTCTL_NETWORK_LABEL="agentctl.managed"
 CLAUDE_MIN_INSTALL_MEM="4G"
 SYSTEM_BASELINE_MANIFEST_FILE="/etc/agentctl/system-manifest.json"
+RECOVERY_LEDGER_FILE="/home/coder/.config/agentctl/upgrade-recovery/ledger.json"
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --no-new-privs --)
 CONTAINER_COPY_SUPPORT=""
 SOCKET_MOUNTS_TEXT=""
@@ -2437,10 +2438,16 @@ Options:
   --no-backup         Skip container export backup image creation
   --dry-run           Show the planned upgrade actions without recreating the container
   --overwrite-config  Replace ~/.codex/config.toml, default profiles, and local_models.json from the upgraded image and recreate ~/.codex/AGENTS.md as a symlink
+  --restore           Restore all default-compatible recovery actions without prompting
+  --no-restore        Do not prompt for recovery; save a resumable recovery plan
+  --restore-version-policy MODE  mixed (default), latest, or locked
 
 Upgrade recreates the container from the target image. Before recreation, it
 warns about extra OS packages installed after the container's stored baseline
 snapshot when those packages are not present in the target image.
+
+Use "$CLI_NAME upgrade restore --name NAME --interactive" to resume a saved
+recovery plan or inspect it with --status and --history.
 
 With --copy, upgrade preserves the source container and creates a second
 container with the requested name and settings instead of replacing it.
@@ -5580,7 +5587,7 @@ refresh_cmd() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --name) name="$2"; shift 2 ;;
+      --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
       --reset-config) reset_config=1; shift ;;
       --yes) assume_yes=1; shift ;;
       --help) usage_refresh; return 0 ;;
@@ -7828,6 +7835,22 @@ feature_managed_packages_json() {
   printf '%s\n' "$packages_json"
 }
 
+feature_managed_python_packages_json() {
+  local features_json="$1"
+  local registry_dir="${AGENTCTL_HOST_FEATURE_REGISTRY_DIR:-$SCRIPT_DIR/features.d}"
+  local packages_json='[]' feature="" manifest="" feature_packages='[]'
+
+  while IFS= read -r feature; do
+    [ -n "$feature" ] || continue
+    case "$feature" in *[!A-Za-z0-9_.-]*) continue ;; esac
+    manifest="$registry_dir/$feature.json"
+    [ -f "$manifest" ] || continue
+    feature_packages="$(jq -c '.python_packages // []' "$manifest" 2>/dev/null || printf '[]\n')"
+    packages_json="$(jq -cn --argjson current "$packages_json" --argjson added "$feature_packages" '$current + $added | map(ascii_downcase) | unique | sort')"
+  done < <(printf '%s' "$features_json" | jq -r '.[]' 2>/dev/null || true)
+  printf '%s\n' "$packages_json"
+}
+
 target_runtime_installable() {
   local name="$1"
   local runtime="$2"
@@ -9236,6 +9259,11 @@ mcp_cmd() {
 }
 
 upgrade_cmd() {
+  if [ "${1:-}" = restore ]; then
+    shift
+    upgrade_restore_cmd "$@"
+    return
+  fi
   local name=""
   local new_name=""
   local copy_mode=0
@@ -9284,6 +9312,11 @@ upgrade_cmd() {
   local preflight_target_manifest=""
   local inspect_info=""
   local upgrade_package_reinstall_commands=""
+  local restore_requested=0
+  local restore_deferred=0
+  local restore_policy="mixed"
+  local recovery_ledger=""
+  local recovery_plan=""
   local -a requested_networks=()
   local requested_socket_mappings=""
   local removed_socket_mappings=""
@@ -9370,6 +9403,9 @@ upgrade_cmd() {
       --no-backup) no_backup=1; shift ;;
       --dry-run) dry_run=1; shift ;;
       --overwrite-config) overwrite_config=1; shift ;;
+      --restore) restore_requested=1; shift ;;
+      --no-restore) restore_deferred=1; shift ;;
+      --restore-version-policy) [ "$#" -ge 2 ] || die "Missing value for --restore-version-policy"; restore_policy="$2"; shift 2 ;;
       --help) usage_upgrade; return 0 ;;
       *) die "Unknown option for upgrade: $1" ;;
     esac
@@ -9378,6 +9414,8 @@ upgrade_cmd() {
   if [ -n "$shm_size" ] && ! shared_memory_size_to_bytes "$shm_size" >/dev/null 2>&1; then
     die "Invalid --shm-size: $shm_size (use a size such as 512M, 1.5G, or 2GiB)"
   fi
+  case "$restore_policy" in mixed|latest|locked) ;; *) die "Invalid --restore-version-policy: $restore_policy" ;; esac
+  [ "$restore_requested" -eq 0 ] || [ "$restore_deferred" -eq 0 ] || die "Cannot combine --restore with --no-restore"
   [ "$ssh_enable_requested" -eq 0 ] || [ "$ssh_disable_requested" -eq 0 ] || die "Cannot combine --ssh with --no-ssh"
   [ "$mcp_enable_requested" -eq 0 ] || [ "$mcp_disable_requested" -eq 0 ] || die "Cannot combine --enable-mcp with --disable-mcp"
   [ "$mcp_port_requested" -eq 0 ] || mcp_validate_port "$MCP_PORT"
@@ -9663,6 +9701,15 @@ upgrade_cmd() {
     return 0
   fi
 
+  # Persist the source inventory before the source container can be removed.
+  # The ledger is user state, so it is included in both the state archive and
+  # the optional backup image.
+  if [ "$was_running" -eq 0 ] && [ "$backup_mode" = export ]; then
+    warn "Skipping live recovery-manifest capture because $name cannot be started safely; its backup image remains available for rescue"
+  else
+    recovery_ledger="$(recovery_prepare_upgrade "$name" "$current_image" "$image")"
+  fi
+
   if [ "$copy_mode" -eq 0 ] && [ "$was_running" -eq 1 ]; then
     if remote_control_registry_available "$name"; then remote_control_quiesced=1; fi
     remote_control_quiesce_preserving_desired "$name"
@@ -9686,6 +9733,7 @@ upgrade_cmd() {
     echo "Exporting container filesystem for state backup: $name" >&2
     export_container_for_upgrade "$name" "$export_file" 0
     extract_export_root "$export_file" "$export_config_root"
+    recovery_ledger="$(recovery_prepare_upgrade_from_export_root "$export_config_root" "$current_image" "$image")"
     if export_root_supports_state_contract "$export_config_root"; then
       source_supports_state_contract=1
     else
@@ -9704,6 +9752,9 @@ upgrade_cmd() {
       warn "Falling back to stopped filesystem export for state backup because $name exits during startup"
       export_container_for_upgrade "$name" "$export_file" 0
       extract_export_root "$export_file" "$export_config_root"
+      if [ -z "$recovery_ledger" ]; then
+        recovery_ledger="$(recovery_prepare_upgrade_from_export_root "$export_config_root" "$current_image" "$image")"
+      fi
       if export_root_supports_state_contract "$export_config_root"; then
         source_supports_state_contract=1
       else
@@ -9846,7 +9897,8 @@ upgrade_cmd() {
     persist_container_system_manifest_baseline_from_image "$target_name" "$image"
   fi
 
-  reinstall_added_runtimes_and_features "$target_name" "$added_runtimes_json" "$added_features_json"
+  # Missing source runtimes and features are recovery actions. They are
+  # restored only after the user has had an opportunity to select them.
   if [ "$ensure_ssh_feature" -eq 1 ]; then
     ensure_requested_feature_installed "$target_name" ssh
   fi
@@ -9855,12 +9907,36 @@ upgrade_cmd() {
   restore_codex_config "$target_name" "$state_backup_file"
   verify_restored_runtime_state "$target_name" "$state_backup_file" \
     || die "Restored runtime state verification failed for $target_name; inspect the backup image before continuing."
-  ensure_relevant_runtimes_and_features_after_restore \
-    "$target_name" \
-    "$target_default_runtime" \
-    "$current_preferred_runtime" \
-    "$added_runtimes_json" \
-    "$added_features_json"
+  local recovery_target_manifest=""
+  local recovery_selected=""
+  recovery_target_manifest="$(run_agent_sh_in_container "$target_name" recovery manifest 2>/dev/null || true)"
+  if [ -n "$recovery_ledger" ] && [ -n "$recovery_target_manifest" ]; then
+    recovery_plan="$(recovery_plan_json "$recovery_ledger" "$recovery_target_manifest" "$restore_policy")"
+    recovery_ledger="$(recovery_append_plan "$recovery_ledger" "$recovery_plan")"
+    recovery_write_ledger "$target_name" "$recovery_ledger"
+    if [ "$restore_requested" -eq 1 ]; then
+      recovery_selected="$(recovery_selected_ids "$recovery_plan" all)"
+    elif [ "$restore_deferred" -eq 0 ] && [ -t 0 ] && [ -t 2 ]; then
+      recovery_selected="$(recovery_selected_ids "$recovery_plan" interactive)"
+    fi
+    if [ -n "$recovery_selected" ]; then
+      echo "Restoring selected upgrade recovery items in $target_name" >&2
+      if recovery_apply_selected "$target_name" "$recovery_plan" "$recovery_selected" "$restore_policy"; then
+        recovery_ledger="$(recovery_mark_action_results "$recovery_ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")"
+        recovery_write_ledger "$target_name" "$recovery_ledger"
+      else
+        recovery_ledger="$(recovery_mark_action_results "$recovery_ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")"
+        recovery_write_ledger "$target_name" "$recovery_ledger"
+        warn "Some recovery actions failed; retry with: ${CLI_NAME} upgrade restore --name $target_name --interactive"
+      fi
+    elif [ "$(printf '%s' "$recovery_plan" | jq -r '.actions | length')" -gt 0 ]; then
+      echo "Recovery deferred. Resume with: ${CLI_NAME} upgrade restore --name $target_name --interactive" >&2
+    fi
+  elif [ -z "$recovery_ledger" ]; then
+    warn "No live recovery ledger was captured for $name; use the backup image for this stopped-source recovery"
+  else
+    warn "Unable to inspect recovery providers in target image $image; saved source ledger remains available in user state"
+  fi
   warn_if_preferred_runtime_lost "$target_name" "$current_preferred_runtime" "$target_default_runtime"
   if [ "$overwrite_config" -eq 1 ]; then
     echo "Overwriting config.toml, default profiles, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $target_name" >&2
@@ -9914,6 +9990,475 @@ upgrade_cmd() {
   if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ]; then
     echo "If everything works as expected, remove the backup image with: ${CLI_NAME} images prune --backup --image $backup_image --keep 0" >&2
   fi
+}
+
+recovery_ledger_json() {
+  local name="$1"
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -c "test -r '$RECOVERY_LEDGER_FILE' && cat '$RECOVERY_LEDGER_FILE'" 2>/dev/null
+}
+
+recovery_write_ledger() {
+  local name="$1"
+  local ledger="$2"
+  write_container_file_content "$name" "$RECOVERY_LEDGER_FILE" "$ledger" "coder:coder" "600"
+}
+
+recovery_source_manifest_json() {
+  local name="$1"
+  local source_image="$2"
+  local target_image="$3"
+  local manifest=""
+
+  if manifest="$(run_agent_sh_in_container "$name" recovery manifest 2>/dev/null)" \
+    && printf '%s' "$manifest" | jq -e '.manifest_schema_version == 1' >/dev/null 2>&1; then
+    jq -c --arg source_image "$source_image" --arg target_image "$target_image" \
+      '. + {source_image: $source_image, target_image: $target_image}' <<<"$manifest"
+    return 0
+  fi
+
+  manifest="$(container_system_manifest_json "$name")" || return 1
+  jq -cn --arg source_image "$source_image" --arg target_image "$target_image" \
+    --argjson system "$manifest" \
+    '{manifest_schema_version: 1, kind: "agentctl-upgrade-recovery-source", legacy_capture: true,
+      captured_at: (now | todateiso8601), source_image: $source_image, target_image: $target_image,
+      system: $system, package_details: [], apt_sources: [], python_environment: null}'
+}
+
+recovery_source_manifest_from_export_root() {
+  local root="$1" source_image="$2" target_image="$3"
+  local package_manager=unknown packages_json='[]' requested_json='[]' details_json='[]' repositories_json='[]'
+  local python_packages_json='[]' python_environment='null' capture_limitations='[]'
+  local package_file="" package="" version="" metadata="" requested=false
+
+  if [ -f "$root/etc/apk/world" ]; then
+    package_manager=apk
+    requested_json="$(sed '/^[[:space:]]*$/d' "$root/etc/apk/world" | sort -u | jq -R . | jq -s .)"
+    if [ -f "$root/lib/apk/db/installed" ]; then
+      details_json="$(awk -F: '
+        /^P:/{ package=$2 }
+        /^V:/{ if (package != "") { print package "\\t" $2; package="" } }
+      ' "$root/lib/apk/db/installed" | jq -R 'split("\t") | {name: .[0], version: .[1]}' | jq -s .)"
+      packages_json="$(printf '%s' "$details_json" | jq '[.[].name] | unique | sort')"
+    fi
+    if [ -f "$root/etc/apk/repositories" ]; then
+      repositories_json="$(sed '/^[[:space:]#]*$/d; s#//[^/@[:space:]]*@#//#g; s/?[^[:space:]]*$//' "$root/etc/apk/repositories" | sort -u | jq -R . | jq -s .)"
+    fi
+  elif [ -f "$root/var/lib/dpkg/status" ]; then
+    package_manager=dpkg
+    details_json="$(awk '
+      BEGIN { RS=""; FS="\n" }
+      {
+        package=""; version=""; status=""
+        for (i=1; i<=NF; i++) {
+          if ($i ~ /^Package: /) package=substr($i,10)
+          if ($i ~ /^Version: /) version=substr($i,10)
+          if ($i ~ /^Status: /) status=substr($i,9)
+        }
+        if (package != "" && status ~ / installed$/) print package "\t" version
+      }
+    ' "$root/var/lib/dpkg/status" | jq -R 'split("\t") | {name: .[0], version: .[1]}' | jq -s .)"
+    packages_json="$(printf '%s' "$details_json" | jq '[.[].name] | unique | sort')"
+    if [ -f "$root/var/lib/apt/extended_states" ]; then
+      local auto_packages_json='[]'
+      auto_packages_json="$(awk '
+        BEGIN { RS=""; FS="\n" }
+        { package=""; auto=0
+          for (i=1; i<=NF; i++) {
+            if ($i ~ /^Package: /) package=substr($i,10)
+            if ($i == "Auto-Installed: 1") auto=1
+          }
+          if (package != "" && auto) print package
+        }
+      ' "$root/var/lib/apt/extended_states" | sort -u | jq -R . | jq -s .)"
+      requested_json="$(jq -cn --argjson packages "$packages_json" --argjson auto "$auto_packages_json" '[$packages[] as $package | select(($auto | index($package)) == null) | $package]')"
+    else
+      # Do not mistake every exported Debian dependency for explicit user
+      # intent when apt's manual-state database is unavailable.
+      requested_json='[]'
+    fi
+  fi
+
+  while IFS= read -r metadata; do
+    [ -n "$metadata" ] || continue
+    package="$(sed -n 's/^Name: //p' "$metadata" | head -n 1)"
+    version="$(sed -n 's/^Version: //p' "$metadata" | head -n 1)"
+    [ -n "$package" ] || continue
+    requested=false
+    [ ! -f "$(dirname "$metadata")/REQUESTED" ] || requested=true
+    python_packages_json="$(jq -cn --argjson packages "$python_packages_json" --arg name "$package" --arg version "$version" --argjson requested "$requested" '$packages + [{name:$name, version:$version, requested:$requested}]')"
+  done < <(find "$root/opt/venv" -type f -path '*.dist-info/METADATA' 2>/dev/null | sort)
+  if [ "$(printf '%s' "$python_packages_json" | jq 'length')" -gt 0 ]; then
+    python_environment="$(jq -cn --argjson packages "$python_packages_json" '{path:"/opt/venv", python:"unknown", pip:"unknown", packages:$packages, freeze:[], export_capture:true}')"
+    # The exported filesystem can identify distributions, but cannot reproduce
+    # pip's resolved requirement set or its interpreter metadata safely.
+    capture_limitations="$(printf '%s' "$capture_limitations" | jq -c '. + ["python-lock"]')"
+  fi
+
+  if [ "$package_manager" = dpkg ]; then
+    # Only legacy one-line APT sources are portable through this offline
+    # capture. Keep the remaining source configuration in the backup image.
+    capture_limitations="$(printf '%s' "$capture_limitations" | jq -c '. + ["apt-sources"]')"
+  fi
+
+  local runtimes_json='[]' features_json='[]' runtime_manifest='' runtime_id='' runtime_command=''
+  if [ -d "$root/etc/agentctl/runtimes.d" ]; then
+    for runtime_manifest in "$root/etc/agentctl/runtimes.d"/*.json; do
+      [ -f "$runtime_manifest" ] || continue
+      runtime_id="$(jq -r '.id // empty' "$runtime_manifest" 2>/dev/null || true)"
+      runtime_command="$(jq -r '.command // empty' "$runtime_manifest" 2>/dev/null || true)"
+      [ -n "$runtime_id" ] && [ -n "$runtime_command" ] || continue
+      if [ -x "$root/opt/agentctl/bin/$runtime_command" ] || [ -x "$root/home/coder/.local/bin/$runtime_command" ] || [ -x "$root/home/coder/bin/$runtime_command" ]; then
+        runtimes_json="$(jq -cn --argjson current "$runtimes_json" --arg id "$runtime_id" '$current + [$id] | unique | sort')"
+      fi
+    done
+  fi
+  if [ -d "$root/var/lib/agentctl/features" ]; then
+    for package_file in "$root/var/lib/agentctl/features"/*/install-complete; do
+      [ -f "$package_file" ] || continue
+      runtime_id="$(basename "$(dirname "$package_file")")"
+      features_json="$(jq -cn --argjson current "$features_json" --arg id "$runtime_id" '$current + [$id] | unique | sort')"
+    done
+  fi
+
+  jq -cn --arg source_image "$source_image" --arg target_image "$target_image" \
+    --arg package_manager "$package_manager" --argjson packages "$packages_json" \
+    --argjson requested_packages "$requested_json" --argjson repositories "$repositories_json" \
+    --argjson details "$details_json" --argjson python_environment "$python_environment" \
+    --argjson runtimes "$runtimes_json" --argjson features "$features_json" --argjson capture_limitations "$capture_limitations" \
+    '{manifest_schema_version:1, kind:"agentctl-upgrade-recovery-source", export_capture:true,
+      captured_at:(now | todateiso8601), architecture:"unknown", source_image:$source_image, target_image:$target_image,
+      system:{package_manager:$package_manager, packages:$packages, requested_packages:$requested_packages,
+        apk_repositories:$repositories, installed_runtimes:$runtimes, installed_features:$features},
+      package_details:$details, apt_sources:[], python_environment:$python_environment,
+      capture_limitations:$capture_limitations}'
+}
+
+recovery_prepare_upgrade_from_export_root() {
+  local root="$1" source_image="$2" target_image="$3" existing='{}' source='' record_id='' parent_id='' ledger=''
+  if [ -f "$root${RECOVERY_LEDGER_FILE}" ]; then
+    existing="$(cat "$root${RECOVERY_LEDGER_FILE}" 2>/dev/null || printf '{}')"
+  fi
+  printf '%s' "$existing" | jq -e 'type == "object" and ((.ledger_schema_version // 1) == 1)' >/dev/null \
+    || die "Invalid upgrade recovery ledger in exported source; rescue or repair it before upgrading"
+  source="$(recovery_source_manifest_from_export_root "$root" "$source_image" "$target_image")" \
+    || die "Unable to capture recovery manifest from exported source"
+  record_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM:-0}"
+  parent_id="$(printf '%s' "$existing" | jq -r '(.records // [])[-1].record_id // empty')"
+  source="$(jq -c --arg record_id "$record_id" --arg parent_id "$parent_id" '. + {record_id:$record_id, parent_record_id:(if $parent_id == "" then null else $parent_id end)}' <<<"$source")"
+  ledger="$(jq -cn --argjson existing "$existing" --argjson source "$source" '{ledger_schema_version:1, records:(($existing.records // []) + [$source]), plans:($existing.plans // [])}')"
+  printf '%s\n' "$ledger"
+}
+
+recovery_prepare_upgrade() {
+  local name="$1"
+  local source_image="$2"
+  local target_image="$3"
+  local existing='{}' source='{}' record_id="" parent_id="" ledger=""
+  local was_running=0
+
+  if container_running "$name"; then
+    was_running=1
+  else
+    start_existing_container_safely "$name" >/dev/null
+    ensure_started_container_is_running "$name" "upgrade recovery capture" \
+      || die "Unable to start $name for upgrade recovery capture"
+  fi
+
+  existing="$(recovery_ledger_json "$name" 2>/dev/null || printf '{}')"
+  if ! printf '%s' "$existing" | jq -e 'type == "object" and ((.ledger_schema_version // 1) == 1)' >/dev/null 2>&1; then
+    die "Invalid upgrade recovery ledger in $name; rescue or repair it before upgrading"
+  fi
+  source="$(recovery_source_manifest_json "$name" "$source_image" "$target_image")" \
+    || die "Unable to capture upgrade recovery manifest from $name before recreation"
+  record_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM:-0}"
+  parent_id="$(printf '%s' "$existing" | jq -r '(.records // [])[-1].record_id // empty')"
+  source="$(jq -c --arg record_id "$record_id" --arg parent_id "$parent_id" \
+    '. + {record_id: $record_id, parent_record_id: (if $parent_id == "" then null else $parent_id end)}' <<<"$source")"
+  ledger="$(jq -cn --argjson existing "$existing" --argjson source "$source" \
+    '{ledger_schema_version: 1,
+      records: (($existing.records // []) + [$source]),
+      plans: ($existing.plans // [])}')"
+  recovery_write_ledger "$name" "$ledger"
+  if [ "$was_running" -eq 0 ]; then
+    stop_existing_container_safely "$name" >/dev/null
+  fi
+  printf '%s\n' "$ledger"
+}
+
+recovery_plan_json() {
+  local ledger="$1"
+  local target_manifest="$2"
+  local policy="${3:-mixed}"
+  local source_features_json='[]' managed_python_packages='[]'
+
+  source_features_json="$(printf '%s' "$ledger" | jq -c '.records[-1].system.installed_features // []')"
+  managed_python_packages="$(feature_managed_python_packages_json "$source_features_json")"
+
+  jq -cn --argjson ledger "$ledger" --argjson target "$target_manifest" --argjson managed_python "$managed_python_packages" --arg policy "$policy" '
+    def python_minor: try (capture("^Python (?<major>[0-9]+)\\.(?<minor>[0-9]+)") | (.major + "." + .minor)) catch "";
+    ($ledger.records[-1]) as $source
+    | ($source.system // {}) as $source_system
+    | ($target.system // $target) as $target_system
+    | ($source_system.package_manager // "unknown") as $source_pm
+    | ($target_system.package_manager // "unknown") as $target_pm
+    | ($target_system.installed_runtimes // []) as $target_runtimes
+    | ($target_system.installed_features // []) as $target_features
+    | ($target_system.requested_packages // []) as $target_packages
+    | ($target_system.apk_repositories // []) as $target_apk_repositories
+    | ($target.apt_sources // []) as $target_apt_sources
+    | ($target.python_environment.packages // []) as $target_python
+    | ($source.package_details // []) as $source_package_details
+    | (($ledger.plans[-1].actions // [])
+       | map(select(.status != "dismissed" and .status != "restored")
+             | if .status == "failed" then .status = "pending" else . end
+             | if .kind == "os-package" then
+                 .default_selected = (.provider == $target_pm)
+                 | .status = (if .provider == $target_pm then "pending" else "incompatible" end)
+               elif .kind == "python-package" and $target.python_environment != null then
+                 .default_selected = true | .status = "pending"
+               else . end)) as $inherited_actions
+    | [($source_system.installed_runtimes // [])[] as $name | select(($target_runtimes | index($name)) == null)
+       | {kind:"runtime", id:("runtime:" + $name), name: $name, default_selected:true, status:"pending"}] as $runtimes
+    | [($source_system.installed_features // [])[] as $name | select(($target_features | index($name)) == null)
+       | {kind:"feature", id:("feature:" + $name), name: $name, default_selected:true, status:"pending"}] as $features
+    | [($source_system.requested_packages // [])[] as $name | select(($target_packages | index($name)) == null)
+       | {kind:"os-package", id:("os:" + $source_pm + ":" + $name), name: $name, provider:$source_pm,
+          version: ([$source_package_details[]? | select(.name == $name) | .version][0] // null),
+          default_selected:($source_pm == $target_pm),
+          status:(if $source_pm == $target_pm then "pending" else "incompatible" end)}] as $os_packages
+    | ([$target_python[]?.name | ascii_downcase]) as $target_python_names
+    | [($source.python_environment.packages // [])[] as $package | select($package.requested == true)
+       | select(($managed_python | index($package.name | ascii_downcase)) == null)
+       | select(($target_python_names | index($package.name | ascii_downcase)) == null)
+       | {kind:"python-package", id:("python:" + ($package.name | ascii_downcase)), name:$package.name,
+          version:$package.version, python_minor:($source.python_environment.python | python_minor), default_selected:($policy == "latest"),
+          status:(if $source.python_environment == null or $target.python_environment == null then "incompatible"
+                  elif ($source.python_environment.python | python_minor) == "" or ($target.python_environment.python | python_minor) == "" then "incompatible"
+                  elif ($source.python_environment.python | python_minor) != ($target.python_environment.python | python_minor) then "incompatible"
+                  else "pending" end)}] as $python_packages
+    | [if $source.python_environment != null and $target.python_environment != null
+          and (($source.python_environment.python | python_minor) != "")
+          and (($source.python_environment.python | python_minor) == ($target.python_environment.python | python_minor))
+          and (($source.python_environment.freeze // []) | length > 0)
+        then {kind:"python-lock", id:"python-lock:/opt/venv", name:"/opt/venv package lock",
+              freeze:[$source.python_environment.freeze[]
+                | select(. as $line | ($line | ascii_downcase) as $lower
+                  | ([ $managed_python[] as $managed
+                       | select($lower | startswith($managed + "==")) ] | length) == 0)],
+              default_selected:($policy != "latest"), status:"pending"}
+        else empty end] as $python_locks
+    | [($source_system.apk_repositories // [])[] as $repository
+       | select(($target_apk_repositories | index($repository)) == null)
+       | {kind:"apk-repository", id:("apk-repository:" + $repository), name:$repository,
+          default_selected:false, status:"requires-confirmation"}] as $apk_repositories
+    | [($source.apt_sources // [])[] as $source_line
+       | select(($target_apt_sources | index($source_line)) == null)
+       | {kind:"apt-source", id:("apt-source:" + $source_line), name:$source_line,
+          default_selected:false, status:"requires-confirmation"}] as $apt_sources
+    | [($source.capture_limitations // [])[] as $limitation
+       | if $limitation == "apt-sources" then
+           {kind:"manual-recovery", id:"manual:apt-sources",
+            name:"APT source configuration (inspect the backup image)",
+            default_selected:false, status:"manual-required"}
+         elif $limitation == "python-lock" then
+           {kind:"manual-recovery", id:"manual:python-lock",
+            name:"Exact /opt/venv package lock (inspect the backup image)",
+            default_selected:false, status:"manual-required"}
+         else
+           {kind:"manual-recovery", id:("manual:" + $limitation), name:$limitation,
+            default_selected:false, status:"manual-required"}
+         end] as $manual_actions
+    | {plan_schema_version:1, created_at:(now | todateiso8601), source_record_id:$source.record_id,
+       policy:$policy,
+       actions: ([($inherited_actions + $manual_actions + $apk_repositories + $apt_sources + $runtimes + $features + $os_packages + $python_locks + $python_packages)[]
+                  | {key: .id, value: .}] | from_entries | [.[]])}'
+}
+
+recovery_append_plan() {
+  local ledger="$1"
+  local plan="$2"
+  jq -cn --argjson ledger "$ledger" --argjson plan "$plan" \
+    '$ledger + {plans: (($ledger.plans // []) + [$plan])}'
+}
+
+recovery_mark_selected_restored() {
+  local ledger="$1"
+  local selected_ids="$2"
+  local selected_json='[]'
+
+  selected_json="$(printf '%s\n' "$selected_ids" | sed '/^$/d' | jq -R . | jq -s .)"
+  jq -cn --argjson ledger "$ledger" --argjson selected "$selected_json" \
+    '$ledger | .plans[-1].actions |= map(. as $action | if ($selected | index($action.id)) != null then .status = "restored" else . end)'
+}
+
+recovery_mark_action_results() {
+  local ledger="$1" restored_ids="$2" failed_ids="$3"
+  local restored_json='[]' failed_json='[]'
+  restored_json="$(printf '%s\n' "$restored_ids" | sed '/^$/d' | jq -R . | jq -s .)"
+  failed_json="$(printf '%s\n' "$failed_ids" | sed '/^$/d' | jq -R . | jq -s .)"
+  jq -cn --argjson ledger "$ledger" --argjson restored "$restored_json" --argjson failed "$failed_json" \
+    '$ledger | .plans[-1].actions |= map(. as $action |
+      if ($restored | index($action.id)) != null then .status = "restored"
+      elif ($failed | index($action.id)) != null then .status = "failed"
+      else . end)'
+}
+
+recovery_print_plan() {
+  local plan="$1"
+  printf '%s\n' "Upgrade recovery plan:" >&2
+  printf '%s' "$plan" | jq -r '.actions[]? | "  [" + (if .default_selected and .status == "pending" then "x" else " " end) + "] " + .kind + ": " + .name + (if .version then " (" + .version + ")" else "" end) + " [" + .status + "]"' >&2
+}
+
+recovery_selected_ids() {
+  local plan="$1"
+  local mode="$2"
+  local answer="" table="" selection="" number=""
+
+  if [ "$mode" = all ]; then
+    printf '%s' "$plan" | jq -r '.actions[]? | select((.status == "pending" or .status == "failed") and .default_selected) | .id'
+    return 0
+  fi
+  [ "$mode" = interactive ] || return 0
+  recovery_print_plan "$plan"
+  if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    return 0
+  fi
+  table="$(printf '%s' "$plan" | jq -r '.actions[]? | select(.status == "pending" or .status == "failed" or .status == "requires-confirmation") | [.id, (.kind + ": " + .name)] | @tsv')"
+  [ -n "$table" ] || return 0
+  printf '%s\n' "$table" | nl -ba -w1 -s '  ' | sed 's/^/  /' >&2
+  printf 'Select items [all, none, or comma-separated numbers; default all] ' >/dev/tty
+  IFS= read -r answer </dev/tty || true
+  case "$answer" in
+    ""|all|ALL|a|A)
+      printf '%s' "$plan" | jq -r '.actions[]? | select((.status == "pending" or .status == "failed") and .default_selected) | .id'
+      ;;
+    none|NONE|n|N) ;;
+    *)
+      selection="$(printf '%s' "$answer" | tr ',' ' ')"
+      for number in $selection; do
+        case "$number" in
+          *[!0-9]*|"") warn "Ignoring invalid recovery selection: $number" ;;
+          *) printf '%s\n' "$table" | sed -n "${number}p" | cut -f1 ;;
+        esac
+      done
+      ;;
+  esac
+}
+
+recovery_apply_selected() {
+  local name="$1"
+  local plan="$2"
+  local selected_ids="$3"
+  local policy="$4"
+  local action id kind package version provider status=0 action_status=0 selected_json='[]'
+  RECOVERY_RESTORED_IDS=""
+  RECOVERY_FAILED_IDS=""
+
+  selected_json="$(printf '%s\n' "$selected_ids" | sed '/^$/d' | jq -R . | jq -s .)"
+  selected_ids="$(printf '%s' "$plan" | jq -r --argjson selected "$selected_json" '
+    [.actions[] as $action | select(($selected | index($action.id)) != null)
+     | $action + {order:(if $action.kind == "apk-repository" or $action.kind == "apt-source" then 0
+                    elif $action.kind == "os-package" then 1
+                    elif $action.kind == "feature" then 2
+                    elif $action.kind == "runtime" then 3
+                    else 4 end)}]
+    | sort_by(.order, .id)[] | .id')"
+
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    action="$(printf '%s' "$plan" | jq -c --arg id "$id" '.actions[] | select(.id == $id)')"
+    kind="$(printf '%s' "$action" | jq -r '.kind')"
+    package="$(printf '%s' "$action" | jq -r '.name')"
+    version="$(printf '%s' "$action" | jq -r '.version // empty')"
+    provider="$(printf '%s' "$action" | jq -r '.provider // empty')"
+    action_status=0
+    case "$kind" in
+      apk-repository)
+        local quoted_repository=""
+        quoted_repository="$(printf '%s' "$package" | jq -Rr '@sh')"
+        "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "grep -Fxq $quoted_repository /etc/apk/repositories || printf '%s\\n' $quoted_repository >> /etc/apk/repositories" || action_status=1
+        ;;
+      apt-source)
+        local quoted_source=""
+        quoted_source="$(printf '%s' "$package" | jq -Rr '@sh')"
+        "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "mkdir -p /etc/apt/sources.list.d && grep -Fxq $quoted_source /etc/apt/sources.list.d/agentctl-recovery.list 2>/dev/null || printf '%s\\n' $quoted_source >> /etc/apt/sources.list.d/agentctl-recovery.list" || action_status=1
+        ;;
+      runtime) install_runtime_in_container "$name" "$package" || action_status=1 ;;
+      feature) run_agent_sh_in_container_root "$name" feature install "$package" || action_status=1 ;;
+      os-package)
+        if [ "$policy" = locked ] && [ -n "$version" ]; then package="${package}=${version}"; fi
+        case "$provider" in
+          apk) "$CONTAINER_CMD" exec -u 0 "$name" apk add --no-cache "$package" || action_status=1 ;;
+          dpkg) "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "apt-get update && apt-get install -y '$package'" || action_status=1 ;;
+          *) action_status=1 ;;
+        esac
+        ;;
+      python-package)
+        if [ "$policy" = latest ]; then version=""; fi
+        "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc "/opt/venv/bin/python -m pip install --no-cache-dir '${package}${version:+==${version}}'" || action_status=1
+        ;;
+      python-lock)
+        local requirements_file="/tmp/agentctl-recovery-requirements-$$.txt"
+        printf '%s' "$action" | jq -r '.freeze[]?' | "$CONTAINER_CMD" exec -i -u 0 "$name" sh -lc "cat > '$requirements_file' && chown coder:coder '$requirements_file'"
+        "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc "/opt/venv/bin/python -m pip install --no-cache-dir -r '$requirements_file'" || action_status=1
+        "$CONTAINER_CMD" exec -u 0 "$name" rm -f "$requirements_file" || true
+        ;;
+    esac
+    if [ "$action_status" -eq 0 ]; then
+      RECOVERY_RESTORED_IDS="${RECOVERY_RESTORED_IDS}${RECOVERY_RESTORED_IDS:+$'\n'}${id}"
+    else
+      RECOVERY_FAILED_IDS="${RECOVERY_FAILED_IDS}${RECOVERY_FAILED_IDS:+$'\n'}${id}"
+      status=1
+    fi
+  done <<<"$selected_ids"
+  return "$status"
+}
+
+upgrade_restore_cmd() {
+  local name="" interactive=0 all=0 status_only=0 history=0 dry_run=0 policy="mixed" ledger="" plan="" was_running=0 selected="" dismiss_id=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
+      --interactive) interactive=1; shift ;;
+      --all-compatible) all=1; shift ;;
+      --status) status_only=1; shift ;;
+      --history) history=1; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      --dismiss) [ "$#" -ge 2 ] || die "Missing value for --dismiss"; dismiss_id="$2"; shift 2 ;;
+      --restore-version-policy) [ "$#" -ge 2 ] || die "Missing value for --restore-version-policy"; policy="$2"; shift 2 ;;
+      --help) echo "Usage: $CLI_NAME upgrade restore --name NAME [--interactive|--all-compatible|--status|--history|--dry-run|--dismiss ITEM_ID]"; return 0 ;;
+      *) die "Unknown upgrade restore option: $1" ;;
+    esac
+  done
+  case "$policy" in mixed|latest|locked) ;; *) die "Invalid --restore-version-policy: $policy" ;; esac
+  [ -n "$name" ] || name="$(default_name "$DEFAULT_NAME_PREFIX")"
+  container_exists "$name" || die "Container not found: $name"
+  ledger="$(recovery_ledger_json "$name")" || die "No upgrade recovery ledger found in $name"
+  if [ "$history" -eq 1 ]; then printf '%s' "$ledger" | jq -r '.records[] | [.record_id, .source_image, .target_image, .captured_at] | @tsv'; return 0; fi
+  plan="$(printf '%s' "$ledger" | jq -c '.plans[-1] // empty')"
+  [ -n "$plan" ] || die "No recovery plan found in $name"
+  if [ -n "$dismiss_id" ]; then
+    if container_running "$name"; then was_running=1; else start_existing_container_safely "$name" >/dev/null; fi
+    ledger="$(printf '%s' "$ledger" | jq -c --arg id "$dismiss_id" '(.plans[-1].actions[] | select(.id == $id) | .status) = "dismissed"')"
+    recovery_write_ledger "$name" "$ledger"
+    [ "$was_running" -eq 1 ] || stop_existing_container_safely "$name" >/dev/null
+    echo "Dismissed recovery item: $dismiss_id" >&2
+    return 0
+  fi
+  if [ "$status_only" -eq 1 ] || [ "$dry_run" -eq 1 ]; then recovery_print_plan "$plan"; return 0; fi
+  if container_running "$name"; then was_running=1; else start_existing_container_safely "$name" >/dev/null; fi
+  if [ "$all" -eq 1 ]; then selected="$(recovery_selected_ids "$plan" all)"; else selected="$(recovery_selected_ids "$plan" interactive)"; fi
+  if [ -z "$selected" ]; then
+    echo "Recovery deferred: $name" >&2
+  elif recovery_apply_selected "$name" "$plan" "$selected" "$policy"; then
+    ledger="$(recovery_mark_action_results "$ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")"
+    recovery_write_ledger "$name" "$ledger"
+  else
+    ledger="$(recovery_mark_action_results "$ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")"
+    recovery_write_ledger "$name" "$ledger"
+    warn "Some recovery actions failed; retry with: ${CLI_NAME} upgrade restore --name $name --interactive"
+  fi
+  [ "$was_running" -eq 1 ] || stop_existing_container_safely "$name" >/dev/null
 }
 
 rescue_cmd() {

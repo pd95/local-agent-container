@@ -317,8 +317,9 @@ refreshing it or mounting the current workdir, use `rescue`:
 agentctl rescue --image <container>-backup-<timestamp>
 ```
 
-For upgrade recovery workflows, backup state inventory, and restore examples,
-see [docs/rescue.md](docs/rescue.md).
+For upgrade recovery workflows, package and Python restoration policies, and
+resumable recovery plans, see [Upgrade recovery](docs/images.md#upgrade-recovery).
+For backup-image rescue and restore examples, see [docs/rescue.md](docs/rescue.md).
 
 If you already have a compatible base container and want to bring the managed
 control surface onto it, use `agentctl bootstrap` instead of starting from a

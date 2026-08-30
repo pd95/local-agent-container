@@ -924,8 +924,8 @@ case "$output" in *"Could not open a connection"*) exit 1 ;; esac
   '
   assert_status 0
 
-  # Rebuild the target without preinstalled SSH to verify that a normal upgrade
-  # preserves the source feature instead of relying on the target image layer.
+  # Rebuild the target without preinstalled SSH to verify that preserved SSH
+  # forwarding ensures its required client feature is available.
   run_capture "$AGENTCTL" build --image agent-plain --rebuild
   assert_status 0
   versioned_image="$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^Building image tags: agent-plain, \(agent-plain:[^[:space:]]*\)$/\1/p' | tail -n 1)"
@@ -941,9 +941,11 @@ case "$output" in *"Could not open a connection"*) exit 1 ;; esac
   run_capture "$AGENTCTL" feature --name "$name" info ssh
   assert_status 0
   printf '%s' "$RUN_OUTPUT" | jq -e '.installed == true' >/dev/null \
-    || fail "Expected upgrade to reinstall the preserved SSH client feature"
+    || fail "Expected preserved SSH forwarding to ensure the SSH client feature"
 
-  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --no-ssh
+  # --no-ssh changes forwarding only. Explicit recovery keeps the independent
+  # SSH client feature installed while that forwarding mount is removed.
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --no-ssh --restore
   assert_status 0
   run_capture "$CONTAINER_CMD" inspect "$name"
   assert_status 0

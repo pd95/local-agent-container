@@ -183,9 +183,54 @@ Before recreation, `upgrade` warns about extra OS packages that were added after
 the source baseline and are not present in the target image, because those
 packages are not preserved automatically.
 
-When an upgrade detects runtimes or features that were added after the source
-image baseline and are still installable in the target image, it reinstalls
-them automatically before restoring user state.
+## Upgrade recovery
+
+Each upgrade records a versioned recovery ledger in
+`~/.config/agentctl/upgrade-recovery/`. It carries source package, runtime,
+feature, and default `/opt/venv` Python-package intent through later upgrades,
+including entries deferred during an earlier image transition.
+
+When attached to a terminal, `agentctl upgrade` offers to restore compatible
+items near completion. OS packages use the target repository's current version;
+compatible Python packages use their captured version by default. For scripts,
+use `--restore` to accept defaults or `--no-restore` to defer. Resume later
+with:
+
+```bash
+agentctl upgrade restore --name my-project --interactive
+agentctl upgrade restore --name my-project --status
+agentctl upgrade restore --name my-project --history
+agentctl upgrade restore --name my-project --dry-run
+agentctl upgrade restore --name my-project --all-compatible
+```
+
+`--dry-run` prints the saved plan without changing the container.
+`--all-compatible` restores its default-compatible items without a prompt. To
+permanently skip one item, use `agentctl upgrade restore --name my-project
+--dismiss ITEM_ID`; use `--status` or `--dry-run` to obtain its item ID.
+
+The version policy controls package restoration:
+
+- `mixed` (the default) uses the target repository's current OS-package
+  versions and, when compatible, restores the captured `/opt/venv` lock.
+- `latest` installs requested Python packages at their current available
+  versions.
+- `locked` makes a best-effort request for captured OS-package versions and
+  restores the captured Python lock. It can fail when the target repository no
+  longer provides a recorded version.
+
+Custom repositories are recorded without credentials and require an explicit
+interactive selection before they are enabled. Package-manager transitions retain OS items as pending rather
+than guessing a cross-distribution package mapping. The backup image remains
+the recovery path for arbitrary filesystem state.
+
+When an upgrade must capture a stopped container from its exported filesystem,
+the recovery plan explicitly marks APT source configuration and exact Python
+environment locks as manual recovery items. Inspect the retained backup image
+before restoring those details.
+
+Compatible missing runtimes and features are preselected in the recovery menu;
+they are installed only when the user accepts or explicitly selects them.
 
 If the current preferred runtime is not available after the upgrade, `agentctl`
 warns and drops the stale user override so the recreated container falls back to
