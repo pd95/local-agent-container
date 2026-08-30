@@ -20,6 +20,8 @@ const httpPort=Number(await new Promise((resolve,reject)=>{let text='';fakeHttp.
 const unusedServer=http.createServer(); await new Promise(resolve=>unusedServer.listen(0,'127.0.0.1',resolve)); const unusedPort=unusedServer.address().port; await new Promise(resolve=>unusedServer.close(resolve));
 const servers=[
   {name:'fake',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_STARTED:starts,AGENTCTL_FAKE_MCP_CLIENT_RESPONSE:clientResponses}},
+  {name:'slow-default',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1100'}},
+  {name:'slow-override',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],timeout_ms:2000,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1100'}},
   {name:'http',transport:'http',url:`http://127.0.0.1:${httpPort}/mcp?fixed=1`,resolved_headers:{authorization:'Bearer configured-secret','x-tenant':'configured-tenant'}},
   {name:'redirect',transport:'http',url:`http://127.0.0.1:${httpPort}/redirect`,resolved_headers:{authorization:'Bearer redirect-secret'}},
   {name:'slow',transport:'http',url:`http://127.0.0.1:${httpPort}/slow`,resolved_headers:{}},
@@ -29,7 +31,7 @@ const servers=[
   {name:'missing',transport:'http',url:`http://127.0.0.1:${httpPort}/mcp?fixed=1`,resolved_headers:{},missing_credentials:['missing-secret']},
   {name:'failed',transport:'http',url:`http://127.0.0.1:${unusedPort}/mcp`,resolved_headers:{}}
 ];
-fs.writeFileSync(config, JSON.stringify({socket_path:socket,nonce:'test-nonce',container:'test-container',http_timeouts:{connect:80,headers:80,idle:80,total:500},servers}), {mode:0o600});
+fs.writeFileSync(config, JSON.stringify({socket_path:socket,nonce:'test-nonce',container:'test-container',timeout_ms:1000,http_timeouts:{connect:80,headers:80,idle:80,total:500},servers}), {mode:0o600});
 let relayLogs='';
 const relay = spawn(process.execPath, [path.join(root,'mcp/host-relay.mjs'),config], {stdio:['ignore','ignore','pipe']});
 relay.stderr.on('data',chunk=>{relayLogs+=chunk;});
@@ -81,6 +83,11 @@ const session=initialized.headers['mcp-session-id']; assert.ok(session);
 assert.equal((await request('POST','/mcp/fake',{jsonrpc:'2.0',id:9,method:'tools/list'},{'mcp-session-id':'expired'})).status,404);
 const tools=await request('POST','/mcp/fake',{jsonrpc:'2.0',id:2,method:'tools/list'}, {'mcp-session-id':session});
 assert.equal(JSON.parse(tools.body).result.tools[0].name,'echo');
+const timedOut=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:21,method:'tools/list'});
+assert.equal(timedOut.status,502); assert.match(timedOut.body,/MCP server response timed out/);
+const completedSlowCall=await request('POST','/mcp/slow-override',{jsonrpc:'2.0',id:22,method:'tools/list'});
+assert.equal(completedSlowCall.status,200); assert.equal(JSON.parse(completedSlowCall.body).result.tools[0].name,'echo');
+assert.match(relayLogs,/response timed out after 1000ms/);
 const sseMessage=new Promise((resolve,reject)=>{
   const get=http.request({socketPath:socket,path:'/mcp/fake',method:'GET',headers:{accept:'text/event-stream','mcp-session-id':session}},res=>{
     let body=''; res.on('data',chunk=>{body+=chunk; if(body.includes('notifications/test')){get.destroy();resolve(body);}});

@@ -999,7 +999,7 @@ mcp_load_registry_config() {
 mcp_definition_json() {
   local value="$1" raw="" base=""
   if [ "$value" = xcode ]; then
-    raw='{"name":"xcode","command":"xcrun","args":["mcpbridge"],"shared":true}'
+    raw='{"name":"xcode","command":"xcrun","args":["mcpbridge"],"shared":true,"timeout_ms":600000}'
   elif [ "${value#@}" != "$value" ]; then
     local file="${value#@}"
     [ -f "$file" ] && [ ! -L "$file" ] || die "MCP definition file must be a regular, non-symlink file: $file"
@@ -1016,7 +1016,7 @@ mcp_definition_json() {
     if (.type // "stdio") == "http" then .
     else
     if (.type // "stdio") != "stdio" then error("invalid type") else . end |
-    if ((keys - ["name","type","command","args","cwd","env","env_vars","shared"])|length)>0 then error("unknown field") else . end |
+    if ((keys - ["name","type","command","args","cwd","env","env_vars","shared","timeout_ms"])|length)>0 then error("unknown field") else . end |
     if (.name|type)!="string" or (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")|not) then error("invalid name") else . end |
     if (.command|type)!="string" or (.command|length)==0 then error("invalid command") else . end |
     if ((.args // [])|type)!="array" or any((.args // [])[]; type!="string") then error("args must contain strings") else . end |
@@ -1024,6 +1024,7 @@ mcp_definition_json() {
     if any((.env // {})|keys[]; test("^[A-Za-z_][A-Za-z0-9_]*$")|not) then error("invalid env name") else . end |
     if ((.env_vars // [])|type)!="array" or any((.env_vars // [])[]; type!="string" or test("^[A-Za-z_][A-Za-z0-9_]*$")|not) then error("invalid env_vars") else . end |
     if ((.shared // false)|type)!="boolean" then error("shared must be boolean") else . end |
+    if ((has("timeout_ms")|not) or ((.timeout_ms|type)=="number" and (.timeout_ms|floor)==.timeout_ms and .timeout_ms>=1000 and .timeout_ms<=3600000)) then . else error("timeout_ms must be an integer from 1000 to 3600000") end |
     .args=(.args // []) | .env=(.env // {}) | .env_vars=(.env_vars // []) |
     if .cwd then .cwd=(if (.cwd|startswith("/")) then .cwd elif $base!="" then ($base+"/"+.cwd) else .cwd end) else . end |
     del(.type) | .transport="stdio"
@@ -1033,7 +1034,7 @@ mcp_definition_json() {
 
 mcp_add_definition() {
   local entries="" entry="" name="" command="" resolved="" cwd="" inherited='{}' transport=""
-  entries="$(mcp_definition_json "$1")"
+  entries="$(mcp_definition_json "$1")" || return 1
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     name="$(printf '%s' "$entry" | jq -r .name)"
@@ -1326,12 +1327,27 @@ mcp_stop_managed() {
   printf '%s' "$response" | jq -e --arg nonce "$nonce" --argjson pid "$pid" '.ok==true and .nonce==$nonce and .pid==$pid' >/dev/null 2>&1 \
     || die "Refusing to signal unverified managed MCP process for $name"
   kill "$pid" 2>/dev/null || true
-  local tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do sleep 0.05; tries=$((tries+1)); done
+  # The relay's SIGTERM handler drains Unix-socket connections for up to two
+  # seconds. Leave a small scheduling margin before escalating to SIGKILL.
+  local tries=0
+  while [ "$tries" -lt 60 ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    sleep 0.05
+    tries=$((tries+1))
+  done
   if kill -0 "$pid" 2>/dev/null; then
     kill -KILL "$pid" 2>/dev/null || true
-    tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do sleep 0.05; tries=$((tries+1)); done
+    tries=0
+    while [ "$tries" -lt 20 ]; do
+      if ! kill -0 "$pid" 2>/dev/null; then break; fi
+      sleep 0.05
+      tries=$((tries+1))
+    done
   fi
   kill -0 "$pid" 2>/dev/null && die "Managed MCP process did not stop for $name; preserving ownership metadata"
+  # Reap a relay started by this agentctl invocation. For a relay inherited
+  # from an earlier invocation this simply returns immediately.
+  wait "$pid" 2>/dev/null || true
   [ ! -S "$socket" ] || rm -f "$socket"
   rm -f "$metadata"
 }
@@ -8704,7 +8720,13 @@ run_container() {
   if [ "$started" -eq 1 ]; then
     if remote_control_registry_available "$actual_name" \
       && [ "$(jq -r '.desired // false' "$(remote_control_registry_path "$actual_name")")" = true ]; then
-      echo "Leaving container running for Remote Control: $actual_name" >&2
+      if [ "$MCP_REQUESTED" -eq 1 ]; then
+        echo "Leaving container running for Remote Control and managed MCP: $actual_name" >&2
+        echo "Stop both with: ${CLI_NAME} stop --name $actual_name" >&2
+      else
+        echo "Leaving container running for Remote Control: $actual_name" >&2
+        echo "Stop it with: ${CLI_NAME} stop --name $actual_name" >&2
+      fi
     elif [ "$MCP_REQUESTED" -eq 1 ] && [ "$(mcp_lease_count "$actual_name")" -gt 1 ]; then
       echo "Leaving container running for another active managed MCP lease: $actual_name" >&2
     else

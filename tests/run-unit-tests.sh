@@ -2125,6 +2125,49 @@ test_run_container_passes_ssh_to_create() {
   printf '%s\n' "$create_log" | grep -Fq -- "--ssh" || fail "Expected SSH create flag, got: $create_log"
 }
 
+test_run_container_explains_retained_remote_control_and_mcp_lifecycle() {
+  begin_test "run_container explains how to stop retained Remote Control and MCP"
+
+  load_agentctl_functions
+  local registry running=0
+  registry="$(mktemp "${TMPDIR:-/tmp}/agentctl-remote-control.XXXXXX")"
+  register_dir_cleanup "$registry"
+  printf '%s\n' '{"desired":true}' >"$registry"
+  MCP_REQUESTED=1
+  CLI_NAME=agentctl
+  container_exists() { return 0; }
+  container_running() { [ "$running" -eq 1 ]; }
+  validate_mount_mode() { :; }
+  validate_existing_container_shm_size() { :; }
+  validate_existing_container_networks() { :; }
+  validate_existing_container_ssh() { :; }
+  validate_existing_socket_mappings() { :; }
+  validate_existing_published_sockets() { :; }
+  validate_container_socket_sources() { :; }
+  validate_published_host_paths_for_start() { :; }
+  warn_if_ssh_forwarding_unavailable_on_start() { :; }
+  mcp_configure_guest() { :; }
+  mcp_persist_registry() { :; }
+  configure_container_host_alias() { :; }
+  warn_if_container_agentctl_versions_differ() { :; }
+  remote_control_restore_if_desired() { :; }
+  remote_control_registry_available() { return 0; }
+  remote_control_registry_path() { printf '%s\n' "$registry"; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      start) running=1 ;;
+      exec) : ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" 0 true
+  assert_status 0
+  assert_contains "Leaving container running for Remote Control and managed MCP: unit-test-container"
+  assert_contains "Stop both with: agentctl stop --name unit-test-container"
+}
+
 test_configure_container_host_alias_replaces_stale_entry() {
   begin_test "container host alias replaces a stale gateway entry"
 
@@ -11830,14 +11873,49 @@ test_mcp_lock_secures_existing_runtime_directory() {
   mcp_lock_release
 }
 
+test_mcp_stop_managed_allows_relay_shutdown_grace_period() {
+  begin_test "managed MCP shutdown allows the relay grace period before escalation"
+
+  load_agentctl_functions
+  local root socket metadata marker pid tries=0
+  root="$(mktemp -d /tmp/agentctl-mcp-stop.XXXXXX)"
+  register_dir_cleanup "$root"
+  socket="$root/mcp-unit.sock"; metadata="$root/mcp-unit.process.json"; marker="$root/clean-exit"
+  unset -f sleep kill 2>/dev/null || true
+  node -e '
+const fs=require("fs"); const net=require("net");
+const socket=process.argv[1]; const marker=process.argv[2];
+const server=net.createServer().listen(socket);
+process.on("SIGTERM",()=>setTimeout(()=>{fs.writeFileSync(marker,"clean\\n"); server.close(()=>process.exit(0));},2100));
+' "$socket" "$marker" &
+  pid=$!
+  while [ ! -S "$socket" ] && [ "$tries" -lt 50 ]; do sleep 0.02; tries=$((tries+1)); done
+  [ -S "$socket" ] || fail "Timed relay fixture did not create its socket"
+  printf '%s\n' "{\"pid\":$pid,\"nonce\":\"unit-nonce\",\"socket\":\"$socket\"}" >"$metadata"
+  chmod 600 "$metadata"
+  mcp_runtime_dir() { printf '%s\n' "$root"; }
+  mcp_identity_hash() { printf '%s\n' unit; }
+  mcp_socket_path() { printf '%s\n' "$socket"; }
+  mcp_validate_private_file() { :; }
+  mcp_paths_equal() { return 0; }
+  curl() { printf '%s\n' "{\"ok\":true,\"nonce\":\"unit-nonce\",\"pid\":$pid}"; }
+
+  mcp_stop_managed agent-unit
+  [ -f "$marker" ] || fail "Managed MCP shutdown escalated before the relay grace period"
+  [ ! -e "$metadata" ] || fail "Managed MCP shutdown did not remove relay metadata"
+}
+
 test_mcp_definition_parses_stdio_and_http_transports() {
-  begin_test "managed MCP definitions discriminate stdio and HTTP transports"
+  begin_test "managed MCP definitions validate stdio timeouts and discriminate HTTP transports"
   load_agentctl_functions
   local executable http_definition
   executable="$(command -v sh)"
   MCP_CONFIG_JSON='[]'; MCP_REQUESTED=0
-  mcp_add_definition "{\"name\":\"stdio-explicit\",\"type\":\"stdio\",\"command\":\"$executable\"}"
-  printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[0].transport=="stdio" and .[0].name=="stdio-explicit"' >/dev/null || fail "Explicit stdio definition was not normalized: $MCP_CONFIG_JSON"
+  mcp_add_definition "{\"name\":\"stdio-explicit\",\"type\":\"stdio\",\"command\":\"$executable\",\"timeout_ms\":600000}"
+  printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[0].transport=="stdio" and .[0].name=="stdio-explicit" and .[0].timeout_ms==600000' >/dev/null || fail "Explicit stdio definition was not normalized: $MCP_CONFIG_JSON"
+  run_capture mcp_add_definition "{\"name\":\"bad-timeout\",\"command\":\"$executable\",\"timeout_ms\":999}"
+  assert_status 1
+  assert_contains "Invalid MCP server definition"
   mcp_keychain_exists() { return 1; }
   mcp_prompt_keychain_credential() { fail "definition normalization must not prompt for Keychain credentials"; }
   mcp_keychain_read() { fail "definition normalization must not read Keychain credentials"; }
@@ -11845,6 +11923,8 @@ test_mcp_definition_parses_stdio_and_http_transports() {
   mcp_add_definition "$http_definition"
   printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[1].transport=="http" and .[1].url=="http://127.0.0.1:9876/mcp?fixed=1" and .[1].bearer_token_keychain=="web-token" and (.[1]|has("resolved_headers")|not)' >/dev/null \
     || fail "HTTP definition was not normalized safely: $MCP_CONFIG_JSON"
+  mcp_definition_json xcode | jq -e '.name=="xcode" and .timeout_ms==600000' >/dev/null \
+    || fail "Xcode MCP preset must use a 10-minute timeout"
 }
 
 test_mcp_http_definition_rejects_unsafe_urls_and_headers() {
@@ -13661,6 +13741,7 @@ main() {
   run_selected_test test_shared_memory_support_check_fails_before_use "test_shared_memory_support_check_fails_before_use"
   run_selected_test test_run_container_passes_shared_memory_size_to_create "test_run_container_passes_shared_memory_size_to_create"
   run_selected_test test_run_container_passes_ssh_to_create "test_run_container_passes_ssh_to_create"
+  run_selected_test test_run_container_explains_retained_remote_control_and_mcp_lifecycle "test_run_container_explains_retained_remote_control_and_mcp_lifecycle"
   run_selected_test test_configure_container_host_alias_replaces_stale_entry "test_configure_container_host_alias_replaces_stale_entry"
   run_selected_test test_migrate_legacy_runtime_config_files "test_migrate_legacy_runtime_config_files"
   run_selected_test test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure "test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure"
@@ -13911,6 +13992,7 @@ main() {
   run_selected_test test_mcp_runtime_paths_normalize_trailing_tmpdir_separator "test_mcp_runtime_paths_normalize_trailing_tmpdir_separator"
   run_selected_test test_mcp_lock_recreates_missing_runtime_directory "test_mcp_lock_recreates_missing_runtime_directory"
   run_selected_test test_mcp_lock_secures_existing_runtime_directory "test_mcp_lock_secures_existing_runtime_directory"
+  run_selected_test test_mcp_stop_managed_allows_relay_shutdown_grace_period "test_mcp_stop_managed_allows_relay_shutdown_grace_period"
   run_selected_test test_mcp_definition_parses_stdio_and_http_transports "test_mcp_definition_parses_stdio_and_http_transports"
   run_selected_test test_mcp_http_definition_rejects_unsafe_urls_and_headers "test_mcp_http_definition_rejects_unsafe_urls_and_headers"
   run_selected_test test_mcp_registry_v2_filters_secrets_and_reads_v1 "test_mcp_registry_v2_filters_secrets_and_reads_v1"

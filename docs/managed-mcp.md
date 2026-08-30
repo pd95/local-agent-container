@@ -117,10 +117,14 @@ Stdio definitions accept:
 - `env`
 - `env_vars`
 - `shared`
+- `timeout_ms` (optional integer from 1,000 to 3,600,000)
 
 The Xcode preset enables `shared`, allowing reconnecting HTTP sessions to reuse
-one `xcrun mcpbridge` process. Generic definitions default to per-session
-process isolation. Literal `env` values live only for the active invocation.
+one `xcrun mcpbridge` process and sets a 10-minute response timeout. Generic
+stdio definitions default to a 30-second response timeout and per-session
+process isolation. Set `timeout_ms` when a known server has longer-running
+operations, for example `{"name":"builder","command":"/path/to/server","timeout_ms":600000}`.
+Literal `env` values live only for the active invocation.
 `env_vars` persists only selected host environment-variable names and resolves
 their current values whenever the host relay starts. Use it for host toolchain
 selection, for example `DEVELOPER_DIR` when running Xcode beta.
@@ -190,6 +194,10 @@ agentctl upgrade --name agent-project --disable-mcp
 Managed relays are container-scoped background services and normally appear
 with parent PID 1 after `agentctl` exits. Their process label includes the
 container name, for example `agentctl-mcp-relay:agent-project`.
+
+Relay log lines begin with an ISO-8601 UTC timestamp. A stdio timeout log also
+includes the configured deadline in milliseconds, making it possible to tell a
+slow tool call from an immediate bridge failure.
 
 Use `agentctl doctor --host` for the authoritative mapping of relay PIDs,
 containers, definitions, leases, sockets, and host/guest route health. Health
