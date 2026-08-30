@@ -22,5 +22,8 @@ input.on('line', line => {
   if (request.method === 'initialize') result = {protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'fake',version:'1'}};
   if (request.method === 'tools/list') result = {tools:[{name:'echo',description:'Echo input',inputSchema:{type:'object'}}]};
   if (request.method === 'tools/call') result = {content:[{type:'text',text:JSON.stringify(request.params?.arguments || {})}]};
-  process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',id:request.id,result})}\n`);
+  const delayMs = Number.parseInt(process.env.AGENTCTL_FAKE_MCP_DELAY_MS || '0', 10);
+  const respond = () => process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',id:request.id,result})}\n`);
+  if (Number.isSafeInteger(delayMs) && delayMs > 0) setTimeout(respond, delayMs);
+  else respond();
 });

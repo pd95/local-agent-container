@@ -11831,13 +11831,16 @@ test_mcp_lock_secures_existing_runtime_directory() {
 }
 
 test_mcp_definition_parses_stdio_and_http_transports() {
-  begin_test "managed MCP definitions discriminate stdio and HTTP transports"
+  begin_test "managed MCP definitions validate stdio timeouts and discriminate HTTP transports"
   load_agentctl_functions
   local executable http_definition
   executable="$(command -v sh)"
   MCP_CONFIG_JSON='[]'; MCP_REQUESTED=0
-  mcp_add_definition "{\"name\":\"stdio-explicit\",\"type\":\"stdio\",\"command\":\"$executable\"}"
-  printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[0].transport=="stdio" and .[0].name=="stdio-explicit"' >/dev/null || fail "Explicit stdio definition was not normalized: $MCP_CONFIG_JSON"
+  mcp_add_definition "{\"name\":\"stdio-explicit\",\"type\":\"stdio\",\"command\":\"$executable\",\"timeout_ms\":600000}"
+  printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[0].transport=="stdio" and .[0].name=="stdio-explicit" and .[0].timeout_ms==600000' >/dev/null || fail "Explicit stdio definition was not normalized: $MCP_CONFIG_JSON"
+  run_capture mcp_add_definition "{\"name\":\"bad-timeout\",\"command\":\"$executable\",\"timeout_ms\":999}"
+  assert_status 1
+  assert_contains "Invalid MCP server definition"
   mcp_keychain_exists() { return 1; }
   mcp_prompt_keychain_credential() { fail "definition normalization must not prompt for Keychain credentials"; }
   mcp_keychain_read() { fail "definition normalization must not read Keychain credentials"; }
@@ -11845,6 +11848,8 @@ test_mcp_definition_parses_stdio_and_http_transports() {
   mcp_add_definition "$http_definition"
   printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[1].transport=="http" and .[1].url=="http://127.0.0.1:9876/mcp?fixed=1" and .[1].bearer_token_keychain=="web-token" and (.[1]|has("resolved_headers")|not)' >/dev/null \
     || fail "HTTP definition was not normalized safely: $MCP_CONFIG_JSON"
+  mcp_definition_json xcode | jq -e '.name=="xcode" and .timeout_ms==600000' >/dev/null \
+    || fail "Xcode MCP preset must use a 10-minute timeout"
 }
 
 test_mcp_http_definition_rejects_unsafe_urls_and_headers() {

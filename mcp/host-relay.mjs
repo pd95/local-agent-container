@@ -28,7 +28,15 @@ const httpAgent = new http.Agent({keepAlive:true});
 const httpsAgent = new https.Agent({keepAlive:true});
 let shuttingDown = false;
 let leaseMissingSince = null;
-function log(message) { process.stderr.write(`[agentctl-mcp] ${message}\n`); }
+function log(message) { process.stderr.write(`${new Date().toISOString()} [agentctl-mcp] ${message}\n`); }
+
+function stdioTimeoutMs(definition) {
+  const configured = definition.timeout_ms;
+  if (Number.isSafeInteger(configured) && configured >= 1000 && configured <= 3600000) return configured;
+  const fallback = config.timeout_ms;
+  if (Number.isSafeInteger(fallback) && fallback >= 1000 && fallback <= 3600000) return fallback;
+  return 30000;
+}
 
 function json(res, status, body) {
   const data = Buffer.from(JSON.stringify(body));
@@ -205,7 +213,7 @@ function startChild(definition) {
         if (state.initializeRequest) {
           try {
             replacement.initializeRequest=state.initializeRequest;
-            replacement.cachedInitializeResponse=await queuedTransact(replacement, state.initializeRequest, config.timeout_ms || 30000);
+            replacement.cachedInitializeResponse=await queuedTransact(replacement, state.initializeRequest, stdioTimeoutMs(definition));
             if (state.initializedNotified) {
               await writeChild(replacement, {jsonrpc:'2.0',method:'notifications/initialized'});
               replacement.initializedNotified=true;
@@ -240,6 +248,7 @@ function transact(state, payload, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       if (state.pending?.id === payload.id) state.pending=null;
+      log(`server ${state.definition.name} response timed out after ${timeoutMs}ms`);
       reject(new Error('MCP server response timed out'));
     }, timeoutMs);
     state.pending = {
@@ -348,7 +357,7 @@ const server = http.createServer(async (req, res) => {
     catch (error) { return json(res, 502, {error:error.message}); }
   }
   try {
-    let responsePromise = queuedTransact(state, payload, config.timeout_ms || 30000);
+    let responsePromise = queuedTransact(state, payload, stdioTimeoutMs(definition));
     if (definition.shared_process && payload.method === 'initialize') state.initializePromise=responsePromise;
     const response = await responsePromise;
     if (definition.shared_process && payload.method === 'initialize') {
