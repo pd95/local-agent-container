@@ -1329,10 +1329,20 @@ mcp_stop_managed() {
   kill "$pid" 2>/dev/null || true
   # The relay's SIGTERM handler drains Unix-socket connections for up to two
   # seconds. Leave a small scheduling margin before escalating to SIGKILL.
-  local tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 60 ]; do sleep 0.05; tries=$((tries+1)); done
+  local tries=0
+  while [ "$tries" -lt 60 ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    sleep 0.05
+    tries=$((tries+1))
+  done
   if kill -0 "$pid" 2>/dev/null; then
     kill -KILL "$pid" 2>/dev/null || true
-    tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do sleep 0.05; tries=$((tries+1)); done
+    tries=0
+    while [ "$tries" -lt 20 ]; do
+      if ! kill -0 "$pid" 2>/dev/null; then break; fi
+      sleep 0.05
+      tries=$((tries+1))
+    done
   fi
   kill -0 "$pid" 2>/dev/null && die "Managed MCP process did not stop for $name; preserving ownership metadata"
   # Reap a relay started by this agentctl invocation. For a relay inherited
@@ -8710,7 +8720,13 @@ run_container() {
   if [ "$started" -eq 1 ]; then
     if remote_control_registry_available "$actual_name" \
       && [ "$(jq -r '.desired // false' "$(remote_control_registry_path "$actual_name")")" = true ]; then
-      echo "Leaving container running for Remote Control: $actual_name" >&2
+      if [ "$MCP_REQUESTED" -eq 1 ]; then
+        echo "Leaving container running for Remote Control and managed MCP: $actual_name" >&2
+        echo "Stop both with: ${CLI_NAME} stop --name $actual_name" >&2
+      else
+        echo "Leaving container running for Remote Control: $actual_name" >&2
+        echo "Stop it with: ${CLI_NAME} stop --name $actual_name" >&2
+      fi
     elif [ "$MCP_REQUESTED" -eq 1 ] && [ "$(mcp_lease_count "$actual_name")" -gt 1 ]; then
       echo "Leaving container running for another active managed MCP lease: $actual_name" >&2
     else

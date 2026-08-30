@@ -2125,6 +2125,49 @@ test_run_container_passes_ssh_to_create() {
   printf '%s\n' "$create_log" | grep -Fq -- "--ssh" || fail "Expected SSH create flag, got: $create_log"
 }
 
+test_run_container_explains_retained_remote_control_and_mcp_lifecycle() {
+  begin_test "run_container explains how to stop retained Remote Control and MCP"
+
+  load_agentctl_functions
+  local registry running=0
+  registry="$(mktemp "${TMPDIR:-/tmp}/agentctl-remote-control.XXXXXX")"
+  register_dir_cleanup "$registry"
+  printf '%s\n' '{"desired":true}' >"$registry"
+  MCP_REQUESTED=1
+  CLI_NAME=agentctl
+  container_exists() { return 0; }
+  container_running() { [ "$running" -eq 1 ]; }
+  validate_mount_mode() { :; }
+  validate_existing_container_shm_size() { :; }
+  validate_existing_container_networks() { :; }
+  validate_existing_container_ssh() { :; }
+  validate_existing_socket_mappings() { :; }
+  validate_existing_published_sockets() { :; }
+  validate_container_socket_sources() { :; }
+  validate_published_host_paths_for_start() { :; }
+  warn_if_ssh_forwarding_unavailable_on_start() { :; }
+  mcp_configure_guest() { :; }
+  mcp_persist_registry() { :; }
+  configure_container_host_alias() { :; }
+  warn_if_container_agentctl_versions_differ() { :; }
+  remote_control_restore_if_desired() { :; }
+  remote_control_registry_available() { return 0; }
+  remote_control_registry_path() { printf '%s\n' "$registry"; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      start) running=1 ;;
+      exec) : ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" 0 true
+  assert_status 0
+  assert_contains "Leaving container running for Remote Control and managed MCP: unit-test-container"
+  assert_contains "Stop both with: agentctl stop --name unit-test-container"
+}
+
 test_configure_container_host_alias_replaces_stale_entry() {
   begin_test "container host alias replaces a stale gateway entry"
 
@@ -11835,9 +11878,10 @@ test_mcp_stop_managed_allows_relay_shutdown_grace_period() {
 
   load_agentctl_functions
   local root socket metadata marker pid tries=0
-  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-stop.XXXXXX")"
+  root="$(mktemp -d /tmp/agentctl-mcp-stop.XXXXXX)"
   register_dir_cleanup "$root"
   socket="$root/mcp-unit.sock"; metadata="$root/mcp-unit.process.json"; marker="$root/clean-exit"
+  unset -f sleep kill 2>/dev/null || true
   node -e '
 const fs=require("fs"); const net=require("net");
 const socket=process.argv[1]; const marker=process.argv[2];
@@ -13697,6 +13741,7 @@ main() {
   run_selected_test test_shared_memory_support_check_fails_before_use "test_shared_memory_support_check_fails_before_use"
   run_selected_test test_run_container_passes_shared_memory_size_to_create "test_run_container_passes_shared_memory_size_to_create"
   run_selected_test test_run_container_passes_ssh_to_create "test_run_container_passes_ssh_to_create"
+  run_selected_test test_run_container_explains_retained_remote_control_and_mcp_lifecycle "test_run_container_explains_retained_remote_control_and_mcp_lifecycle"
   run_selected_test test_configure_container_host_alias_replaces_stale_entry "test_configure_container_host_alias_replaces_stale_entry"
   run_selected_test test_migrate_legacy_runtime_config_files "test_migrate_legacy_runtime_config_files"
   run_selected_test test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure "test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure"
