@@ -5613,10 +5613,26 @@ bootstrap_cmd() {
   echo "Bootstrap complete: $name" >&2
 }
 
+refresh_cleanup_temporary_start() {
+  local name="$1"
+  local attempted="$2"
+
+  [ "$attempted" -eq 1 ] || return 0
+  warn "Refresh failed after temporarily starting $name; restoring its stopped state"
+  if container_running "$name"; then
+    remote_control_quiesce_preserving_desired "$name" \
+      || warn "Unable to quiesce Remote Control while cleaning up failed refresh: $name"
+    stop_existing_container_safely "$name" >/dev/null \
+      || warn "Unable to stop container while cleaning up failed refresh: $name"
+  fi
+  mcp_stop_managed "$name" \
+    || warn "Unable to stop managed MCP while cleaning up failed refresh: $name"
+}
+
 refresh_cmd() {
   local name=""
-  local was_running=0
   local started_for_refresh=0
+  local temporary_start_attempted=0
   local reset_config=0
   local assume_yes=0
 
@@ -5644,11 +5660,15 @@ refresh_cmd() {
     confirm_config_reset "$assume_yes"
   fi
 
-  if container_running "$name"; then
-    was_running=1
-  else
+  remote_control_lock_acquire "$name"
+  mcp_lock_acquire "$name"
+  trap 'refresh_cleanup_temporary_start "$name" "$temporary_start_attempted"; mcp_lock_release; remote_control_lock_release' EXIT
+
+  if ! container_running "$name"; then
+    mcp_require_no_active_leases "$name" refresh
     echo "Starting container for refresh: $name" >&2
-    start_existing_container_safely "$name" >/dev/null
+    temporary_start_attempted=1
+    start_existing_container_managed "$name" >/dev/null
     started_for_refresh=1
   fi
 
@@ -5672,10 +5692,16 @@ refresh_cmd() {
     reset_runtime_config_in_container "$name" codex
   fi
 
-  if [ "$started_for_refresh" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+  if [ "$started_for_refresh" -eq 1 ]; then
     echo "Stopping container: $name" >&2
+    remote_control_quiesce_preserving_desired "$name"
     stop_existing_container_safely "$name" >/dev/null
+    mcp_stop_managed "$name"
+    temporary_start_attempted=0
   fi
+  mcp_lock_release
+  remote_control_lock_release
+  trap - EXIT
   echo "Refresh complete: $name" >&2
   if [ "$reset_config" -eq 1 ]; then
     echo "Active Codex configuration reset from refreshed defaults." >&2

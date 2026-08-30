@@ -1223,6 +1223,15 @@ curl -fsS -X POST -H "content-type: application/json" \
   starts_before_doctor="$(wc -l <"$marker" | tr -d ' ')"
   run_capture "$AGENTCTL" stop --name "$name"
   assert_status 0
+  log "managed-mcp: refreshing a stopped container with an expired relay socket"
+  run_capture "$AGENTCTL" refresh --name "$name"
+  assert_status 0
+  assert_contains "Refresh complete: $name"
+  run_capture "$CONTAINER_CMD" ls --quiet
+  if printf '%s\n' "$RUN_OUTPUT" | grep -Fqx -- "$name"; then fail "Refresh did not restore the stopped container state"; fi
+  run_capture "$AGENTCTL" doctor --host
+  assert_contains "Container $name"
+  assert_contains "host relay inactive because the container is stopped"
   run_capture "$AGENTCTL" doctor --name "$name"
   assert_status 0
   assert_contains "host relay inactive because the container is stopped"
