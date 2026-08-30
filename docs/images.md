@@ -200,10 +200,24 @@ with:
 agentctl upgrade restore --name my-project --interactive
 agentctl upgrade restore --name my-project --status
 agentctl upgrade restore --name my-project --history
+agentctl upgrade restore --name my-project --dry-run
+agentctl upgrade restore --name my-project --all-compatible
 ```
 
-Use `--restore-version-policy latest` to update Python packages as well, or
-`--restore-version-policy locked` for a best-effort source-version install.
+`--dry-run` prints the saved plan without changing the container.
+`--all-compatible` restores its default-compatible items without a prompt. To
+permanently skip one item, use `agentctl upgrade restore --name my-project
+--dismiss ITEM_ID`; use `--status` or `--dry-run` to obtain its item ID.
+
+The version policy controls package restoration:
+
+- `mixed` (the default) uses the target repository's current OS-package
+  versions and, when compatible, restores the captured `/opt/venv` lock.
+- `latest` installs requested Python packages at their current available
+  versions.
+- `locked` makes a best-effort request for captured OS-package versions and
+  restores the captured Python lock. It can fail when the target repository no
+  longer provides a recorded version.
 
 Custom repositories are recorded without credentials and require an explicit
 interactive selection before they are enabled. Package-manager transitions retain OS items as pending rather
