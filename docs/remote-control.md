@@ -33,6 +33,17 @@ status helper into the existing container automatically; a separate
 
 ## Start and pair
 
+To persist the desired service configuration without leaving a stopped
+container running, enable it first. Ordinary `agentctl start` and `stop` then
+start and quiesce the service with the container:
+
+```bash
+agentctl remote-control enable
+agentctl start
+```
+
+`remote-control start` remains the one-command convenience form.
+
 From the project directory associated with the container:
 
 ```bash

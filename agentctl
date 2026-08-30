@@ -2184,7 +2184,8 @@ Usage: $CLI_NAME <command> [options]
 Commands:
   version    Print the agentctl release version
   build      Build agent images
-  run        Create/start a container for the current directory
+  create     Create and initially configure a stopped container
+  run        Create if needed, start, and run an agent in the foreground
   bootstrap  Bootstrap agentctl into an existing compatible container
   runtime    Manage coding runtimes inside an existing container
   feature    Manage installable feature packs inside an existing container
@@ -2273,8 +2274,8 @@ Options:
   --mount-socket HOST_PATH:CONTAINER_PATH  Mount a host Unix socket (repeatable)
   --publish-socket HOST_PATH:CONTAINER_PATH  Publish a container Unix socket on the host (repeatable)
   --mcp VALUE         Expose a host stdio or fixed HTTP MCP upstream (repeatable)
-  --runtime NAME  Preferred runtime to launch in the container (e.g. codex, claude)
-  --install-runtime  Install the selected runtime before launch
+  --runtime NAME  Preferred runtime to launch for this session (e.g. codex, claude)
+  --install-runtime  Install the selected runtime before launch (new containers only)
   -c, --config KEY=VALUE  Pass runtime-specific launch config (repeatable)
   --model NAME    Override the launch model for the selected runtime
   --start-ollama  Start a host Ollama listener for this local runtime launch when needed
@@ -2293,6 +2294,21 @@ Options:
   --shm-size SIZE Size of /dev/shm (e.g. 512M, 1G; requires new container)
   --network NAME   Attach to a named network (repeatable; requires new container)
   --ssh            Forward the host SSH agent and ensure SSH client tooling
+EOF
+}
+
+usage_create() {
+  cat <<EOF
+Usage: $CLI_NAME create [options]
+
+Create and initially configure a named container, then leave it stopped.
+It fails when the name already exists. Use $CLI_NAME upgrade to change image,
+mount, network, resource, SSH, socket, or managed MCP configuration later.
+
+Create accepts the persistent container options from $CLI_NAME run: --name,
+--image, --workdir, --home, --mount-socket, --publish-socket, --mcp,
+--read-only, --cpu, --mem, --shm-size, --network, and --ssh. It also accepts
+--runtime and --install-runtime for initial runtime setup.
 EOF
 }
 
@@ -2448,6 +2464,7 @@ Options:
   --ssh               Enable SSH-agent forwarding and ensure SSH client tooling
   --no-ssh            Disable preserved SSH-agent forwarding
   --enable-mcp        Enable the managed host MCP bridge
+  --mcp VALUE         Replace managed MCP definitions (repeatable; enables MCP)
   --disable-mcp       Disable the managed host MCP bridge and remove its registry after success
   --mcp-port PORT     Set the guest loopback MCP port (default: preserve, or 47123)
   --backup-image NAME Backup image name for container export (default: <new-name-or-name>-backup-<timestamp>)
@@ -2529,14 +2546,16 @@ EOF
 
 usage_remote_control() {
   cat <<EOF
-Usage: $CLI_NAME remote-control <start|status|pair|stop> [options]
+Usage: $CLI_NAME remote-control <enable|disable|start|status|pair|stop> [options]
 
 Options:
   --name NAME  Existing Codex container (default: agent-<dir>)
   --json       Print stable machine-readable JSON
 
 Remote Control is experimental and requires online Codex authentication.
-Start is detached and pairing remains an explicit action.
+Enable records the desired service configuration without leaving a previously
+stopped container running. Start is retained as the detached convenience form;
+pairing remains an explicit action.
 EOF
 }
 
@@ -5459,8 +5478,8 @@ bootstrap_cmd() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
-      --image) image="$2"; shift 2 ;;
-      --workdir) workdir="$2"; shift 2 ;;
+      --image) image="$2"; persistent_options_requested=1; shift 2 ;;
+      --workdir) workdir="$2"; persistent_options_requested=1; shift 2 ;;
       --cpu) cpu="$2"; shift 2 ;;
       --mem) mem="$2"; shift 2 ;;
       --shm-size) shm_size="$2"; shift 2 ;;
@@ -8545,6 +8564,9 @@ run_container() {
   local actual_name="$name"
   local socket_mount_arg=""
   local run_complete=0
+  local started_with_managed_mcp=0
+  local effective_socket_mappings="$SOCKET_MOUNTS_TEXT"
+  local effective_published_sockets="$PUBLISHED_SOCKETS_TEXT"
 
   run_container_cleanup() {
     ollama_listener_report_dangling
@@ -8555,10 +8577,23 @@ run_container() {
           "$CONTAINER_CMD" stop "$actual_name" >/dev/null 2>&1 || true
         fi
       fi
+      if [ -n "$actual_name" ] && [ "$(mcp_lease_count "$actual_name")" -le 1 ]; then
+        mcp_stop_managed "$actual_name" >/dev/null 2>&1 || true
+      fi
       if [ "$temp" -eq 1 ] && [ -n "$actual_name" ] && container_exists "$actual_name"; then
         "$CONTAINER_CMD" rm "$actual_name" >/dev/null 2>&1 || true
       fi
     fi
+    if [ "$run_complete" -eq 0 ] && [ "$CREATE_MODE" -eq 1 ] && [ "$created" -eq 1 ] \
+      && [ -n "$actual_name" ] && container_exists "$actual_name"; then
+      if container_running "$actual_name"; then "$CONTAINER_CMD" stop "$actual_name" >/dev/null 2>&1 || true; fi
+      "$CONTAINER_CMD" rm "$actual_name" >/dev/null 2>&1 || true
+      mcp_stop_managed "$actual_name" >/dev/null 2>&1 || true
+      rm -f "$(mcp_registry_path "$actual_name")"
+    fi
+    mcp_lock_release
+    remote_control_lock_release
+    mcp_release_lease
   }
   trap 'run_container_cleanup' EXIT
 
@@ -8579,12 +8614,16 @@ run_container() {
     validate_existing_container_shm_size "$actual_name" "$shm_size"
     validate_existing_container_networks "$actual_name" "$network_text"
     validate_existing_container_ssh "$actual_name" "$ssh_requested"
-    validate_existing_socket_mappings "$actual_name" "$(socket_mappings_without_mcp "$SOCKET_MOUNTS_TEXT")"
-    validate_existing_published_sockets "$actual_name" "$PUBLISHED_SOCKETS_TEXT"
+    if [ -n "$effective_socket_mappings" ]; then
+      validate_existing_socket_mappings "$actual_name" "$(socket_mappings_without_mcp "$effective_socket_mappings")"
+    fi
+    if [ -n "$effective_published_sockets" ]; then
+      validate_existing_published_sockets "$actual_name" "$effective_published_sockets"
+    fi
   fi
   if [ -n "$actual_name" ] && container_running "$actual_name"; then
     already_running=1
-    validate_running_published_listeners "$PUBLISHED_SOCKETS_TEXT"
+    validate_running_published_listeners "$effective_published_sockets"
   else
     if [ -n "$actual_name" ] && [ "$temp" -eq 1 ] && container_exists "$actual_name"; then
       die "Container already exists: $actual_name (omit --temp or remove it)"
@@ -8594,7 +8633,7 @@ run_container() {
     fi
 
     if [ -z "$actual_name" ] || ! container_exists "$actual_name"; then
-      validate_published_host_paths_for_start "$PUBLISHED_SOCKETS_TEXT"
+      validate_published_host_paths_for_start "$effective_published_sockets"
       if [ "$ssh_requested" -eq 1 ]; then
         require_container_ssh_support
         require_host_ssh_socket
@@ -8649,21 +8688,28 @@ run_container() {
       created=1
     fi
 
-    if [ "$created" -eq 0 ] && [ "$ssh_requested" -eq 0 ]; then
-      warn_if_ssh_forwarding_unavailable_on_start "$actual_name"
-    fi
     if [ "$created" -eq 0 ]; then
-      validate_container_socket_sources "$actual_name"
-      validate_published_host_paths_for_start "$PUBLISHED_SOCKETS_TEXT"
+      remote_control_lock_acquire "$actual_name"
+      mcp_lock_acquire "$actual_name"
+      mcp_require_no_active_leases "$actual_name" start
+      # Mark ownership before the helper can start the container. Its guest
+      # proxy or Remote Control setup may fail after the container is live.
+      started=1
+      start_existing_container_managed "$actual_name" 1
+      mcp_lock_release
+      remote_control_lock_release
+      started_with_managed_mcp=1
     fi
 
-    echo "Starting container: $actual_name" >&2
-    if [ "$stdio" -eq 1 ]; then
-      "$CONTAINER_CMD" start "$actual_name" >/dev/null
-    else
-      "$CONTAINER_CMD" start "$actual_name"
+    if [ "$started_with_managed_mcp" -eq 0 ]; then
+      echo "Starting container: $actual_name" >&2
+      if [ "$stdio" -eq 1 ]; then
+        "$CONTAINER_CMD" start "$actual_name" >/dev/null
+      else
+        "$CONTAINER_CMD" start "$actual_name"
+      fi
+      started=1
     fi
-    started=1
   fi
 
   if [ "$created" -eq 1 ]; then
@@ -8718,21 +8764,14 @@ run_container() {
     return "$exit_code"
   fi
   if [ "$started" -eq 1 ]; then
-    if remote_control_registry_available "$actual_name" \
-      && [ "$(jq -r '.desired // false' "$(remote_control_registry_path "$actual_name")")" = true ]; then
-      if [ "$MCP_REQUESTED" -eq 1 ]; then
-        echo "Leaving container running for Remote Control and managed MCP: $actual_name" >&2
-        echo "Stop both with: ${CLI_NAME} stop --name $actual_name" >&2
-      else
-        echo "Leaving container running for Remote Control: $actual_name" >&2
-        echo "Stop it with: ${CLI_NAME} stop --name $actual_name" >&2
-      fi
-    elif [ "$MCP_REQUESTED" -eq 1 ] && [ "$(mcp_lease_count "$actual_name")" -gt 1 ]; then
+    if [ "$MCP_REQUESTED" -eq 1 ] && [ "$(mcp_lease_count "$actual_name")" -gt 1 ]; then
       echo "Leaving container running for another active managed MCP lease: $actual_name" >&2
     else
       echo "Stopping container: $actual_name" >&2
+      remote_control_quiesce_preserving_desired "$actual_name" >/dev/null 2>&1 || true
       "$CONTAINER_CMD" stop "$actual_name" >/dev/null 2>&1
-      report_leftover_published_sockets "$PUBLISHED_SOCKETS_TEXT" || true
+      report_leftover_published_sockets "$effective_published_sockets" || true
+      mcp_stop_managed "$actual_name" >/dev/null 2>&1 || true
     fi
   fi
   if [ "$temp" -eq 1 ]; then
@@ -8740,6 +8779,7 @@ run_container() {
     "$CONTAINER_CMD" rm "$actual_name" >/dev/null 2>&1
   fi
   run_complete=1
+  mcp_release_lease
   trap - EXIT
   return "$exit_code"
 }
@@ -8810,6 +8850,9 @@ run_mode() {
     cmd=(env "${cmd_env[@]}" "${cmd_override[@]}")
     shell=0
   fi
+  if [ -n "$RUN_SELECTED_RUNTIME" ]; then
+    cmd=(env "AGENTCTL_RUNTIME_OVERRIDE=$RUN_SELECTED_RUNTIME" "${cmd[@]}")
+  fi
 
   run_container "$name" "$image" "$temp" "$shell" "$cpu" "$mem" "$read_only" "$workdir" "$home_mount" "$pre_exec" "$post_exec" "$reset_config" "$stdio" "$shm_size" "$network_text" "$ssh_requested" "${cmd[@]}"
 }
@@ -8827,6 +8870,8 @@ RUN_RUNTIME_CONFIG_JSON='{}'
 RUN_ENSURE_SSH_FEATURE=0
 RUN_MCP_CONFIG_JSON='[]'
 RUN_START_OLLAMA=0
+RUN_PERSIST_RUNTIME_SELECTION=0
+CREATE_MODE=0
 
 run_post_exec() {
   local name="$1"
@@ -8870,7 +8915,9 @@ run_pre_exec() {
     if [ "$RUN_INSTALL_RUNTIME" -eq 1 ]; then
       install_runtime_in_container "$name" "$RUN_SELECTED_RUNTIME"
     fi
-    run_agent_sh_in_container "$name" preferred set "$RUN_SELECTED_RUNTIME"
+    if [ "$RUN_PERSIST_RUNTIME_SELECTION" -eq 1 ]; then
+      run_agent_sh_in_container "$name" preferred set "$RUN_SELECTED_RUNTIME"
+    fi
   fi
 
   if [ "$MCP_REQUESTED" -eq 1 ]; then
@@ -8933,6 +8980,46 @@ update_codex_pre_exec() {
   run_agent_sh_in_container "$name" runtime update codex
 }
 
+create_cmd() {
+  local option=""
+  local name=""
+  local workdir=""
+  local -a create_args=("$@")
+
+  for option in "$@"; do
+    case "$option" in
+      --online|--auth|--update|--start-ollama|--shell|--cmd|--stdio|--temp|--reset-config|--yes|--model|-c|--config)
+        die "Option $option is a run-session option and is not supported by create"
+        ;;
+    esac
+  done
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
+      --workdir) [ "$#" -ge 2 ] || die "Missing value for --workdir"; workdir="$2"; shift 2 ;;
+      --help) usage_create; return 0 ;;
+      *) shift ;;
+    esac
+  done
+  if [ -z "$name" ]; then
+    if [ -n "$workdir" ] && [ -d "$workdir" ]; then
+      workdir="$(CDPATH= cd -- "$workdir" && pwd)"
+    fi
+    name="$(default_name "$DEFAULT_NAME_PREFIX" "${workdir:-$PWD}")"
+  fi
+  container_exists "$name" && die "Container already exists: $name (use ${CLI_NAME} upgrade to change its configuration)"
+
+  # Reuse the normal creation and first-run setup path, but execute no user
+  # workload. run_container stops a container it started before returning.
+  CREATE_MODE=1
+  if [ "${#create_args[@]}" -gt 0 ]; then
+    run_cmd "${create_args[@]}" --cmd true
+  else
+    run_cmd --cmd true
+  fi
+  CREATE_MODE=0
+}
+
 run_cmd() {
   local name=""
   local image=""
@@ -8966,13 +9053,14 @@ run_cmd() {
   local -a cmd_override=()
   local cmd_override_set=0
   local shell_set=0
+  local persistent_options_requested=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
       --image) image="$2"; shift 2 ;;
       --workdir) workdir="$2"; shift 2 ;;
-      --home) home_mount="$2"; shift 2 ;;
+      --home) home_mount="$2"; persistent_options_requested=1; shift 2 ;;
       --runtime) runtime="$2"; shift 2 ;;
       --install-runtime) install_runtime=1; shift ;;
       --model) model_override="$2"; shift 2 ;;
@@ -8983,32 +9071,35 @@ run_cmd() {
       --yes) assume_yes=1; shift ;;
       --update) update=1; shift ;;
       --temp) temp=1; shift ;;
-      --read-only) read_only=1; shift ;;
+      --read-only) read_only=1; persistent_options_requested=1; shift ;;
       --shell) shell=1; shell_set=1; shift ;;
       --stdio) stdio=1; shift ;;
       -c|--config) runtime_config_entries+=("$2"); shift 2 ;;
       --cmd) shift; cmd_override_set=1; cmd_override=("$@"); break ;;
-      --cpu) cpu="$2"; shift 2 ;;
-      --mem) mem="$2"; shift 2 ;;
-      --shm-size) shm_size="$2"; shift 2 ;;
-      --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); shift 2 ;;
-      --ssh) ssh_requested=1; shift ;;
+      --cpu) cpu="$2"; persistent_options_requested=1; shift 2 ;;
+      --mem) mem="$2"; persistent_options_requested=1; shift 2 ;;
+      --shm-size) shm_size="$2"; persistent_options_requested=1; shift 2 ;;
+      --network) [ "$#" -ge 2 ] || die "Missing value for --network"; networks+=("$2"); persistent_options_requested=1; shift 2 ;;
+      --ssh) ssh_requested=1; persistent_options_requested=1; shift ;;
       --mcp)
         [ "$#" -ge 2 ] || die "Missing value for --mcp"
         mcp_value="$2"
         mcp_add_definition "$mcp_value"
+        persistent_options_requested=1
         shift 2
         ;;
       --mount-socket)
         [ "$#" -ge 2 ] || die "Missing value for --mount-socket"
         socket_mapping="$(parse_socket_mapping "$2")"
         socket_mappings="${socket_mappings}${socket_mappings:+$'\n'}${socket_mapping}"
+        persistent_options_requested=1
         shift 2
         ;;
       --publish-socket)
         [ "$#" -ge 2 ] || die "Missing value for --publish-socket"
         socket_mapping="$(parse_published_socket_mapping "$2")"
         published_sockets="${published_sockets}${published_sockets:+$'\n'}${socket_mapping}"
+        persistent_options_requested=1
         shift 2
         ;;
       --help) usage_run; return 0 ;;
@@ -9086,6 +9177,14 @@ run_cmd() {
   if [ -z "$name" ] && [ "$temp" -eq 0 ]; then
     name="$(default_name "$DEFAULT_NAME_PREFIX" "$workdir")"
   fi
+  if [ "$CREATE_MODE" -eq 0 ] && [ "$temp" -eq 0 ] && [ -n "$name" ] \
+    && container_exists "$name" && [ "$persistent_options_requested" -eq 1 ]; then
+    die "Persistent container options cannot be changed with run for an existing container. Use ${CLI_NAME} upgrade --name $name."
+  fi
+  if [ "$CREATE_MODE" -eq 0 ] && [ "$temp" -eq 0 ] && [ -n "$name" ] \
+    && container_exists "$name" && [ "$install_runtime" -eq 1 ]; then
+    die "Install persistent runtimes with: ${CLI_NAME} runtime install --name $name $runtime"
+  fi
   if [ "$reset_config" -eq 1 ]; then
     confirm_config_reset "$assume_yes"
   fi
@@ -9149,6 +9248,7 @@ run_cmd() {
   RUN_ENSURE_SSH_FEATURE="$ssh_requested"
   RUN_MCP_CONFIG_JSON="$MCP_CONFIG_JSON"
   RUN_START_OLLAMA="$start_ollama"
+  RUN_PERSIST_RUNTIME_SELECTION="$CREATE_MODE"
   OLLAMA_LISTENER_REMINDER_REPORTED=0
   if [ "$online" -eq 1 ]; then
     RUN_EFFECTIVE_MODE="online"
@@ -9356,6 +9456,7 @@ upgrade_cmd() {
   local published_host_path=""
   local published_arg=""
   local mcp_enable_requested=0
+  local mcp_definition_requested=0
   local mcp_disable_requested=0
   local mcp_port_requested=0
   local mcp_current_enabled=0
@@ -9419,6 +9520,10 @@ upgrade_cmd() {
       --ssh) ssh_enable_requested=1; shift ;;
       --no-ssh) ssh_disable_requested=1; shift ;;
       --enable-mcp) mcp_enable_requested=1; shift ;;
+      --mcp)
+        [ "$#" -ge 2 ] || die "Missing value for --mcp"
+        mcp_add_definition "$2"; mcp_definition_requested=1; mcp_enable_requested=1; shift 2
+        ;;
       --disable-mcp) mcp_disable_requested=1; shift ;;
       --mcp-port) [ "$#" -ge 2 ] || die "Missing value for --mcp-port"; MCP_PORT="$2"; mcp_port_requested=1; shift 2 ;;
       --backup-image) backup_image="$2"; shift 2 ;;
@@ -9499,7 +9604,7 @@ upgrade_cmd() {
     mcp_validate_private_file "$mcp_registry" "Managed MCP registry"
     mcp_current_enabled=1
     if [ "$mcp_port_requested" -eq 0 ]; then MCP_PORT="$(jq -r '.port // 47123' "$mcp_registry")"; fi
-    mcp_load_registry_config "$mcp_registry"
+    if [ "$mcp_definition_requested" -eq 0 ]; then mcp_load_registry_config "$mcp_registry"; fi
   fi
   mcp_target_enabled="$mcp_current_enabled"
   [ "$mcp_enable_requested" -eq 0 ] || mcp_target_enabled=1
@@ -11108,7 +11213,7 @@ remote_control_print_status() {
 }
 
 remote_control_cmd() {
-  local action="${1:-}" name="" machine=0 registry="" started=0 backend="" boot="" installation_id="" duplicate="" json="" state="" i=0
+  local action="${1:-}" name="" machine=0 registry="" started=0 backend="" boot="" installation_id="" duplicate="" json="" state="" i=0 was_running=0
   local registry_existed=0 start_committed=0 mcp_locked=0 mcp_relay_started=0
   remote_control_command_cleanup() {
     if [ "$action" = start ] && [ "$started" -eq 1 ] && [ "$start_committed" -eq 0 ]; then
@@ -11130,9 +11235,30 @@ remote_control_cmd() {
     --help|-h) usage_remote_control; return 0 ;;
     *) die "Unknown option for remote-control: $1" ;;
   esac; done
-  case "$action" in start|status|pair|stop) ;; *) die "Unknown remote-control command: $action" ;; esac
+  case "$action" in enable|disable|start|status|pair|stop) ;; *) die "Unknown remote-control command: $action" ;; esac
   require_container
   name="${name:-$(default_name "$DEFAULT_NAME_PREFIX")}"; registry="$(remote_control_registry_path "$name")"
+  if [ "$action" = enable ]; then
+    [ "$machine" -eq 0 ] || die "--json is not supported with remote-control enable; use remote-control status after enabling"
+    container_exists "$name" || die "Container not found: $name"
+    container_running "$name" && was_running=1
+    remote_control_cmd start --name "$name"
+    if [ "$was_running" -eq 0 ]; then
+      (
+        remote_control_lock_acquire "$name"
+        mcp_lock_acquire "$name"
+        trap 'mcp_lock_release; remote_control_lock_release' EXIT
+        remote_control_quiesce_preserving_desired "$name"
+        "$CONTAINER_CMD" stop "$name" >/dev/null
+        mcp_stop_managed "$name"
+      )
+    fi
+    return 0
+  fi
+  if [ "$action" = disable ]; then
+    if [ "$machine" -eq 1 ]; then remote_control_cmd stop --name "$name" --json; else remote_control_cmd stop --name "$name"; fi
+    return $?
+  fi
   if [ "$action" = start ] || [ "$action" = stop ]; then
     remote_control_lock_acquire "$name"
     trap 'remote_control_command_cleanup' EXIT
@@ -11150,7 +11276,7 @@ remote_control_cmd() {
           mcp_lock_acquire "$name"; mcp_locked=1
           mcp_require_no_active_leases "$name" start
           if [ ! -f "$(mcp_registry_path "$name")" ] || [ -L "$(mcp_registry_path "$name")" ]; then
-            die "Container $name has managed MCP wiring but its private host registry is unavailable. Reconfigure it with: ${CLI_NAME} run --name $name --mcp VALUE"
+            die "Container $name has managed MCP wiring but its private host registry is unavailable. Reconfigure it with: ${CLI_NAME} upgrade --name $name --mcp VALUE"
           fi
           mcp_stop_managed "$name"
           mcp_start_from_registry "$name" \
@@ -11214,6 +11340,34 @@ remote_control_cmd() {
   fi
 }
 
+start_existing_container_managed() {
+  local name="$1"
+  local foreground_lease="${2:-0}"
+  local published_sockets=""
+
+  # Callers hold both lifecycle locks. Keeping them through relay restoration,
+  # guest proxy startup, and lease creation closes the stop/restart race.
+  warn_if_ssh_forwarding_unavailable_on_start "$name"
+  validate_container_socket_sources "$name"
+  published_sockets="$(container_published_sockets "$name")"
+  validate_published_host_paths_for_start "$published_sockets"
+  if container_has_mcp_wiring "$name"; then
+    if [ ! -f "$(mcp_registry_path "$name")" ] || [ -L "$(mcp_registry_path "$name")" ]; then
+      die "Container $name has managed MCP wiring but its private host registry is unavailable. Reconfigure it with: ${CLI_NAME} upgrade --name $name --mcp VALUE"
+    fi
+    mcp_stop_managed "$name"
+    mcp_start_from_registry "$name" \
+      || die "Unable to restore the managed MCP relay required to start stopped container $name"
+  fi
+  "$CONTAINER_CMD" start "$name"
+  configure_container_host_alias "$name"
+  if [ "$MCP_REQUESTED" -eq 1 ]; then
+    mcp_configure_guest "$name"
+    [ "$foreground_lease" -eq 0 ] || mcp_create_lease "$name"
+  fi
+  remote_control_restore_if_desired "$name"
+}
+
 simple_name_cmd() {
   local action="$1"
   shift
@@ -11244,14 +11398,7 @@ simple_name_cmd() {
 
   case "$action" in
     start)
-      warn_if_ssh_forwarding_unavailable_on_start "$name"
-      validate_container_socket_sources "$name"
-      validate_published_host_paths_for_start "$published_sockets"
-      if [ -f "$(mcp_registry_path "$name")" ]; then mcp_stop_managed "$name"; mcp_start_from_registry "$name"; fi
-      "$CONTAINER_CMD" start "$name"
-      configure_container_host_alias "$name"
-      if [ "$MCP_REQUESTED" -eq 1 ]; then mcp_configure_guest "$name"; fi
-      remote_control_restore_if_desired "$name"
+      start_existing_container_managed "$name"
       ;;
     stop)
       remote_control_quiesce_preserving_desired "$name"
@@ -11452,6 +11599,7 @@ cmd="${1:-}"
 case "$cmd" in
   --version|-V|version) shift; version_cmd "$@" ;;
   build) shift; build_cmd "$@" ;;
+  create) shift; create_cmd "$@" ;;
   run) shift; run_cmd "$@" ;;
   bootstrap) shift; bootstrap_cmd "$@" ;;
   runtime) shift; runtime_cmd "$@" ;;
