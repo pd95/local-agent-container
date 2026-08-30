@@ -2493,6 +2493,7 @@ test_start_and_restart_refresh_host_alias() {
   configure_container_host_alias() { alias_log="${alias_log}$1"$'\n'; }
   validate_container_socket_sources() { :; }
   container_published_sockets() { :; }
+  container_has_mcp_wiring() { return 1; }
   mcp_require_no_active_leases() { :; }
   CONTAINER_CMD=container
   container() { action_log="${action_log}$1:$2"$'\n'; }
@@ -11702,15 +11703,20 @@ test_refresh_updates_managed_files_without_recreate() {
   default_name() { printf 'unit-test-container\n'; }
   container_exists() { [ "$1" = "unit-test-container" ]; }
   container_running() { return 1; }
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
+  mcp_require_no_active_leases() { :; }
+  start_existing_container_managed() { start_calls=$((start_calls + 1)); }
+  remote_control_quiesce_preserving_desired() { :; }
+  mcp_stop_managed() { :; }
   CONTAINER_CMD=container
   container() {
     case "$1" in
       copy)
         [ "${2:-}" = "--help" ] && return 1
         fail "Unexpected container copy invocation: $*"
-        ;;
-      start)
-        start_calls=$((start_calls + 1))
         ;;
       stop)
         stop_calls=$((stop_calls + 1))
@@ -11759,6 +11765,109 @@ test_refresh_updates_managed_files_without_recreate() {
   assert_contains "refresh --name unit-test-container --reset-config"
 }
 
+test_refresh_restores_managed_mcp_for_stopped_container() {
+  begin_test "refresh restores managed MCP while temporarily starting a stopped container"
+
+  load_agentctl_functions
+
+  local lifecycle=""
+  local running=0
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { [ "$running" -eq 1 ]; }
+  remote_control_lock_acquire() { lifecycle="${lifecycle}remote-lock\n"; }
+  remote_control_lock_release() { lifecycle="${lifecycle}remote-unlock\n"; }
+  mcp_lock_acquire() { lifecycle="${lifecycle}mcp-lock\n"; }
+  mcp_lock_release() { lifecycle="${lifecycle}mcp-unlock\n"; }
+  mcp_require_no_active_leases() { lifecycle="${lifecycle}lease-check:$2\n"; }
+  start_existing_container_managed() { running=1; lifecycle="${lifecycle}managed-start\n"; }
+  remote_control_quiesce_preserving_desired() { lifecycle="${lifecycle}remote-quiesce\n"; }
+  stop_existing_container_safely() { running=0; lifecycle="${lifecycle}container-stop\n"; }
+  mcp_stop_managed() { lifecycle="${lifecycle}relay-stop\n"; }
+  migrate_legacy_runtime_config_files() { :; }
+  refresh_container_file() { :; }
+  refresh_codex_config_files() { :; }
+  refresh_optional_runtime_default_files() { :; }
+  refresh_container_tree() { :; }
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = exec ] || fail "Unexpected container invocation: $*"
+  }
+
+  run_capture refresh_cmd --name unit-test-container
+  assert_status 0
+  [ "$running" -eq 0 ] || fail "Expected refresh to restore the stopped container state"
+  [ "$lifecycle" = 'remote-lock\nmcp-lock\nlease-check:refresh\nmanaged-start\nremote-quiesce\ncontainer-stop\nrelay-stop\nmcp-unlock\nremote-unlock\n' ] \
+    || fail "Unexpected stopped-container refresh lifecycle: $lifecycle"
+}
+
+test_refresh_failure_restores_temporarily_started_container() {
+  begin_test "refresh failure cleans up a temporarily started managed container"
+
+  load_agentctl_functions
+
+  local temp_dir lifecycle_file running_file
+  temp_dir="$(new_workdir)"
+  lifecycle_file="$temp_dir/lifecycle"
+  running_file="$temp_dir/running"
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { [ -f "$running_file" ]; }
+  remote_control_lock_acquire() { printf '%s\n' remote-lock >>"$lifecycle_file"; }
+  remote_control_lock_release() { printf '%s\n' remote-unlock >>"$lifecycle_file"; }
+  mcp_lock_acquire() { printf '%s\n' mcp-lock >>"$lifecycle_file"; }
+  mcp_lock_release() { printf '%s\n' mcp-unlock >>"$lifecycle_file"; }
+  mcp_require_no_active_leases() { printf 'lease-check:%s\n' "$2" >>"$lifecycle_file"; }
+  start_existing_container_managed() { : >"$running_file"; printf '%s\n' managed-start >>"$lifecycle_file"; }
+  remote_control_quiesce_preserving_desired() { printf '%s\n' remote-quiesce >>"$lifecycle_file"; }
+  stop_existing_container_safely() { rm -f "$running_file"; printf '%s\n' container-stop >>"$lifecycle_file"; }
+  mcp_stop_managed() { printf '%s\n' relay-stop >>"$lifecycle_file"; }
+  refresh_container_file() { die "Injected refresh copy failure"; }
+  failed_refresh() { ( refresh_cmd --name unit-test-container ); }
+
+  run_capture failed_refresh
+  assert_status 1
+  assert_contains "Refresh failed after temporarily starting unit-test-container; restoring its stopped state"
+  [ ! -f "$running_file" ] || fail "Expected failed refresh to restore the stopped container state"
+  [ "$(cat "$lifecycle_file")" = $'remote-lock\nmcp-lock\nlease-check:refresh\nmanaged-start\nremote-quiesce\ncontainer-stop\nrelay-stop\nmcp-unlock\nremote-unlock' ] \
+    || fail "Unexpected failed-refresh cleanup lifecycle: $(cat "$lifecycle_file")"
+  unset -f failed_refresh
+}
+
+test_refresh_checks_container_state_under_lifecycle_locks() {
+  begin_test "refresh checks container state after acquiring lifecycle locks"
+
+  load_agentctl_functions
+
+  local remote_locked=0 mcp_locked=0 managed_starts=0 stops=0
+  require_container() { :; }
+  container_exists() { return 0; }
+  remote_control_lock_acquire() { remote_locked=1; }
+  remote_control_lock_release() { remote_locked=0; }
+  mcp_lock_acquire() { mcp_locked=1; }
+  mcp_lock_release() { mcp_locked=0; }
+  container_running() {
+    [ "$remote_locked" -eq 1 ] && [ "$mcp_locked" -eq 1 ] \
+      || fail "Container state was sampled without both lifecycle locks"
+    return 0
+  }
+  start_existing_container_managed() { managed_starts=$((managed_starts + 1)); }
+  stop_existing_container_safely() { stops=$((stops + 1)); }
+  migrate_legacy_runtime_config_files() { :; }
+  refresh_container_file() { :; }
+  refresh_codex_config_files() { :; }
+  refresh_optional_runtime_default_files() { :; }
+  refresh_container_tree() { :; }
+  CONTAINER_CMD=container
+  container() { [ "$1" = exec ] || fail "Unexpected container invocation: $*"; }
+
+  run_capture refresh_cmd --name unit-test-container
+  assert_status 0
+  [ "$managed_starts" -eq 0 ] || fail "Refresh started a container that was running after lock acquisition"
+  [ "$stops" -eq 0 ] || fail "Refresh stopped a container that it did not start"
+  [ "$remote_locked" -eq 0 ] && [ "$mcp_locked" -eq 0 ] || fail "Refresh did not release lifecycle locks"
+}
+
 test_refresh_reset_config_applies_refreshed_codex_defaults() {
   begin_test "refresh --reset-config applies refreshed Codex defaults after managed files update"
 
@@ -11769,6 +11878,10 @@ test_refresh_reset_config_applies_refreshed_codex_defaults() {
   default_name() { printf 'unit-test-container\n'; }
   container_exists() { [ "$1" = "unit-test-container" ]; }
   container_running() { return 0; }
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
   migrate_legacy_runtime_config_files() { lifecycle="${lifecycle}migrate\n"; }
   refresh_container_file() { lifecycle="${lifecycle}file:$3\n"; }
   refresh_codex_config_files() { lifecycle="${lifecycle}codex-defaults\n"; }
@@ -14009,6 +14122,9 @@ main() {
   run_selected_test test_image_system_manifest_removes_temp_container_after_exec_failure "test_image_system_manifest_removes_temp_container_after_exec_failure"
   run_selected_test test_collect_upgrade_container_preflight_starts_stopped_container_once "test_collect_upgrade_container_preflight_starts_stopped_container_once"
   run_selected_test test_refresh_updates_managed_files_without_recreate "test_refresh_updates_managed_files_without_recreate"
+  run_selected_test test_refresh_restores_managed_mcp_for_stopped_container "test_refresh_restores_managed_mcp_for_stopped_container"
+  run_selected_test test_refresh_failure_restores_temporarily_started_container "test_refresh_failure_restores_temporarily_started_container"
+  run_selected_test test_refresh_checks_container_state_under_lifecycle_locks "test_refresh_checks_container_state_under_lifecycle_locks"
   run_selected_test test_refresh_reset_config_applies_refreshed_codex_defaults "test_refresh_reset_config_applies_refreshed_codex_defaults"
   run_selected_test test_doctor_reports_state_permission_problems "test_doctor_reports_state_permission_problems"
   run_selected_test test_doctor_excludes_managed_mcp_from_user_socket_failures "test_doctor_excludes_managed_mcp_from_user_socket_failures"
