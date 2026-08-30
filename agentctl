@@ -1327,12 +1327,17 @@ mcp_stop_managed() {
   printf '%s' "$response" | jq -e --arg nonce "$nonce" --argjson pid "$pid" '.ok==true and .nonce==$nonce and .pid==$pid' >/dev/null 2>&1 \
     || die "Refusing to signal unverified managed MCP process for $name"
   kill "$pid" 2>/dev/null || true
-  local tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do sleep 0.05; tries=$((tries+1)); done
+  # The relay's SIGTERM handler drains Unix-socket connections for up to two
+  # seconds. Leave a small scheduling margin before escalating to SIGKILL.
+  local tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 60 ]; do sleep 0.05; tries=$((tries+1)); done
   if kill -0 "$pid" 2>/dev/null; then
     kill -KILL "$pid" 2>/dev/null || true
     tries=0; while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do sleep 0.05; tries=$((tries+1)); done
   fi
   kill -0 "$pid" 2>/dev/null && die "Managed MCP process did not stop for $name; preserving ownership metadata"
+  # Reap a relay started by this agentctl invocation. For a relay inherited
+  # from an earlier invocation this simply returns immediately.
+  wait "$pid" 2>/dev/null || true
   [ ! -S "$socket" ] || rm -f "$socket"
   rm -f "$metadata"
 }

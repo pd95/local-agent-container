@@ -11830,6 +11830,37 @@ test_mcp_lock_secures_existing_runtime_directory() {
   mcp_lock_release
 }
 
+test_mcp_stop_managed_allows_relay_shutdown_grace_period() {
+  begin_test "managed MCP shutdown allows the relay grace period before escalation"
+
+  load_agentctl_functions
+  local root socket metadata marker pid tries=0
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-stop.XXXXXX")"
+  register_dir_cleanup "$root"
+  socket="$root/mcp-unit.sock"; metadata="$root/mcp-unit.process.json"; marker="$root/clean-exit"
+  node -e '
+const fs=require("fs"); const net=require("net");
+const socket=process.argv[1]; const marker=process.argv[2];
+const server=net.createServer().listen(socket);
+process.on("SIGTERM",()=>setTimeout(()=>{fs.writeFileSync(marker,"clean\\n"); server.close(()=>process.exit(0));},2100));
+' "$socket" "$marker" &
+  pid=$!
+  while [ ! -S "$socket" ] && [ "$tries" -lt 50 ]; do sleep 0.02; tries=$((tries+1)); done
+  [ -S "$socket" ] || fail "Timed relay fixture did not create its socket"
+  printf '%s\n' "{\"pid\":$pid,\"nonce\":\"unit-nonce\",\"socket\":\"$socket\"}" >"$metadata"
+  chmod 600 "$metadata"
+  mcp_runtime_dir() { printf '%s\n' "$root"; }
+  mcp_identity_hash() { printf '%s\n' unit; }
+  mcp_socket_path() { printf '%s\n' "$socket"; }
+  mcp_validate_private_file() { :; }
+  mcp_paths_equal() { return 0; }
+  curl() { printf '%s\n' "{\"ok\":true,\"nonce\":\"unit-nonce\",\"pid\":$pid}"; }
+
+  mcp_stop_managed agent-unit
+  [ -f "$marker" ] || fail "Managed MCP shutdown escalated before the relay grace period"
+  [ ! -e "$metadata" ] || fail "Managed MCP shutdown did not remove relay metadata"
+}
+
 test_mcp_definition_parses_stdio_and_http_transports() {
   begin_test "managed MCP definitions validate stdio timeouts and discriminate HTTP transports"
   load_agentctl_functions
@@ -13916,6 +13947,7 @@ main() {
   run_selected_test test_mcp_runtime_paths_normalize_trailing_tmpdir_separator "test_mcp_runtime_paths_normalize_trailing_tmpdir_separator"
   run_selected_test test_mcp_lock_recreates_missing_runtime_directory "test_mcp_lock_recreates_missing_runtime_directory"
   run_selected_test test_mcp_lock_secures_existing_runtime_directory "test_mcp_lock_secures_existing_runtime_directory"
+  run_selected_test test_mcp_stop_managed_allows_relay_shutdown_grace_period "test_mcp_stop_managed_allows_relay_shutdown_grace_period"
   run_selected_test test_mcp_definition_parses_stdio_and_http_transports "test_mcp_definition_parses_stdio_and_http_transports"
   run_selected_test test_mcp_http_definition_rejects_unsafe_urls_and_headers "test_mcp_http_definition_rejects_unsafe_urls_and_headers"
   run_selected_test test_mcp_registry_v2_filters_secrets_and_reads_v1 "test_mcp_registry_v2_filters_secrets_and_reads_v1"
