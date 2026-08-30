@@ -465,6 +465,9 @@ EOF
   mcp_identity_hash() { printf 'timeout\n'; }
   ollama_listener_healthy() { return 1; }
   ollama_listener_deadline_expired() {
+    # The listener is launched in the background. Do not let the synthetic
+    # deadline win the scheduling race before the fixture has executed.
+    [ -f "$pid_file" ] || return 1
     deadline_calls=$((deadline_calls + 1))
     [ "$deadline_calls" -ge 2 ]
   }
@@ -718,7 +721,7 @@ test_remote_control_help_reports_experimental_commands() {
 
   run_capture "$AGENTCTL" remote-control --help
   assert_status 0
-  assert_contains "remote-control <start|status|pair|stop>"
+  assert_contains "remote-control <enable|disable|start|status|pair|stop>"
   assert_contains "--json"
   assert_contains "experimental"
 }
@@ -2125,8 +2128,23 @@ test_run_container_passes_ssh_to_create() {
   printf '%s\n' "$create_log" | grep -Fq -- "--ssh" || fail "Expected SSH create flag, got: $create_log"
 }
 
-test_run_container_explains_retained_remote_control_and_mcp_lifecycle() {
-  begin_test "run_container explains how to stop retained Remote Control and MCP"
+test_create_cmd_delegates_initial_setup_to_the_first_run_path() {
+  begin_test "create configures through the first-run path and refuses duplicate names"
+
+  load_agentctl_functions
+  local captured="" create_mode=""
+  container_exists() { return 1; }
+  run_cmd() { create_mode="$CREATE_MODE"; captured="$(printf '%s\n' "$@")"; }
+
+  create_cmd --name unit-test-container --image agent-plain
+  [ "$create_mode" = 1 ] || fail "Expected create mode while configuring a new container"
+  printf '%s\n' "$captured" | grep -Fxq -- '--cmd' || fail "Expected create to use the foreground setup path"
+  printf '%s\n' "$captured" | grep -Fxq -- true || fail "Expected create to execute only true"
+
+}
+
+test_run_container_stops_its_remote_control_and_mcp_lifecycle() {
+  begin_test "run_container stops services it started, including Remote Control and MCP"
 
   load_agentctl_functions
   local registry running=0
@@ -2148,15 +2166,18 @@ test_run_container_explains_retained_remote_control_and_mcp_lifecycle() {
   warn_if_ssh_forwarding_unavailable_on_start() { :; }
   mcp_configure_guest() { :; }
   mcp_persist_registry() { :; }
+  mcp_stop_managed() { :; }
   configure_container_host_alias() { :; }
   warn_if_container_agentctl_versions_differ() { :; }
   remote_control_restore_if_desired() { :; }
+  remote_control_quiesce_preserving_desired() { :; }
   remote_control_registry_available() { return 0; }
   remote_control_registry_path() { printf '%s\n' "$registry"; }
   CONTAINER_CMD=container
   container() {
     case "$1" in
       start) running=1 ;;
+      stop) running=0 ;;
       exec) : ;;
       *) fail "Unexpected container invocation: $*" ;;
     esac
@@ -2164,8 +2185,7 @@ test_run_container_explains_retained_remote_control_and_mcp_lifecycle() {
 
   run_capture run_container unit-test-container agent-plain 0 0 "" "" 0 "$TEST_ROOT" "" "" "" 0 0 "" "" 0 true
   assert_status 0
-  assert_contains "Leaving container running for Remote Control and managed MCP: unit-test-container"
-  assert_contains "Stop both with: agentctl stop --name unit-test-container"
+  assert_contains "Stopping container: unit-test-container"
 }
 
 test_configure_container_host_alias_replaces_stale_entry() {
@@ -2473,6 +2493,7 @@ test_start_and_restart_refresh_host_alias() {
   configure_container_host_alias() { alias_log="${alias_log}$1"$'\n'; }
   validate_container_socket_sources() { :; }
   container_published_sockets() { :; }
+  mcp_require_no_active_leases() { :; }
   CONTAINER_CMD=container
   container() { action_log="${action_log}$1:$2"$'\n'; }
 
@@ -3197,6 +3218,7 @@ test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
   RUN_LOCAL_MODEL_PREFLIGHT=0
   RUN_UPDATE_CODEX=0
   RUN_REQUESTED_IMAGE="agent-plain"
+  RUN_PERSIST_RUNTIME_SELECTION=0
 
   run_agent_sh_in_container() {
     call_log="${call_log}user:$1:$2:${3:-}:${4:-}"$'\n'
@@ -3210,7 +3232,7 @@ test_run_pre_exec_syncs_selected_runtime_auth_when_available() {
   run_capture run_pre_exec unit-test-container
   assert_status 0
   printf '%s' "$call_log" | grep -Fq $'user:unit-test-container:runtime:install:claude' || fail "Expected user runtime install call, got: $call_log"
-  printf '%s' "$call_log" | grep -Fq $'user:unit-test-container:preferred:set' || fail "Expected preferred set call, got: $call_log"
+  printf '%s' "$call_log" | grep -Fq $'user:unit-test-container:preferred:set' && fail "run session unexpectedly changed preferred runtime: $call_log"
   printf '%s' "$call_log" | grep -Fq $'sync:unit-test-container:claude:claude_ai_oauth_json' || fail "Expected runtime auth sync call, got: $call_log"
 }
 
@@ -9867,8 +9889,8 @@ EOF
 
   run_capture "$AGENTCTL" run --name unit-test-container --workdir "$TEST_ROOT" --cpu 4 --mem 8G --cmd true
   assert_status 1
-  assert_contains "Error: --cpu and --mem only apply when creating a new container."
-  assert_contains "agentctl upgrade --name unit-test-container --image $DEFAULT_IMAGE --cpu 4 --mem 8G"
+  assert_contains "Error: Persistent container options cannot be changed with run for an existing container."
+  assert_contains "agentctl upgrade --name unit-test-container"
 }
 
 test_upgrade_rejects_no_backup_for_legacy_source() {
@@ -13741,7 +13763,8 @@ main() {
   run_selected_test test_shared_memory_support_check_fails_before_use "test_shared_memory_support_check_fails_before_use"
   run_selected_test test_run_container_passes_shared_memory_size_to_create "test_run_container_passes_shared_memory_size_to_create"
   run_selected_test test_run_container_passes_ssh_to_create "test_run_container_passes_ssh_to_create"
-  run_selected_test test_run_container_explains_retained_remote_control_and_mcp_lifecycle "test_run_container_explains_retained_remote_control_and_mcp_lifecycle"
+  run_selected_test test_create_cmd_delegates_initial_setup_to_the_first_run_path "test_create_cmd_delegates_initial_setup_to_the_first_run_path"
+  run_selected_test test_run_container_stops_its_remote_control_and_mcp_lifecycle "test_run_container_stops_its_remote_control_and_mcp_lifecycle"
   run_selected_test test_configure_container_host_alias_replaces_stale_entry "test_configure_container_host_alias_replaces_stale_entry"
   run_selected_test test_migrate_legacy_runtime_config_files "test_migrate_legacy_runtime_config_files"
   run_selected_test test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure "test_migrate_legacy_runtime_config_files_preserves_source_on_copy_failure"

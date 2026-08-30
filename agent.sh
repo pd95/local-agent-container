@@ -6,6 +6,7 @@ readonly DEFAULT_RUNTIME_FILE="/etc/agentctl/preferred-runtime"
 readonly USER_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/agentctl"
 readonly USER_RUNTIME_FILE="${USER_CONFIG_DIR}/preferred-runtime"
 readonly RUNTIME_CONFIG_JSON="${AGENTCTL_RUNTIME_CONFIG_JSON-}"
+readonly RUNTIME_OVERRIDE="${AGENTCTL_RUNTIME_OVERRIDE-}"
 readonly MODEL_OVERRIDE="${AGENTCTL_MODEL_OVERRIDE:-}"
 readonly RUN_MODE="${AGENTCTL_RUN_MODE:-local}"
 readonly RUNTIME_REGISTRY_DIR="${AGENTCTL_RUNTIME_REGISTRY_DIR:-/etc/agentctl/runtimes.d}"
@@ -1126,7 +1127,7 @@ main() {
       usage
       ;;
     run)
-      run_runtime "$(runtime_preferred)" "$@"
+      run_runtime "${RUNTIME_OVERRIDE:-$(runtime_preferred)}" "$@"
       ;;
     version)
       printf '%s\n' "agent.sh phase2"

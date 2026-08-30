@@ -1,6 +1,6 @@
 # Managed host MCP bridge
 
-Use `agentctl run --mcp` to expose an explicitly authorized host stdio MCP
+Use `agentctl create --mcp` to expose an explicitly authorized host stdio MCP
 server or fixed HTTP/HTTPS MCP upstream to a container. Agentctl uses a private
 Unix socket and a guest proxy bound only to `127.0.0.1`; it does not open a host
 TCP port. Container requests cannot alter the authorized host command or
@@ -16,17 +16,17 @@ file containing one definition or an array:
 
 ```bash
 # Built-in Xcode preset (host command: xcrun mcpbridge)
-agentctl run --mcp xcode
+agentctl create --mcp xcode
 
 # Generic inline definition
-agentctl run --mcp '{"name":"example","command":"/absolute/path/to/server","args":[]}'
+agentctl create --mcp '{"name":"example","command":"/absolute/path/to/server","args":[]}'
 
 # Host-loopback HTTP upstream with a named macOS Keychain token
 agentctl mcp credential set macos-ui-helper-token
-agentctl run --mcp '{"name":"macos-ui-helper","type":"http","url":"http://127.0.0.1:9876/mcp","bearer_token_keychain":"macos-ui-helper-token"}'
+agentctl create --mcp '{"name":"macos-ui-helper","type":"http","url":"http://127.0.0.1:9876/mcp","bearer_token_keychain":"macos-ui-helper-token"}'
 
 # Private file containing one definition or an array
-agentctl run --mcp @"$HOME/.config/agentctl/private-mcp.json"
+agentctl create --mcp @"$HOME/.config/agentctl/private-mcp.json"
 ```
 
 For Codex, agentctl automatically registers every enabled server as a

@@ -1168,9 +1168,8 @@ test "$(wc -l </workdir/mcp-started | tr -d " ")" = 1
   grep -Fq -- "$token" "$registry" && fail "HTTP MCP Keychain value was persisted in the registry"
   if lsof -nP -iTCP:47123 -sTCP:LISTEN 2>/dev/null | grep -q agentctl; then fail "agentctl unexpectedly opened a host TCP listener on the guest MCP port"; fi
 
-  log "managed-mcp: reusing the same named container through run --mcp"
-  run_capture "$AGENTCTL" run --name "$name" --image agent-python --workdir "$workdir" \
-    --mcp "$definition" --cmd true
+  log "managed-mcp: reusing the persisted bridge through plain run"
+  run_capture "$AGENTCTL" run --name "$name" --cmd true
   assert_status 0
 
   assert_mcp_initialize() {

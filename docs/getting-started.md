@@ -87,6 +87,17 @@ name so later lifecycle commands do not depend on your current directory:
 agentctl run --name agent-my-project --workdir /path/to/project
 ```
 
+For an explicit lifecycle, create once and start later:
+
+```bash
+agentctl create --name agent-my-project --workdir /path/to/project
+agentctl start --name agent-my-project
+```
+
+`run` remains the convenient foreground form: it creates a missing container,
+starts a stopped one, and stops it again when the foreground session ends.
+Change persistent container settings with `agentctl upgrade`.
+
 ## First build
 
 Build the curated images:
