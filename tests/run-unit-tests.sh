@@ -10802,7 +10802,7 @@ test_upgrade_package_warning_excludes_reinstalled_feature_packages() {
 }
 
 test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
-  begin_test "upgrade reinstalls added runtimes and features in the target container"
+  begin_test "upgrade defers added runtimes and features to the recovery plan"
 
   load_agentctl_functions
 
@@ -10828,6 +10828,10 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   restore_codex_config() { :; }
   persist_container_system_manifest_baseline() { :; }
   persist_container_system_manifest_baseline_from_image() { :; }
+  recovery_prepare_upgrade() { printf '{"ledger_schema_version":1,"records":[{"record_id":"source","system":{"package_manager":"apk","installed_runtimes":["codex","claude"],"installed_features":["office"],"requested_packages":[]},"python_environment":null}],"plans":[]}' ; }
+  recovery_plan_json() { printf '{"plan_schema_version":1,"actions":[{"id":"runtime:claude","kind":"runtime","name":"claude","default_selected":true,"status":"pending"},{"id":"feature:office","kind":"feature","name":"office","default_selected":true,"status":"pending"}]}' ; }
+  recovery_append_plan() { printf '%s\n' "$1"; }
+  recovery_write_ledger() { :; }
   collect_upgrade_container_preflight() {
     UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":[]}'
     UPGRADE_PREFLIGHT_BASELINE_MANIFEST=''
@@ -10837,6 +10841,10 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   sanitize_image_name() { printf '%s\n' "$1"; }
   build_backup_image_from_export() { :; }
   run_agent_sh_in_container() {
+    if [ "$2" = "recovery" ] && [ "$3" = "manifest" ]; then
+      printf '{"system":{"package_manager":"apk","installed_runtimes":["codex"],"installed_features":[],"requested_packages":[]},"python_environment":null}\n'
+      return 0
+    fi
     if [ "$2" = "runtime" ] && [ "$3" = "info" ] && [ "$4" = "claude" ]; then
       printf '{"runtime":"claude","installed":false,"capabilities":{"install":true}}\n'
       return 0
@@ -10895,10 +10903,9 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
 
   run_capture upgrade_cmd --name unit-test-container --image agent-python --no-backup
   assert_status 0
-  assert_contains "Reinstalling added runtime in unit-test-container: claude"
-  assert_contains "Reinstalling added feature in unit-test-container: office"
-  printf '%s\n' "$user_call_log" | grep -Fx -- "runtime install claude" >/dev/null || fail "Expected runtime reinstall call, got: $user_call_log"
-  printf '%s\n' "$root_call_log" | grep -Fx -- "feature install office" >/dev/null || fail "Expected feature reinstall call, got: $root_call_log"
+  assert_contains "Recovery deferred. Resume with:"
+  [ -z "$user_call_log" ] || fail "Expected runtime reinstall to be deferred, got: $user_call_log"
+  [ -z "$root_call_log" ] || fail "Expected feature reinstall to be deferred, got: $root_call_log"
   assert_contains "Upgrade complete: unit-test-container (backup skipped)"
   printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
   printf '%s\n' "$rm_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected removal of source container, got: $rm_log"
@@ -10908,7 +10915,7 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
 }
 
 test_upgrade_reinstalls_missing_default_runtime_after_restore() {
-  begin_test "upgrade reinstalls missing default runtime after restore"
+  begin_test "upgrade defers missing runtime restoration to the recovery plan"
 
   load_agentctl_functions
 
@@ -10933,6 +10940,10 @@ test_upgrade_reinstalls_missing_default_runtime_after_restore() {
   verify_restored_codex_state() { return 0; }
   persist_container_system_manifest_baseline() { :; }
   persist_container_system_manifest_baseline_from_image() { :; }
+  recovery_prepare_upgrade() { printf '{"ledger_schema_version":1,"records":[{"record_id":"source","system":{"package_manager":"apk","installed_runtimes":["codex"],"installed_features":[],"requested_packages":[]},"python_environment":null}],"plans":[]}' ; }
+  recovery_plan_json() { printf '{"plan_schema_version":1,"actions":[{"id":"runtime:codex","kind":"runtime","name":"codex","default_selected":true,"status":"pending"}]}' ; }
+  recovery_append_plan() { printf '%s\n' "$1"; }
+  recovery_write_ledger() { :; }
   collect_upgrade_container_preflight() {
     UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":[]}'
     UPGRADE_PREFLIGHT_BASELINE_MANIFEST=''
@@ -10942,6 +10953,10 @@ test_upgrade_reinstalls_missing_default_runtime_after_restore() {
   sanitize_image_name() { printf '%s\n' "$1"; }
   build_backup_image_from_export() { :; }
   run_agent_sh_in_container() {
+    if [ "$2" = "recovery" ] && [ "$3" = "manifest" ]; then
+      printf '{"system":{"package_manager":"apk","installed_runtimes":[],"installed_features":[],"requested_packages":[]},"python_environment":null}\n'
+      return 0
+    fi
     if [ "$2" = "runtime" ] && [ "$3" = "info" ] && [ "$4" = "codex" ]; then
       printf '{"runtime":"codex","installed":false,"capabilities":{"install":true}}\n'
       return 0
@@ -10979,8 +10994,8 @@ test_upgrade_reinstalls_missing_default_runtime_after_restore() {
 
   run_capture upgrade_cmd --name unit-test-container --image agent-python --no-backup
   assert_status 0
-  assert_contains "Reinstalling target default runtime in unit-test-container: codex"
-  printf '%s\n' "$install_log" | grep -Fq -- "unit-test-container AGENTCTL_SKIP_PREFERRED_SET=1 -- runtime install codex" || fail "Expected default runtime reinstall without preferred-runtime side effect, got: $install_log"
+  assert_contains "Recovery deferred. Resume with:"
+  [ -z "$install_log" ] || fail "Expected runtime reinstall to be deferred, got: $install_log"
   printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
 }
 
@@ -13460,6 +13475,106 @@ test_validate_backup_image_stops_validation_container_before_remove() {
   printf '%s\n' "$call_log" | grep -Fq "stop agentctl-backup-validate-20260406120000-$$" || fail "Expected validation container stop before removal, got: $call_log"
 }
 
+test_upgrade_recovery_plan_keeps_deferred_actions_across_images() {
+  begin_test "upgrade recovery plan keeps deferred actions across image changes"
+
+  load_agentctl_functions
+
+  local ledger
+  local target
+  ledger='{"ledger_schema_version":1,"records":[{"record_id":"first","system":{"package_manager":"apk","installed_runtimes":["codex","claude"],"installed_features":["office"],"requested_packages":["tree"]},"python_environment":{"python":"Python 3.14.1","packages":[{"name":"httpx","version":"0.28.1","requested":true}]}}]}'
+  target='{"system":{"package_manager":"dpkg","installed_runtimes":["codex"],"installed_features":[],"requested_packages":[]},"python_environment":{"python":"Python 3.14.5","packages":[]}}'
+
+  run_capture recovery_plan_json "$ledger" "$target" mixed
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '
+    (.actions | map(.id) | index("runtime:claude"))
+    and (.actions | map(.id) | index("feature:office"))
+    and (.actions[] | select(.id == "os:apk:tree") | .status == "incompatible")
+    and (.actions[] | select(.id == "python:httpx") | .status == "pending")
+  ' >/dev/null || fail "Expected runtime, feature, deferred OS, and Python recovery actions, got: $RUN_OUTPUT"
+}
+
+test_upgrade_recovery_ledger_appends_immutable_records() {
+  begin_test "upgrade recovery ledger appends immutable source records"
+
+  load_agentctl_functions
+
+  local ledger
+  local source
+  local updated
+  ledger='{"ledger_schema_version":1,"records":[{"record_id":"first"}],"plans":[]}'
+  source='{"record_id":"second","parent_record_id":"first","system":{"package_manager":"apk"}}'
+
+  updated="$(jq -cn --argjson ledger "$ledger" --argjson source "$source" '$ledger + {records: ($ledger.records + [$source])}')"
+  run_capture recovery_append_plan "$updated" '{"plan_schema_version":1,"actions":[{"id":"os:apk:tree","status":"pending"}]}'
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '(.records | length) == 2 and .records[0].record_id == "first" and .records[1].parent_record_id == "first"' >/dev/null \
+    || fail "Expected ledger history to remain append-only, got: $RUN_OUTPUT"
+}
+
+test_upgrade_recovery_marks_successful_items_restored() {
+  begin_test "upgrade recovery marks successful selected items restored"
+
+  load_agentctl_functions
+
+  run_capture recovery_mark_selected_restored \
+    '{"ledger_schema_version":1,"plans":[{"actions":[{"id":"runtime:claude","status":"pending"},{"id":"os:apk:tree","status":"pending"}]}]}' \
+    'runtime:claude'
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.plans[-1].actions[] | select(.id == "runtime:claude") | .status == "restored"' >/dev/null \
+    || fail "Expected selected recovery item to be marked restored, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -e '.plans[-1].actions[] | select(.id == "os:apk:tree") | .status == "pending"' >/dev/null \
+    || fail "Expected unselected recovery item to remain pending, got: $RUN_OUTPUT"
+}
+
+test_upgrade_recovery_retries_failed_actions() {
+  begin_test "upgrade recovery makes failed compatible actions retryable"
+
+  load_agentctl_functions
+
+  local ledger
+  local target
+  ledger='{"ledger_schema_version":1,"records":[{"record_id":"next","system":{"package_manager":"apk","installed_runtimes":[],"installed_features":[],"requested_packages":[]},"python_environment":null}],"plans":[{"actions":[{"id":"os:apk:tree","kind":"os-package","name":"tree","provider":"apk","default_selected":true,"status":"failed"}]}]}'
+  target='{"system":{"package_manager":"apk","installed_runtimes":[],"installed_features":[],"requested_packages":[]},"python_environment":null}'
+
+  run_capture recovery_plan_json "$ledger" "$target" mixed
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.actions[] | select(.id == "os:apk:tree") | .status == "pending" and .default_selected == true' >/dev/null \
+    || fail "Expected failed compatible action to become retryable, got: $RUN_OUTPUT"
+}
+
+test_upgrade_recovery_restore_selects_failed_actions() {
+  begin_test "upgrade recovery restore selects failed actions for retry"
+
+  load_agentctl_functions
+
+  run_capture recovery_selected_ids \
+    '{"actions":[{"id":"os:apk:tree","kind":"os-package","name":"tree","default_selected":true,"status":"failed"}]}' \
+    all
+  assert_status 0
+  [ "$RUN_OUTPUT" = "os:apk:tree" ] \
+    || fail "Expected --all-compatible recovery to retry failed default action, got: $RUN_OUTPUT"
+}
+
+test_upgrade_recovery_reports_export_capture_limitations() {
+  begin_test "upgrade recovery reports stopped export capture limitations"
+
+  load_agentctl_functions
+
+  local ledger
+  local target
+  ledger='{"ledger_schema_version":1,"records":[{"record_id":"exported","capture_limitations":["apt-sources","python-lock"],"system":{"package_manager":"dpkg","installed_runtimes":[],"installed_features":[],"requested_packages":[]},"apt_sources":[],"python_environment":{"path":"/opt/venv","python":"unknown","packages":[],"freeze":[]}}]}'
+  target='{"system":{"package_manager":"dpkg","installed_runtimes":[],"installed_features":[],"requested_packages":[]},"apt_sources":[],"python_environment":{"path":"/opt/venv","python":"Python 3.14.1","packages":[]}}'
+
+  run_capture recovery_plan_json "$ledger" "$target" mixed
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '
+    (.actions[] | select(.id == "manual:apt-sources") | .status == "manual-required")
+    and (.actions[] | select(.id == "manual:python-lock") | .status == "manual-required")
+  ' >/dev/null || fail "Expected explicit manual recovery items for stopped export limitations, got: $RUN_OUTPUT"
+}
+
 main() {
   log "Using agentctl at $AGENTCTL"
   log "Using agentctl implementation at $AGENTCTL_IMPL"
@@ -13779,6 +13894,12 @@ main() {
   run_selected_test test_upgrade_accepts_workdir_override_when_original_mount_is_missing "test_upgrade_accepts_workdir_override_when_original_mount_is_missing"
   run_selected_test test_upgrade_unpublishes_stale_mapping_without_starting_stopped_source "test_upgrade_unpublishes_stale_mapping_without_starting_stopped_source"
   run_selected_test test_upgrade_allows_no_backup_for_modern_export_source "test_upgrade_allows_no_backup_for_modern_export_source"
+  run_selected_test test_upgrade_recovery_plan_keeps_deferred_actions_across_images "test_upgrade_recovery_plan_keeps_deferred_actions_across_images"
+  run_selected_test test_upgrade_recovery_ledger_appends_immutable_records "test_upgrade_recovery_ledger_appends_immutable_records"
+  run_selected_test test_upgrade_recovery_marks_successful_items_restored "test_upgrade_recovery_marks_successful_items_restored"
+  run_selected_test test_upgrade_recovery_retries_failed_actions "test_upgrade_recovery_retries_failed_actions"
+  run_selected_test test_upgrade_recovery_restore_selects_failed_actions "test_upgrade_recovery_restore_selects_failed_actions"
+  run_selected_test test_upgrade_recovery_reports_export_capture_limitations "test_upgrade_recovery_reports_export_capture_limitations"
   run_selected_test test_container_baseline_manifest_starts_stopped_container_and_restores_state "test_container_baseline_manifest_starts_stopped_container_and_restores_state"
   run_selected_test test_image_system_manifest_removes_temp_container_after_success "test_image_system_manifest_removes_temp_container_after_success"
   run_selected_test test_image_system_manifest_removes_temp_container_after_exec_failure "test_image_system_manifest_removes_temp_container_after_exec_failure"

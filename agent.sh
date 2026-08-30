@@ -762,6 +762,71 @@ json_system_manifest() {
     }'
 }
 
+json_recovery_manifest() {
+  local system_manifest package_details='[]' apt_sources='[]' python_environment='null'
+  local venv_dir="${AGENTCTL_RECOVERY_VENV_DIR:-/opt/venv}"
+  local inspect_json='{}' freeze_text='' inspect_file=''
+
+  system_manifest="$(json_system_manifest | jq '.apk_repositories |= map(gsub("://[^/@[:space:]]+@"; "://") | split("?")[0])')"
+  case "$(printf '%s' "$system_manifest" | jq -r '.package_manager')" in
+    apk)
+      if command -v apk >/dev/null 2>&1; then
+        package_details="$(apk query --format json --installed 2>/dev/null || printf '[]')"
+      fi
+      ;;
+    dpkg)
+      if command -v dpkg-query >/dev/null 2>&1; then
+        package_details="$(dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null | jq -R 'split("\t") | {name: .[0], version: .[1]}' | jq -s .)"
+      fi
+      if [ -r /etc/apt/sources.list ] || [ -d /etc/apt/sources.list.d ]; then
+        apt_sources="$({
+          [ ! -r /etc/apt/sources.list ] || sed -n '/^[[:space:]]*deb[[:space:]]/ { s#//[^/@[:space:]]*@#//#g; s/?[^[:space:]]*$//; p; }' /etc/apt/sources.list
+          for source_file in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -r "$source_file" ] || continue
+            # deb822 (.sources) files are deliberately not flattened into a
+            # sources.list file; they require their structured key material.
+            case "$source_file" in
+              *.list) sed -n '/^[[:space:]]*deb[[:space:]]/ { s#//[^/@[:space:]]*@#//#g; s/?[^[:space:]]*$//; p; }' "$source_file" ;;
+            esac
+          done
+        } 2>/dev/null | sort -u | jq -R . | jq -s .)"
+      fi
+      ;;
+  esac
+
+  if [ -x "$venv_dir/bin/python" ]; then
+    inspect_json="$("$venv_dir/bin/python" -m pip inspect --local 2>/dev/null || printf '{}')"
+    freeze_text="$("$venv_dir/bin/python" -m pip freeze --all 2>/dev/null | sed 's#//[^/@[:space:]]*@#//#g; s/?[^[:space:]]*$//' || true)"
+    inspect_file="$(mktemp)"
+    printf '%s' "$inspect_json" >"$inspect_file"
+    python_environment="$(jq -cn \
+      --arg path "$venv_dir" \
+      --arg python "$("$venv_dir/bin/python" --version 2>&1 || true)" \
+      --arg pip "$("$venv_dir/bin/python" -m pip --version 2>&1 || true)" \
+      --arg freeze "$freeze_text" \
+      --slurpfile inspect_file "$inspect_file" \
+      '{path: $path, python: $python, pip: $pip,
+        packages: [(($inspect_file[0] // {}).installed // [])[] | {
+          name: (.metadata.name // ""), version: (.metadata.version // ""),
+          requested: (.requested // false),
+          direct_url: ((.direct_url.url // null) | if . == null then null else gsub("://[^/@[:space:]]+@"; "://") | split("?")[0] end)
+        }],
+        freeze: ($freeze | split("\n") | map(select(length > 0)))}')"
+    rm -f "$inspect_file"
+  fi
+
+  jq -cn \
+    --argjson system "$system_manifest" \
+    --argjson package_details "$package_details" \
+    --argjson apt_sources "$apt_sources" \
+    --argjson python_environment "$python_environment" \
+    --arg architecture "$(uname -m)" \
+    '{manifest_schema_version: 1, kind: "agentctl-upgrade-recovery-source",
+      captured_at: (now | todateiso8601), architecture: $architecture,
+      system: $system, package_details: $package_details, apt_sources: $apt_sources,
+      python_environment: $python_environment}'
+}
+
 state_unique_paths() {
   awk 'NF && !seen[$0]++'
 }
@@ -1048,6 +1113,7 @@ Usage:
   agent.sh state export
   agent.sh state import
   agent.sh system manifest
+  agent.sh recovery manifest
 EOF
 }
 
@@ -1167,6 +1233,16 @@ main() {
           ;;
         *)
           die "unknown system command: ${1:-}"
+          ;;
+      esac
+      ;;
+    recovery)
+      case "${1:-}" in
+        manifest)
+          json_recovery_manifest
+          ;;
+        *)
+          die "unknown recovery command: ${1:-}"
           ;;
       esac
       ;;

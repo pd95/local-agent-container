@@ -38,6 +38,12 @@
       "zlib"
     ]
   },
+  "python_packages": [
+    "python-docx",
+    "python-pptx",
+    "xlrd",
+    "pdfplumber"
+  ],
   "capabilities": {
     "install": true,
     "remove": false,
