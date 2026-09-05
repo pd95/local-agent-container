@@ -9720,6 +9720,48 @@ EOF
   assert_not_contains "converter"
 }
 
+test_ls_sorts_running_containers_first_then_by_state_and_name() {
+  begin_test "ls sorts running containers first then by state and name"
+
+  load_agentctl_functions
+
+  require_container() { return 0; }
+  require_container_service() { return 0; }
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "ls -a --quiet")
+        printf '%s\n' agent-stopped-zeta agent-running-zeta agent-unknown agent-starting \
+          agent-running-alpha agent-stopped-alpha
+        ;;
+      "image ls --format json")
+        printf '[]\n'
+        ;;
+      "inspect agent-running-alpha"|"inspect agent-running-zeta")
+        printf '%s\n' '[{"configuration":{"image":{"reference":"agent-plain:latest"}},"status":"running"}]'
+        ;;
+      "inspect agent-starting")
+        printf '%s\n' '[{"configuration":{"image":{"reference":"agent-plain:latest"}},"status":"starting"}]'
+        ;;
+      "inspect agent-stopped-alpha"|"inspect agent-stopped-zeta")
+        printf '%s\n' '[{"configuration":{"image":{"reference":"agent-plain:latest"}},"status":"stopped"}]'
+        ;;
+      "inspect agent-unknown")
+        printf '%s\n' '[{"configuration":{"image":{"reference":"agent-plain:latest"}}}]'
+        ;;
+      *)
+        fail "Unexpected container invocation: $*"
+        ;;
+    esac
+  }
+
+  run_capture ls_cmd
+  assert_status 0
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | awk 'NR > 1 { print $1 "\t" $2 }')" = \
+    $'agent-running-alpha\trunning\nagent-running-zeta\trunning\nagent-starting\tstarting\nagent-stopped-alpha\tstopped\nagent-stopped-zeta\tstopped\nagent-unknown\tunknown' ] \
+    || fail "Expected state and name ordering, got: $RUN_OUTPUT"
+}
+
 test_ls_reports_unknown_snapshot_when_timestamp_missing() {
   begin_test "ls reports unknown snapshot when only latest matches digest"
 
@@ -14082,6 +14124,7 @@ main() {
   run_selected_test test_ls_reports_stopped_container_service "test_ls_reports_stopped_container_service"
   run_selected_test test_container_requirement_reports_stopped_service "test_container_requirement_reports_stopped_service"
   run_selected_test test_ls_reports_matching_snapshot_ref_by_default "test_ls_reports_matching_snapshot_ref_by_default"
+  run_selected_test test_ls_sorts_running_containers_first_then_by_state_and_name "test_ls_sorts_running_containers_first_then_by_state_and_name"
   run_selected_test test_ls_reports_unknown_snapshot_when_timestamp_missing "test_ls_reports_unknown_snapshot_when_timestamp_missing"
   run_selected_test test_ls_keeps_row_when_inspect_fails "test_ls_keeps_row_when_inspect_fails"
   run_selected_test test_ls_handles_malformed_image_list_json "test_ls_handles_malformed_image_list_json"

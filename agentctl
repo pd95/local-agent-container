@@ -11479,7 +11479,8 @@ ls_cmd() {
 Usage: $CLI_NAME ls [--details|--raw]
 
 Options:
-  --details  Show managed containers with image digest and matching timestamp snapshot (default)
+  --details  Show managed containers with image digest and matching timestamp snapshot (default),
+             ordered with running containers first, then by state and name
   --raw      Show the legacy filtered container list
 EOF
         return 0
@@ -11600,24 +11601,43 @@ format_tsv_table() {
   '
 }
 
+sort_ls_details_rows() {
+  local tab=$'\t'
+
+  awk -F '\t' '
+    NF > 0 {
+      state = tolower($2)
+      if (state == "running") rank = 0
+      else if (state == "stopped") rank = 2
+      else if (state == "unknown") rank = 3
+      else rank = 1
+      printf "%d\t%s\t%s\t%s\n", rank, state, $1, $0
+    }
+  ' \
+    | LC_ALL=C sort -t "$tab" -k1,1n -k2,2 -k3,3 \
+    | cut -f4-
+}
+
 ls_details_cmd() {
   local images_json
   local images_json_file
   local name
   local inspect_json
-  local rows
+  local rows=""
 
   images_json="$(image_list_json)"
   images_json_file="$(mktemp "${TMPDIR:-/tmp}/agentctl-images.XXXXXX")"
   printf '%s\n' "$images_json" >"$images_json_file"
-  rows="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "NAME" "STATE" "IMAGE" "SNAPSHOT" "DIGEST" "WORKDIR" "MOUNT" "CPU" "MEMORY" "CREATED")"
   while IFS= read -r name; do
     [ -n "$name" ] || continue
     inspect_json="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null || true)"
-    rows="${rows}"$'\n'"$(ls_details_row "$name" "$images_json_file" "$inspect_json")"
+    rows="${rows}$(ls_details_row "$name" "$images_json_file" "$inspect_json")"$'\n'
   done < <(managed_container_names)
-  printf '%s\n' "$rows" | format_tsv_table
+  {
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "NAME" "STATE" "IMAGE" "SNAPSHOT" "DIGEST" "WORKDIR" "MOUNT" "CPU" "MEMORY" "CREATED"
+    printf '%s' "$rows" | sort_ls_details_rows
+  } | format_tsv_table
   rm -f "$images_json_file"
 }
 
