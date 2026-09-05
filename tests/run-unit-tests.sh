@@ -52,6 +52,10 @@ done
 load_agentctl_functions() {
   local harness
 
+  # Some lifecycle tests stub the trap builtin. Do not let that test double
+  # leak into subsequently loaded production functions.
+  unset -f trap 2>/dev/null || true
+
   harness="$(mktemp "${TMPDIR:-/tmp}/agentctl-unit.XXXXXX")"
   register_dir_cleanup "$harness"
 
