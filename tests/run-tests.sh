@@ -1068,7 +1068,7 @@ PY
 
 test_managed_mcp_bridge_lifecycle() {
   begin_test "managed MCP bridge exchanges traffic and survives start, restart, upgrade, and disable"
-  local name workdir marker node_path definition replacement_definition registry port debug_dir http_pid http_port_file http_port credential token rotated_token expected_auth_file
+  local name workdir marker node_path definition added_definition replacement_definition registry port debug_dir http_pid http_port_file http_port credential token rotated_token expected_auth_file
 
   command -v node >/dev/null 2>&1 || fail "managed MCP integration test requires host Node.js"
   name="$(unique_name managed-mcp)"
@@ -1109,6 +1109,10 @@ test_managed_mcp_bridge_lifecycle() {
     --arg url "http://127.0.0.1:${http_port}/mcp?fixed=1" \
     --arg credential "$credential" \
     '[{name:"fake",command:$command,args:[$server],env:{AGENTCTL_FAKE_MCP_STARTED:$marker},shared:true},{name:"http-fake",type:"http",url:$url,bearer_token_keychain:$credential}]')"
+  added_definition="$(jq -cn \
+    --arg command "$node_path" \
+    --arg server "$TEST_ROOT/tests/fixtures/fake-mcp-server.mjs" \
+    '{name:"added",command:$command,args:[$server],shared:true}')"
   replacement_definition="$(jq -cn \
     --arg command "$node_path" \
     --arg server "$TEST_ROOT/tests/fixtures/fake-mcp-server.mjs" \
@@ -1191,6 +1195,62 @@ curl -fsS -X POST -H "content-type: application/json" \
   assert_status 0
   assert_mcp_initialize
 
+  log "managed-mcp: adding a live definition"
+  run_capture "$AGENTCTL" mcp add --name "$name" "$added_definition"
+  assert_status 0; assert_contains "Added managed MCP definition(s)"
+
+  log "managed-mcp: listing live definitions"
+  run_capture "$AGENTCTL" mcp list --name "$name"
+  assert_status 0; assert_contains "added"; assert_contains "host stdio"; assert_contains "http://127.0.0.1:$http_port"
+  assert_not_contains "/mcp?fixed=1"; assert_not_contains "$credential"
+
+  log "managed-mcp: verifying the added Codex endpoint and relay route"
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '
+set -e
+codex_json="$(codex mcp get added --json)"
+printf "%s\n" "$codex_json" | jq -e ".transport.url == \"http://127.0.0.1:'"$port"'/mcp/added\"" >/dev/null || {
+  printf "Unexpected Codex MCP definition: %s\n" "$codex_json" >&2
+  exit 1
+}
+response="$(curl -fsS -X POST -H "content-type: application/json" \
+  --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}" \
+  http://127.0.0.1:'"$port"'/mcp/added)"
+printf "%s\n" "$response" | jq -e ".result.serverInfo.name == \"fake\"" >/dev/null || {
+  printf "Unexpected added MCP route response: %s\n" "$response" >&2
+  exit 1
+}
+  '
+  assert_status 0
+
+  log "managed-mcp: accepting an identical live definition"
+  run_capture "$AGENTCTL" mcp add --name "$name" "$added_definition"
+  assert_status 0; assert_contains "already configured"
+
+  log "managed-mcp: removing a live definition"
+  run_capture "$AGENTCTL" mcp remove --name "$name" added
+  assert_status 0; assert_contains "Removed managed MCP definition added"
+
+  log "managed-mcp: verifying removal from Codex and the relay"
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '
+if codex mcp get added --json >/dev/null 2>&1; then
+  echo "Codex still contains removed managed MCP server: added" >&2
+  exit 1
+fi
+response_file=/tmp/agentctl-mcp-removed-response.json
+status="$(curl -sS -o "$response_file" -w "%{http_code}" -X POST --data "{}" http://127.0.0.1:'"$port"'/mcp/added)"
+[ "$status" = 503 ] || {
+  printf "Removed MCP relay route returned HTTP %s instead of 503\n" "$status" >&2
+  cat "$response_file" >&2
+  exit 1
+}
+jq -e ".error == \"MCP server is not configured: added\"" "$response_file" >/dev/null || {
+  printf "Unexpected removed MCP route response: " >&2
+  cat "$response_file" >&2
+  exit 1
+}
+  '
+  assert_status 0
+
   log "managed-mcp: rotating and removing Keychain-backed HTTP credentials"
   printf '%s' "$rotated_token" | "$AGENTCTL" mcp credential set "$credential" --stdin >/dev/null
   printf 'Bearer %s' "$rotated_token" | shasum -a 256 | awk '{print $1}' >"$expected_auth_file"
@@ -1226,6 +1286,18 @@ curl -fsS -X POST -H "content-type: application/json" \
   log "managed-mcp: checking stopped-container doctor supervision"
   local starts_before_doctor
   starts_before_doctor="$(wc -l <"$marker" | tr -d ' ')"
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+  log "managed-mcp: deferring a stopped-container definition until managed start"
+  run_capture "$AGENTCTL" mcp add --name "$name" "$added_definition"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" ls --quiet
+  if printf '%s\n' "$RUN_OUTPUT" | grep -Fqx -- "$name"; then fail "MCP add unexpectedly started a stopped container"; fi
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc \
+    'codex mcp get added --json | jq -e ".transport.url == \"http://127.0.0.1:'"$port"'/mcp/added\"" >/dev/null'
+  assert_status 0
   run_capture "$AGENTCTL" stop --name "$name"
   assert_status 0
   log "managed-mcp: refreshing a stopped container with an expired relay socket"
