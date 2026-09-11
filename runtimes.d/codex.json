@@ -42,6 +42,7 @@
     "runtime update codex",
     "runtime reset-config codex",
     "runtime mcp-add codex NAME URL",
+    "runtime mcp-sync codex DESIRED_JSON",
     "auth login codex",
     "auth read codex json_refresh_token",
     "auth write codex json_refresh_token",

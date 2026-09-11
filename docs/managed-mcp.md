@@ -166,16 +166,26 @@ Containers created without MCP wiring need an explicit migration:
 agentctl upgrade --name agent-project --enable-mcp
 ```
 
-Enabling MCP adds bridge wiring only; it does not configure an MCP server. A
-running managed relay retains its current definitions and cannot be
-reconfigured in place. To configure the first server after an upgrade, or to
-replace existing definitions, stop the container and relay, then rerun the
-desired `run --mcp` command:
+Enabling MCP adds bridge wiring only; it does not configure an MCP server. To
+configure the first server after an upgrade, or to replace existing
+definitions, use `upgrade --mcp`. Repeat `--mcp` for every server that should
+remain enabled:
 
 ```bash
-agentctl stop --name agent-project
-agentctl run --name agent-project --mcp xcode
+agentctl upgrade --name agent-project \
+  --mcp xcode \
+  --mcp @"$HOME/.config/agentctl/private-mcp.json"
 ```
+
+For Codex, agentctl reconciles its local MCP endpoint configuration after an
+upgrade and on later managed starts. This writes only the private guest URLs;
+it does not initialize an MCP server or invoke an MCP tool. User-created or
+user-modified Codex MCP entries are preserved rather than overwritten. The
+ownership record is stored privately in
+`~/.config/agentctl/codex-managed-mcp.json` and is included in upgrade state
+backups. If an older container does not yet provide the synchronization
+command, agentctl preserves its Codex configuration and prints the exact
+`agentctl refresh` command needed to enable reconciliation.
 
 For an Xcode beta definition, export `DEVELOPER_DIR` before the `run` command
 and include it in the definition's `env_vars`. Export the variable again before

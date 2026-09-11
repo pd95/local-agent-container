@@ -1068,7 +1068,7 @@ PY
 
 test_managed_mcp_bridge_lifecycle() {
   begin_test "managed MCP bridge exchanges traffic and survives start, restart, upgrade, and disable"
-  local name workdir marker node_path definition registry port debug_dir http_pid http_port_file http_port credential token rotated_token expected_auth_file
+  local name workdir marker node_path definition replacement_definition registry port debug_dir http_pid http_port_file http_port credential token rotated_token expected_auth_file
 
   command -v node >/dev/null 2>&1 || fail "managed MCP integration test requires host Node.js"
   name="$(unique_name managed-mcp)"
@@ -1109,6 +1109,11 @@ test_managed_mcp_bridge_lifecycle() {
     --arg url "http://127.0.0.1:${http_port}/mcp?fixed=1" \
     --arg credential "$credential" \
     '[{name:"fake",command:$command,args:[$server],env:{AGENTCTL_FAKE_MCP_STARTED:$marker},shared:true},{name:"http-fake",type:"http",url:$url,bearer_token_keychain:$credential}]')"
+  replacement_definition="$(jq -cn \
+    --arg command "$node_path" \
+    --arg server "$TEST_ROOT/tests/fixtures/fake-mcp-server.mjs" \
+    --arg marker "$marker" \
+    '[{name:"replacement",command:$command,args:[$server],env:{AGENTCTL_FAKE_MCP_STARTED:$marker},shared:true}]')"
 
   log "managed-mcp: creating bridge and checking lazy child startup"
   run_capture "$AGENTCTL" run --name "$name" --image agent-python --workdir "$workdir" \
@@ -1244,17 +1249,36 @@ curl -fsS -X POST -H "content-type: application/json" \
   run_capture "$AGENTCTL" doctor --host
   assert_contains "Container $name"
   assert_contains "host relay inactive because the container is stopped"
-  log "managed-mcp: checking stopped-container upgrade preservation"
+  log "managed-mcp: replacing definitions during stopped-container upgrade"
   starts_before_doctor="$(wc -l <"$marker" | tr -d ' ')"
-  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
+  port=48124
+  run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --mcp-port "$port" --mcp "$replacement_definition"
   assert_status 0
   [ "$(wc -l <"$marker" | tr -d ' ')" = "$starts_before_doctor" ] || fail "Stopped MCP upgrade preflight unexpectedly started the MCP child"
   run_capture "$AGENTCTL" start --name "$name"
   assert_status 0
-  assert_mcp_initialize
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '
+set -e
+codex mcp get replacement --json | jq -e ".transport.url == \"http://127.0.0.1:'"$port"'/mcp/replacement\"" >/dev/null
+! codex mcp get fake --json >/dev/null 2>&1
+! codex mcp get http-fake --json >/dev/null 2>&1
+  '
+  assert_status 0
+  [ "$(wc -l <"$marker" | tr -d ' ')" = "$starts_before_doctor" ] || fail "Codex endpoint reconciliation unexpectedly connected to the MCP child"
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '
+set -e
+curl -fsS -X POST -H "content-type: application/json" \
+  --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}" \
+  http://127.0.0.1:'"$port"'/mcp/replacement | jq -e ".result.serverInfo.name == \"fake\"" >/dev/null
+  '
+  assert_status 0
+  jq -e --argjson port "$port" '[.servers[].name] == ["replacement"] and .port == $port' "$registry" >/dev/null \
+    || fail "Stopped-container upgrade did not persist replacement MCP definitions: $(cat "$registry")"
 
   log "managed-mcp: disabling bridge"
   run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --disable-mcp
+  assert_status 0
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '! codex mcp get replacement --json >/dev/null 2>&1'
   assert_status 0
   [ ! -e "$registry" ] || fail "Expected --disable-mcp to remove the registry"
   run_capture "$CONTAINER_CMD" inspect "$name"
