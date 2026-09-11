@@ -179,9 +179,11 @@ The stored baseline records:
 
 ## Upgrade Behavior
 
-Before recreation, `upgrade` warns about extra OS packages that were added after
-the source baseline and are not present in the target image, because those
-packages are not preserved automatically.
+Before recreation, `upgrade` summarizes OS packages that are absent from the
+target image and reports how many missing top-level packages the recovery plan
+will offer. It does not print the complete dependency-level difference by
+default. Use `--package-details` when troubleshooting an upgrade to see that
+full preflight inventory.
 
 ## Upgrade recovery
 
@@ -208,6 +210,22 @@ agentctl upgrade restore --name my-project --all-compatible
 `--all-compatible` restores its default-compatible items without a prompt. To
 permanently skip one item, use `agentctl upgrade restore --name my-project
 --dismiss ITEM_ID`; use `--status` or `--dry-run` to obtain its item ID.
+
+Selected DPKG packages are restored with one `apt-get update` and one batched
+`apt-get install` transaction. Selected APK packages are likewise passed to one
+`apk add` transaction. If a batch command fails after installing only some
+packages, agentctl checks each requested package and records its individual
+restored or failed state in the recovery ledger. For a failed DPKG transaction,
+an already-installed dependency is considered restored only when it is also
+marked as manually requested; locked recovery also verifies the exact captured
+version. Each recovery attempt ends with restored, failed, and deferred counts;
+retry guidance is printed only while unresolved actions remain.
+
+Tagged APK packages are not selected by `--restore` or `--all-compatible` when
+their repository is absent from the target. Use interactive recovery to review
+and select both the repository and its dependent packages. Known Alpine edge
+repository tags can be reconstructed; unknown tags remain manual recovery
+items so agentctl never guesses a private repository URL.
 
 The version policy controls package restoration:
 

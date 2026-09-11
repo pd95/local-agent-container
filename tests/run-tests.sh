@@ -416,22 +416,16 @@ test_upgrade_no_backup_preserves_state() {
   assert_contains "runtime-state-ok"
 }
 
-test_upgrade_repeats_tagged_apk_reinstall_instructions() {
-  begin_test "upgrade repeats complete tagged APK reinstall instructions"
+test_upgrade_restores_tagged_apk_packages_through_recovery() {
+  begin_test "upgrade defers and restores tagged APK packages through recovery"
   local name
   local workdir
-  local reinstall_command
   local main_repository
   local community_repository
-  local main_restore_fragment
-  local community_restore_fragment
-  local preflight_output
-  local reminder_output
 
   name="$(unique_name upgrade-tagged-apk)"
   workdir="$(new_workdir)"
   register_container_cleanup "$name"
-  reinstall_command="agentctl su-exec --name $name apk add --no-cache nano@agentctlmain tree@agentctlcommunity"
 
   run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd true
   assert_status 0
@@ -474,39 +468,67 @@ printf "AGENTCTL_COMMUNITY_REPOSITORY=%s\n" "$community_repository"
   community_repository="$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^AGENTCTL_COMMUNITY_REPOSITORY=//p' | tail -n 1)"
   [ -n "$main_repository" ] || fail "Could not capture the tagged APK main repository"
   [ -n "$community_repository" ] || fail "Could not capture the tagged APK community repository"
-  main_restore_fragment="grep -Fxq '\\''@agentctlmain $main_repository'\\'' /etc/apk/repositories"
-  community_restore_fragment="grep -Fxq '\\''@agentctlcommunity $community_repository'\\'' /etc/apk/repositories"
 
   run_capture "$AGENTCTL" upgrade --name "$name" --image agent-plain --no-backup
   assert_status 0
   assert_contains "Upgrade complete: $name (backup skipped)"
-  assert_contains "Reminder: reinstall top-level packages removed by the upgrade if you still need them:"
+  assert_contains "Upgrade recovery will offer 2 top-level apk package(s)"
+  assert_contains "Recovery summary: 0 restored, 0 failed, 4 deferred."
+  assert_not_contains "Manual package recovery remains unresolved"
+  assert_not_contains "apk add --no-cache"
 
-  preflight_output="$(printf '%s\n' "$RUN_OUTPUT" | sed '/^Reminder: reinstall top-level packages removed by the upgrade if you still need them:$/,$d')"
-  reminder_output="$(printf '%s\n' "$RUN_OUTPUT" | sed -n '/^Reminder: reinstall top-level packages removed by the upgrade if you still need them:$/,$p')"
+  run_capture "$AGENTCTL" upgrade restore --name "$name" --status
+  assert_status 0
+  assert_contains "os-package: nano@agentctlmain"
+  assert_contains "os-package: tree@agentctlcommunity"
+  assert_contains "apk-repository: @agentctlmain $main_repository"
+  assert_contains "apk-repository: @agentctlcommunity $community_repository"
 
-  printf '%s\n' "$preflight_output" | grep -Fq "Restore APK repository tag(s) before reinstalling tagged packages:" \
-    || fail "Expected tagged APK repository instructions during upgrade preflight"
-  printf '%s\n' "$reminder_output" | grep -Fq "Restore APK repository tag(s) before reinstalling tagged packages:" \
-    || fail "Expected tagged APK repository instructions in the final reminder"
-  printf '%s\n' "$preflight_output" | grep -Fq "$main_restore_fragment" \
-    || fail "Expected the exact APK main repository restore command during upgrade preflight"
-  printf '%s\n' "$preflight_output" | grep -Fq "$community_restore_fragment" \
-    || fail "Expected the exact APK community repository restore command during upgrade preflight"
-  printf '%s\n' "$reminder_output" | grep -Fq "$main_restore_fragment" \
-    || fail "Expected the exact APK main repository restore command in the final reminder"
-  printf '%s\n' "$reminder_output" | grep -Fq "$community_restore_fragment" \
-    || fail "Expected the exact APK community repository restore command in the final reminder"
-  printf '%s\n' "$preflight_output" | grep -Fq "agentctl su-exec --name $name apk update" \
-    || fail "Expected apk update during upgrade preflight"
-  printf '%s\n' "$reminder_output" | grep -Fq "agentctl su-exec --name $name apk update" \
-    || fail "Expected apk update in the final reminder"
-  printf '%s\n' "$preflight_output" | grep -Fq "$reinstall_command" \
-    || fail "Expected the tagged APK reinstall command during upgrade preflight"
-  printf '%s\n' "$reminder_output" | grep -Fq "$reinstall_command" \
-    || fail "Expected the tagged APK reinstall command in the final reminder"
+  run_capture sh -c \
+    'printf "1,2,3,4\n" | script -q /dev/null "$@"' \
+    sh "$AGENTCTL" upgrade restore --name "$name" --interactive
+  assert_status 0
+  assert_contains "Recovery summary: 4 restored, 0 failed, 0 deferred."
 
-  run_capture "$CONTAINER_CMD" exec "$name" sh -lc '! apk info -e nano && ! apk info -e tree'
+  run_capture "$CONTAINER_CMD" exec "$name" sh -lc 'apk info -e nano && apk info -e tree'
+  assert_status 0
+}
+
+test_upgrade_batches_dpkg_recovery() {
+  begin_test "upgrade restores DPKG packages in one recovery transaction"
+  local name
+  local workdir
+
+  name="$(unique_name upgrade-dpkg-recovery)"
+  workdir="$(new_workdir)"
+  register_container_cleanup "$name"
+
+  run_capture "$AGENTCTL" run --name "$name" --image agent-swift --workdir "$workdir" --cmd true
+  assert_status 0
+
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+
+  run_capture "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
+set -e
+! dpkg -s tree >/dev/null 2>&1
+! dpkg -s sqlite3 >/dev/null 2>&1
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tree sqlite3
+'
+  assert_status 0
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --image agent-swift --no-backup --restore
+  assert_status 0
+  assert_contains "Upgrade recovery will offer 2 top-level dpkg package(s)"
+  assert_contains "Restoring 2 DPKG package(s) in one transaction."
+  assert_contains "Recovery summary: 2 restored, 0 failed, 0 deferred."
+  assert_not_contains "Manual package recovery remains unresolved"
+
+  run_capture "$CONTAINER_CMD" exec "$name" sh -lc '
+dpkg -s tree >/dev/null
+dpkg -s sqlite3 >/dev/null
+'
   assert_status 0
 }
 
@@ -1813,7 +1835,8 @@ main() {
   run_selected_test test_named_run_persists_until_rm "named run persists until explicit removal" smoke
   run_selected_test test_build_rebuild_stops_buildkit "build --rebuild stops buildkit after a successful build" full
   run_selected_test test_upgrade_no_backup_preserves_state "upgrade --no-backup preserves state without creating backup images" full
-  run_selected_test test_upgrade_repeats_tagged_apk_reinstall_instructions "upgrade repeats complete tagged APK reinstall instructions" full
+  run_selected_test test_upgrade_restores_tagged_apk_packages_through_recovery "upgrade defers and restores tagged APK packages through recovery" full
+  run_selected_test test_upgrade_batches_dpkg_recovery "upgrade restores DPKG packages in one recovery transaction" full
   run_selected_test test_upgrade_with_backup_creates_recovery_image "upgrade creates a backup image by default" full
   run_selected_test test_upgrade_backup_restores_home_and_boots_rescue_image "upgrade backup restores home state and creates a bootable full-rootfs rescue image" full
   run_selected_test test_upgrade_preflight_failure_keeps_container "upgrade preflight failure leaves the original container intact" full

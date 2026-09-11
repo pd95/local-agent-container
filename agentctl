@@ -2496,6 +2496,7 @@ Options:
   --restore           Restore all default-compatible recovery actions without prompting
   --no-restore        Do not prompt for recovery; save a resumable recovery plan
   --restore-version-policy MODE  mixed (default), latest, or locked
+  --package-details   Show complete dependency-level package differences during preflight
 
 Upgrade recreates the container from the target image. Before recreation, it
 warns about extra OS packages installed after the container's stored baseline
@@ -8077,7 +8078,10 @@ persist_container_system_manifest_baseline_from_live_state() {
 print_upgrade_package_reinstall_line() {
   local line="$1"
 
-  printf '%s\n' "$line" >&2
+  if [ -n "$upgrade_package_reinstall_commands" ] \
+    && printf '%s\n' "$upgrade_package_reinstall_commands" | grep -Fqx -- "$line"; then
+    return 0
+  fi
   upgrade_package_reinstall_commands="${upgrade_package_reinstall_commands:+${upgrade_package_reinstall_commands}
 }${line}"
 }
@@ -8146,6 +8150,7 @@ warn_upgrade_package_loss() {
   local target_manifest="${6:-}"
   local target_name="${7:-$name}"
   local added_features_json="${8:-[]}"
+  local presentation="${9:-detailed}"
   local stored_manifest=""
   local current_package_manager=""
   local source_package_manager=""
@@ -8161,13 +8166,12 @@ warn_upgrade_package_loss() {
   local added_packages_json='[]'
   local lost_packages_json='[]'
   local baseline_packages_in_current_json='[]'
-  local baseline_requested_packages_in_current_json='[]'
   local removed_baseline_packages_json='[]'
-  local removed_baseline_requested_packages_json='[]'
   local removed_baseline_package_count=0
-  local removed_baseline_requested_package_count=0
   local added_requested_packages_json='[]'
   local reinstall_packages_json='[]'
+  local recovery_packages_json='[]'
+  local recovery_features_json='[]'
   local managed_feature_packages_json='[]'
   local reinstall_package_count=0
   local reinstall_package_manager=""
@@ -8231,37 +8235,11 @@ warn_upgrade_package_loss() {
       added_requested_packages_json="$(json_string_array_difference "$current_requested_packages_json" "$source_requested_packages_json")"
       if [ "$source_package_manager" = "$target_package_manager" ]; then
         baseline_packages_in_current_json="$(json_string_array_intersection "$source_packages_json" "$current_packages_json")"
-        baseline_requested_packages_in_current_json="$(json_string_array_intersection "$source_requested_packages_json" "$current_requested_packages_json")"
         removed_baseline_packages_json="$(json_string_array_difference "$baseline_packages_in_current_json" "$target_packages_json")"
-        removed_baseline_requested_packages_json="$(json_string_array_difference "$baseline_requested_packages_in_current_json" "$target_requested_packages_json")"
         removed_baseline_package_count="$(printf '%s' "$removed_baseline_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
-        if [ "$removed_baseline_package_count" -gt 0 ]; then
+        if [ "$removed_baseline_package_count" -gt 0 ] && [ "$presentation" = detailed ]; then
           warn "Upgrade will also remove $removed_baseline_package_count image-provided $current_package_manager package(s) from $current_image that are no longer present in $target_image:"
           printf '%s' "$removed_baseline_packages_json" | jq -r '.[] | "  - " + .' >&2
-          removed_baseline_requested_package_count="$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
-          if [ "$removed_baseline_requested_package_count" -gt 0 ]; then
-            printf 'If you still need them, reinstall top-level packages after upgrade:\n' >&2
-            if [ "$target_package_manager" = "dpkg" ]; then
-              reminder_line="  ${CLI_NAME} su-exec --name ${target_name} apt-get update"
-              print_upgrade_package_reinstall_line "$reminder_line"
-              reminder_line="$(printf '  %s su-exec --name %s apt-get install -y %s' \
-                "$CLI_NAME" \
-                "$target_name" \
-                "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')")"
-              print_upgrade_package_reinstall_line "$reminder_line"
-            elif [ "$target_package_manager" = "apk" ]; then
-              print_apk_repository_restore_instructions \
-                "$removed_baseline_requested_packages_json" \
-                "$current_apk_repositories_json" \
-                "$target_apk_repositories_json" \
-                "$target_name"
-              reminder_line="$(printf '  %s su-exec --name %s apk add --no-cache %s' \
-                "$CLI_NAME" \
-                "$target_name" \
-                "$(printf '%s' "$removed_baseline_requested_packages_json" | jq -r 'join(" ")')")"
-              print_upgrade_package_reinstall_line "$reminder_line"
-            fi
-          fi
         fi
       fi
     else
@@ -8279,14 +8257,40 @@ warn_upgrade_package_loss() {
     reinstall_packages_json="$added_requested_packages_json"
   fi
 
+  recovery_features_json="$(jq -cn \
+    --argjson missing "$(json_string_array_difference \
+      "$(manifest_installed_features_json "$current_manifest")" \
+      "$(manifest_installed_features_json "$target_manifest")")" \
+    --argjson added "$added_features_json" \
+    '$missing + $added | unique')"
   managed_feature_packages_json="$(feature_managed_packages_json \
-    "$added_features_json" "$target_image" "$target_package_manager")"
+    "$recovery_features_json" "$target_image" "$target_package_manager")"
   reinstall_packages_json="$(json_string_array_difference \
     "$reinstall_packages_json" "$managed_feature_packages_json")"
+  recovery_packages_json="$(json_string_array_difference \
+    "$(json_string_array_difference "$current_requested_packages_json" "$target_requested_packages_json")" \
+    "$managed_feature_packages_json")"
 
   reinstall_package_count="$(printf '%s' "$reinstall_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
+  if [ "$presentation" = summary ] && [ "$requested_package_data_available" -eq 1 ]; then
+    reinstall_package_count="$(printf '%s' "$recovery_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')"
+    if [ "$reinstall_package_count" -eq 0 ] \
+      && [ "$(printf '%s' "$managed_feature_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')" -gt 0 ]; then
+      return 0
+    fi
+  fi
   if [ "$requested_package_data_available" -eq 1 ] && [ "$reinstall_package_count" -eq 0 ] \
     && [ "$(printf '%s' "$managed_feature_packages_json" | jq -r 'length' 2>/dev/null || printf '0\n')" -gt 0 ]; then
+    return 0
+  fi
+
+  if [ "$presentation" = summary ] && [ "$requested_package_data_available" -eq 1 ]; then
+    [ "$reinstall_package_count" -gt 0 ] || return 0
+    if [ "$current_package_manager" != "$target_package_manager" ]; then
+      warn "Upgrade changes package manager from $current_package_manager to $target_package_manager; $reinstall_package_count top-level package(s) will remain in the recovery plan as incompatible"
+    else
+      warn "Upgrade recovery will offer $reinstall_package_count top-level $current_package_manager package(s) not present in $target_image"
+    fi
     return 0
   fi
 
@@ -8303,7 +8307,8 @@ warn_upgrade_package_loss() {
     reinstall_packages_json="$lost_packages_json"
     reinstall_package_count="$lost_count"
   fi
-  if [ "$current_package_manager" = "$target_package_manager" ] && [ "$reinstall_package_count" -gt 0 ]; then
+  if [ "$current_package_manager" = "$target_package_manager" ] && [ "$reinstall_package_count" -gt 0 ] \
+    && [ "$requested_package_data_available" -eq 0 ]; then
     case "$target_package_manager" in
       apk)
         reinstall_package_manager="apk"
@@ -8322,7 +8327,7 @@ warn_upgrade_package_loss() {
       if [ "$requested_package_data_available" -eq 1 ]; then
         reinstall_label="To reinstall top-level packages after upgrade:"
       fi
-      printf '%s\n' "$reinstall_label" >&2
+      print_upgrade_package_reinstall_line "$reinstall_label"
       if [ "$reinstall_package_manager" = "apk" ]; then
         print_apk_repository_restore_instructions \
           "$reinstall_packages_json" \
@@ -9764,6 +9769,7 @@ upgrade_cmd() {
   local restore_requested=0
   local restore_deferred=0
   local restore_policy="mixed"
+  local package_warning_mode="summary"
   local recovery_ledger=""
   local recovery_plan=""
   local -a requested_networks=()
@@ -9863,6 +9869,7 @@ upgrade_cmd() {
       --restore) restore_requested=1; shift ;;
       --no-restore) restore_deferred=1; shift ;;
       --restore-version-policy) [ "$#" -ge 2 ] || die "Missing value for --restore-version-policy"; restore_policy="$2"; shift 2 ;;
+      --package-details) package_warning_mode="detailed"; shift ;;
       --help) usage_upgrade; return 0 ;;
       *) die "Unknown option for upgrade: $1" ;;
     esac
@@ -10078,7 +10085,7 @@ upgrade_cmd() {
       "" "$preflight_source_manifest" "$preflight_target_manifest" 2>/dev/null || printf '[]\n')"
     warn_upgrade_package_loss "$name" "$current_image" "$image" \
       "" "$preflight_source_manifest" "$preflight_target_manifest" "$target_name" \
-      "$added_features_json"
+      "$added_features_json" "$package_warning_mode"
     backup_mode="start"
   else
     if [ "$was_running" -eq 0 ] && container_has_mcp_wiring "$name"; then
@@ -10111,7 +10118,7 @@ upgrade_cmd() {
       "$preflight_current_manifest" "$preflight_source_manifest" "$preflight_target_manifest" 2>/dev/null || printf '[]\n')"
     warn_upgrade_package_loss "$name" "$current_image" "$image" \
       "$preflight_current_manifest" "$preflight_source_manifest" "$preflight_target_manifest" "$target_name" \
-      "$added_features_json"
+      "$added_features_json" "$package_warning_mode"
     current_preferred_runtime="$(container_preferred_runtime "$name" "$preflight_current_manifest" 2>/dev/null || true)"
     target_default_runtime="$(target_default_runtime_for_upgrade "$image" "$preflight_target_manifest" 2>/dev/null || true)"
     if [ "$was_running" -eq 0 ]; then
@@ -10375,7 +10382,7 @@ upgrade_cmd() {
   local recovery_selected=""
   recovery_target_manifest="$(run_agent_sh_in_container "$target_name" recovery manifest 2>/dev/null || true)"
   if [ -n "$recovery_ledger" ] && [ -n "$recovery_target_manifest" ]; then
-    recovery_plan="$(recovery_plan_json "$recovery_ledger" "$recovery_target_manifest" "$restore_policy")"
+    recovery_plan="$(recovery_plan_json "$recovery_ledger" "$recovery_target_manifest" "$restore_policy" "$image")"
     recovery_ledger="$(recovery_append_plan "$recovery_ledger" "$recovery_plan")"
     recovery_write_ledger "$target_name" "$recovery_ledger"
     if [ "$restore_requested" -eq 1 ]; then
@@ -10385,15 +10392,24 @@ upgrade_cmd() {
     fi
     if [ -n "$recovery_selected" ]; then
       echo "Restoring selected upgrade recovery items in $target_name" >&2
+      local recovery_apply_status=0
       if recovery_apply_selected "$target_name" "$recovery_plan" "$recovery_selected" "$restore_policy"; then
-        recovery_ledger="$(recovery_mark_action_results "$recovery_ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")"
-        recovery_write_ledger "$target_name" "$recovery_ledger"
+        recovery_apply_status=0
       else
-        recovery_ledger="$(recovery_mark_action_results "$recovery_ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")"
-        recovery_write_ledger "$target_name" "$recovery_ledger"
+        recovery_apply_status=$?
+      fi
+      recovery_ledger="$(recovery_mark_action_results "$recovery_ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")"
+      recovery_write_ledger "$target_name" "$recovery_ledger"
+      local recovery_result_plan=""
+      recovery_result_plan="$(printf '%s' "$recovery_ledger" | jq -c '.plans[-1]')"
+      recovery_print_summary "$recovery_result_plan"
+      if [ "$recovery_apply_status" -ne 0 ]; then
         warn "Some recovery actions failed; retry with: ${CLI_NAME} upgrade restore --name $target_name --interactive"
+      elif [ "$(recovery_unresolved_count "$recovery_result_plan")" -gt 0 ]; then
+        echo "Recovery has deferred actions. Resume with: ${CLI_NAME} upgrade restore --name $target_name --interactive" >&2
       fi
     elif [ "$(printf '%s' "$recovery_plan" | jq -r '.actions | length')" -gt 0 ]; then
+      recovery_print_summary "$recovery_plan"
       echo "Recovery deferred. Resume with: ${CLI_NAME} upgrade restore --name $target_name --interactive" >&2
     fi
   elif [ -z "$recovery_ledger" ]; then
@@ -10452,7 +10468,7 @@ upgrade_cmd() {
   trap - EXIT
   echo >&2
   if [ -n "$upgrade_package_reinstall_commands" ]; then
-    echo "Reminder: reinstall top-level packages removed by the upgrade if you still need them:" >&2
+    echo "Manual package recovery remains unresolved:" >&2
     printf '%s\n\n' "$upgrade_package_reinstall_commands" >&2
   fi
   echo "If no valid AGENTS.md configuration already exists, reset it with: ${CLI_NAME} run --name $target_name --reset-config" >&2
@@ -10658,13 +10674,52 @@ recovery_plan_json() {
   local ledger="$1"
   local target_manifest="$2"
   local policy="${3:-mixed}"
+  local target_image="${4:-}"
   local source_features_json='[]' managed_python_packages='[]'
+  local target_features_json='[]' recovery_features_json='[]' managed_os_packages='[]'
+  local source_package_manager="" source_packages_json='[]' inherited_apk_packages_json='[]' source_repositories_json='[]'
+  local target_repositories_json='[]'
+  local missing_repository_tags_json='[]' default_repository_lines_json='[]' unresolved_repository_tags_json='[]'
 
   source_features_json="$(printf '%s' "$ledger" | jq -c '.records[-1].system.installed_features // []')"
+  target_features_json="$(printf '%s' "$target_manifest" | jq -c '(.system // .).installed_features // []')"
+  recovery_features_json="$(json_string_array_difference "$source_features_json" "$target_features_json")"
   managed_python_packages="$(feature_managed_python_packages_json "$source_features_json")"
+  source_package_manager="$(printf '%s' "$ledger" | jq -r '.records[-1].system.package_manager // "unknown"')"
+  if [ -n "$target_image" ]; then
+    managed_os_packages="$(feature_managed_packages_json \
+      "$recovery_features_json" "$target_image" \
+      "$(printf '%s' "$target_manifest" | jq -r '(.system // .).package_manager // "unknown"')")"
+  fi
+  if [ "$source_package_manager" = apk ]; then
+    source_packages_json="$(printf '%s' "$ledger" | jq -c '.records[-1].system.requested_packages // []')"
+    inherited_apk_packages_json="$(printf '%s' "$ledger" | jq -c \
+      '[.plans[-1].actions[]? | select(.kind == "os-package" and .provider == "apk" and .status != "restored" and .status != "dismissed") | .name]')"
+    source_packages_json="$(jq -cn --argjson source "$source_packages_json" --argjson inherited "$inherited_apk_packages_json" \
+      '$source + $inherited | unique | sort')"
+    source_repositories_json="$(printf '%s' "$ledger" | jq -c '.records[-1].system.apk_repositories // []')"
+    target_repositories_json="$(printf '%s' "$target_manifest" | jq -c '(.system // .).apk_repositories // []')"
+    missing_repository_tags_json="$(json_string_array_difference \
+      "$(apk_package_tags_json "$source_packages_json")" \
+      "$(apk_repository_tags_json "$source_repositories_json")")"
+    default_repository_lines_json="$(apk_default_repository_lines_for_tags_json "$missing_repository_tags_json")"
+    if [ "$(printf '%s' "$default_repository_lines_json" | jq -r 'length')" -gt 0 ]; then
+      source_repositories_json="$(jq -cn --argjson source "$source_repositories_json" --argjson defaults "$default_repository_lines_json" '$source + $defaults | unique | sort')"
+      ledger="$(printf '%s' "$ledger" | jq -c --argjson repositories "$source_repositories_json" '.records[-1].system.apk_repositories = $repositories')"
+    fi
+    unresolved_repository_tags_json="$(json_string_array_difference \
+      "$missing_repository_tags_json" \
+      "$(apk_repository_tags_json "$default_repository_lines_json")")"
+  fi
 
-  jq -cn --argjson ledger "$ledger" --argjson target "$target_manifest" --argjson managed_python "$managed_python_packages" --arg policy "$policy" '
+  jq -cn --argjson ledger "$ledger" --argjson target "$target_manifest" \
+    --argjson managed_python "$managed_python_packages" --argjson managed_os "$managed_os_packages" \
+    --argjson source_apk_repositories "$source_repositories_json" --argjson target_apk_repositories "$target_repositories_json" \
+    --argjson unresolved_apk_tags "$unresolved_repository_tags_json" --arg policy "$policy" '
     def python_minor: try (capture("^Python (?<major>[0-9]+)\\.(?<minor>[0-9]+)") | (.major + "." + .minor)) catch "";
+    def package_without_constraint: sub("[<>=~].*$"; "");
+    def package_base: package_without_constraint | split("@")[0];
+    def package_tag: package_without_constraint | if contains("@") then split("@")[1] else "" end;
     ($ledger.records[-1]) as $source
     | ($source.system // {}) as $source_system
     | ($target.system // $target) as $target_system
@@ -10677,24 +10732,38 @@ recovery_plan_json() {
     | ($target.apt_sources // []) as $target_apt_sources
     | ($target.python_environment.packages // []) as $target_python
     | ($source.package_details // []) as $source_package_details
-    | (($ledger.plans[-1].actions // [])
+    | def apk_repository_present($tag):
+        any($source_apk_repositories[]?;
+          . as $repository
+          | ($repository | startswith("@" + $tag + " "))
+            and (($target_apk_repositories | index($repository)) != null));
+      def os_status($name; $provider):
+        ($name | package_tag) as $tag
+        | if $provider != $target_pm then "incompatible"
+          elif $provider != "apk" or $tag == "" or apk_repository_present($tag) then "pending"
+          elif ($unresolved_apk_tags | index($tag)) != null then "manual-required"
+          else "requires-confirmation" end;
+      (($ledger.plans[-1].actions // [])
        | map(select(.status != "dismissed" and .status != "restored")
              | if .status == "failed" then .status = "pending" else . end
              | if .kind == "os-package" then
-                 .default_selected = (.provider == $target_pm)
-                 | .status = (if .provider == $target_pm then "pending" else "incompatible" end)
+                 .status = os_status(.name; .provider)
+                 | .default_selected = (.status == "pending")
                elif .kind == "python-package" and $target.python_environment != null then
                  .default_selected = true | .status = "pending"
-               else . end)) as $inherited_actions
+               else . end)
+       | map(. as $action | select($action.kind != "os-package" or ($managed_os | index($action.name | package_base)) == null))) as $inherited_actions
     | [($source_system.installed_runtimes // [])[] as $name | select(($target_runtimes | index($name)) == null)
        | {kind:"runtime", id:("runtime:" + $name), name: $name, default_selected:true, status:"pending"}] as $runtimes
     | [($source_system.installed_features // [])[] as $name | select(($target_features | index($name)) == null)
        | {kind:"feature", id:("feature:" + $name), name: $name, default_selected:true, status:"pending"}] as $features
-    | [($source_system.requested_packages // [])[] as $name | select(($target_packages | index($name)) == null)
+    | [($source_system.requested_packages // [])[] as $name
+       | select(($target_packages | index($name)) == null)
+       | select(($managed_os | index($name | package_base)) == null)
        | {kind:"os-package", id:("os:" + $source_pm + ":" + $name), name: $name, provider:$source_pm,
-          version: ([$source_package_details[]? | select(.name == $name) | .version][0] // null),
-          default_selected:($source_pm == $target_pm),
-          status:(if $source_pm == $target_pm then "pending" else "incompatible" end)}] as $os_packages
+          version: ([$source_package_details[]? | select((.name | package_base) == ($name | package_base)) | .version][0] // null),
+          status:os_status($name; $source_pm)}
+       | .default_selected = (.status == "pending")] as $os_packages
     | ([$target_python[]?.name | ascii_downcase]) as $target_python_names
     | [($source.python_environment.packages // [])[] as $package | select($package.requested == true)
        | select(($managed_python | index($package.name | ascii_downcase)) == null)
@@ -10737,9 +10806,13 @@ recovery_plan_json() {
            {kind:"manual-recovery", id:("manual:" + $limitation), name:$limitation,
             default_selected:false, status:"manual-required"}
          end] as $manual_actions
+    | [$unresolved_apk_tags[] as $tag
+       | {kind:"manual-recovery", id:("manual:apk-repository:" + $tag),
+          name:("APK repository @" + $tag + " (inspect the backup image)"),
+          default_selected:false, status:"manual-required"}] as $manual_apk_repositories
     | {plan_schema_version:1, created_at:(now | todateiso8601), source_record_id:$source.record_id,
        policy:$policy,
-       actions: ([($inherited_actions + $manual_actions + $apk_repositories + $apt_sources + $runtimes + $features + $os_packages + $python_locks + $python_packages)[]
+       actions: ([($inherited_actions + $manual_actions + $manual_apk_repositories + $apk_repositories + $apt_sources + $runtimes + $features + $os_packages + $python_locks + $python_packages)[]
                   | {key: .id, value: .}] | from_entries | [.[]])}'
 }
 
@@ -10778,6 +10851,27 @@ recovery_print_plan() {
   printf '%s' "$plan" | jq -r '.actions[]? | "  [" + (if .default_selected and .status == "pending" then "x" else " " end) + "] " + .kind + ": " + .name + (if .version then " (" + .version + ")" else "" end) + " [" + .status + "]"' >&2
 }
 
+recovery_print_summary() {
+  local plan="$1"
+  local counts=""
+  local restored=0 failed=0 deferred=0
+
+  counts="$(printf '%s' "$plan" | jq -r '
+    [(.actions // [])[] | .status] as $statuses
+    | [($statuses | map(select(. == "restored")) | length),
+       ($statuses | map(select(. == "failed")) | length),
+       ($statuses | map(select(. != "restored" and . != "failed" and . != "dismissed")) | length)]
+    | @tsv')"
+  IFS=$'\t' read -r restored failed deferred <<<"$counts"
+  printf 'Recovery summary: %s restored, %s failed, %s deferred.\n' \
+    "$restored" "$failed" "$deferred" >&2
+}
+
+recovery_unresolved_count() {
+  local plan="$1"
+  printf '%s' "$plan" | jq -r '[.actions[]? | select(.status != "restored" and .status != "dismissed")] | length'
+}
+
 recovery_selected_ids() {
   local plan="$1"
   local mode="$2"
@@ -10788,12 +10882,13 @@ recovery_selected_ids() {
     return 0
   fi
   [ "$mode" = interactive ] || return 0
-  recovery_print_plan "$plan"
   if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+    recovery_print_plan "$plan"
     return 0
   fi
-  table="$(printf '%s' "$plan" | jq -r '.actions[]? | select(.status == "pending" or .status == "failed" or .status == "requires-confirmation") | [.id, (.kind + ": " + .name)] | @tsv')"
+  table="$(printf '%s' "$plan" | jq -r '.actions[]? | select(.status == "pending" or .status == "failed" or .status == "requires-confirmation") | [.id, (.kind + ": " + .name + (if .version then " (" + .version + ")" else "" end) + " [" + .status + (if .default_selected then ", default" else "" end) + "]")] | @tsv')"
   [ -n "$table" ] || return 0
+  printf '%s\n' "Upgrade recovery selection:" >&2
   printf '%s\n' "$table" | nl -ba -w1 -s '  ' | sed 's/^/  /' >&2
   printf 'Select items [all, none, or comma-separated numbers; default all] ' >/dev/tty
   IFS= read -r answer </dev/tty || true
@@ -10814,12 +10909,121 @@ recovery_selected_ids() {
   esac
 }
 
+recovery_record_action_result() {
+  local id="$1"
+  local result="$2"
+
+  if [ "$result" = restored ]; then
+    RECOVERY_RESTORED_IDS="${RECOVERY_RESTORED_IDS}${RECOVERY_RESTORED_IDS:+$'\n'}${id}"
+  else
+    RECOVERY_FAILED_IDS="${RECOVERY_FAILED_IDS}${RECOVERY_FAILED_IDS:+$'\n'}${id}"
+  fi
+}
+
+apk_package_unversioned_spec() {
+  local package="$1"
+  printf '%s\n' "${package%%[<>=~]*}"
+}
+
+recovery_os_package_restored() {
+  local name="$1"
+  local provider="$2"
+  local package="$3"
+  local version="$4"
+  local policy="$5"
+  local package_name="${package%%=*}"
+  local installed=""
+  local installed_version=""
+
+  package_name="${package_name%%@*}"
+  case "$provider" in
+    apk)
+      "$CONTAINER_CMD" exec -u 0 "$name" apk info -e "$package_name" >/dev/null 2>&1 || return 1
+      "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+        while IFS= read -r entry; do
+          case "$entry" in
+            "$1"|"$1"@*|"$1"~*|"$1"=*|"$1"\<*|"$1"\>*) exit 0 ;;
+          esac
+        done </etc/apk/world
+        exit 1
+      ' sh "$package_name" || return 1
+      if [ "$policy" = locked ] && [ -n "$version" ]; then
+        "$CONTAINER_CMD" exec -u 0 "$name" apk info -e "${package_name}=${version}" >/dev/null 2>&1
+      fi
+      ;;
+    dpkg)
+      installed="$("$CONTAINER_CMD" exec -u 0 "$name" \
+        dpkg-query -W '-f=${db:Status-Abbrev}\t${Version}' "$package_name" 2>/dev/null)" || return 1
+      case "$installed" in ii\ $'\t'*) ;; *) return 1 ;; esac
+      "$CONTAINER_CMD" exec -u 0 "$name" apt-mark showmanual 2>/dev/null \
+        | grep -Fxq -- "$package_name" || return 1
+      if [ "$policy" = locked ] && [ -n "$version" ]; then
+        installed_version="${installed#*$'\t'}"
+        [ "$installed_version" = "$version" ]
+      fi
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+recovery_apply_os_package_batch() {
+  local name="$1"
+  local plan="$2"
+  local selected_json="$3"
+  local policy="$4"
+  local provider="$5"
+  local actions="" action="" id="" package="" version="" install_status=0 result_status=0 index=0
+  local -a ids=()
+  local -a packages=()
+  local -a versions=()
+
+  actions="$(printf '%s' "$plan" | jq -c --arg provider "$provider" --argjson selected "$selected_json" '
+    .actions[] | . as $action
+    | select(.kind == "os-package" and .provider == $provider and ($selected | index($action.id)) != null)')"
+  while IFS= read -r action; do
+    [ -n "$action" ] || continue
+    id="$(printf '%s' "$action" | jq -r '.id')"
+    package="$(printf '%s' "$action" | jq -r '.name')"
+    version="$(printf '%s' "$action" | jq -r '.version // empty')"
+    if [ "$provider" = apk ]; then package="$(apk_package_unversioned_spec "$package")"; fi
+    if [ "$policy" = locked ] && [ -n "$version" ]; then package="${package}=${version}"; fi
+    ids+=("$id")
+    packages+=("$package")
+    versions+=("$version")
+  done <<<"$actions"
+  [ "${#ids[@]}" -gt 0 ] || return 0
+
+  case "$provider" in
+    apk)
+      printf 'Restoring %s APK package(s) in one transaction.\n' "${#packages[@]}" >&2
+      "$CONTAINER_CMD" exec -u 0 "$name" apk add --no-cache "${packages[@]}" || install_status=$?
+      ;;
+    dpkg)
+      printf 'Restoring %s DPKG package(s) in one transaction.\n' "${#packages[@]}" >&2
+      "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"' sh "${packages[@]}" || install_status=$?
+      ;;
+    *) install_status=1 ;;
+  esac
+
+  while [ "$index" -lt "${#ids[@]}" ]; do
+    if [ "$install_status" -eq 0 ] \
+      || recovery_os_package_restored "$name" "$provider" "${packages[$index]}" "${versions[$index]}" "$policy"; then
+      recovery_record_action_result "${ids[$index]}" restored
+    else
+      recovery_record_action_result "${ids[$index]}" failed
+      result_status=1
+    fi
+    index=$((index + 1))
+  done
+  return "$result_status"
+}
+
 recovery_apply_selected() {
   local name="$1"
   local plan="$2"
   local selected_ids="$3"
   local policy="$4"
-  local action id kind package version provider status=0 action_status=0 selected_json='[]'
+  local action id kind package version status=0 action_status=0 selected_json='[]'
   RECOVERY_RESTORED_IDS=""
   RECOVERY_FAILED_IDS=""
 
@@ -10838,8 +11042,6 @@ recovery_apply_selected() {
     action="$(printf '%s' "$plan" | jq -c --arg id "$id" '.actions[] | select(.id == $id)')"
     kind="$(printf '%s' "$action" | jq -r '.kind')"
     package="$(printf '%s' "$action" | jq -r '.name')"
-    version="$(printf '%s' "$action" | jq -r '.version // empty')"
-    provider="$(printf '%s' "$action" | jq -r '.provider // empty')"
     action_status=0
     case "$kind" in
       apk-repository)
@@ -10852,16 +11054,31 @@ recovery_apply_selected() {
         quoted_source="$(printf '%s' "$package" | jq -Rr '@sh')"
         "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "mkdir -p /etc/apt/sources.list.d && grep -Fxq $quoted_source /etc/apt/sources.list.d/agentctl-recovery.list 2>/dev/null || printf '%s\\n' $quoted_source >> /etc/apt/sources.list.d/agentctl-recovery.list" || action_status=1
         ;;
+      os-package|runtime|feature|python-package|python-lock) continue ;;
+      *) action_status=1 ;;
+    esac
+    if [ "$action_status" -eq 0 ]; then
+      recovery_record_action_result "$id" restored
+    else
+      recovery_record_action_result "$id" failed
+      status=1
+    fi
+  done <<<"$selected_ids"
+
+  recovery_apply_os_package_batch "$name" "$plan" "$selected_json" "$policy" apk || status=1
+  recovery_apply_os_package_batch "$name" "$plan" "$selected_json" "$policy" dpkg || status=1
+
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    action="$(printf '%s' "$plan" | jq -c --arg id "$id" '.actions[] | select(.id == $id)')"
+    kind="$(printf '%s' "$action" | jq -r '.kind')"
+    package="$(printf '%s' "$action" | jq -r '.name')"
+    version="$(printf '%s' "$action" | jq -r '.version // empty')"
+    action_status=0
+    case "$kind" in
+      apk-repository|apt-source|os-package) continue ;;
       runtime) install_runtime_in_container "$name" "$package" || action_status=1 ;;
       feature) run_agent_sh_in_container_root "$name" feature install "$package" || action_status=1 ;;
-      os-package)
-        if [ "$policy" = locked ] && [ -n "$version" ]; then package="${package}=${version}"; fi
-        case "$provider" in
-          apk) "$CONTAINER_CMD" exec -u 0 "$name" apk add --no-cache "$package" || action_status=1 ;;
-          dpkg) "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "apt-get update && apt-get install -y '$package'" || action_status=1 ;;
-          *) action_status=1 ;;
-        esac
-        ;;
       python-package)
         if [ "$policy" = latest ]; then version=""; fi
         "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc "/opt/venv/bin/python -m pip install --no-cache-dir '${package}${version:+==${version}}'" || action_status=1
@@ -10872,11 +11089,12 @@ recovery_apply_selected() {
         "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc "/opt/venv/bin/python -m pip install --no-cache-dir -r '$requirements_file'" || action_status=1
         "$CONTAINER_CMD" exec -u 0 "$name" rm -f "$requirements_file" || true
         ;;
+      *) action_status=1 ;;
     esac
     if [ "$action_status" -eq 0 ]; then
-      RECOVERY_RESTORED_IDS="${RECOVERY_RESTORED_IDS}${RECOVERY_RESTORED_IDS:+$'\n'}${id}"
+      recovery_record_action_result "$id" restored
     else
-      RECOVERY_FAILED_IDS="${RECOVERY_FAILED_IDS}${RECOVERY_FAILED_IDS:+$'\n'}${id}"
+      recovery_record_action_result "$id" failed
       status=1
     fi
   done <<<"$selected_ids"
@@ -10918,14 +11136,25 @@ upgrade_restore_cmd() {
   if container_running "$name"; then was_running=1; else start_existing_container_safely "$name" >/dev/null; fi
   if [ "$all" -eq 1 ]; then selected="$(recovery_selected_ids "$plan" all)"; else selected="$(recovery_selected_ids "$plan" interactive)"; fi
   if [ -z "$selected" ]; then
-    echo "Recovery deferred: $name" >&2
-  elif recovery_apply_selected "$name" "$plan" "$selected" "$policy"; then
-    ledger="$(recovery_mark_action_results "$ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")"
-    recovery_write_ledger "$name" "$ledger"
+    recovery_print_summary "$plan"
+    if [ "$(recovery_unresolved_count "$plan")" -gt 0 ]; then
+      echo "Recovery deferred: $name" >&2
+    else
+      echo "Recovery already complete: $name" >&2
+    fi
   else
+    local recovery_apply_status=0
+    recovery_apply_selected "$name" "$plan" "$selected" "$policy" || recovery_apply_status=$?
     ledger="$(recovery_mark_action_results "$ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")"
     recovery_write_ledger "$name" "$ledger"
-    warn "Some recovery actions failed; retry with: ${CLI_NAME} upgrade restore --name $name --interactive"
+    local recovery_result_plan=""
+    recovery_result_plan="$(printf '%s' "$ledger" | jq -c '.plans[-1]')"
+    recovery_print_summary "$recovery_result_plan"
+    if [ "$recovery_apply_status" -ne 0 ]; then
+      warn "Some recovery actions failed; retry with: ${CLI_NAME} upgrade restore --name $name --interactive"
+    elif [ "$(recovery_unresolved_count "$recovery_result_plan")" -gt 0 ]; then
+      echo "Recovery has deferred actions. Resume with: ${CLI_NAME} upgrade restore --name $name --interactive" >&2
+    fi
   fi
   [ "$was_running" -eq 1 ] || stop_existing_container_safely "$name" >/dev/null
 }
