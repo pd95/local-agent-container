@@ -112,6 +112,7 @@ run_agent_sh_capture_env() {
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d"
     "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features"
     "AGENTCTL_FEATURE_STATE_DIR=$temp_home/state"
+    "AGENTCTL_CODEX_DEFAULT_CONFIG_DIR=$temp_home/defaults/codex"
   )
   if [ "${#env_args[@]}" -gt 0 ]; then
     run_cmd_args+=("${env_args[@]}")
@@ -6806,6 +6807,7 @@ EOF
     "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
     "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
     "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    "AGENTCTL_CODEX_DEFAULT_CONFIG_DIR=$temp_home/defaults/codex" \
     "AGENTCTL_OLLAMA_ROUTE_FILE=$temp_home/proc-net-route" \
     /bin/bash "$TEST_ROOT/agent.sh" run --json >"$stdout_log" 2>"$stderr_log"
   jq -c . "$stdout_log" >/dev/null || fail "Expected stdout to remain valid JSONL"

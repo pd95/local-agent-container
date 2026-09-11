@@ -1,4 +1,5 @@
 CODEX_DEFAULT_PROFILE="${AGENTCTL_CODEX_PROFILE:-gpt-oss}"
+CODEX_DEFAULT_CONFIG_DIR="${AGENTCTL_CODEX_DEFAULT_CONFIG_DIR:-/etc/agentctl/codex}"
 
 codex_normalize_release() {
   case "$1" in
@@ -202,8 +203,8 @@ codex_ensure_config_file() {
     codex_copy_missing_default_profile_configs
     return 0
   fi
-  if [ -f /etc/agentctl/codex/config.toml ]; then
-    cp /etc/agentctl/codex/config.toml "$config_file"
+  if [ -f "$CODEX_DEFAULT_CONFIG_DIR/config.toml" ]; then
+    cp "$CODEX_DEFAULT_CONFIG_DIR/config.toml" "$config_file"
     codex_copy_missing_default_profile_configs
     return 0
   fi
@@ -214,8 +215,8 @@ codex_copy_missing_default_profile_configs() {
   local profile_config=""
   local target=""
 
-  [ -d /etc/agentctl/codex ] || return 0
-  for profile_config in /etc/agentctl/codex/*.config.toml; do
+  [ -d "$CODEX_DEFAULT_CONFIG_DIR" ] || return 0
+  for profile_config in "$CODEX_DEFAULT_CONFIG_DIR"/*.config.toml; do
     [ -e "$profile_config" ] || continue
     target="$(codex_home_dir)/$(basename "$profile_config")"
     [ -f "$target" ] && continue

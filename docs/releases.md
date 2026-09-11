@@ -36,6 +36,7 @@ refreshes without changing tracked project files.
 
    ```bash
    bash tests/run-unit-tests.sh
+   /workdir/.bin/bash3 tests/run-unit-tests.sh
    ```
 
 4. Run the complete host suite on macOS with Apple's supported `container`
@@ -67,13 +68,20 @@ refreshes without changing tracked project files.
    git push origin "v$version"
    ```
 
-8. Publish the GitHub release from that verified tag:
+8. Write curated release notes with an H1 theme, a summary of no more than
+   three sentences, `## Highlights`, a version-specific update section, and a
+   final `## Full changelog` comparison link. The update section must state
+   separately whether users need to pull the repository, run `agentctl
+   refresh`, run `agentctl upgrade`, recreate containers, or rebuild images.
+   Save the notes to a file and publish the GitHub release from the verified
+   tag:
 
    ```bash
+   release_notes_file="/path/to/release-notes.md"
    gh release create "v$version" \
      --verify-tag \
      --title "v$version" \
-     --generate-notes
+     --notes-file "$release_notes_file"
    ```
 
 9. Confirm the release and its tag point at the intended commit:
