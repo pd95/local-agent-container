@@ -14391,6 +14391,25 @@ test_upgrade_recovery_restore_selects_failed_actions() {
     || fail "Expected --all-compatible recovery to retry failed default action, got: $RUN_OUTPUT"
 }
 
+test_upgrade_recovery_interactive_all_confirms_repository_actions() {
+  begin_test "upgrade recovery interactive all includes confirmation-required actions"
+
+  load_agentctl_functions
+
+  local plan='{"actions":[{"id":"os:apk:tree","default_selected":true,"status":"pending"},{"id":"apk-repository:@edge https://example.test","default_selected":false,"status":"requires-confirmation"},{"id":"os:apk:nano@edge","default_selected":false,"status":"requires-confirmation"},{"id":"manual:repo","default_selected":false,"status":"manual-required"}]}'
+  local table=$'os:apk:tree\tpackage\napk-repository:@edge https://example.test\trepository\nos:apk:nano@edge\ttagged package'
+
+  run_capture recovery_ids_for_interactive_answer "$plan" "$table" ""
+  assert_status 0
+  [ "$RUN_OUTPUT" = "os:apk:tree" ] \
+    || fail "Expected the empty answer to keep the recommended selection, got: $RUN_OUTPUT"
+
+  run_capture recovery_ids_for_interactive_answer "$plan" "$table" all
+  assert_status 0
+  [ "$RUN_OUTPUT" = $'os:apk:tree\napk-repository:@edge https://example.test\nos:apk:nano@edge' ] \
+    || fail "Expected explicit all to include confirmation-required actions, got: $RUN_OUTPUT"
+}
+
 test_upgrade_recovery_reports_export_capture_limitations() {
   begin_test "upgrade recovery reports stopped export capture limitations"
 
@@ -14750,6 +14769,7 @@ main() {
   run_selected_test test_upgrade_recovery_applies_actions_in_dependency_order "test_upgrade_recovery_applies_actions_in_dependency_order"
   run_selected_test test_upgrade_recovery_retries_failed_actions "test_upgrade_recovery_retries_failed_actions"
   run_selected_test test_upgrade_recovery_restore_selects_failed_actions "test_upgrade_recovery_restore_selects_failed_actions"
+  run_selected_test test_upgrade_recovery_interactive_all_confirms_repository_actions "test_upgrade_recovery_interactive_all_confirms_repository_actions"
   run_selected_test test_upgrade_recovery_reports_export_capture_limitations "test_upgrade_recovery_reports_export_capture_limitations"
   run_selected_test test_container_baseline_manifest_starts_stopped_container_and_restores_state "test_container_baseline_manifest_starts_stopped_container_and_restores_state"
   run_selected_test test_image_system_manifest_removes_temp_container_after_success "test_image_system_manifest_removes_temp_container_after_success"

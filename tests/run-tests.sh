@@ -485,7 +485,7 @@ printf "AGENTCTL_COMMUNITY_REPOSITORY=%s\n" "$community_repository"
   assert_contains "apk-repository: @agentctlcommunity $community_repository"
 
   run_capture sh -c \
-    'printf "1,2,3,4\n" | script -q /dev/null "$@"' \
+    '(sleep 1; printf "all\n") | script -q /dev/null "$@"' \
     sh "$AGENTCTL" upgrade restore --name "$name" --interactive
   assert_status 0
   assert_contains "Recovery summary: 4 restored, 0 failed, 0 deferred."

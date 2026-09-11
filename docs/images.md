@@ -223,7 +223,9 @@ retry guidance is printed only while unresolved actions remain.
 
 Tagged APK packages are not selected by `--restore` or `--all-compatible` when
 their repository is absent from the target. Use interactive recovery to review
-and select both the repository and its dependent packages. Known Alpine edge
+and select both the repository and its dependent packages; entering `all`
+explicitly confirms every listed confirmation-required action, while pressing
+Return accepts only the recommended compatible actions. Known Alpine edge
 repository tags can be reconstructed; unknown tags remain manual recovery
 items so agentctl never guesses a private repository URL.
 

@@ -10872,10 +10872,36 @@ recovery_unresolved_count() {
   printf '%s' "$plan" | jq -r '[.actions[]? | select(.status != "restored" and .status != "dismissed")] | length'
 }
 
+recovery_ids_for_interactive_answer() {
+  local plan="$1"
+  local table="$2"
+  local answer="$3"
+  local selection="" number=""
+
+  case "$answer" in
+    "")
+      printf '%s' "$plan" | jq -r '.actions[]? | select((.status == "pending" or .status == "failed") and .default_selected) | .id'
+      ;;
+    all|ALL|a|A)
+      printf '%s' "$plan" | jq -r '.actions[]? | select(.status == "pending" or .status == "failed" or .status == "requires-confirmation") | .id'
+      ;;
+    none|NONE|n|N) ;;
+    *)
+      selection="$(printf '%s' "$answer" | tr ',' ' ')"
+      for number in $selection; do
+        case "$number" in
+          *[!0-9]*|"") warn "Ignoring invalid recovery selection: $number" ;;
+          *) printf '%s\n' "$table" | sed -n "${number}p" | cut -f1 ;;
+        esac
+      done
+      ;;
+  esac
+}
+
 recovery_selected_ids() {
   local plan="$1"
   local mode="$2"
-  local answer="" table="" selection="" number=""
+  local answer="" table=""
 
   if [ "$mode" = all ]; then
     printf '%s' "$plan" | jq -r '.actions[]? | select((.status == "pending" or .status == "failed") and .default_selected) | .id'
@@ -10890,23 +10916,9 @@ recovery_selected_ids() {
   [ -n "$table" ] || return 0
   printf '%s\n' "Upgrade recovery selection:" >&2
   printf '%s\n' "$table" | nl -ba -w1 -s '  ' | sed 's/^/  /' >&2
-  printf 'Select items [all, none, or comma-separated numbers; default all] ' >/dev/tty
+  printf 'Select items [all, none, or comma-separated numbers; default recommended] ' >/dev/tty
   IFS= read -r answer </dev/tty || true
-  case "$answer" in
-    ""|all|ALL|a|A)
-      printf '%s' "$plan" | jq -r '.actions[]? | select((.status == "pending" or .status == "failed") and .default_selected) | .id'
-      ;;
-    none|NONE|n|N) ;;
-    *)
-      selection="$(printf '%s' "$answer" | tr ',' ' ')"
-      for number in $selection; do
-        case "$number" in
-          *[!0-9]*|"") warn "Ignoring invalid recovery selection: $number" ;;
-          *) printf '%s\n' "$table" | sed -n "${number}p" | cut -f1 ;;
-        esac
-      done
-      ;;
-  esac
+  recovery_ids_for_interactive_answer "$plan" "$table" "$answer"
 }
 
 recovery_record_action_result() {
