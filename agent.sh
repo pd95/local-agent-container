@@ -542,6 +542,9 @@ Expose or proxy Ollama onto the container network.
 See docs/networking.md.
 
 Host-side fixes:
+- Rerun the agent from the macOS host with a managed listener:
+  agentctl run --start-ollama
+
 - Start a second Ollama listener:
   OLLAMA_HOST=http://${gateway}:${ollama_port} ollama serve
 

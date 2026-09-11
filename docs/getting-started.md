@@ -64,7 +64,10 @@ endpoints, remote Ollama servers, and proxy setups.
 The listener stays running after the agent session. Use `agentctl ollama
 status` to inspect it and `agentctl ollama stop` when it is no longer needed.
 For an existing container, `agentctl ollama start` starts its default-route
-gateway listener without launching a runtime.
+gateway listener without launching a runtime. If a local run cannot reach the
+default gateway listener, its error also points back to `agentctl run
+--start-ollama`. For diagnostic logging and the sensitive-prompt warning, see
+[Networking and Ollama connectivity](networking.md#managed-listener-diagnostics).
 
 ## Workspace model
 

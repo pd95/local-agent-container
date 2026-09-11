@@ -183,6 +183,39 @@ Use `agentctl ollama status` to list the listeners agentctl started and
 metadata-based lifecycle support is not managed; stop it manually by targeting
 its gateway-bound process.
 
+### Managed listener diagnostics
+
+Both managed startup forms accept optional Ollama diagnostics:
+
+```bash
+agentctl ollama start --debug-level 2 --log-requests \
+  --request-log-dir "$HOME/Library/Logs/agentctl-ollama"
+
+agentctl run --start-ollama --debug-level 1
+```
+
+Debug level `0` is normal informational logging, `1` enables debug logging,
+and `2` enables trace logging. `--request-log-dir` requires `--log-requests`
+and selects a parent directory; Ollama creates a private
+`ollama-request-logs-*` child directory because Ollama does not support an
+exact request-log path. If the parent does not exist, agentctl creates it with
+user-only permissions.
+
+> [!WARNING]
+> Request logging writes complete inference request bodies, including
+> potentially sensitive prompts, plus replay commands. Protect these files
+> and remove them when they are no longer needed.
+
+`agentctl ollama status` reports the active diagnostic settings, configured
+request-log parent, and managed server-log path. Ollama writes the generated
+request-log directory to that server log during startup. Diagnostic settings
+apply when the server process starts; if a listener is already using different
+settings, stop it with the command shown by agentctl and start it again with
+the requested options. This includes returning to the defaults, so a later
+plain startup cannot silently keep request logging enabled. Agentctl will not
+claim that diagnostics were applied to an unmanaged or differently configured
+process.
+
 ### Option 2: run a gateway listener yourself
 
 Use this when you want to manage the listener outside `agentctl`.

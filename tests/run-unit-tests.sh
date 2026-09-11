@@ -277,7 +277,73 @@ test_ollama_help_reports_lifecycle_commands() {
   assert_contains "start   Start a listener for an existing container's default-route gateway"
   assert_contains "stop    Stop every Ollama listener started and tracked by agentctl"
   assert_contains "--gateway IP  Limit the command to one container gateway"
+  assert_contains "--debug-level 0|1|2"
+  assert_contains "--log-requests"
+  assert_contains "--request-log-dir DIR"
+  assert_contains "request logs may contain sensitive prompts"
 }
+
+test_run_start_ollama_accepts_diagnostics() (
+  begin_test "run_cmd passes managed Ollama diagnostics into host pre-exec state"
+
+  load_agentctl_functions
+
+  local temp_dir capture_file workdir request_dir
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-run-ollama-diagnostics.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  capture_file="$temp_dir/captured"
+  request_dir="$temp_dir/request logs"
+  workdir="$(new_workdir)"
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  run_mode() {
+    printf '%s\n%s\n%s\n%s\n' \
+      "$RUN_START_OLLAMA" \
+      "$OLLAMA_LISTENER_DEBUG_LEVEL" \
+      "$OLLAMA_LISTENER_LOG_REQUESTS" \
+      "$OLLAMA_LISTENER_REQUEST_LOG_PARENT" >"$capture_file"
+  }
+
+  run_capture run_cmd --name unit-test-container --workdir "$workdir" \
+    --start-ollama --debug-level 2 --log-requests --request-log-dir "$request_dir"
+
+  assert_status 0
+  assert_contains "may contain sensitive prompts"
+  [ -d "$request_dir" ] || fail "Expected request-log parent to be created"
+  [ "$(sed -n '1p' "$capture_file")" = 1 ] || fail "Expected managed listener startup"
+  [ "$(sed -n '2p' "$capture_file")" = 2 ] || fail "Expected Ollama trace level"
+  [ "$(sed -n '3p' "$capture_file")" = 1 ] || fail "Expected Ollama request logging"
+  [ "$(sed -n '4p' "$capture_file")" = "$(CDPATH= cd -- "$request_dir" && pwd -P)" ] \
+    || fail "Expected canonical request-log parent"
+)
+
+test_run_ollama_diagnostics_validate_dependencies() (
+  begin_test "run_cmd validates managed Ollama diagnostics options"
+
+  load_agentctl_functions
+
+  local workdir
+  workdir="$(new_workdir)"
+  require_container() { return 0; }
+  default_name() { printf 'unit-test-container\n'; }
+  diagnostics_wrapper() { ( run_cmd --name unit-test-container --workdir "$workdir" "$@" ); }
+
+  run_capture diagnostics_wrapper --debug-level 1
+  assert_status 1
+  assert_contains "require --start-ollama"
+
+  run_capture diagnostics_wrapper --start-ollama --debug-level 3
+  assert_status 1
+  assert_contains "must be 0, 1, or 2"
+
+  run_capture diagnostics_wrapper --start-ollama --request-log-dir "$workdir/logs"
+  assert_status 1
+  assert_contains "--request-log-dir requires --log-requests"
+
+  run_capture diagnostics_wrapper --start-ollama --debug-level 1 --debug-level 2
+  assert_status 1
+  assert_contains "--debug-level may only be specified once"
+)
 
 test_run_start_ollama_wires_host_pre_exec() {
   begin_test "run_cmd wires --start-ollama into host pre-exec"
@@ -344,7 +410,7 @@ test_ollama_listener_starts_gateway_bound_server() {
   apply_fake_ollama_listener() {
     cat >"$fake_bin/ollama" <<EOF
 #!/bin/sh
-printf '%s\n' "\$OLLAMA_HOST" >"$capture_file"
+printf '%s\n%s\n%s\n' "\$OLLAMA_HOST" "\$OLLAMA_DEBUG" "\$OLLAMA_DEBUG_LOG_REQUESTS" >"$capture_file"
 EOF
     chmod +x "$fake_bin/ollama"
   }
@@ -368,11 +434,58 @@ EOF
     health=1
   }
 
+  OLLAMA_DEBUG=2 OLLAMA_DEBUG_LOG_REQUESTS=1 PATH="$fake_bin:$PATH" ollama_ensure_listener unit-test-container
+
+  [ "$(sed -n '1p' "$capture_file")" = "http://192.168.64.1:11434" ] \
+    || fail "Expected gateway-bound OLLAMA_HOST, got: $(cat "$capture_file" 2>/dev/null || true)"
+  [ "$(sed -n '2p' "$capture_file")" = 0 ] \
+    || fail "Expected inherited OLLAMA_DEBUG to be disabled"
+  [ "$(sed -n '3p' "$capture_file")" = 0 ] \
+    || fail "Expected inherited request logging to be disabled"
+  [ -z "$OLLAMA_LISTENER_LOCK_DIR" ] || fail "Expected listener startup lock to be released"
+  unset -f container
+}
+
+test_ollama_listener_passes_diagnostics_to_server() {
+  begin_test "Ollama listener passes requested diagnostics to the server process"
+
+  load_agentctl_functions
+
+  local temp_dir fake_bin capture_file request_dir health=0
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-listener-diagnostics.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  fake_bin="$temp_dir/bin"
+  capture_file="$temp_dir/ollama-env"
+  request_dir="$temp_dir/request-logs"
+  mkdir -p "$fake_bin"
+  cat >"$fake_bin/ollama" <<EOF
+#!/bin/sh
+printf '%s\n%s\n%s\n' "\$OLLAMA_DEBUG" "\$OLLAMA_DEBUG_LOG_REQUESTS" "\$TMPDIR" >"$capture_file"
+EOF
+  chmod +x "$fake_bin/ollama"
+
+  CONTAINER_CMD=container
+  container() { printf '192.168.64.1\n'; }
+  mcp_runtime_dir() { printf '%s\n' "$temp_dir/runtime"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  mcp_prepare_log_file() { : >"$1"; chmod 600 "$1"; }
+  mcp_identity_hash() { printf 'diagnostics\n'; }
+  ollama_listener_healthy() { [ "$health" -eq 1 ]; }
+  ollama_listener_write_metadata() { :; }
+  ollama_listener_wait_for_health() {
+    local tries=0
+    while [ "$tries" -lt 20 ] && [ ! -f "$capture_file" ]; do sleep 0.05; tries=$((tries + 1)); done
+    [ -f "$capture_file" ] || return 1
+    health=1
+  }
+
+  ollama_configure_diagnostics 2 1 1 "$request_dir"
   PATH="$fake_bin:$PATH" ollama_ensure_listener unit-test-container
 
-  [ "$(cat "$capture_file")" = "http://192.168.64.1:11434" ] \
-    || fail "Expected gateway-bound OLLAMA_HOST, got: $(cat "$capture_file" 2>/dev/null || true)"
-  [ -z "$OLLAMA_LISTENER_LOCK_DIR" ] || fail "Expected listener startup lock to be released"
+  [ "$(sed -n '1p' "$capture_file")" = 2 ] || fail "Expected OLLAMA_DEBUG=2"
+  [ "$(sed -n '2p' "$capture_file")" = 1 ] || fail "Expected OLLAMA_DEBUG_LOG_REQUESTS=1"
+  [ "$(sed -n '3p' "$capture_file")" = "$(CDPATH= cd -- "$request_dir" && pwd -P)" ] \
+    || fail "Expected TMPDIR to use request-log parent"
   unset -f container
 }
 
@@ -403,7 +516,7 @@ test_ollama_listener_uses_container_default_route_gateway() {
 }
 
 test_ollama_listener_skips_healthy_gateway() {
-  begin_test "Ollama listener skips startup when the gateway is already healthy"
+  begin_test "Ollama listener serializes reuse when the gateway is already healthy"
 
   load_agentctl_functions
 
@@ -414,7 +527,7 @@ test_ollama_listener_skips_healthy_gateway() {
 
   ollama_ensure_listener unit-test-container
 
-  [ "$started" -eq 0 ] || fail "Did not expect a listener lock or launch for a healthy gateway"
+  [ "$started" -eq 1 ] || fail "Expected healthy listener reuse to be serialized through the startup lock"
 }
 
 test_ollama_listener_reports_missing_host_cli() {
@@ -493,11 +606,11 @@ EOF
 }
 
 test_ollama_listener_lock_recovers_stale_owner_and_observes_competing_health() {
-  begin_test "Ollama listener lock recovers stale owners and yields to a healthy competitor"
+  begin_test "Ollama listener lock recovers stale owners and waits for a competing startup"
 
   load_agentctl_functions
 
-  local temp_dir lock health_calls=0
+  local temp_dir lock release_pid
   temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-lock.XXXXXX")"
   register_dir_cleanup "$temp_dir"
   mcp_runtime_dir() { printf '%s\n' "$temp_dir/runtime"; }
@@ -513,17 +626,19 @@ test_ollama_listener_lock_recovers_stale_owner_and_observes_competing_health() {
   ollama_listener_lock_release
 
   mkdir -p "$lock"
-  printf '%s\n' "$$" >"$lock/pid"
-  ollama_listener_healthy() {
-    health_calls=$((health_calls + 1))
-    [ "$health_calls" -ge 1 ]
-  }
-  if ollama_listener_lock_acquire 192.168.64.1 http://192.168.64.1:11434; then
-    fail "Expected a healthy competing listener to win the startup race"
-  fi
-  [ -z "$OLLAMA_LISTENER_LOCK_DIR" ] || fail "Did not expect lock ownership after a healthy competitor"
-  rm -f "$lock/pid"
-  rmdir "$lock"
+  printf '%s %s\n' "$$" "$(mcp_process_token "$$")" >"$lock/pid"
+  (
+    sleep 0.1
+    rm -f "$lock/pid"
+    rmdir "$lock"
+  ) &
+  release_pid=$!
+  ollama_listener_healthy() { return 0; }
+  ollama_listener_lock_acquire 192.168.64.1 http://192.168.64.1:11434
+  wait "$release_pid"
+  [ "$OLLAMA_LISTENER_LOCK_DIR" = "$lock" ] \
+    || fail "Expected startup to wait for and then acquire the competing listener lock"
+  ollama_listener_lock_release
 }
 
 test_ollama_listener_status_and_stop_manage_owned_listener() {
@@ -544,6 +659,9 @@ test_ollama_listener_status_and_stop_manage_owned_listener() {
   sleep 60 &
   listener_pid=$!
   register_pid_cleanup "$listener_pid"
+  OLLAMA_LISTENER_DEBUG_LEVEL=2
+  OLLAMA_LISTENER_LOG_REQUESTS=1
+  OLLAMA_LISTENER_REQUEST_LOG_PARENT="$temp_dir/requests"
   ollama_listener_write_metadata 192.168.64.1 http://192.168.64.1:11434 "$listener_pid" "$log" agentctl-ollama-1-1-1
   metadata="$(ollama_listener_metadata_path 192.168.64.1)"
   [ -f "$metadata" ] || fail "Expected owned listener metadata"
@@ -552,6 +670,9 @@ test_ollama_listener_status_and_stop_manage_owned_listener() {
   run_capture ollama_listener_status_cmd
   assert_status 0
   assert_contains "Ollama listener: http://192.168.64.1:11434 (PID $listener_pid, running)"
+  assert_contains "Server log: $log"
+  assert_contains "Diagnostics: debug level 2; request logging on"
+  assert_contains "Request log parent: $temp_dir/requests"
 
   run_capture ollama_cmd stop
   assert_status 0
@@ -657,6 +778,150 @@ test_ollama_cmd_dispatches_start_and_limits_name_option() {
   assert_status 1
   assert_contains "--gateway may only be specified once"
 }
+
+test_ollama_start_accepts_diagnostics() (
+  begin_test "ollama start accepts and validates diagnostics options"
+
+  load_agentctl_functions
+
+  local temp_dir request_dir capture_file
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-command-diagnostics.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  request_dir="$temp_dir/request-logs"
+  capture_file="$temp_dir/captured"
+  require_container() { :; }
+  ollama_start_cmd() {
+    printf '%s\n%s\n%s\n%s\n' "$1" "$OLLAMA_LISTENER_DEBUG_LEVEL" \
+      "$OLLAMA_LISTENER_LOG_REQUESTS" "$OLLAMA_LISTENER_REQUEST_LOG_PARENT" >"$capture_file"
+  }
+
+  run_capture ollama_cmd start --name named-container --debug-level 1 \
+    --log-requests --request-log-dir "$request_dir"
+  assert_status 0
+  assert_contains "may contain sensitive prompts"
+  [ "$(sed -n '1p' "$capture_file")" = named-container ] || fail "Expected selected container"
+  [ "$(sed -n '2p' "$capture_file")" = 1 ] || fail "Expected debug level 1"
+  [ "$(sed -n '3p' "$capture_file")" = 1 ] || fail "Expected request logging enabled"
+  [ "$(sed -n '4p' "$capture_file")" = "$(CDPATH= cd -- "$request_dir" && pwd -P)" ] \
+    || fail "Expected canonical request-log parent"
+
+  status_diagnostics_wrapper() { ( ollama_cmd status --debug-level 1 ); }
+  run_capture status_diagnostics_wrapper
+  assert_status 1
+  assert_contains "only supported by ollama start"
+)
+
+test_ollama_listener_metadata_supports_diagnostics_and_legacy_records() (
+  begin_test "managed Ollama metadata records diagnostics and accepts legacy records"
+
+  load_agentctl_functions
+
+  local temp_dir runtime_dir metadata listener_pid
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-metadata.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  runtime_dir="$temp_dir/runtime"
+  mcp_runtime_dir() { printf '%s\n' "$runtime_dir"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  mcp_process_token() { printf 'token-%s\n' "$1"; }
+  mcp_identity_hash() { printf 'metadata\n'; }
+  mcp_prepare_private_dir "$runtime_dir"
+  sleep 60 &
+  listener_pid=$!
+  register_pid_cleanup "$listener_pid"
+
+  OLLAMA_LISTENER_DEBUG_LEVEL=2
+  OLLAMA_LISTENER_LOG_REQUESTS=1
+  OLLAMA_LISTENER_REQUEST_LOG_PARENT="$temp_dir/requests"
+  ollama_listener_write_metadata 192.168.64.1 http://192.168.64.1:11434 \
+    "$listener_pid" "$temp_dir/server.log" agentctl-ollama-1-1-1
+  metadata="$(ollama_listener_metadata_path 192.168.64.1)"
+  jq -e --arg parent "$temp_dir/requests" \
+    '.schema_version == 2 and .debug_level == 2 and .log_requests == true and .request_log_parent == $parent' \
+    "$metadata" >/dev/null || fail "Expected diagnostics in managed listener metadata"
+  ollama_listener_metadata_matches_diagnostics "$metadata" \
+    || fail "Expected matching diagnostics metadata"
+
+  jq -n --argjson pid "$listener_pid" --arg token "token-$listener_pid" \
+    '{schema_version:1,gateway:"192.168.64.1",base_url:"http://192.168.64.1:11434",pid:$pid,
+      process_token:$token,process_marker:"agentctl-ollama-1-1-1",log_path:"/tmp/legacy.log"}' >"$metadata"
+  chmod 600 "$metadata"
+  ollama_listener_metadata_validate "$metadata"
+  OLLAMA_LISTENER_DEBUG_LEVEL=0
+  OLLAMA_LISTENER_LOG_REQUESTS=0
+  OLLAMA_LISTENER_REQUEST_LOG_PARENT=""
+  ollama_listener_metadata_matches_diagnostics "$metadata" \
+    || fail "Expected schema-v1 metadata to represent default diagnostics"
+)
+
+test_ollama_listener_rejects_diagnostics_mismatch() (
+  begin_test "managed Ollama listener rejects diagnostics that cannot be applied"
+
+  load_agentctl_functions
+
+  local temp_dir runtime_dir metadata listener_pid
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-mismatch.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  runtime_dir="$temp_dir/runtime"
+  mcp_runtime_dir() { printf '%s\n' "$runtime_dir"; }
+  mcp_prepare_private_dir() { mkdir -p "$1"; chmod 700 "$1"; }
+  mcp_process_token() { printf 'token-%s\n' "$1"; }
+  mcp_identity_hash() { printf 'mismatch\n'; }
+  ollama_listener_gateway_for_container() { printf '192.168.64.1\n'; }
+  ollama_listener_healthy() { return 0; }
+  ollama_listener_process_owned() { return 0; }
+  mcp_prepare_private_dir "$runtime_dir"
+  sleep 60 &
+  listener_pid=$!
+  register_pid_cleanup "$listener_pid"
+  ollama_listener_write_metadata 192.168.64.1 http://192.168.64.1:11434 \
+    "$listener_pid" "$temp_dir/server.log" agentctl-ollama-1-1-1
+  metadata="$(ollama_listener_metadata_path 192.168.64.1)"
+  [ -f "$metadata" ] || fail "Expected listener metadata"
+
+  OLLAMA_LISTENER_DEBUG_LEVEL=2
+  OLLAMA_LISTENER_DIAGNOSTICS_REQUESTED=1
+  mismatch_wrapper() { ( ollama_ensure_listener unit-test-container ); }
+  run_capture mismatch_wrapper
+  assert_status 1
+  assert_contains "uses different diagnostics"
+  assert_contains "ollama stop --gateway 192.168.64.1"
+
+  OLLAMA_LISTENER_DEBUG_LEVEL=1
+  OLLAMA_LISTENER_LOG_REQUESTS=1
+  OLLAMA_LISTENER_REQUEST_LOG_PARENT="$temp_dir/requests"
+  ollama_listener_write_metadata 192.168.64.1 http://192.168.64.1:11434 \
+    "$listener_pid" "$temp_dir/server.log" agentctl-ollama-1-1-1
+  OLLAMA_LISTENER_DEBUG_LEVEL=0
+  OLLAMA_LISTENER_LOG_REQUESTS=0
+  OLLAMA_LISTENER_REQUEST_LOG_PARENT=""
+  OLLAMA_LISTENER_DIAGNOSTICS_REQUESTED=0
+  run_capture mismatch_wrapper
+  assert_status 1
+  assert_contains "request logging is active"
+  assert_contains "may contain sensitive prompts"
+)
+
+test_ollama_listener_rejects_diagnostics_for_unmanaged_server() (
+  begin_test "managed Ollama diagnostics reject an existing unmanaged server"
+
+  load_agentctl_functions
+
+  local temp_dir
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-ollama-unmanaged.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  mcp_runtime_dir() { printf '%s\n' "$temp_dir/runtime"; }
+  mcp_identity_hash() { printf 'unmanaged\n'; }
+  ollama_listener_gateway_for_container() { printf '192.168.64.1\n'; }
+  ollama_listener_healthy() { return 0; }
+  OLLAMA_LISTENER_DEBUG_LEVEL=1
+  OLLAMA_LISTENER_DIAGNOSTICS_REQUESTED=1
+
+  unmanaged_wrapper() { ( ollama_ensure_listener unit-test-container ); }
+  run_capture unmanaged_wrapper
+  assert_status 1
+  assert_contains "not managed by agentctl"
+  assert_contains "Stop it manually"
+)
 
 test_ollama_stop_gateway_filter_leaves_other_listener_untouched() {
   begin_test "ollama stop gateway filter leaves other listener records untouched"
@@ -6441,6 +6706,49 @@ EOF
   assert_status 1
   assert_contains "Configured Ollama host: http://192.168.64.1:11439/api/version"
   assert_contains "Use a URL reachable from inside the container"
+}
+
+test_agent_sh_codex_local_run_suggests_managed_ollama_listener() {
+  begin_test "agent.sh local run suggests --start-ollama when the gateway is unreachable"
+
+  local temp_home fake_bin route_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  route_file="$temp_home/proc-net-route"
+  mkdir -p "$fake_bin" "$temp_home/home/.codex"
+
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+  cat >"$fake_bin/curl" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+  chmod +x "$fake_bin/curl"
+  cat >"$route_file" <<'EOF'
+Iface   Destination Gateway     Flags RefCnt Use Metric Mask        MTU Window IRTT
+eth0    00000000    0100A8C0    0003  0      0   0      00000000    0   0      0
+EOF
+  cat >"$temp_home/home/.codex/config.toml" <<'EOF'
+[model_providers.myollama]
+name = "Ollama"
+base_url = "http://old-host:11434/v1"
+
+[profiles.gpt-oss]
+model_provider = "myollama"
+model = "gpt-oss:20b"
+EOF
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_OLLAMA_ROUTE_FILE="$route_file" \
+    -- run
+  assert_status 1
+  assert_contains "Detected host gateway: http://192.168.0.1:11434/api/version"
+  assert_contains "agentctl run --start-ollama"
 }
 
 test_agent_sh_codex_local_metadata_status_uses_stderr() {
@@ -14446,8 +14754,11 @@ main() {
   run_selected_test test_reset_config_yes_requires_reset_config "test_reset_config_yes_requires_reset_config"
   run_selected_test test_ollama_help_reports_lifecycle_commands "test_ollama_help_reports_lifecycle_commands"
   run_selected_test test_run_start_ollama_wires_host_pre_exec "test_run_start_ollama_wires_host_pre_exec"
+  run_selected_test test_run_start_ollama_accepts_diagnostics "test_run_start_ollama_accepts_diagnostics"
+  run_selected_test test_run_ollama_diagnostics_validate_dependencies "test_run_ollama_diagnostics_validate_dependencies"
   run_selected_test test_run_start_ollama_rejects_incompatible_options "test_run_start_ollama_rejects_incompatible_options"
   run_selected_test test_ollama_listener_starts_gateway_bound_server "test_ollama_listener_starts_gateway_bound_server"
+  run_selected_test test_ollama_listener_passes_diagnostics_to_server "test_ollama_listener_passes_diagnostics_to_server"
   run_selected_test test_ollama_listener_uses_container_default_route_gateway "test_ollama_listener_uses_container_default_route_gateway"
   run_selected_test test_ollama_listener_skips_healthy_gateway "test_ollama_listener_skips_healthy_gateway"
   run_selected_test test_ollama_listener_reports_missing_host_cli "test_ollama_listener_reports_missing_host_cli"
@@ -14458,6 +14769,10 @@ main() {
   run_selected_test test_ollama_listener_reports_dangling_session "test_ollama_listener_reports_dangling_session"
   run_selected_test test_ollama_start_restores_a_stopped_container "test_ollama_start_restores_a_stopped_container"
   run_selected_test test_ollama_cmd_dispatches_start_and_limits_name_option "test_ollama_cmd_dispatches_start_and_limits_name_option"
+  run_selected_test test_ollama_start_accepts_diagnostics "test_ollama_start_accepts_diagnostics"
+  run_selected_test test_ollama_listener_metadata_supports_diagnostics_and_legacy_records "test_ollama_listener_metadata_supports_diagnostics_and_legacy_records"
+  run_selected_test test_ollama_listener_rejects_diagnostics_mismatch "test_ollama_listener_rejects_diagnostics_mismatch"
+  run_selected_test test_ollama_listener_rejects_diagnostics_for_unmanaged_server "test_ollama_listener_rejects_diagnostics_for_unmanaged_server"
   run_selected_test test_ollama_stop_gateway_filter_leaves_other_listener_untouched "test_ollama_stop_gateway_filter_leaves_other_listener_untouched"
   run_selected_test test_ollama_listener_lock_recovers_pid_token_mismatch "test_ollama_listener_lock_recovers_pid_token_mismatch"
   run_selected_test test_ollama_listener_requires_its_unique_process_marker "test_ollama_listener_requires_its_unique_process_marker"
@@ -14645,6 +14960,7 @@ main() {
   run_selected_test test_agent_sh_codex_local_run_uses_ollama_host_env "test_agent_sh_codex_local_run_uses_ollama_host_env"
   run_selected_test test_agent_sh_codex_local_run_config_ollama_host_overrides_env "test_agent_sh_codex_local_run_config_ollama_host_overrides_env"
   run_selected_test test_agent_sh_codex_local_run_reports_unreachable_ollama_host "test_agent_sh_codex_local_run_reports_unreachable_ollama_host"
+  run_selected_test test_agent_sh_codex_local_run_suggests_managed_ollama_listener "test_agent_sh_codex_local_run_suggests_managed_ollama_listener"
   run_selected_test test_agent_sh_codex_local_metadata_status_uses_stderr "test_agent_sh_codex_local_metadata_status_uses_stderr"
   run_selected_test test_agent_sh_codex_local_run_with_explicit_profile_updates_catalog "test_agent_sh_codex_local_run_with_explicit_profile_updates_catalog"
   run_selected_test test_agent_sh_codex_local_run_updates_stale_catalog_entry "test_agent_sh_codex_local_run_updates_stale_catalog_entry"

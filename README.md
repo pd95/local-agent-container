@@ -87,6 +87,14 @@ an agent session, use `agentctl ollama start` (optionally `--name NAME`).
 When several gateways are listed, target one with `agentctl ollama stop
 --gateway IP`.
 
+For troubleshooting, add `--debug-level 1` (debug) or `--debug-level 2`
+(trace) to either startup form. `--log-requests` records request bodies and
+replay commands; these files may contain sensitive prompts. Ollama creates its
+request-log directory beneath the system temporary directory by default, or
+beneath a parent selected with `--request-log-dir DIR`. Use `agentctl ollama
+status` to find the managed server log, which reports the generated request-log
+directory.
+
 ## Quick start
 
 Build the curated images once:
