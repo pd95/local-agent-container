@@ -810,9 +810,219 @@ agent_runtime_mcp_add() {
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   codex_command="$(runtime_command_path "$runtime")" || die "runtime not installed: $runtime"
+  codex_ensure_home_dir
   export CODEX_HOME="$(codex_home_dir)"
   "$codex_command" mcp remove "$name" >/dev/null 2>&1 || true
   "$codex_command" mcp add "$name" --url "$url" >/dev/null
+}
+
+codex_managed_mcp_state_file() {
+  printf '%s\n' "${HOME}/.config/agentctl/codex-managed-mcp.json"
+}
+
+codex_mcp_normalized_json() {
+  jq -cSe '
+    select(type == "object" and (.name|type) == "string" and (.enabled|type) == "boolean"
+      and (.transport|type) == "object" and (.transport.type|type) == "string")
+    | {name,enabled,transport,enabled_tools:(.enabled_tools // null),disabled_tools:(.disabled_tools // null),
+       startup_timeout_sec:(.startup_timeout_sec // null),tool_timeout_sec:(.tool_timeout_sec // null)}
+  '
+}
+
+codex_mcp_fingerprint() {
+  local normalized="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$normalized" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$normalized" | shasum -a 256 | awk '{print $1}'
+  else
+    die "sha256sum or shasum is required for managed Codex MCP ownership"
+  fi
+}
+
+codex_mcp_get_normalized() {
+  local codex_command="$1" name="$2" result=""
+  result="$("$codex_command" mcp get "$name" --json)" || return 1
+  printf '%s' "$result" | codex_mcp_normalized_json
+}
+
+codex_mcp_is_plain_managed_entry() {
+  local normalized="$1" url="$2"
+  printf '%s' "$normalized" | jq -e --arg url "$url" '
+    .enabled == true and .transport.type == "streamable_http" and .transport.url == $url
+    and .transport.bearer_token_env_var == null and .transport.http_headers == null
+    and .transport.env_http_headers == null and .transport.http_headers_helper == null
+    and .enabled_tools == null and .disabled_tools == null
+    and .startup_timeout_sec == null and .tool_timeout_sec == null
+  ' >/dev/null
+}
+
+codex_write_managed_mcp_state() {
+  local state="$1" servers="$2" directory="" temporary=""
+  directory="$(dirname "$state")"
+  [ ! -L "$directory" ] || die "unsafe managed Codex MCP state directory symlink: $directory"
+  [ ! -e "$directory" ] || [ -d "$directory" ] || die "managed Codex MCP state directory is not a directory: $directory"
+  mkdir -p "$directory"
+  chmod 700 "$directory"
+  [ ! -L "$state" ] || die "unsafe managed Codex MCP state symlink: $state"
+  [ ! -e "$state" ] || [ -f "$state" ] || die "managed Codex MCP state is not a regular file: $state"
+  temporary="$(mktemp "${state}.tmp.XXXXXX")"
+  jq -cn --argjson servers "$servers" '{schema_version:2,servers:($servers|sort_by(.name))}' >"$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$state"
+}
+
+agent_runtime_mcp_sync() {
+  local runtime="$1" desired="$2" legacy="${3:-[]}" codex_command="" state="" owned='[]' names='[]'
+  local entry name url record='' normalized='' fingerprint='' status='' recorded_fingerprint='' failed=0
+
+  [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
+  codex_command="$(runtime_command_path "$runtime")" || die "runtime not installed: $runtime"
+  codex_ensure_home_dir
+  export CODEX_HOME="$(codex_home_dir)"
+  state="$(codex_managed_mcp_state_file)"
+  if [ -e "$state" ]; then
+    [ -f "$state" ] && [ ! -L "$state" ] || die "unsafe managed Codex MCP state: $state"
+    chmod 600 "$state"
+    owned="$(jq -ce 'select(.schema_version == 2 and (.servers|type) == "array"
+      and ((.servers|map(.name)|length) == (.servers|map(.name)|unique|length))
+      and all(.servers[]; (.name|type) == "string" and (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$"))
+        and (.url|type) == "string" and (.url|startswith("http://127.0.0.1:"))
+        and ((.fingerprint == null) or ((.fingerprint|type) == "string" and (.fingerprint|test("^[0-9a-f]{64}$"))))
+        and (.status as $status | (["installed","pending-add","pending-update"] | index($status)) != null)
+        and (if .status == "pending-add" then .fingerprint == null else (.fingerprint|type) == "string" end))) | .servers' "$state" 2>/dev/null)" \
+      || die "invalid managed Codex MCP state: $state"
+  fi
+  desired="$(printf '%s' "$desired" | jq -ce 'if (map(.name)|length) != (map(.name)|unique|length) then error("duplicate names") else sort_by(.name) end')" \
+    || die "invalid desired managed Codex MCP state"
+  legacy="$(printf '%s' "$legacy" | jq -ce 'if (map(.name)|length) != (map(.name)|unique|length) then error("duplicate names") else sort_by(.name) end')" \
+    || die "invalid legacy managed Codex MCP state"
+  names="$("$codex_command" mcp list --json | jq -ce 'select(type == "array") | map(.name)')" \
+    || die "failed to inspect Codex MCP configuration"
+
+  # Conservative migration: adopt only an exact, plain entry described by the
+  # previous host registry. Ambiguous legacy entries remain user-owned.
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    name="$(printf '%s' "$entry" | jq -r .name)"; url="$(printf '%s' "$entry" | jq -r .url)"
+    printf '%s' "$owned" | jq -e --arg name "$name" 'any(.[]; .name == $name)' >/dev/null && continue
+    printf '%s' "$names" | jq -e --arg name "$name" 'index($name) != null' >/dev/null || continue
+    normalized="$(codex_mcp_get_normalized "$codex_command" "$name")" || die "failed to inspect Codex MCP server: $name"
+    if codex_mcp_is_plain_managed_entry "$normalized" "$url"; then
+      fingerprint="$(codex_mcp_fingerprint "$normalized")"
+      record="$(jq -cn --arg name "$name" --arg url "$url" --arg fingerprint "$fingerprint" '{name:$name,url:$url,fingerprint:$fingerprint,status:"installed"}')"
+      owned="$(printf '%s' "$owned" | jq -c --argjson record "$record" '. + [$record]')"
+      codex_write_managed_mcp_state "$state" "$owned"
+    fi
+  done < <(printf '%s' "$legacy" | jq -c '.[]')
+
+  # Remove no-longer-desired entries only while their complete configuration
+  # still matches the snapshot agentctl installed.
+  while IFS= read -r record; do
+    [ -n "$record" ] || continue
+    name="$(printf '%s' "$record" | jq -r .name)"
+    printf '%s' "$desired" | jq -e --arg name "$name" 'any(.[]; .name == $name)' >/dev/null && continue
+    if ! printf '%s' "$names" | jq -e --arg name "$name" 'index($name) != null' >/dev/null; then
+      owned="$(printf '%s' "$owned" | jq -c --arg name "$name" 'map(select(.name != $name))')"
+      codex_write_managed_mcp_state "$state" "$owned"
+      continue
+    fi
+    normalized="$(codex_mcp_get_normalized "$codex_command" "$name")" || die "failed to inspect Codex MCP server: $name"
+    fingerprint="$(codex_mcp_fingerprint "$normalized")"
+    status="$(printf '%s' "$record" | jq -r '.status // "installed"')"
+    recorded_fingerprint="$(printf '%s' "$record" | jq -r '.fingerprint // empty')"
+    if [ "$status" = installed ] && [ "$fingerprint" = "$recorded_fingerprint" ]; then
+      :
+    elif [ "$status" = pending-update ] && { [ "$fingerprint" = "$recorded_fingerprint" ] || codex_mcp_is_plain_managed_entry "$normalized" "$(printf '%s' "$record" | jq -r .url)"; }; then
+      :
+    elif [ "$status" = pending-add ] && codex_mcp_is_plain_managed_entry "$normalized" "$(printf '%s' "$record" | jq -r .url)"; then
+      :
+    else
+      printf 'Warning: preserving user-modified Codex MCP server: %s\n' "$name" >&2; failed=1; continue
+    fi
+    "$codex_command" mcp remove "$name" >/dev/null || { printf 'Warning: failed to remove managed Codex MCP server: %s\n' "$name" >&2; failed=1; continue; }
+    owned="$(printf '%s' "$owned" | jq -c --arg name "$name" 'map(select(.name != $name))')"
+    names="$(printf '%s' "$names" | jq -c --arg name "$name" 'map(select(. != $name))')"
+    codex_write_managed_mcp_state "$state" "$owned"
+  done < <(printf '%s' "$owned" | jq -c '.[]')
+
+  # Add or update desired entries. A pending record is written before mutation
+  # so an interrupted remove/add sequence can be retried safely.
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    name="$(printf '%s' "$entry" | jq -r .name)"; url="$(printf '%s' "$entry" | jq -r .url)"
+    record="$(printf '%s' "$owned" | jq -c --arg name "$name" '.[] | select(.name == $name)' | head -n 1)"
+    if [ -n "$record" ]; then
+      status="$(printf '%s' "$record" | jq -r '.status // "installed"')"
+      if printf '%s' "$names" | jq -e --arg name "$name" 'index($name) != null' >/dev/null; then
+        normalized="$(codex_mcp_get_normalized "$codex_command" "$name")" || die "failed to inspect Codex MCP server: $name"
+        fingerprint="$(codex_mcp_fingerprint "$normalized")"
+        recorded_fingerprint="$(printf '%s' "$record" | jq -r '.fingerprint // empty')"
+        case "$status" in
+          installed)
+            if [ "$fingerprint" != "$recorded_fingerprint" ]; then
+              printf 'Warning: preserving user-modified Codex MCP server: %s\n' "$name" >&2; failed=1; continue
+            fi
+            if [ "$url" = "$(printf '%s' "$record" | jq -r .url)" ]; then continue; fi
+            record="$(printf '%s' "$record" | jq -c --arg url "$url" '.url=$url | .status="pending-update"')"
+            owned="$(printf '%s' "$owned" | jq -c --arg name "$name" --argjson record "$record" 'map(if .name == $name then $record else . end)')"
+            codex_write_managed_mcp_state "$state" "$owned"
+            ;;
+          pending-update)
+            if codex_mcp_is_plain_managed_entry "$normalized" "$url"; then
+              record="$(jq -cn --arg name "$name" --arg url "$url" --arg fingerprint "$fingerprint" '{name:$name,url:$url,fingerprint:$fingerprint,status:"installed"}')"
+              owned="$(printf '%s' "$owned" | jq -c --arg name "$name" --argjson record "$record" 'map(if .name == $name then $record else . end)')"
+              codex_write_managed_mcp_state "$state" "$owned"
+              continue
+            fi
+            if [ "$fingerprint" != "$recorded_fingerprint" ]; then
+              printf 'Warning: preserving conflicting Codex MCP server during managed update: %s\n' "$name" >&2; failed=1; continue
+            fi
+            record="$(printf '%s' "$record" | jq -c --arg url "$url" '.url=$url')"
+            owned="$(printf '%s' "$owned" | jq -c --arg name "$name" --argjson record "$record" 'map(if .name == $name then $record else . end)')"
+            codex_write_managed_mcp_state "$state" "$owned"
+            ;;
+          pending-add)
+            if codex_mcp_is_plain_managed_entry "$normalized" "$url"; then
+              record="$(jq -cn --arg name "$name" --arg url "$url" --arg fingerprint "$fingerprint" '{name:$name,url:$url,fingerprint:$fingerprint,status:"installed"}')"
+              owned="$(printf '%s' "$owned" | jq -c --arg name "$name" --argjson record "$record" 'map(if .name == $name then $record else . end)')"
+              codex_write_managed_mcp_state "$state" "$owned"
+              continue
+            fi
+            printf 'Warning: preserving conflicting Codex MCP server during managed add: %s\n' "$name" >&2; failed=1; continue
+            ;;
+          *) die "invalid managed Codex MCP state status for $name: $status" ;;
+        esac
+        "$codex_command" mcp remove "$name" >/dev/null \
+          || { printf 'Warning: failed to prepare managed Codex MCP update: %s\n' "$name" >&2; failed=1; continue; }
+        names="$(printf '%s' "$names" | jq -c --arg name "$name" 'map(select(. != $name))')"
+      elif [ "$status" = installed ]; then
+        printf 'Warning: preserving user-removed Codex MCP server: %s\n' "$name" >&2; failed=1; continue
+      else
+        record="$(printf '%s' "$record" | jq -c --arg url "$url" '.url=$url')"
+        owned="$(printf '%s' "$owned" | jq -c --arg name "$name" --argjson record "$record" 'map(if .name == $name then $record else . end)')"
+      fi
+    else
+      if printf '%s' "$names" | jq -e --arg name "$name" 'index($name) != null' >/dev/null; then
+        printf 'Warning: preserving existing unowned Codex MCP server: %s\n' "$name" >&2; failed=1; continue
+      fi
+      record="$(jq -cn --arg name "$name" --arg url "$url" '{name:$name,url:$url,fingerprint:null,status:"pending-add"}')"
+      owned="$(printf '%s' "$owned" | jq -c --argjson record "$record" '. + [$record]')"
+    fi
+    codex_write_managed_mcp_state "$state" "$owned"
+    "$codex_command" mcp add "$name" --url "$url" >/dev/null \
+      || { printf 'Warning: failed to add managed Codex MCP server: %s\n' "$name" >&2; failed=1; continue; }
+    normalized="$(codex_mcp_get_normalized "$codex_command" "$name")" || die "failed to verify managed Codex MCP server: $name"
+    codex_mcp_is_plain_managed_entry "$normalized" "$url" \
+      || die "Codex created an unexpected MCP configuration for managed server: $name"
+    fingerprint="$(codex_mcp_fingerprint "$normalized")"
+    record="$(jq -cn --arg name "$name" --arg url "$url" --arg fingerprint "$fingerprint" '{name:$name,url:$url,fingerprint:$fingerprint,status:"installed"}')"
+    owned="$(printf '%s' "$owned" | jq -c --arg name "$name" --argjson record "$record" 'map(if .name == $name then $record else . end)')"
+    names="$(printf '%s' "$names" | jq -c --arg name "$name" '. + [$name] | unique')"
+    codex_write_managed_mcp_state "$state" "$owned"
+  done < <(printf '%s' "$desired" | jq -c '.[]')
+
+  [ "$failed" -eq 0 ]
 }
 
 agent_runtime_reset_config() {
@@ -820,6 +1030,7 @@ agent_runtime_reset_config() {
   local config_dir="$2"
   local codex_dir=""
   local profile_config=""
+  local state_file=""
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   codex_dir="$(codex_home_dir)"
@@ -837,6 +1048,9 @@ agent_runtime_reset_config() {
     rm -f "$codex_dir/local_models.json"
   fi
   ln -sf /etc/agentctl/image.md "$codex_dir/AGENTS.md"
+  state_file="$(codex_managed_mcp_state_file)"
+  [ ! -L "$state_file" ] || die "unsafe managed Codex MCP state symlink: $state_file"
+  rm -f "$state_file"
   rm -f "$USER_RUNTIME_FILE"
 }
 

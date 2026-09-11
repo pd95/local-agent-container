@@ -354,6 +354,7 @@ reset_runtime_hooks() {
     agent_runtime_auth_write \
     agent_runtime_auth_login \
     agent_runtime_mcp_add \
+    agent_runtime_mcp_sync \
     >/dev/null 2>&1 || true
 }
 
@@ -1081,6 +1082,21 @@ runtime_mcp_add() {
   agent_runtime_mcp_add "$runtime" "$name" "$url"
 }
 
+runtime_mcp_sync() {
+  local runtime="${1:-}"
+  local desired_json="${2:-}"
+  local legacy_json="${3:-[]}"
+  ensure_runtime_known "$runtime"
+  [ -n "$desired_json" ] || die "runtime mcp-sync requires RUNTIME DESIRED_JSON"
+  printf '%s' "$desired_json" | jq -e 'type == "array" and all(.[]; type == "object" and (.name|type) == "string" and (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")) and (.url|type) == "string" and (.url|startswith("http://127.0.0.1:")))' >/dev/null \
+    || die "runtime mcp-sync requires an array of name/url objects"
+  printf '%s' "$legacy_json" | jq -e 'type == "array" and all(.[]; type == "object" and (.name|type) == "string" and (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")) and (.url|type) == "string" and (.url|startswith("http://127.0.0.1:")))' >/dev/null \
+    || die "runtime mcp-sync legacy state requires an array of name/url objects"
+  load_runtime_adapter "$runtime"
+  declare -F agent_runtime_mcp_sync >/dev/null 2>&1 || die "runtime does not support managed HTTP MCP synchronization: $runtime"
+  agent_runtime_mcp_sync "$runtime" "$desired_json" "$legacy_json"
+}
+
 refresh_agent() {
   jq -n \
     --arg preferred "$(runtime_preferred)" \
@@ -1105,6 +1121,7 @@ Usage:
   agent.sh runtime update codex
   agent.sh runtime reset-config codex
   agent.sh runtime mcp-add codex NAME URL
+  agent.sh runtime mcp-sync codex '[{"name":"example","url":"http://127.0.0.1:47123/mcp/example"}]'
   agent.sh feature info office
   agent.sh feature install office
   agent.sh feature remove office
@@ -1157,6 +1174,9 @@ main() {
           ;;
         mcp-add)
           runtime_mcp_add "${2:-}" "${3:-}" "${4:-}"
+          ;;
+        mcp-sync)
+          runtime_mcp_sync "${2:-}" "${3:-}" "${4:-[]}"
           ;;
         *)
           die "unknown runtime command: ${1:-}"

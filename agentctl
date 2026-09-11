@@ -5668,7 +5668,7 @@ refresh_cmd() {
     mcp_require_no_active_leases "$name" refresh
     echo "Starting container for refresh: $name" >&2
     temporary_start_attempted=1
-    start_existing_container_managed "$name" >/dev/null
+    start_existing_container_managed "$name" 0 0 >/dev/null
     started_for_refresh=1
   fi
 
@@ -5691,6 +5691,8 @@ refresh_cmd() {
     warn "refresh --reset-config will replace active Codex configuration in ~/.codex with refreshed defaults"
     reset_runtime_config_in_container "$name" codex
   fi
+  sync_codex_managed_mcp_from_registry "$name" 1 \
+    || die "Failed to synchronize managed MCP servers with Codex in $name"
 
   if [ "$started_for_refresh" -eq 1 ]; then
     echo "Stopping container: $name" >&2
@@ -8749,7 +8751,6 @@ run_container() {
 
   configure_container_host_alias "$actual_name"
   warn_if_container_agentctl_versions_differ "$actual_name"
-  remote_control_restore_if_desired "$actual_name"
 
   if [ "$reset_config" -eq 1 ]; then
     local reset_runtime="${RUN_SELECTED_RUNTIME:-}"
@@ -8762,6 +8763,8 @@ run_container() {
       warn "Failed to preserve preferred runtime after reset-config: $reset_runtime"
     fi
   fi
+  sync_codex_managed_mcp_from_registry "$actual_name" 0
+  remote_control_restore_if_desired "$actual_name"
   if [ -n "$pre_exec" ]; then
     if [ "$stdio" -eq 1 ]; then
       "$pre_exec" "$actual_name" </dev/null
@@ -8895,6 +8898,7 @@ RUN_REQUESTED_IMAGE=""
 RUN_RUNTIME_CONFIG_JSON='{}'
 RUN_ENSURE_SSH_FEATURE=0
 RUN_MCP_CONFIG_JSON='[]'
+RUN_MCP_SYNC_REQUESTED=0
 RUN_START_OLLAMA=0
 RUN_PERSIST_RUNTIME_SELECTION=0
 CREATE_MODE=0
@@ -8913,6 +8917,71 @@ run_post_exec() {
   fi
   [ -n "$effective_runtime" ] || return 0
   sync_runtime_auth_from_container_if_available "$name" "$effective_runtime"
+}
+
+mcp_codex_desired_json() {
+  local config_json="${1:-$MCP_CONFIG_JSON}"
+  local port="${2:-$MCP_PORT}"
+  printf '%s' "$config_json" | jq -ce --argjson port "$port" \
+    '[.[] | {name:.name, url:("http://127.0.0.1:" + ($port|tostring) + "/mcp/" + .name)}] | sort_by(.name)'
+}
+
+mcp_codex_desired_from_registry() {
+  local registry="$1"
+  jq -ce '[.servers[] | {name:.name, url:("http://127.0.0.1:" + ((.port // $port)|tostring) + "/mcp/" + .name)}] | sort_by(.name)' \
+    --argjson port "$(jq -r '.port // 47123' "$registry")" "$registry"
+}
+
+sync_codex_managed_mcp() {
+  local name="$1" config_json="${2:-$MCP_CONFIG_JSON}" port="${3:-$MCP_PORT}" legacy="${4:-[]}" required="${5:-1}"
+  local desired='[]' runtime_info=''
+  desired="$(mcp_codex_desired_json "$config_json" "$port")" \
+    || die "Unable to build managed MCP URLs for Codex in $name"
+  if ! runtime_info="$(runtime_info_in_container "$name" codex 2>/dev/null)"; then
+    if [ "$required" -eq 1 ]; then
+      warn "Unable to inspect Codex before managed MCP synchronization in $name"
+      return 1
+    fi
+    warn "Skipping managed Codex MCP synchronization in $name because runtime inspection failed"
+    return 0
+  fi
+  if ! printf '%s' "$runtime_info" | jq -e 'type == "object" and (.installed|type) == "boolean"' >/dev/null 2>&1; then
+    if [ "$required" -eq 1 ]; then
+      warn "Codex runtime inspection returned invalid data in $name"
+      return 1
+    fi
+    warn "Skipping managed Codex MCP synchronization in $name because runtime inspection returned invalid data"
+    return 0
+  fi
+  if ! printf '%s' "$runtime_info" | jq -e '.installed == true' >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! printf '%s' "$runtime_info" | jq -e '.commands | index("runtime mcp-sync codex DESIRED_JSON") != null' >/dev/null 2>&1; then
+    if [ "$required" -eq 1 ]; then
+      warn "Container $name does not support managed Codex MCP synchronization. Run: ${CLI_NAME} refresh --name $name"
+      return 1
+    fi
+    warn "Managed Codex MCP synchronization is unavailable in $name; run: ${CLI_NAME} refresh --name $name"
+    return 0
+  fi
+  if ! run_agent_sh_in_container "$name" runtime mcp-sync codex "$desired" "$legacy"; then
+    if [ "$required" -eq 1 ]; then
+      return 1
+    fi
+    warn "Managed Codex MCP synchronization reported conflicts or errors in $name; preserving the existing Codex configuration"
+  fi
+  return 0
+}
+
+sync_codex_managed_mcp_from_registry() {
+  local name="$1" required="${2:-0}" registry="" config_json="" port="" legacy='[]'
+  registry="$(mcp_registry_path "$name")"
+  [ -f "$registry" ] && [ ! -L "$registry" ] || return 0
+  mcp_validate_private_file "$registry" "Managed MCP registry"
+  config_json="$(jq -ce '.servers' "$registry")" || die "Invalid managed MCP registry: $registry"
+  port="$(jq -r '.port // 47123' "$registry")"
+  legacy="$(mcp_codex_desired_from_registry "$registry")" || die "Invalid managed MCP registry: $registry"
+  sync_codex_managed_mcp "$name" "$config_json" "$port" "$legacy" "$required"
 }
 
 run_pre_exec() {
@@ -8946,22 +9015,9 @@ run_pre_exec() {
     fi
   fi
 
-  if [ "$MCP_REQUESTED" -eq 1 ]; then
-    effective_runtime="$RUN_SELECTED_RUNTIME"
-    if [ -z "$effective_runtime" ]; then
-      effective_runtime="$(run_agent_sh_in_container "$name" preferred get 2>/dev/null || true)"
-    fi
-    if [ "$effective_runtime" = codex ]; then
-      local mcp_name=""
-      while IFS= read -r mcp_name; do
-        [ -n "$mcp_name" ] || continue
-        run_agent_sh_in_container "$name" runtime mcp-add codex "$mcp_name" \
-          "http://127.0.0.1:${MCP_PORT}/mcp/${mcp_name}" \
-          || die "Failed to register managed MCP server $mcp_name with Codex in $name"
-      done < <(printf '%s' "$RUN_MCP_CONFIG_JSON" | jq -r '.[].name')
-    elif [ -n "$effective_runtime" ]; then
-      warn "Managed MCP URLs were not registered automatically because runtime $effective_runtime has no HTTP MCP adapter"
-    fi
+  if [ "$RUN_MCP_SYNC_REQUESTED" -eq 1 ]; then
+    sync_codex_managed_mcp "$name" "$RUN_MCP_CONFIG_JSON" "$MCP_PORT" '[]' 1 \
+      || die "Failed to synchronize managed MCP servers with Codex in $name"
   fi
 
   if [ "$RUN_SYNC_RUNTIME_AUTH" -eq 1 ] || [ "$RUN_SYNC_POST_RUNTIME_AUTH" -eq 1 ]; then
@@ -9273,6 +9329,7 @@ run_cmd() {
   RUN_RUNTIME_CONFIG_JSON="$runtime_config_json"
   RUN_ENSURE_SSH_FEATURE="$ssh_requested"
   RUN_MCP_CONFIG_JSON="$MCP_CONFIG_JSON"
+  RUN_MCP_SYNC_REQUESTED="$MCP_REQUESTED"
   RUN_START_OLLAMA="$start_ollama"
   RUN_PERSIST_RUNTIME_SELECTION="$CREATE_MODE"
   OLLAMA_LISTENER_REMINDER_REPORTED=0
@@ -9487,6 +9544,9 @@ upgrade_cmd() {
   local mcp_port_requested=0
   local mcp_current_enabled=0
   local mcp_target_enabled=0
+  local mcp_target_config_json='[]'
+  local mcp_target_port="$MCP_DEFAULT_PORT"
+  local mcp_source_codex_json='[]'
   local mcp_registry=""
   local remote_control_quiesced=0
   local remote_control_owner=""
@@ -9629,6 +9689,8 @@ upgrade_cmd() {
   if [ -f "$mcp_registry" ] && [ ! -L "$mcp_registry" ]; then
     mcp_validate_private_file "$mcp_registry" "Managed MCP registry"
     mcp_current_enabled=1
+    mcp_source_codex_json="$(mcp_codex_desired_from_registry "$mcp_registry")" \
+      || die "Invalid managed MCP registry: $mcp_registry"
     if [ "$mcp_port_requested" -eq 0 ]; then MCP_PORT="$(jq -r '.port // 47123' "$mcp_registry")"; fi
     if [ "$mcp_definition_requested" -eq 0 ]; then mcp_load_registry_config "$mcp_registry"; fi
   fi
@@ -9644,6 +9706,8 @@ upgrade_cmd() {
   else
     removed_socket_mappings="${removed_socket_mappings}${removed_socket_mappings:+$'\n'}"$'\t'"${MCP_GUEST_SOCKET}"
   fi
+  mcp_target_config_json="$MCP_CONFIG_JSON"
+  mcp_target_port="$MCP_PORT"
 
   inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
   current_socket_mappings="$(container_extra_mount_text "$name")"
@@ -9999,6 +10063,9 @@ upgrade_cmd() {
     elif [ "$target_name" = "$name" ]; then
       mcp_stop_managed "$name"
     fi
+    MCP_CONFIG_JSON="$mcp_target_config_json"
+    MCP_PORT="$mcp_target_port"
+    MCP_REQUESTED=1
     mcp_start_relay "$target_name"
     mcp_upgrade_relay_started=1
     mcp_upgrade_relay_name="$target_name"
@@ -10094,6 +10161,11 @@ upgrade_cmd() {
   if [ "$overwrite_config" -eq 1 ]; then
     echo "Overwriting config.toml, default profiles, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $target_name" >&2
     reset_runtime_config_in_container "$target_name" codex
+  fi
+  if [ "$mcp_target_enabled" -eq 1 ]; then
+    sync_codex_managed_mcp "$target_name" "$mcp_target_config_json" "$mcp_target_port" "$mcp_source_codex_json" 0
+  elif [ "$mcp_disable_requested" -eq 1 ]; then
+    sync_codex_managed_mcp "$target_name" '[]' "$mcp_target_port" "$mcp_source_codex_json" 0
   fi
 
   if [ "$copy_mode" -eq 0 ]; then
@@ -11312,6 +11384,8 @@ remote_control_cmd() {
         start_existing_container_safely "$name" >/dev/null; started=1
         if [ "$mcp_relay_started" -eq 1 ]; then mcp_configure_guest "$name"; fi
       fi
+      sync_codex_managed_mcp_from_registry "$name" 1 \
+        || die "Failed to synchronize managed MCP servers with Codex in $name"
       if ! runtime_info_in_container "$name" codex | jq -e '.installed == true' >/dev/null; then die "Codex runtime is not installed in $name"; fi
       sync_runtime_auth_to_container "$name" codex json_refresh_token
       remote_control_install_helper "$name"
@@ -11369,6 +11443,7 @@ remote_control_cmd() {
 start_existing_container_managed() {
   local name="$1"
   local foreground_lease="${2:-0}"
+  local reconcile_codex="${3:-1}"
   local published_sockets=""
 
   # Callers hold both lifecycle locks. Keeping them through relay restoration,
@@ -11390,6 +11465,9 @@ start_existing_container_managed() {
   if [ "$MCP_REQUESTED" -eq 1 ]; then
     mcp_configure_guest "$name"
     [ "$foreground_lease" -eq 0 ] || mcp_create_lease "$name"
+  fi
+  if [ "$reconcile_codex" -eq 1 ]; then
+    sync_codex_managed_mcp_from_registry "$name" 0
   fi
   remote_control_restore_if_desired "$name"
 }
@@ -11446,6 +11524,7 @@ simple_name_cmd() {
       "$CONTAINER_CMD" start "$name"
       configure_container_host_alias "$name"
       if [ "$MCP_REQUESTED" -eq 1 ]; then mcp_configure_guest "$name"; fi
+      sync_codex_managed_mcp_from_registry "$name" 0
       remote_control_restore_if_desired "$name"
       ;;
     rm)

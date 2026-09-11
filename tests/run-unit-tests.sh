@@ -1078,6 +1078,7 @@ test_remote_control_start_restores_mcp_for_stopped_container() {
   mcp_start_from_registry() { lifecycle="${lifecycle}relay-start\n"; }
   start_existing_container_safely() { running=1; lifecycle="${lifecycle}container-start\n"; }
   mcp_configure_guest() { lifecycle="${lifecycle}proxy-start\n"; }
+  sync_codex_managed_mcp_from_registry() { lifecycle="${lifecycle}codex-sync\n"; }
   runtime_info_in_container() { printf '%s\n' '{"installed":true}'; }
   sync_runtime_auth_to_container() { :; }
   remote_control_install_helper() { :; }
@@ -1092,7 +1093,7 @@ test_remote_control_start_restores_mcp_for_stopped_container() {
   remote_control_print_status() { :; }
 
   remote_control_cmd start --name unit-remote
-  [ "$lifecycle" = 'mcp-lock\nrelay-stop\nrelay-start\ncontainer-start\nproxy-start\nmcp-unlock\n' ] \
+  [ "$lifecycle" = 'mcp-lock\nrelay-stop\nrelay-start\ncontainer-start\nproxy-start\ncodex-sync\nmcp-unlock\n' ] \
     || fail "Unexpected Remote Control MCP lifecycle: $lifecycle"
 }
 
@@ -2492,6 +2493,7 @@ test_start_and_restart_refresh_host_alias() {
 
   local action_log=""
   local alias_log=""
+  local sync_log=""
   require_container() { :; }
   container_exists() { [ "$1" = "unit-test-container" ]; }
   configure_container_host_alias() { alias_log="${alias_log}$1"$'\n'; }
@@ -2499,6 +2501,7 @@ test_start_and_restart_refresh_host_alias() {
   container_published_sockets() { :; }
   container_has_mcp_wiring() { return 1; }
   mcp_require_no_active_leases() { :; }
+  sync_codex_managed_mcp_from_registry() { sync_log="${sync_log}$1"$'\n'; }
   CONTAINER_CMD=container
   container() { action_log="${action_log}$1:$2"$'\n'; }
 
@@ -2509,6 +2512,8 @@ test_start_and_restart_refresh_host_alias() {
     || fail "Expected start and restart actions, got: $action_log"
   [ "${alias_log%$'\n'}" = $'unit-test-container\nunit-test-container' ] \
     || fail "Expected alias refresh after both actions, got: $alias_log"
+  [ "${sync_log%$'\n'}" = $'unit-test-container\nunit-test-container' ] \
+    || fail "Expected Codex MCP reconciliation after both actions, got: $sync_log"
   unset -f container
 }
 
@@ -3673,6 +3678,9 @@ test_run_container_reset_config_uses_runtime_helper() {
   reset_runtime_config_in_container() {
     helper_log="${helper_log}$1:$2"$'\n'
   }
+  sync_codex_managed_mcp_from_registry() {
+    helper_log="${helper_log}$1:mcp-sync"$'\n'
+  }
   run_agent_sh_in_container() {
     if [ "$2" = "preferred" ] && [ "$3" = "get" ]; then
       printf '%s\n' codex
@@ -3689,6 +3697,8 @@ test_run_container_reset_config_uses_runtime_helper() {
   assert_status 0
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:codex' || fail "Expected runtime reset-config helper call, got: $helper_log"
   printf '%s' "$helper_log" | grep -Fq $'unit-test-container:preferred-set:codex' || fail "Expected preferred runtime to be preserved, got: $helper_log"
+  [ "$helper_log" = $'unit-test-container:codex\nunit-test-container:preferred-set:codex\nunit-test-container:mcp-sync\n' ] \
+    || fail "Expected managed MCP reconciliation after config reset, got: $helper_log"
 }
 
 test_run_container_reset_config_uses_selected_runtime() {
@@ -4523,6 +4533,162 @@ test_agent_sh_runtime_info_reports_registry_metadata() {
   run_agent_sh_capture "$temp_home" runtime info codex
   assert_status 0
   printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "standalone-installer" and .default_config_dir == "/etc/agentctl/codex" and (.auth_formats | index("json_refresh_token") != null) and .launch_configs.profile.type == "string" and .launch_configs.profile.default == "gpt-oss"' >/dev/null || fail "Expected runtime info JSON for codex, got: $RUN_OUTPUT"
+}
+
+test_agent_sh_codex_mcp_sync_reconciles_only_owned_servers() {
+  begin_test "agent.sh Codex MCP sync reconciles owned servers without removing user servers"
+
+  local temp_home fake_bin state_file fail_marker desired ownership
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  state_file="$temp_home/codex-mcp.json"
+  fail_marker="$temp_home/fail-next-update"
+  mkdir -p "$fake_bin"
+  printf '%s\n' '{"custom":{"name":"custom","enabled":true,"transport":{"type":"stdio","command":"custom-server","args":[],"env":null,"env_vars":[]},"enabled_tools":null,"disabled_tools":null,"startup_timeout_sec":null,"tool_timeout_sec":null}}' >"$state_file"
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+set -eu
+case "$1:$2" in
+  mcp:get)
+    jq -e --arg name "$3" '.[$name]' "$MCP_FAKE_STATE"
+    ;;
+  mcp:list)
+    jq '[.[]]' "$MCP_FAKE_STATE"
+    ;;
+  mcp:add)
+    if [ -n "${MCP_FAIL_MARKER:-}" ] && [ "$5" = "http://127.0.0.1:48124/mcp/xcode" ] && [ ! -e "$MCP_FAIL_MARKER" ]; then
+      : >"$MCP_FAIL_MARKER"
+      exit 1
+    fi
+    jq --arg name "$3" --arg url "$5" '. + {($name):{name:$name,enabled:true,transport:{type:"streamable_http",url:$url,bearer_token_env_var:null,http_headers:null,env_http_headers:null,http_headers_helper:null},enabled_tools:null,disabled_tools:null,startup_timeout_sec:null,tool_timeout_sec:null}}' "$MCP_FAKE_STATE" >"$MCP_FAKE_STATE.tmp"
+    mv "$MCP_FAKE_STATE.tmp" "$MCP_FAKE_STATE"
+    ;;
+  mcp:remove)
+    jq --arg name "$3" 'del(.[$name])' "$MCP_FAKE_STATE" >"$MCP_FAKE_STATE.tmp"
+    mv "$MCP_FAKE_STATE.tmp" "$MCP_FAKE_STATE"
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$fake_bin/codex"
+
+  desired='[{"name":"xcode","url":"http://127.0.0.1:47123/mcp/xcode"}]'
+  run_agent_sh_capture_env "$temp_home" "PATH=$fake_bin:/usr/bin:/bin" "MCP_FAKE_STATE=$state_file" "MCP_FAIL_MARKER=$fail_marker" -- runtime mcp-sync codex "$desired"
+  assert_status 0
+  jq -e '.custom.transport.type == "stdio" and .xcode.transport.url == "http://127.0.0.1:47123/mcp/xcode"' "$state_file" >/dev/null \
+    || fail "Expected managed Xcode route and preserved custom route: $(cat "$state_file")"
+
+  desired='[{"name":"xcode","url":"http://127.0.0.1:48124/mcp/xcode"}]'
+  run_agent_sh_capture_env "$temp_home" "PATH=$fake_bin:/usr/bin:/bin" "MCP_FAKE_STATE=$state_file" "MCP_FAIL_MARKER=$fail_marker" -- runtime mcp-sync codex "$desired"
+  assert_status 1
+  ownership="$temp_home/home/.config/agentctl/codex-managed-mcp.json"
+  jq -e '.servers[0].status == "pending-update" and .servers[0].fingerprint != null' "$ownership" >/dev/null \
+    || fail "Expected retryable pending update ownership: $(cat "$ownership")"
+
+  run_agent_sh_capture_env "$temp_home" "PATH=$fake_bin:/usr/bin:/bin" "MCP_FAKE_STATE=$state_file" "MCP_FAIL_MARKER=$fail_marker" -- runtime mcp-sync codex "$desired"
+  assert_status 0
+  jq -e '.custom.transport.type == "stdio" and .xcode.transport.url == "http://127.0.0.1:48124/mcp/xcode"' "$state_file" >/dev/null \
+    || fail "Expected interrupted update to finish on retry: $(cat "$state_file")"
+  jq -e '.schema_version == 2 and .servers[0].name == "xcode" and .servers[0].status == "installed" and (.servers[0].fingerprint|length) == 64' "$ownership" >/dev/null \
+    || fail "Expected fingerprinted managed ownership state: $(cat "$ownership")"
+
+  jq '.xcode.transport.http_headers={"x-user":"custom"}' "$state_file" >"$state_file.tmp"
+  mv "$state_file.tmp" "$state_file"
+  desired='[{"name":"helper","url":"http://127.0.0.1:47123/mcp/helper"}]'
+  run_agent_sh_capture_env "$temp_home" "PATH=$fake_bin:/usr/bin:/bin" "MCP_FAKE_STATE=$state_file" "MCP_FAIL_MARKER=$fail_marker" -- runtime mcp-sync codex "$desired"
+  assert_status 1
+  assert_contains "preserving user-modified Codex MCP server: xcode"
+  jq -e '.custom.transport.type == "stdio" and .xcode.transport.http_headers["x-user"] == "custom" and .helper.transport.url == "http://127.0.0.1:47123/mcp/helper"' "$state_file" >/dev/null \
+    || fail "Expected user-modified and unowned routes to be preserved: $(cat "$state_file")"
+}
+
+test_agent_sh_codex_mcp_sync_conservatively_adopts_legacy_route() {
+  begin_test "agent.sh Codex MCP sync adopts only an exact plain legacy managed route"
+
+  local temp_home fake_bin state_file legacy desired ownership
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"; state_file="$temp_home/codex-mcp.json"; mkdir -p "$fake_bin"
+  printf '%s\n' '{"xcode":{"name":"xcode","enabled":true,"transport":{"type":"streamable_http","url":"http://127.0.0.1:47123/mcp/xcode","bearer_token_env_var":null,"http_headers":null,"env_http_headers":null,"http_headers_helper":null},"enabled_tools":null,"disabled_tools":null,"startup_timeout_sec":null,"tool_timeout_sec":null}}' >"$state_file"
+  cat >"$fake_bin/codex" <<'EOF'
+#!/bin/sh
+set -eu
+case "$1:$2" in
+  mcp:get) jq -e --arg name "$3" '.[$name]' "$MCP_FAKE_STATE" ;;
+  mcp:list) jq '[.[]]' "$MCP_FAKE_STATE" ;;
+  mcp:add|mcp:remove) exit 88 ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$fake_bin/codex"
+  desired='[{"name":"xcode","url":"http://127.0.0.1:47123/mcp/xcode"}]'; legacy="$desired"
+  run_agent_sh_capture_env "$temp_home" "PATH=$fake_bin:/usr/bin:/bin" "MCP_FAKE_STATE=$state_file" -- runtime mcp-sync codex "$desired" "$legacy"
+  assert_status 0
+  ownership="$temp_home/home/.config/agentctl/codex-managed-mcp.json"
+  jq -e '.schema_version == 2 and .servers[0].name == "xcode" and .servers[0].status == "installed"' "$ownership" >/dev/null \
+    || fail "Expected exact legacy route adoption: $(cat "$ownership")"
+  chmod 644 "$ownership"
+  run_agent_sh_capture_env "$temp_home" "PATH=$fake_bin:/usr/bin:/bin" "MCP_FAKE_STATE=$state_file" -- runtime mcp-sync codex "$desired" "$legacy"
+  assert_status 0
+  [ "$(stat -c %a "$ownership")" = 600 ] || fail "Expected owner-only managed MCP state permissions"
+  jq '.servers += [.servers[0]]' "$ownership" >"$ownership.tmp"; mv "$ownership.tmp" "$ownership"
+  run_agent_sh_capture_env "$temp_home" "PATH=$fake_bin:/usr/bin:/bin" "MCP_FAKE_STATE=$state_file" -- runtime mcp-sync codex "$desired" "$legacy"
+  assert_status 1
+  assert_contains "invalid managed Codex MCP state"
+}
+
+test_agentctl_codex_mcp_sync_uses_registry_port_and_capability_contract() {
+  begin_test "agentctl Codex MCP sync uses persisted definitions, port, and guest capability"
+
+  load_agentctl_functions
+  local temp_dir registry_file invocation=""
+  temp_dir="$(new_workdir)"; registry_file="$temp_dir/registry.json"
+  printf '%s\n' '{"schema_version":2,"container":"unit","port":48124,"servers":[{"name":"xcode","transport":"stdio","command":"xcrun","args":[],"env":{},"env_vars":[]},{"name":"private","transport":"http","url":"https://example.test/mcp","headers":{},"header_env_vars":{},"header_keychain_credentials":{},"bearer_token_env_var":null,"bearer_token_keychain":"private-token"}]}' >"$registry_file"
+  chmod 600 "$registry_file"
+  mcp_registry_path() { printf '%s\n' "$registry_file"; }
+  mcp_validate_private_file() { :; }
+  runtime_info_in_container() { printf '%s\n' '{"installed":true,"commands":["runtime mcp-sync codex DESIRED_JSON"]}'; }
+  run_agent_sh_in_container() { invocation="$*"; }
+
+  sync_codex_managed_mcp_from_registry unit 1
+  printf '%s' "$invocation" | grep -Fq 'runtime mcp-sync codex' || fail "Expected runtime sync invocation: $invocation"
+  printf '%s' "$invocation" | grep -Fq 'http://127.0.0.1:48124/mcp/xcode' || fail "Expected persisted Xcode loopback URL: $invocation"
+  printf '%s' "$invocation" | grep -Fq 'http://127.0.0.1:48124/mcp/private' || fail "Expected persisted private loopback URL: $invocation"
+
+  runtime_info_in_container() { printf '%s\n' '{"installed":true,"commands":[]}'; }
+  run_capture sync_codex_managed_mcp_from_registry unit 0
+  assert_status 0
+  assert_contains "run: $CLI_NAME refresh --name unit"
+  run_capture sync_codex_managed_mcp_from_registry unit 1
+  assert_status 1
+  assert_contains "does not support managed Codex MCP synchronization"
+
+  runtime_info_in_container() { printf '%s\n' '{"installed":true,"commands":["runtime mcp-sync codex DESIRED_JSON"]}'; }
+  run_agent_sh_in_container() { return 1; }
+  run_capture sync_codex_managed_mcp_from_registry unit 0
+  assert_status 0
+  assert_contains "reported conflicts or errors"
+  run_capture sync_codex_managed_mcp_from_registry unit 1
+  assert_status 1
+}
+
+test_run_pre_exec_does_not_reconcile_from_mutated_mcp_lifecycle_state() {
+  begin_test "run pre-exec keeps explicit MCP intent separate from restored registry state"
+
+  load_agentctl_functions
+  local sync_calls=0
+  RUN_SELECTED_RUNTIME=""; RUN_INSTALL_RUNTIME=0; RUN_SYNC_RUNTIME_AUTH=0; RUN_SYNC_POST_RUNTIME_AUTH=0
+  RUN_FORCE_RUNTIME_AUTH=0; RUN_UPDATE_CODEX=0; RUN_START_OLLAMA=0; RUN_ENSURE_SSH_FEATURE=0
+  RUN_MCP_CONFIG_JSON='[]'; RUN_MCP_SYNC_REQUESTED=0
+  MCP_REQUESTED=1
+  sync_codex_managed_mcp() { sync_calls=$((sync_calls + 1)); }
+
+  run_pre_exec unit
+  [ "$sync_calls" -eq 0 ] || fail "Restored MCP lifecycle state must not trigger stale run-pre-exec reconciliation"
+  RUN_MCP_SYNC_REQUESTED=1
+  run_pre_exec unit
+  [ "$sync_calls" -eq 1 ] || fail "Explicit run MCP intent should trigger reconciliation exactly once"
 }
 
 test_agent_sh_feature_list_reports_declared_features() {
@@ -5667,6 +5833,8 @@ command = "custom-mcp"
 EOF
   printf '{"models":[{"slug":"custom"}]}\n' >"$temp_home/home/.codex/local_models.json"
   printf '# custom agents\n' >"$temp_home/home/.codex/AGENTS.md"
+  mkdir -p "$temp_home/home/.config/agentctl"
+  printf '%s\n' '{"schema_version":2,"servers":[]}' >"$temp_home/home/.config/agentctl/codex-managed-mcp.json"
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
@@ -5683,6 +5851,7 @@ EOF
   jq -er '.models == []' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected Codex local_models.json to reset to image defaults"
   [ -L "$temp_home/home/.codex/AGENTS.md" ] || fail "Expected Codex AGENTS.md to reset to a symlink"
   [ "$(readlink "$temp_home/home/.codex/AGENTS.md")" = "/etc/agentctl/image.md" ] || fail "Expected Codex AGENTS.md to point at image defaults"
+  [ ! -e "$temp_home/home/.config/agentctl/codex-managed-mcp.json" ] || fail "Expected reset-config to clear managed MCP ownership state"
 }
 
 test_agent_sh_opencode_runtime_reset_config_writes_ollama_config() {
@@ -11835,6 +12004,7 @@ test_refresh_restores_managed_mcp_for_stopped_container() {
   refresh_codex_config_files() { :; }
   refresh_optional_runtime_default_files() { :; }
   refresh_container_tree() { :; }
+  sync_codex_managed_mcp_from_registry() { lifecycle="${lifecycle}codex-sync\n"; }
   CONTAINER_CMD=container
   container() {
     [ "$1" = exec ] || fail "Unexpected container invocation: $*"
@@ -11843,7 +12013,7 @@ test_refresh_restores_managed_mcp_for_stopped_container() {
   run_capture refresh_cmd --name unit-test-container
   assert_status 0
   [ "$running" -eq 0 ] || fail "Expected refresh to restore the stopped container state"
-  [ "$lifecycle" = 'remote-lock\nmcp-lock\nlease-check:refresh\nmanaged-start\nremote-quiesce\ncontainer-stop\nrelay-stop\nmcp-unlock\nremote-unlock\n' ] \
+  [ "$lifecycle" = 'remote-lock\nmcp-lock\nlease-check:refresh\nmanaged-start\ncodex-sync\nremote-quiesce\ncontainer-stop\nrelay-stop\nmcp-unlock\nremote-unlock\n' ] \
     || fail "Unexpected stopped-container refresh lifecycle: $lifecycle"
 }
 
@@ -14002,6 +14172,10 @@ main() {
   run_selected_test test_images_list_falls_back_to_refs_when_metadata_is_unavailable "test_images_list_falls_back_to_refs_when_metadata_is_unavailable"
   run_selected_test test_rm_help_reports_force_option "test_rm_help_reports_force_option"
   run_selected_test test_agent_sh_runtime_info_reports_registry_metadata "test_agent_sh_runtime_info_reports_registry_metadata"
+  run_selected_test test_agent_sh_codex_mcp_sync_reconciles_only_owned_servers "test_agent_sh_codex_mcp_sync_reconciles_only_owned_servers"
+  run_selected_test test_agent_sh_codex_mcp_sync_conservatively_adopts_legacy_route "test_agent_sh_codex_mcp_sync_conservatively_adopts_legacy_route"
+  run_selected_test test_agentctl_codex_mcp_sync_uses_registry_port_and_capability_contract "test_agentctl_codex_mcp_sync_uses_registry_port_and_capability_contract"
+  run_selected_test test_run_pre_exec_does_not_reconcile_from_mutated_mcp_lifecycle_state "test_run_pre_exec_does_not_reconcile_from_mutated_mcp_lifecycle_state"
   run_selected_test test_agent_sh_feature_list_reports_declared_features "test_agent_sh_feature_list_reports_declared_features"
   run_selected_test test_agent_sh_feature_info_reports_manifest_metadata "test_agent_sh_feature_info_reports_manifest_metadata"
   run_selected_test test_agent_sh_feature_install_office_creates_feature_state "test_agent_sh_feature_install_office_creates_feature_state"
