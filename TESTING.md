@@ -754,6 +754,25 @@ agentctl ollama stop
 agentctl ollama start
 ```
 
+Exercise diagnostic startup separately while no gateway listener is running:
+
+```bash
+OLLAMA_DIAGNOSTICS_DIR="$(mktemp -d)"
+agentctl ollama start --debug-level 2 --log-requests \
+  --request-log-dir "$OLLAMA_DIAGNOSTICS_DIR"
+agentctl ollama status
+```
+
+Expected output includes the sensitive-prompt warning and a `Server log:`
+path. After making one inference request, that server log should identify an
+`ollama-request-logs-*` child beneath `$OLLAMA_DIAGNOSTICS_DIR`, containing a
+request-body JSON file and replay script. A second start with different
+diagnostics must fail with stop-and-restart guidance instead of claiming the
+new settings were applied. Stop the listener, then repeat through
+`agentctl run --start-ollama --debug-level 1` to cover the session startup
+path. Delete the diagnostic directory after inspecting it because it contains
+prompt data.
+
 If status lists more than one listener, stop one explicitly with
 `agentctl ollama stop --gateway <IP>`.
 
