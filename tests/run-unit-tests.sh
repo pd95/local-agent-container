@@ -4350,15 +4350,15 @@ test_host_test_filter_normalizes_case_hyphens_spaces_and_underscores() {
 
   TEST_FILTER="TAGGED-APK"
   test_matches_filter \
-    test_upgrade_repeats_tagged_apk_reinstall_instructions \
-    "upgrade repeats complete tagged APK reinstall instructions" \
+    test_upgrade_restores_tagged_apk_packages_through_recovery \
+    "upgrade defers and restores tagged APK packages through recovery" \
     || fail "Expected a mixed-case hyphenated filter to match underscore and space separators"
 
   TEST_START_FROM="Tagged-Apk"
   TEST_START_ACTIVE=0
   test_matches_start_from \
-    test_upgrade_repeats_tagged_apk_reinstall_instructions \
-    "upgrade repeats complete tagged APK reinstall instructions" \
+    test_upgrade_restores_tagged_apk_packages_through_recovery \
+    "upgrade defers and restores tagged APK packages through recovery" \
     || fail "Expected a mixed-case hyphenated --from value to match underscore and space separators"
   [ "$TEST_START_ACTIVE" -eq 1 ] \
     || fail "Expected a matching --from value to activate subsequent tests"
@@ -4366,6 +4366,15 @@ test_host_test_filter_normalizes_case_hyphens_spaces_and_underscores() {
   TEST_FILTER="$original_filter"
   TEST_START_FROM="$original_start_from"
   TEST_START_ACTIVE="$original_start_active"
+}
+
+test_upgrade_help_reports_package_detail_option() {
+  begin_test "upgrade help reports opt-in package details"
+
+  run_capture "$AGENTCTL" upgrade --help
+  assert_status 0
+  assert_contains "--package-details"
+  assert_contains "Show complete dependency-level package differences during preflight"
 }
 
 test_refresh_help_reports_new_command() {
@@ -10885,19 +10894,19 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
   assert_not_contains "  - curl"
   assert_not_contains "  - bash"
   assert_contains "Upgrade complete: unit-test-container (backup skipped)"
-  assert_contains "Reminder: reinstall top-level packages removed by the upgrade if you still need them:"
-  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "su-exec --name unit-test-container apt-get update")" -eq 2 ] \
-    || fail "Expected apt-get update before and after upgrade"
-  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "su-exec --name unit-test-container apt-get install -y tree")" -eq 2 ] \
-    || fail "Expected apt-get install before and after upgrade"
+  assert_contains "Manual package recovery remains unresolved:"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "su-exec --name unit-test-container apt-get update")" -eq 1 ] \
+    || fail "Expected one final apt-get update instruction"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "su-exec --name unit-test-container apt-get install -y tree")" -eq 1 ] \
+    || fail "Expected one final apt-get install instruction"
   printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
   [ "$start_calls" -eq 2 ] || fail "Expected 2 persisted start calls, got: $start_calls"
   [ "$stop_calls" -eq 2 ] || fail "Expected 2 persisted stop calls, got: $stop_calls"
   [ "$rm_calls" -eq 1 ] || fail "Expected 1 persisted rm call, got: $rm_calls"
 }
 
-test_upgrade_reinstall_command_prefers_requested_apk_packages() {
-  begin_test "upgrade reinstall command prefers requested apk packages"
+test_upgrade_package_summary_uses_top_level_apk_count() {
+  begin_test "upgrade package summary reports top-level APK recovery without dependency details"
 
   load_agentctl_functions
 
@@ -10910,23 +10919,89 @@ test_upgrade_reinstall_command_prefers_requested_apk_packages() {
     '{"package_manager":"apk","packages":["bash","gcc","g++","gmp","musl-dev"],"requested_packages":["bash","g++"]}' \
     '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
     '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
-    unit-test-container
+    unit-test-container \
+    '[]' \
+    summary
 
   assert_status 0
-  assert_contains "Upgrade will remove 4 extra apk package(s) not present in agent-python:"
-  assert_contains "  - g++"
-  assert_contains "  - gcc"
-  assert_contains "  - gmp"
-  assert_contains "  - musl-dev"
-  assert_contains "To reinstall top-level packages after upgrade:"
-  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache g++"
-  assert_not_contains "apk add --no-cache gcc"
-  assert_not_contains "apk add --no-cache gmp"
-  assert_not_contains "apk add --no-cache musl-dev"
+  assert_contains "Upgrade recovery will offer 1 top-level apk package(s) not present in agent-python"
+  assert_not_contains "  - g++"
+  assert_not_contains "  - gcc"
+  assert_not_contains "apk add --no-cache"
 }
 
-test_upgrade_reinstall_command_restores_missing_apk_repository_tags() {
-  begin_test "upgrade reinstall command restores missing apk repository tags"
+test_upgrade_recovery_plan_restores_missing_apk_repository_tags() {
+  begin_test "upgrade recovery plan restores captured and default APK repository tags"
+
+  load_agentctl_functions
+
+  local ledger='{"ledger_schema_version":1,"records":[{"record_id":"source","system":{"package_manager":"apk","installed_features":[],"requested_packages":["bash","go@customrepo=1.24","golangci-lint@edgecommunity","nano@stable","curl@mismatch~8"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main","@customrepo https://packages.example.test/alpine/community","@stable https://packages.example.test/alpine/stable","@mismatch https://source.example.test/alpine/main"]},"package_details":[{"name":"go","version":"1.25.1-r0"},{"name":"golangci-lint","version":"2.4.0-r1"},{"name":"nano","version":"8.6-r0"},{"name":"curl","version":"8.14.1-r2"}],"python_environment":null}],"plans":[]}'
+  local target='{"system":{"package_manager":"apk","installed_features":[],"requested_packages":["bash"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main","@stable https://packages.example.test/alpine/stable","@mismatch https://target.example.test/alpine/main"]},"python_environment":null}'
+
+  run_capture recovery_plan_json "$ledger" "$target" mixed
+
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '
+    any(.actions[]; .id == "apk-repository:@customrepo https://packages.example.test/alpine/community" and .status == "requires-confirmation")
+    and any(.actions[]; .id == "apk-repository:@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community" and .status == "requires-confirmation")
+    and any(.actions[]; .id == "os:apk:go@customrepo=1.24" and .status == "requires-confirmation" and .default_selected == false and .version == "1.25.1-r0")
+    and any(.actions[]; .id == "os:apk:golangci-lint@edgecommunity" and .status == "requires-confirmation" and .default_selected == false and .version == "2.4.0-r1")
+    and any(.actions[]; .id == "os:apk:nano@stable" and .status == "pending" and .default_selected == true and .version == "8.6-r0")
+    and any(.actions[]; .id == "os:apk:curl@mismatch~8" and .status == "requires-confirmation" and .default_selected == false and .version == "8.14.1-r2")
+  ' >/dev/null || fail "Expected captured and default APK repository recovery actions, got: $RUN_OUTPUT"
+}
+
+test_upgrade_recovery_plan_reports_unknown_apk_repository_tags() {
+  begin_test "upgrade recovery plan reports APK tags without known repository URLs"
+
+  load_agentctl_functions
+
+  local ledger='{"ledger_schema_version":1,"records":[{"record_id":"source","system":{"package_manager":"apk","installed_features":[],"requested_packages":["tool@private"],"apk_repositories":[]},"python_environment":null}],"plans":[]}'
+  local target='{"system":{"package_manager":"apk","installed_features":[],"requested_packages":[],"apk_repositories":[]},"python_environment":null}'
+
+  run_capture recovery_plan_json "$ledger" "$target" mixed
+
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '
+    any(.actions[]; .id == "manual:apk-repository:private"
+      and .name == "APK repository @private (inspect the backup image)"
+      and .status == "manual-required")
+    and any(.actions[]; .id == "os:apk:tool@private"
+      and .status == "manual-required"
+      and .default_selected == false)
+  ' >/dev/null || fail "Expected explicit manual recovery for an unknown APK repository tag, got: $RUN_OUTPUT"
+}
+
+test_upgrade_recovery_plan_keeps_inherited_tagged_packages_gated() {
+  begin_test "upgrade recovery keeps inherited tagged APK packages gated by their exact repository"
+
+  load_agentctl_functions
+
+  local ledger='{"ledger_schema_version":1,"records":[{"record_id":"source","system":{"package_manager":"apk","installed_features":[],"requested_packages":[],"apk_repositories":["@private https://source.example.test/alpine/main"]},"python_environment":null}],"plans":[{"actions":[{"id":"os:apk:tool@private","kind":"os-package","name":"tool@private","provider":"apk","default_selected":false,"status":"requires-confirmation"},{"id":"os:apk:secret@unknown","kind":"os-package","name":"secret@unknown","provider":"apk","default_selected":false,"status":"manual-required"},{"id":"os:apk:lint@edgecommunity","kind":"os-package","name":"lint@edgecommunity","provider":"apk","default_selected":false,"status":"requires-confirmation"},{"id":"apk-repository:@private https://source.example.test/alpine/main","kind":"apk-repository","name":"@private https://source.example.test/alpine/main","default_selected":false,"status":"requires-confirmation"}]}]}'
+  local target='{"system":{"package_manager":"apk","installed_features":[],"requested_packages":[],"apk_repositories":["@private https://different.example.test/alpine/main"]},"python_environment":null}'
+
+  run_capture recovery_plan_json "$ledger" "$target" mixed
+
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '
+    any(.actions[]; .id == "os:apk:tool@private"
+      and .status == "requires-confirmation"
+      and .default_selected == false)
+    and any(.actions[]; .id == "os:apk:secret@unknown"
+      and .status == "manual-required"
+      and .default_selected == false)
+    and any(.actions[]; .id == "os:apk:lint@edgecommunity"
+      and .status == "requires-confirmation"
+      and .default_selected == false)
+    and any(.actions[]; .id == "apk-repository:@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community")
+  ' >/dev/null || fail "Expected inherited tagged package to remain gated, got: $RUN_OUTPUT"
+  run_capture recovery_selected_ids "$RUN_OUTPUT" all
+  assert_status 0
+  [ -z "$RUN_OUTPUT" ] || fail "Expected inherited tagged package to remain excluded from automatic recovery, got: $RUN_OUTPUT"
+}
+
+test_upgrade_warns_about_image_packages_removed_from_target() {
+  begin_test "upgrade warns about image-provided packages removed from the target image"
 
   load_agentctl_functions
 
@@ -10941,65 +11016,6 @@ test_upgrade_reinstall_command_restores_missing_apk_repository_tags() {
 
   run_capture warn_with_final_package_reminder \
     unit-test-container \
-    agent-plain \
-    agent-python \
-    '{"package_manager":"apk","packages":["bash","go","golangci-lint","zstd"],"requested_packages":["bash","go@customrepo","golangci-lint@edgecommunity","zstd"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main","@customrepo https://packages.example.test/alpine/community"]}' \
-    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main"]}' \
-    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":["https://dl-cdn.alpinelinux.org/alpine/v3.22/main"]}' \
-    unit-test-container
-
-  assert_status 0
-  assert_contains "Upgrade will remove 3 extra apk package(s) not present in agent-python:"
-  assert_contains "To reinstall top-level packages after upgrade:"
-  assert_contains "Restore APK repository tag(s) before reinstalling tagged packages:"
-  assert_contains "@customrepo https://packages.example.test/alpine/community"
-  assert_contains "agentctl su-exec --name unit-test-container sh -lc 'grep -Fxq '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' /etc/apk/repositories || printf \"%s\\\\n\" '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' >> /etc/apk/repositories'"
-  assert_contains "agentctl su-exec --name unit-test-container apk update"
-  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache go@customrepo golangci-lint@edgecommunity zstd"
-  assert_contains "Final reminder:"
-  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "Restore APK repository tag(s) before reinstalling tagged packages:")" -eq 2 ] \
-    || fail "Expected APK repository restore heading before and after upgrade"
-  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "agentctl su-exec --name unit-test-container sh -lc")" -eq 4 ] \
-    || fail "Expected both APK repository restore commands before and after upgrade"
-  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "agentctl su-exec --name unit-test-container apk update")" -eq 2 ] \
-    || fail "Expected apk update before and after upgrade"
-  [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "agentctl su-exec --name unit-test-container apk add --no-cache go@customrepo golangci-lint@edgecommunity zstd")" -eq 2 ] \
-    || fail "Expected APK reinstall command before and after upgrade"
-}
-
-test_upgrade_reinstall_command_suggests_default_apk_edge_tags() {
-  begin_test "upgrade reinstall command suggests default apk edge tags"
-
-  load_agentctl_functions
-
-  CLI_NAME=agentctl
-
-  run_capture warn_upgrade_package_loss \
-    unit-test-container \
-    agent-plain \
-    agent-python \
-    '{"package_manager":"apk","packages":["bash","go","golangci-lint","zstd"],"requested_packages":["bash","go@edgecommunity","golangci-lint@edgecommunity","zstd"],"apk_repositories":[]}' \
-    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":[]}' \
-    '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"],"apk_repositories":[]}' \
-    unit-test-container
-
-  assert_status 0
-  assert_contains "Restore APK repository tag(s) before reinstalling tagged packages:"
-  assert_contains "agentctl su-exec --name unit-test-container sh -lc 'grep -Fxq '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' /etc/apk/repositories || printf \"%s\\\\n\" '\\''@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community'\\'' >> /etc/apk/repositories'"
-  assert_contains "agentctl su-exec --name unit-test-container apk update"
-  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache go@edgecommunity golangci-lint@edgecommunity zstd"
-  assert_not_contains "original repository URL was not available"
-}
-
-test_upgrade_warns_about_image_packages_removed_from_target() {
-  begin_test "upgrade warns about image-provided packages removed from the target image"
-
-  load_agentctl_functions
-
-  CLI_NAME=agentctl
-
-  run_capture warn_upgrade_package_loss \
-    unit-test-container \
     agent-python \
     agent-python \
     '{"package_manager":"apk","packages":["bash","git","legacy-lib","legacy-tool"],"requested_packages":["bash","git","legacy-tool@edgecommunity"],"apk_repositories":["@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"]}' \
@@ -11011,17 +11027,15 @@ test_upgrade_warns_about_image_packages_removed_from_target() {
   assert_contains "Upgrade will also remove 2 image-provided apk package(s) from agent-python that are no longer present in agent-python:"
   assert_contains "  - legacy-lib"
   assert_contains "  - legacy-tool"
-  assert_contains "If you still need them, reinstall top-level packages after upgrade:"
-  assert_contains "Restore APK repository tag(s) before reinstalling tagged packages:"
-  assert_contains "@edgecommunity https://dl-cdn.alpinelinux.org/alpine/edge/community"
-  assert_contains "agentctl su-exec --name unit-test-container apk update"
-  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache legacy-tool@edgecommunity"
+  assert_not_contains "reinstall top-level packages after upgrade"
+  assert_not_contains "Restore APK repository tag(s)"
+  assert_not_contains "agentctl su-exec"
   assert_not_contains "Upgrade will remove 2 extra apk package(s)"
   assert_not_contains "apk add --no-cache legacy-lib"
 }
 
-test_upgrade_reinstall_command_prefers_requested_dpkg_packages() {
-  begin_test "upgrade reinstall command prefers requested dpkg packages"
+test_upgrade_package_summary_uses_top_level_dpkg_count() {
+  begin_test "upgrade package summary reports top-level DPKG recovery without dependency details"
 
   load_agentctl_functions
 
@@ -11034,14 +11048,14 @@ test_upgrade_reinstall_command_prefers_requested_dpkg_packages() {
     '{"package_manager":"dpkg","packages":["bash","libc6","tree"],"requested_packages":["bash","tree"]}' \
     '{"package_manager":"dpkg","packages":["bash","libc6"],"requested_packages":["bash"]}' \
     '{"package_manager":"dpkg","packages":["bash","libc6"],"requested_packages":["bash"]}' \
-    unit-test-container
+    unit-test-container \
+    '[]' \
+    summary
 
   assert_status 0
-  assert_contains "Upgrade will remove 1 extra dpkg package(s) not present in agent-swift:"
-  assert_contains "  - tree"
-  assert_contains "To reinstall top-level packages after upgrade:"
-  assert_contains "agentctl su-exec --name unit-test-container apt-get update"
-  assert_contains "agentctl su-exec --name unit-test-container apt-get install -y tree"
+  assert_contains "Upgrade recovery will offer 1 top-level dpkg package(s) not present in agent-swift"
+  assert_not_contains "  - tree"
+  assert_not_contains "apt-get update"
 }
 
 test_upgrade_package_warning_excludes_reinstalled_feature_packages() {
@@ -11068,12 +11082,12 @@ test_upgrade_package_warning_excludes_reinstalled_feature_packages() {
     '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
     '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
     unit-test-container \
-    '["office"]'
+    '["office"]' \
+    summary
 
   assert_status 0
-  assert_contains "agentctl su-exec --name unit-test-container apk add --no-cache ripgrep"
-  assert_not_contains "apk add --no-cache build-base"
-  assert_not_contains "apk add --no-cache pandoc-cli"
+  assert_contains "Upgrade recovery will offer 1 top-level apk package(s)"
+  assert_not_contains "apk add --no-cache"
 
   run_capture warn_upgrade_package_loss \
     unit-test-container \
@@ -11083,7 +11097,8 @@ test_upgrade_package_warning_excludes_reinstalled_feature_packages() {
     '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
     '{"package_manager":"apk","packages":["bash"],"requested_packages":["bash"]}' \
     unit-test-container \
-    '["office"]'
+    '["office"]' \
+    summary
 
   assert_status 0
   [ -z "$RUN_OUTPUT" ] || fail "Expected feature-owned package warning to be suppressed, got: $RUN_OUTPUT"
@@ -14126,6 +14141,227 @@ test_upgrade_recovery_marks_successful_items_restored() {
     || fail "Expected unselected recovery item to remain pending, got: $RUN_OUTPUT"
 }
 
+test_upgrade_recovery_summary_counts_outcomes() {
+  begin_test "upgrade recovery summarizes restored failed and deferred actions"
+
+  load_agentctl_functions
+
+  run_capture recovery_print_summary \
+    '{"actions":[{"status":"restored"},{"status":"restored"},{"status":"failed"},{"status":"pending"},{"status":"requires-confirmation"},{"status":"manual-required"},{"status":"dismissed"}]}'
+
+  assert_status 0
+  [ "$RUN_OUTPUT" = "Recovery summary: 2 restored, 1 failed, 3 deferred." ] \
+    || fail "Expected concise recovery outcome counts, got: $RUN_OUTPUT"
+}
+
+test_upgrade_recovery_excludes_feature_owned_os_packages() {
+  begin_test "upgrade recovery excludes OS packages owned by a missing feature"
+
+  load_agentctl_functions
+
+  local feature_registry
+  local ledger
+  local target
+  local recovery_plan
+  feature_registry="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-feature-registry.XXXXXX")"
+  register_dir_cleanup "$feature_registry"
+  printf '%s\n' \
+    '{"supported_image_families":["agent-python"],"system_packages":{"apk":["libreoffice","font-noto"]}}' \
+    >"$feature_registry/office.json"
+  AGENTCTL_HOST_FEATURE_REGISTRY_DIR="$feature_registry"
+  ledger='{"ledger_schema_version":1,"records":[{"record_id":"source","system":{"package_manager":"apk","installed_features":["office"],"requested_packages":["tree","libreoffice","font-noto"]},"python_environment":null}],"plans":[{"actions":[{"id":"os:apk:libreoffice","kind":"os-package","name":"libreoffice","provider":"apk","default_selected":true,"status":"failed"}]}]}'
+  target='{"system":{"package_manager":"apk","installed_features":[],"requested_packages":[]},"python_environment":null}'
+
+  run_capture recovery_plan_json "$ledger" "$target" mixed agent-python
+
+  assert_status 0
+  recovery_plan="$RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -e '
+    any(.actions[]; .id == "feature:office")
+    and ([.actions[] | select(.kind == "os-package" and .default_selected)] | map(.name)) == ["tree"]
+    and all(.actions[]; .id != "os:apk:libreoffice" and .id != "os:apk:font-noto")
+  ' >/dev/null || fail "Expected feature-owned packages to be absent from recovery actions, got: $RUN_OUTPUT"
+
+  run_capture warn_upgrade_package_loss \
+    unit-test-container agent-python agent-python \
+    '{"package_manager":"apk","packages":["tree","libreoffice","font-noto"],"requested_packages":["tree","libreoffice","font-noto"],"installed_features":["office"]}' \
+    '{"package_manager":"apk","packages":[],"requested_packages":[],"installed_features":[]}' \
+    '{"package_manager":"apk","packages":[],"requested_packages":[],"installed_features":[]}' \
+    unit-test-container '["office"]' summary
+  assert_status 0
+  assert_contains "Upgrade recovery will offer 1 top-level apk package(s)"
+  [ "$(printf '%s' "$recovery_plan" | jq '[.actions[] | select(.kind == "os-package" and .default_selected)] | length')" -eq 1 ] \
+    || fail "Expected concise count to match the recovery plan"
+}
+
+test_upgrade_restore_reports_completed_plan_without_deferral() {
+  begin_test "upgrade restore reports an already-completed plan without deferral"
+
+  load_agentctl_functions
+
+  container_exists() { return 0; }
+  container_running() { return 0; }
+  recovery_ledger_json() {
+    printf '%s\n' '{"ledger_schema_version":1,"plans":[{"actions":[{"id":"os:apk:tree","status":"restored"},{"id":"runtime:claude","status":"dismissed"}]}]}'
+  }
+
+  run_capture upgrade_restore_cmd --name unit-test-container --all-compatible
+
+  assert_status 0
+  assert_contains "Recovery summary: 1 restored, 0 failed, 0 deferred."
+  assert_contains "Recovery already complete: unit-test-container"
+  assert_not_contains "Recovery deferred"
+}
+
+test_upgrade_recovery_batches_compatible_os_packages() {
+  begin_test "upgrade recovery batches compatible DPKG and APK packages"
+
+  load_agentctl_functions
+
+  local call_log=""
+  local plan='{"actions":[{"id":"os:dpkg:curl","kind":"os-package","name":"curl","provider":"dpkg"},{"id":"os:dpkg:tree","kind":"os-package","name":"tree","provider":"dpkg"},{"id":"os:apk:git","kind":"os-package","name":"git@edgecommunity=2.0","provider":"apk"},{"id":"os:apk:ripgrep","kind":"os-package","name":"ripgrep","provider":"apk"}]}'
+  CONTAINER_CMD=container
+  container() {
+    call_log="${call_log}$*"$'\n'
+    return 0
+  }
+
+  run_capture recovery_apply_selected unit-test-container "$plan" \
+    $'os:dpkg:curl\nos:dpkg:tree\nos:apk:git\nos:apk:ripgrep' mixed
+
+  assert_status 0
+  [ "$(printf '%s' "$call_log" | grep -Fc 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"')" -eq 1 ] \
+    || fail "Expected one batched APT transaction, got: $call_log"
+  printf '%s' "$call_log" | grep -Fq "sh curl tree" \
+    || fail "Expected both DPKG packages in one transaction, got: $call_log"
+  [ "$(printf '%s' "$call_log" | grep -Fc 'apk add --no-cache')" -eq 1 ] \
+    || fail "Expected one batched APK transaction, got: $call_log"
+  printf '%s' "$call_log" | grep -Fq "apk add --no-cache git@edgecommunity ripgrep" \
+    || fail "Expected one unpinned mixed-policy APK transaction, got: $call_log"
+  [ "$RECOVERY_RESTORED_IDS" = $'os:apk:git\nos:apk:ripgrep\nos:dpkg:curl\nos:dpkg:tree' ] \
+    || fail "Expected every batched package action to be restored, got: $RECOVERY_RESTORED_IDS"
+  [ -z "$RECOVERY_FAILED_IDS" ] || fail "Expected no failed package actions, got: $RECOVERY_FAILED_IDS"
+}
+
+test_upgrade_recovery_locked_apk_uses_captured_version_once() {
+  begin_test "upgrade recovery locked APK normalizes constraints before applying the captured version"
+
+  load_agentctl_functions
+
+  local call_log=""
+  local plan='{"actions":[{"id":"os:apk:go@customrepo=1.24","kind":"os-package","name":"go@customrepo=1.24","provider":"apk","version":"1.25.1-r0"}]}'
+  CONTAINER_CMD=container
+  container() {
+    call_log="${call_log}$*"$'\n'
+    return 0
+  }
+
+  run_capture recovery_apply_selected unit-test-container "$plan" 'os:apk:go@customrepo=1.24' locked
+
+  assert_status 0
+  printf '%s' "$call_log" | grep -Fq "apk add --no-cache go@customrepo=1.25.1-r0" \
+    || fail "Expected one normalized locked APK constraint, got: $call_log"
+  if printf '%s' "$call_log" | grep -Fq "go@customrepo=1.24=1.25.1-r0"; then
+    fail "Did not expect doubled APK constraints: $call_log"
+  fi
+}
+
+test_upgrade_recovery_verifies_each_package_after_batch_failure() {
+  begin_test "upgrade recovery preserves per-package results after a failed batch"
+
+  load_agentctl_functions
+
+  local call_log=""
+  local plan='{"actions":[{"id":"os:dpkg:curl","kind":"os-package","name":"curl","provider":"dpkg"},{"id":"os:dpkg:tree","kind":"os-package","name":"tree","provider":"dpkg"}]}'
+  CONTAINER_CMD=container
+  container() {
+    call_log="${call_log}$*"$'\n'
+    case "$*" in
+      *"apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install"*) return 1 ;;
+      *"dpkg-query"*" curl") printf 'ii \t8.0\n'; return 0 ;;
+      *"dpkg-query"*" tree") return 1 ;;
+      *"apt-mark showmanual"*) printf 'curl\n'; return 0 ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture recovery_apply_selected unit-test-container "$plan" $'os:dpkg:curl\nos:dpkg:tree' mixed
+
+  assert_status 1
+  [ "$(printf '%s' "$call_log" | grep -Fc 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"')" -eq 1 ] \
+    || fail "Expected one failed APT transaction, got: $call_log"
+  [ "$RECOVERY_RESTORED_IDS" = "os:dpkg:curl" ] \
+    || fail "Expected installed package to be recorded as restored, got: $RECOVERY_RESTORED_IDS"
+  [ "$RECOVERY_FAILED_IDS" = "os:dpkg:tree" ] \
+    || fail "Expected missing package to remain failed, got: $RECOVERY_FAILED_IDS"
+}
+
+test_upgrade_recovery_rejects_false_success_after_failed_locked_batch() {
+  begin_test "upgrade recovery rejects automatic and wrong-version packages after a failed locked batch"
+
+  load_agentctl_functions
+
+  local plan='{"actions":[{"id":"os:dpkg:auto","kind":"os-package","name":"auto","provider":"dpkg","version":"1.0"},{"id":"os:dpkg:wrong","kind":"os-package","name":"wrong","provider":"dpkg","version":"2.0"},{"id":"os:dpkg:exact","kind":"os-package","name":"exact","provider":"dpkg","version":"3.0"}]}'
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      *"apt-get update &&"*) return 1 ;;
+      *"dpkg-query"*" auto") printf 'ii \t1.0\n'; return 0 ;;
+      *"dpkg-query"*" wrong") printf 'ii \t1.5\n'; return 0 ;;
+      *"dpkg-query"*" exact") printf 'ii \t3.0\n'; return 0 ;;
+      *"apt-mark showmanual"*) printf 'wrong\nexact\n'; return 0 ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture recovery_apply_selected unit-test-container "$plan" \
+    $'os:dpkg:auto\nos:dpkg:wrong\nos:dpkg:exact' locked
+
+  assert_status 1
+  [ "$RECOVERY_RESTORED_IDS" = "os:dpkg:exact" ] \
+    || fail "Expected only the manual exact-version package restored, got: $RECOVERY_RESTORED_IDS"
+  [ "$RECOVERY_FAILED_IDS" = $'os:dpkg:auto\nos:dpkg:wrong' ] \
+    || fail "Expected automatic and wrong-version packages to remain failed, got: $RECOVERY_FAILED_IDS"
+}
+
+test_upgrade_recovery_applies_actions_in_dependency_order() {
+  begin_test "upgrade recovery applies repositories packages features runtimes and Python in order"
+
+  load_agentctl_functions
+
+  local call_log=""
+  local plan='{"actions":[{"id":"python:httpx","kind":"python-package","name":"httpx","version":"0.28.1"},{"id":"runtime:claude","kind":"runtime","name":"claude"},{"id":"feature:office","kind":"feature","name":"office"},{"id":"os:apk:tree","kind":"os-package","name":"tree","provider":"apk"},{"id":"apk-repository:@edgecommunity https://example.test/community","kind":"apk-repository","name":"@edgecommunity https://example.test/community"}]}'
+  CONTAINER_CMD=container
+  SETPRIV_ARGS=(setpriv)
+  container() {
+    case "$*" in
+      *"/etc/apk/repositories"*) call_log="${call_log}repository"$'\n'; return 1 ;;
+      *"apk add --no-cache tree"*) call_log="${call_log}os-package"$'\n'; return 0 ;;
+      *"pip install"*) call_log="${call_log}python-package"$'\n'; return 0 ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  run_agent_sh_in_container_root() {
+    call_log="${call_log}feature"$'\n'
+    return 0
+  }
+  install_runtime_in_container() {
+    call_log="${call_log}runtime"$'\n'
+    return 0
+  }
+
+  run_capture recovery_apply_selected unit-test-container "$plan" \
+    $'python:httpx\nruntime:claude\nfeature:office\nos:apk:tree\napk-repository:@edgecommunity https://example.test/community' mixed
+
+  assert_status 1
+  [ "$call_log" = $'repository\nos-package\nfeature\nruntime\npython-package\n' ] \
+    || fail "Expected dependency-safe recovery order, got: $call_log"
+  [ "$RECOVERY_FAILED_IDS" = "apk-repository:@edgecommunity https://example.test/community" ] \
+    || fail "Expected failed repository accounting, got: $RECOVERY_FAILED_IDS"
+  [ "$RECOVERY_RESTORED_IDS" = $'os:apk:tree\nfeature:office\nruntime:claude\npython:httpx' ] \
+    || fail "Expected later per-action accounting to continue, got: $RECOVERY_RESTORED_IDS"
+}
+
 test_upgrade_recovery_retries_failed_actions() {
   begin_test "upgrade recovery makes failed compatible actions retryable"
 
@@ -14153,6 +14389,25 @@ test_upgrade_recovery_restore_selects_failed_actions() {
   assert_status 0
   [ "$RUN_OUTPUT" = "os:apk:tree" ] \
     || fail "Expected --all-compatible recovery to retry failed default action, got: $RUN_OUTPUT"
+}
+
+test_upgrade_recovery_interactive_all_confirms_repository_actions() {
+  begin_test "upgrade recovery interactive all includes confirmation-required actions"
+
+  load_agentctl_functions
+
+  local plan='{"actions":[{"id":"os:apk:tree","default_selected":true,"status":"pending"},{"id":"apk-repository:@edge https://example.test","default_selected":false,"status":"requires-confirmation"},{"id":"os:apk:nano@edge","default_selected":false,"status":"requires-confirmation"},{"id":"manual:repo","default_selected":false,"status":"manual-required"}]}'
+  local table=$'os:apk:tree\tpackage\napk-repository:@edge https://example.test\trepository\nos:apk:nano@edge\ttagged package'
+
+  run_capture recovery_ids_for_interactive_answer "$plan" "$table" ""
+  assert_status 0
+  [ "$RUN_OUTPUT" = "os:apk:tree" ] \
+    || fail "Expected the empty answer to keep the recommended selection, got: $RUN_OUTPUT"
+
+  run_capture recovery_ids_for_interactive_answer "$plan" "$table" all
+  assert_status 0
+  [ "$RUN_OUTPUT" = $'os:apk:tree\napk-repository:@edge https://example.test\nos:apk:nano@edge' ] \
+    || fail "Expected explicit all to include confirmation-required actions, got: $RUN_OUTPUT"
 }
 
 test_upgrade_recovery_reports_export_capture_limitations() {
@@ -14326,6 +14581,7 @@ main() {
   run_selected_test test_bootstrap_cmd_rejects_unsupported_base "test_bootstrap_cmd_rejects_unsupported_base"
   run_selected_test test_agentctl_wrapper_usage_banner "test_agentctl_wrapper_usage_banner"
   run_selected_test test_host_test_filter_normalizes_case_hyphens_spaces_and_underscores "test_host_test_filter_normalizes_case_hyphens_spaces_and_underscores"
+  run_selected_test test_upgrade_help_reports_package_detail_option "test_upgrade_help_reports_package_detail_option"
   run_selected_test test_refresh_help_reports_new_command "test_refresh_help_reports_new_command"
   run_selected_test test_bootstrap_help_reports_new_command "test_bootstrap_help_reports_new_command"
   run_selected_test test_system_manifest_help_reports_new_command "test_system_manifest_help_reports_new_command"
@@ -14486,11 +14742,12 @@ main() {
   run_selected_test test_upgrade_copy_dry_run_reports_copy_plan "test_upgrade_copy_dry_run_reports_copy_plan"
   run_selected_test test_upgrade_stopped_dry_run_does_not_start_source "test_upgrade_stopped_dry_run_does_not_start_source"
   run_selected_test test_upgrade_warns_about_added_packages_missing_from_target_image "test_upgrade_warns_about_added_packages_missing_from_target_image"
-  run_selected_test test_upgrade_reinstall_command_prefers_requested_apk_packages "test_upgrade_reinstall_command_prefers_requested_apk_packages"
-  run_selected_test test_upgrade_reinstall_command_restores_missing_apk_repository_tags "test_upgrade_reinstall_command_restores_missing_apk_repository_tags"
-  run_selected_test test_upgrade_reinstall_command_suggests_default_apk_edge_tags "test_upgrade_reinstall_command_suggests_default_apk_edge_tags"
+  run_selected_test test_upgrade_package_summary_uses_top_level_apk_count "test_upgrade_package_summary_uses_top_level_apk_count"
+  run_selected_test test_upgrade_recovery_plan_restores_missing_apk_repository_tags "test_upgrade_recovery_plan_restores_missing_apk_repository_tags"
+  run_selected_test test_upgrade_recovery_plan_reports_unknown_apk_repository_tags "test_upgrade_recovery_plan_reports_unknown_apk_repository_tags"
+  run_selected_test test_upgrade_recovery_plan_keeps_inherited_tagged_packages_gated "test_upgrade_recovery_plan_keeps_inherited_tagged_packages_gated"
   run_selected_test test_upgrade_warns_about_image_packages_removed_from_target "test_upgrade_warns_about_image_packages_removed_from_target"
-  run_selected_test test_upgrade_reinstall_command_prefers_requested_dpkg_packages "test_upgrade_reinstall_command_prefers_requested_dpkg_packages"
+  run_selected_test test_upgrade_package_summary_uses_top_level_dpkg_count "test_upgrade_package_summary_uses_top_level_dpkg_count"
   run_selected_test test_upgrade_package_warning_excludes_reinstalled_feature_packages "test_upgrade_package_warning_excludes_reinstalled_feature_packages"
   run_selected_test test_upgrade_reinstalls_added_runtimes_and_features_in_target "test_upgrade_reinstalls_added_runtimes_and_features_in_target"
   run_selected_test test_upgrade_reinstalls_missing_default_runtime_after_restore "test_upgrade_reinstalls_missing_default_runtime_after_restore"
@@ -14502,8 +14759,17 @@ main() {
   run_selected_test test_upgrade_recovery_plan_keeps_deferred_actions_across_images "test_upgrade_recovery_plan_keeps_deferred_actions_across_images"
   run_selected_test test_upgrade_recovery_ledger_appends_immutable_records "test_upgrade_recovery_ledger_appends_immutable_records"
   run_selected_test test_upgrade_recovery_marks_successful_items_restored "test_upgrade_recovery_marks_successful_items_restored"
+  run_selected_test test_upgrade_recovery_summary_counts_outcomes "test_upgrade_recovery_summary_counts_outcomes"
+  run_selected_test test_upgrade_recovery_excludes_feature_owned_os_packages "test_upgrade_recovery_excludes_feature_owned_os_packages"
+  run_selected_test test_upgrade_restore_reports_completed_plan_without_deferral "test_upgrade_restore_reports_completed_plan_without_deferral"
+  run_selected_test test_upgrade_recovery_batches_compatible_os_packages "test_upgrade_recovery_batches_compatible_os_packages"
+  run_selected_test test_upgrade_recovery_locked_apk_uses_captured_version_once "test_upgrade_recovery_locked_apk_uses_captured_version_once"
+  run_selected_test test_upgrade_recovery_verifies_each_package_after_batch_failure "test_upgrade_recovery_verifies_each_package_after_batch_failure"
+  run_selected_test test_upgrade_recovery_rejects_false_success_after_failed_locked_batch "test_upgrade_recovery_rejects_false_success_after_failed_locked_batch"
+  run_selected_test test_upgrade_recovery_applies_actions_in_dependency_order "test_upgrade_recovery_applies_actions_in_dependency_order"
   run_selected_test test_upgrade_recovery_retries_failed_actions "test_upgrade_recovery_retries_failed_actions"
   run_selected_test test_upgrade_recovery_restore_selects_failed_actions "test_upgrade_recovery_restore_selects_failed_actions"
+  run_selected_test test_upgrade_recovery_interactive_all_confirms_repository_actions "test_upgrade_recovery_interactive_all_confirms_repository_actions"
   run_selected_test test_upgrade_recovery_reports_export_capture_limitations "test_upgrade_recovery_reports_export_capture_limitations"
   run_selected_test test_container_baseline_manifest_starts_stopped_container_and_restores_state "test_container_baseline_manifest_starts_stopped_container_and_restores_state"
   run_selected_test test_image_system_manifest_removes_temp_container_after_success "test_image_system_manifest_removes_temp_container_after_success"
