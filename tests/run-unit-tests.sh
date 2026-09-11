@@ -14404,18 +14404,31 @@ test_upgrade_recovery_plan_keeps_deferred_actions_across_images() {
   load_agentctl_functions
 
   local ledger
+  local first_plan
   local target
-  ledger='{"ledger_schema_version":1,"records":[{"record_id":"first","system":{"package_manager":"apk","installed_runtimes":["codex","claude"],"installed_features":["office"],"requested_packages":["tree"]},"python_environment":{"python":"Python 3.14.1","packages":[{"name":"httpx","version":"0.28.1","requested":true}]}}]}'
+  ledger='{"ledger_schema_version":1,"records":[{"record_id":"first","system":{"package_manager":"apk","installed_runtimes":["codex","claude"],"installed_features":["office"],"requested_packages":["tree"],"preferred_runtime":"claude"},"python_environment":{"python":"Python 3.14.1","packages":[{"name":"httpx","version":"0.28.1","requested":true}]}}]}'
   target='{"system":{"package_manager":"dpkg","installed_runtimes":["codex"],"installed_features":[],"requested_packages":[]},"python_environment":{"python":"Python 3.14.5","packages":[]}}'
 
   run_capture recovery_plan_json "$ledger" "$target" mixed
   assert_status 0
   printf '%s' "$RUN_OUTPUT" | jq -e '
-    (.actions | map(.id) | index("runtime:claude"))
+    (.actions[] | select(.id == "runtime:claude") | .restore_preference == true)
     and (.actions | map(.id) | index("feature:office"))
     and (.actions[] | select(.id == "os:apk:tree") | .status == "incompatible")
     and (.actions[] | select(.id == "python:httpx") | .status == "pending")
   ' >/dev/null || fail "Expected runtime, feature, deferred OS, and Python recovery actions, got: $RUN_OUTPUT"
+
+  first_plan="$RUN_OUTPUT"
+  ledger="$(jq -cn --argjson ledger "$ledger" --argjson plan "$first_plan" '
+    $ledger
+    | .records += [{record_id:"second", system:{package_manager:"dpkg", installed_runtimes:["codex"],
+        installed_features:[], requested_packages:[], preferred_runtime:"codex"}, python_environment:null}]
+    | .plans = [$plan]')"
+  run_capture recovery_plan_json "$ledger" "$target" mixed
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '
+    .actions[] | select(.id == "runtime:claude") | .restore_preference == true
+  ' >/dev/null || fail "Expected deferred Claude preference intent to survive a later recovery plan, got: $RUN_OUTPUT"
 }
 
 test_upgrade_recovery_ledger_appends_immutable_records() {
@@ -14670,6 +14683,98 @@ test_upgrade_recovery_applies_actions_in_dependency_order() {
     || fail "Expected failed repository accounting, got: $RECOVERY_FAILED_IDS"
   [ "$RECOVERY_RESTORED_IDS" = $'os:apk:tree\nfeature:office\nruntime:claude\npython:httpx' ] \
     || fail "Expected later per-action accounting to continue, got: $RECOVERY_RESTORED_IDS"
+}
+
+test_upgrade_recovery_runtime_install_preserves_preferred_runtime() {
+  begin_test "upgrade recovery installs runtimes without changing the preferred runtime"
+
+  load_agentctl_functions
+
+  local normal_install_called=0
+  local skip_preferred_install_called=0
+  local preferred_runtime="codex"
+  local plan='{"actions":[{"id":"runtime:claude","kind":"runtime","name":"claude"}]}'
+
+  runtime_install_memory_pressure_limit() { return 1; }
+  recovery_apply_os_package_batch() { return 0; }
+  run_agent_sh_in_container() {
+    normal_install_called=1
+    preferred_runtime="$4"
+  }
+  run_agent_sh_in_container_env() {
+    [ "$2" = "AGENTCTL_SKIP_PREFERRED_SET=1" ] \
+      && [ "$3" = "--" ] \
+      && [ "$4" = "runtime" ] \
+      && [ "$5" = "install" ] \
+      && [ "$6" = "claude" ] \
+      || fail "Expected recovery runtime install to skip preference changes, got: $*"
+    skip_preferred_install_called=1
+  }
+
+  run_capture recovery_apply_selected unit-test-container "$plan" runtime:claude mixed
+
+  assert_status 0
+  [ "$normal_install_called" -eq 0 ] \
+    || fail "Did not expect recovery to use a preference-changing runtime install"
+  [ "$skip_preferred_install_called" -eq 1 ] \
+    || fail "Expected recovery to use the skip-preference runtime install path"
+  [ "$preferred_runtime" = "codex" ] \
+    || fail "Expected preferred runtime to remain codex, got: $preferred_runtime"
+  [ "$RECOVERY_RESTORED_IDS" = "runtime:claude" ] \
+    || fail "Expected Claude recovery to be recorded as restored, got: $RECOVERY_RESTORED_IDS"
+}
+
+test_upgrade_recovery_restores_deferred_preferred_runtime() {
+  begin_test "upgrade recovery reselects a successfully restored preferred runtime"
+
+  load_agentctl_functions
+
+  local install_status=0
+  local preferred_set=""
+  local plan='{"actions":[{"id":"runtime:claude","kind":"runtime","name":"claude","restore_preference":true}]}'
+
+  recovery_apply_os_package_batch() { return 0; }
+  install_runtime_in_container() {
+    [ "$3" = "1" ] || fail "Expected recovery installation to skip its implicit preference change"
+    return "$install_status"
+  }
+  set_preferred_runtime_in_container() {
+    preferred_set="$2"
+  }
+
+  run_capture recovery_apply_selected unit-test-container "$plan" runtime:claude mixed
+
+  assert_status 0
+  [ "$preferred_set" = "claude" ] \
+    || fail "Expected a successfully restored preferred runtime to be reselected, got: $preferred_set"
+  [ "$RECOVERY_RESTORED_IDS" = "runtime:claude" ] \
+    || fail "Expected Claude recovery to be recorded as restored, got: $RECOVERY_RESTORED_IDS"
+
+  install_status=42
+  preferred_set=""
+  run_capture recovery_apply_selected unit-test-container "$plan" runtime:claude mixed
+
+  assert_status 1
+  [ -z "$preferred_set" ] \
+    || fail "Did not expect a failed runtime restoration to change the preferred runtime"
+  [ "$RECOVERY_FAILED_IDS" = "runtime:claude" ] \
+    || fail "Expected failed Claude recovery to remain retryable, got: $RECOVERY_FAILED_IDS"
+}
+
+test_install_runtime_in_container_propagates_install_failure() {
+  begin_test "runtime installation helper propagates normal and skip-preference failures"
+
+  load_agentctl_functions
+
+  runtime_install_memory_pressure_limit() { return 1; }
+  run_agent_sh_in_container() { return 42; }
+  run_agent_sh_in_container_env() { return 43; }
+
+  run_capture install_runtime_in_container unit-test-container claude
+  assert_status 42
+
+  run_capture install_runtime_in_container unit-test-container claude 1
+  assert_status 43
 }
 
 test_upgrade_recovery_retries_failed_actions() {
@@ -15085,6 +15190,9 @@ main() {
   run_selected_test test_upgrade_recovery_verifies_each_package_after_batch_failure "test_upgrade_recovery_verifies_each_package_after_batch_failure"
   run_selected_test test_upgrade_recovery_rejects_false_success_after_failed_locked_batch "test_upgrade_recovery_rejects_false_success_after_failed_locked_batch"
   run_selected_test test_upgrade_recovery_applies_actions_in_dependency_order "test_upgrade_recovery_applies_actions_in_dependency_order"
+  run_selected_test test_upgrade_recovery_runtime_install_preserves_preferred_runtime "test_upgrade_recovery_runtime_install_preserves_preferred_runtime"
+  run_selected_test test_upgrade_recovery_restores_deferred_preferred_runtime "test_upgrade_recovery_restores_deferred_preferred_runtime"
+  run_selected_test test_install_runtime_in_container_propagates_install_failure "test_install_runtime_in_container_propagates_install_failure"
   run_selected_test test_upgrade_recovery_retries_failed_actions "test_upgrade_recovery_retries_failed_actions"
   run_selected_test test_upgrade_recovery_restore_selects_failed_actions "test_upgrade_recovery_restore_selects_failed_actions"
   run_selected_test test_upgrade_recovery_interactive_all_confirms_repository_actions "test_upgrade_recovery_interactive_all_confirms_repository_actions"

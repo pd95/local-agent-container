@@ -7377,13 +7377,11 @@ install_runtime_in_container() {
   fi
 
   if [ "$skip_preferred" -eq 1 ]; then
-    if run_agent_sh_in_container_env "$name" AGENTCTL_SKIP_PREFERRED_SET=1 -- runtime install "$runtime"; then
-      return 0
-    fi
-  elif run_agent_sh_in_container "$name" runtime install "$runtime"; then
-    return 0
+    run_agent_sh_in_container_env "$name" AGENTCTL_SKIP_PREFERRED_SET=1 -- runtime install "$runtime" || status=$?
+  else
+    run_agent_sh_in_container "$name" runtime install "$runtime" || status=$?
   fi
-  status=$?
+  [ "$status" -ne 0 ] || return 0
 
   if [ -n "$low_mem_limit" ]; then
     die "Claude runtime install failed in $name. The container is limited to $low_mem_limit, and the installer can be killed by memory pressure. Recreate it with: ${CLI_NAME} upgrade --name $name --mem $CLAUDE_MIN_INSTALL_MEM"
@@ -10931,7 +10929,11 @@ recovery_plan_json() {
           elif $provider != "apk" or $tag == "" or apk_repository_present($tag) then "pending"
           elif ($unresolved_apk_tags | index($tag)) != null then "manual-required"
           else "requires-confirmation" end;
-      (($ledger.plans[-1].actions // [])
+      (($ledger.plans[-1].source_record_id // "") as $inherited_source_record_id
+       | ([$ledger.records[]?
+           | select(.record_id == $inherited_source_record_id)
+           | .system.preferred_runtime // empty][0] // "") as $inherited_preferred_runtime
+       | ($ledger.plans[-1].actions // [])
        | map(select(.status != "dismissed" and .status != "restored")
              | if .status == "failed" then .status = "pending" else . end
              | if .kind == "os-package" then
@@ -10939,10 +10941,14 @@ recovery_plan_json() {
                  | .default_selected = (.status == "pending")
                elif .kind == "python-package" and $target.python_environment != null then
                  .default_selected = true | .status = "pending"
+               elif .kind == "runtime" then
+                 .restore_preference = ((.restore_preference // false) or (.name == $inherited_preferred_runtime))
                else . end)
        | map(. as $action | select($action.kind != "os-package" or ($managed_os | index($action.name | package_base)) == null))) as $inherited_actions
     | [($source_system.installed_runtimes // [])[] as $name | select(($target_runtimes | index($name)) == null)
-       | {kind:"runtime", id:("runtime:" + $name), name: $name, default_selected:true, status:"pending"}] as $runtimes
+       | {kind:"runtime", id:("runtime:" + $name), name: $name, default_selected:true, status:"pending",
+          restore_preference:((($source_system.preferred_runtime // "") == $name)
+            or any($inherited_actions[]?; .id == ("runtime:" + $name) and (.restore_preference // false)))}] as $runtimes
     | [($source_system.installed_features // [])[] as $name | select(($target_features | index($name)) == null)
        | {kind:"feature", id:("feature:" + $name), name: $name, default_selected:true, status:"pending"}] as $features
     | [($source_system.requested_packages // [])[] as $name
@@ -11223,7 +11229,7 @@ recovery_apply_selected() {
   local plan="$2"
   local selected_ids="$3"
   local policy="$4"
-  local action id kind package version status=0 action_status=0 selected_json='[]'
+  local action id kind package version restore_preference status=0 action_status=0 selected_json='[]'
   RECOVERY_RESTORED_IDS=""
   RECOVERY_FAILED_IDS=""
 
@@ -11274,10 +11280,19 @@ recovery_apply_selected() {
     kind="$(printf '%s' "$action" | jq -r '.kind')"
     package="$(printf '%s' "$action" | jq -r '.name')"
     version="$(printf '%s' "$action" | jq -r '.version // empty')"
+    restore_preference="$(printf '%s' "$action" | jq -r '.restore_preference // false')"
     action_status=0
     case "$kind" in
       apk-repository|apt-source|os-package) continue ;;
-      runtime) install_runtime_in_container "$name" "$package" || action_status=1 ;;
+      runtime)
+        if install_runtime_in_container "$name" "$package" 1; then
+          if [ "$restore_preference" = true ]; then
+            set_preferred_runtime_in_container "$name" "$package" || action_status=1
+          fi
+        else
+          action_status=1
+        fi
+        ;;
       feature) run_agent_sh_in_container_root "$name" feature install "$package" || action_status=1 ;;
       python-package)
         if [ "$policy" = latest ]; then version=""; fi
