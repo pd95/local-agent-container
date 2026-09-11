@@ -35,6 +35,21 @@ temporary containers. Persisted containers retain both the safe host
 definitions and Codex endpoint registration, so later `run --online` sessions
 do not need to repeat `--mcp`.
 
+After a container has MCP wiring, manage its definitions without recreating it:
+
+```bash
+agentctl mcp add xcode
+agentctl mcp add @"$HOME/.config/agentctl/private-mcp.json"
+agentctl mcp list
+agentctl mcp remove xcode
+```
+
+Use `--name NAME` when targeting a container outside its project workdir.
+Adding an identical definition is a successful no-op. To change an existing
+definition, remove it and then add its replacement. Definition changes fail
+while an `agentctl run` MCP lease is active. Removing the final definition
+leaves the bridge wiring enabled so another definition can be added later.
+
 Other runtimes currently require manual configuration using URLs such as:
 
 ```text
@@ -136,6 +151,10 @@ host loopback. HTTPS uses normal certificate and hostname verification.
 The private host registry persists safe definitions and credential references,
 never literal values or resolved credentials. A container request cannot change
 the authorized command, upstream URL, or configured authentication header.
+Because `agentctl mcp add` changes persistent configuration rather than starting
+an invocation, it rejects literal `env` and `headers` values. Use `env_vars`,
+`header_env_vars`, `header_keychain_credentials`, `bearer_token_env_var`, or
+`bearer_token_keychain` instead.
 
 For the complete HTTP schema and implementation security model, see
 [Managed HTTP MCP upstreams](managed-mcp-http-upstreams.md).
@@ -166,10 +185,16 @@ Containers created without MCP wiring need an explicit migration:
 agentctl upgrade --name agent-project --enable-mcp
 ```
 
-Enabling MCP adds bridge wiring only; it does not configure an MCP server. To
-configure the first server after an upgrade, or to replace existing
-definitions, use `upgrade --mcp`. Repeat `--mcp` for every server that should
-remain enabled:
+Enabling MCP adds bridge wiring only; it does not configure an MCP server. Add
+the first definitions after the upgrade without another recreation:
+
+```bash
+agentctl mcp add --name agent-project xcode
+agentctl mcp add --name agent-project @"$HOME/.config/agentctl/private-mcp.json"
+```
+
+For a declarative full-set replacement during an upgrade, use `upgrade --mcp`.
+Repeat `--mcp` for every server that should remain enabled:
 
 ```bash
 agentctl upgrade --name agent-project \
@@ -178,7 +203,10 @@ agentctl upgrade --name agent-project \
 ```
 
 For Codex, agentctl reconciles its local MCP endpoint configuration after an
-upgrade and on later managed starts. This writes only the private guest URLs;
+upgrade, after a live `mcp add` or `mcp remove`, and on later managed starts.
+Changing definitions on a stopped container does not start it; reconciliation
+is deferred until its next managed start. This writes only the private guest
+URLs;
 it does not initialize an MCP server or invoke an MCP tool. User-created or
 user-modified Codex MCP entries are preserved rather than overwritten. The
 ownership record is stored privately in
@@ -189,8 +217,10 @@ command, agentctl preserves its Codex configuration and prints the exact
 
 For an Xcode beta definition, export `DEVELOPER_DIR` before the `run` command
 and include it in the definition's `env_vars`. Export the variable again before
-later `agentctl start` or `agentctl restart` commands so the host relay can
-resolve it.
+later `agentctl start`, `agentctl restart`, `agentctl mcp add`, or
+`agentctl mcp remove` commands so the host relay can resolve it. A live
+definition change restarts the shared relay and re-resolves environment-backed
+values for every configured route.
 
 The MCP port can be changed during an upgrade, or MCP support can be removed:
 

@@ -142,6 +142,13 @@ file_mtime() {
     || stat -f %m "$path"
 }
 
+file_mode() {
+  local path="$1"
+
+  stat -c %a "$path" 2>/dev/null \
+    || stat -f %Lp "$path"
+}
+
 test_run_config_wires_runtime_config_json() {
   begin_test "run_cmd wires repeated --config values into the launched agent.sh command"
 
@@ -4631,7 +4638,7 @@ EOF
   chmod 644 "$ownership"
   run_agent_sh_capture_env "$temp_home" "PATH=$fake_bin:/usr/bin:/bin" "MCP_FAKE_STATE=$state_file" -- runtime mcp-sync codex "$desired" "$legacy"
   assert_status 0
-  [ "$(stat -c %a "$ownership")" = 600 ] || fail "Expected owner-only managed MCP state permissions"
+  [ "$(file_mode "$ownership")" = 600 ] || fail "Expected owner-only managed MCP state permissions"
   jq '.servers += [.servers[0]]' "$ownership" >"$ownership.tmp"; mv "$ownership.tmp" "$ownership"
   run_agent_sh_capture_env "$temp_home" "PATH=$fake_bin:/usr/bin:/bin" "MCP_FAKE_STATE=$state_file" -- runtime mcp-sync codex "$desired" "$legacy"
   assert_status 1
@@ -12358,6 +12365,166 @@ test_mcp_conflicting_active_relay_explains_how_to_reconfigure() (
   assert_contains "agentctl stop --name agent-unit"
 )
 
+test_mcp_definition_commands_manage_stopped_registry_without_starting_container() {
+  begin_test "managed MCP add and remove update a stopped container registry"
+  load_agentctl_functions
+  local root test_registry definition orphan_log
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-definitions.XXXXXX")"; register_dir_cleanup "$root"
+  test_registry="$root/agent-unit.json"
+  printf '%s\n' '{"schema_version":2,"container":"agent-unit","port":47123,"servers":[]}' >"$test_registry"; chmod 600 "$test_registry"
+  definition="$(jq -cn --arg command "$(command -v sh)" '{name:"shell",command:$command,args:["-c","exit 0"],env_vars:[]}')"
+  mcp_registry_dir() { printf '%s\n' "$root"; }
+  mcp_registry_path() { printf '%s\n' "$test_registry"; }
+  container_exists() { return 0; }
+  container_has_mcp_wiring() { return 0; }
+  container_running() { return 1; }
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
+  mcp_require_no_active_leases() { :; }
+  mcp_stop_managed() { fail "Stopped definition mutation must not stop a relay"; }
+  mcp_start_from_registry() { fail "Stopped definition mutation must not start a relay"; }
+  mcp_configure_guest() { fail "Stopped definition mutation must not start the guest proxy"; }
+  sync_codex_managed_mcp_from_registry() { fail "Stopped definition mutation must defer Codex synchronization"; }
+  attempt_add() ( mcp_definition_mutate add agent-unit "$1" )
+  attempt_remove() ( mcp_definition_mutate remove agent-unit "$1" )
+
+  run_capture attempt_add "$definition"
+  assert_status 0; assert_contains "Added managed MCP definition(s)"
+  jq -e '.servers | length==1 and .[0].name=="shell"' "$test_registry" >/dev/null || fail "MCP add did not persist the definition"
+
+  run_capture attempt_add "$definition"
+  assert_status 0; assert_contains "already configured"
+  jq -e '.servers | length==1' "$test_registry" >/dev/null || fail "Idempotent MCP add duplicated the definition"
+
+  mcp_require_no_active_leases() { die "Cannot change managed MCP definitions while 1 managed MCP lease is active"; }
+  run_capture attempt_remove shell
+  assert_status 1; assert_contains "managed MCP lease is active"
+  jq -e '.servers | length==1' "$test_registry" >/dev/null || fail "Active-lease rejection changed the registry"
+  mcp_require_no_active_leases() { :; }
+
+  local changed_definition
+  changed_definition="$(jq -cn --arg command "$(command -v sh)" '{name:"shell",command:$command,args:["-c","echo changed"],env_vars:[]}')"
+  run_capture attempt_add "$changed_definition"
+  assert_status 1; assert_contains "remove it before adding the replacement"
+  jq -e '.servers[0].args==["-c","exit 0"]' "$test_registry" >/dev/null || fail "Rejected MCP replacement changed the registry"
+
+  run_capture attempt_remove shell
+  assert_status 0; assert_contains "Removed managed MCP definition shell"
+  jq -e '.servers==[]' "$test_registry" >/dev/null || fail "Removing the final definition did not preserve an empty registry"
+
+  orphan_log="$root/orphan-log"; mkdir -p "$root/runtime"
+  printf '%s\n' '{}' >"$root/runtime/mcp-unit.process.json"
+  mcp_runtime_dir() { printf '%s\n' "$root/runtime"; }
+  mcp_identity_hash() { printf '%s\n' unit; }
+  mcp_socket_path() { printf '%s\n' "$root/runtime/mcp-unit.sock"; }
+  mcp_stop_managed() { printf '%s\n' stop-orphan >>"$orphan_log"; rm -f "$root/runtime/mcp-unit.process.json"; }
+  run_capture attempt_add "$definition"
+  assert_status 0
+  [ "$(cat "$orphan_log")" = stop-orphan ] || fail "Stopped-container mutation did not clean its owned orphan relay"
+  jq -e '[.servers[].name]==["shell"]' "$test_registry" >/dev/null || fail "Stopped-container orphan cleanup lost the registry mutation"
+}
+
+test_mcp_definition_command_dispatches_container_scoped_actions() {
+  begin_test "managed MCP command dispatches add remove and list with container selection"
+  load_agentctl_functions
+  local calls=""
+  require_container() { :; }
+  require_jq() { :; }
+  default_name() { printf '%s\n' agent-default; }
+  mcp_definition_mutate() { calls="${calls}$1:$2:$3"$'\n'; }
+  mcp_definition_list() { calls="${calls}list:$1"$'\n'; }
+
+  mcp_cmd add --name agent-explicit definition-json
+  mcp_cmd remove old-route
+  mcp_cmd list
+  [ "$calls" = $'add:agent-explicit:definition-json\nremove:agent-default:old-route\nlist:agent-default\n' ] \
+    || fail "Unexpected MCP command dispatch: $calls"
+}
+
+test_mcp_definition_commands_reject_transient_values_and_redact_list() {
+  begin_test "managed MCP definition commands reject transient values and redact list output"
+  load_agentctl_functions
+  local root test_registry
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-list.XXXXXX")"; register_dir_cleanup "$root"
+  test_registry="$root/agent-unit.json"
+  printf '%s\n' '{"schema_version":2,"container":"agent-unit","port":47123,"servers":[{"name":"shell","transport":"stdio","command":"/private/secret-command","args":["secret-argument"],"env_vars":[]},{"name":"web","transport":"http","url":"https://example.test/private/path?token=query-secret","bearer_token_keychain":"web-token"}]}' >"$test_registry"; chmod 600 "$test_registry"
+  mcp_registry_path() { printf '%s\n' "$test_registry"; }
+  container_exists() { return 0; }
+  container_has_mcp_wiring() { return 0; }
+
+  run_capture mcp_definition_list agent-unit
+  assert_status 0; assert_contains "NAME"; assert_contains "shell"; assert_contains "host stdio"; assert_contains "https://example.test"
+  assert_not_contains "secret-command"; assert_not_contains "secret-argument"; assert_not_contains "private/path"; assert_not_contains "query-secret"; assert_not_contains "web-token"
+
+  attempt_reject_transient() ( mcp_definition_reject_transient_values "$1" )
+  run_capture attempt_reject_transient '[{"name":"shell","transport":"stdio","env":{"TOKEN":"secret"}}]'
+  assert_status 1; assert_contains "cannot contain literal env values"; assert_not_contains "secret"
+  run_capture attempt_reject_transient '[{"name":"web","transport":"http","headers":{"authorization":"secret"}}]'
+  assert_status 1; assert_contains "cannot contain literal HTTP headers"; assert_not_contains "secret"
+}
+
+test_mcp_definition_commands_activate_running_registry_and_roll_back_failures() {
+  begin_test "managed MCP definition changes activate live and roll back failed relay replacement"
+  load_agentctl_functions
+  local root test_registry lifecycle fail_guest definition
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-live-definitions.XXXXXX")"; register_dir_cleanup "$root"
+  test_registry="$root/agent-unit.json"; lifecycle="$root/lifecycle"; fail_guest="$root/fail-guest"
+  printf '%s\n' '{"schema_version":2,"container":"agent-unit","port":47123,"servers":[{"name":"old","transport":"stdio","command":"/bin/sh","args":[],"env_vars":[],"shared_process":false}]}' >"$test_registry"; chmod 600 "$test_registry"
+  definition="$(jq -cn --arg command "$(command -v sh)" '{name:"new",command:$command,args:[],env_vars:[]}')"
+  mcp_registry_dir() { printf '%s\n' "$root"; }
+  mcp_registry_path() { printf '%s\n' "$test_registry"; }
+  container_exists() { return 0; }
+  container_has_mcp_wiring() { return 0; }
+  container_running() { return 0; }
+  remote_control_lock_acquire() { printf '%s\n' remote-lock >>"$lifecycle"; }
+  remote_control_lock_release() { printf '%s\n' remote-unlock >>"$lifecycle"; }
+  mcp_lock_acquire() { printf '%s\n' mcp-lock >>"$lifecycle"; }
+  mcp_lock_release() { printf '%s\n' mcp-unlock >>"$lifecycle"; }
+  mcp_require_no_active_leases() { :; }
+  mcp_stop_managed() { printf '%s\n' stop >>"$lifecycle"; }
+  mcp_start_from_registry() { mcp_load_registry_config "$test_registry"; MCP_REQUESTED=1; printf '%s\n' start >>"$lifecycle"; }
+  mcp_configure_guest() {
+    printf '%s\n' guest >>"$lifecycle"
+    if [ -e "$fail_guest" ]; then rm -f "$fail_guest"; die "simulated guest activation failure"; fi
+  }
+  sync_codex_managed_mcp_from_registry() { printf '%s\n' sync >>"$lifecycle"; }
+  attempt_live_add() ( mcp_definition_mutate add agent-unit "$definition" )
+
+  run_capture attempt_live_add
+  assert_status 0
+  [ "$(cat "$lifecycle")" = $'remote-lock\nmcp-lock\nstop\nstart\nguest\nsync\nmcp-unlock\nremote-unlock' ] \
+    || fail "Unexpected live MCP activation and lock sequence: $(cat "$lifecycle")"
+  jq -e '[.servers[].name]|sort==["new","old"]' "$test_registry" >/dev/null || fail "Live MCP add did not persist both definitions"
+
+  printf '%s\n' '{"schema_version":2,"container":"agent-unit","port":47123,"servers":[{"name":"old","transport":"stdio","command":"/bin/sh","args":[],"env_vars":[],"shared_process":false}]}' >"$test_registry"
+  : >"$lifecycle"
+  sync_codex_managed_mcp_from_registry() { printf '%s\n' sync >>"$lifecycle"; return 1; }
+  run_capture attempt_live_add
+  assert_status 1; assert_contains "definitions changed, but Codex synchronization is incomplete"
+  jq -e '[.servers[].name]|sort==["new","old"]' "$test_registry" >/dev/null \
+    || fail "Codex synchronization failure rolled back an active host registry"
+
+  printf '%s\n' '{"schema_version":2,"container":"agent-unit","port":47123,"servers":[{"name":"old","transport":"stdio","command":"/bin/sh","args":[],"env_vars":[],"shared_process":false}]}' >"$test_registry"
+  : >"$lifecycle"; : >"$fail_guest"
+  sync_codex_managed_mcp_from_registry() { printf '%s\n' sync >>"$lifecycle"; }
+  run_capture attempt_live_add
+  assert_status 1; assert_contains "Recovering the previous managed MCP state"
+  jq -e '[.servers[].name]==["old"]' "$test_registry" >/dev/null || fail "Failed live MCP activation did not restore the old registry"
+  [ "$(cat "$lifecycle")" = $'remote-lock\nmcp-lock\nstop\nstart\nguest\nstop\nstart\nguest\nmcp-unlock\nremote-unlock' ] \
+    || fail "Unexpected MCP rollback sequence: $(cat "$lifecycle")"
+
+  printf '%s\n' '{"schema_version":2,"container":"agent-unit","port":47123,"servers":[{"name":"old","transport":"stdio","command":"/bin/sh","args":[],"env_vars":[],"shared_process":false}]}' >"$test_registry"
+  : >"$lifecycle"
+  mcp_stop_managed() { printf '%s\n' stop >>"$lifecycle"; die "simulated partial relay stop failure"; }
+  run_capture attempt_live_add
+  assert_status 1; assert_contains "simulated partial relay stop failure"
+  [ "$(cat "$lifecycle")" = $'remote-lock\nmcp-lock\nstop\nstart\nguest\nmcp-unlock\nremote-unlock' ] \
+    || fail "Partial relay stop failure did not restore the previous relay under both locks: $(cat "$lifecycle")"
+  jq -e '[.servers[].name]==["old"]' "$test_registry" >/dev/null || fail "Partial relay stop failure changed the registry"
+}
+
 test_mcp_keychain_slots_are_separate_from_runtime_auth() {
   begin_test "managed MCP credentials use dedicated Keychain slots"
   load_agentctl_functions
@@ -14358,6 +14525,10 @@ main() {
   run_selected_test test_mcp_registry_v2_filters_secrets_and_reads_v1 "test_mcp_registry_v2_filters_secrets_and_reads_v1"
   run_selected_test test_mcp_fingerprints_preserve_stdio_compatibility_and_detect_http_rotation "test_mcp_fingerprints_preserve_stdio_compatibility_and_detect_http_rotation"
   run_selected_test test_mcp_conflicting_active_relay_explains_how_to_reconfigure "test_mcp_conflicting_active_relay_explains_how_to_reconfigure"
+  run_selected_test test_mcp_definition_commands_manage_stopped_registry_without_starting_container "test_mcp_definition_commands_manage_stopped_registry_without_starting_container"
+  run_selected_test test_mcp_definition_command_dispatches_container_scoped_actions "test_mcp_definition_command_dispatches_container_scoped_actions"
+  run_selected_test test_mcp_definition_commands_reject_transient_values_and_redact_list "test_mcp_definition_commands_reject_transient_values_and_redact_list"
+  run_selected_test test_mcp_definition_commands_activate_running_registry_and_roll_back_failures "test_mcp_definition_commands_activate_running_registry_and_roll_back_failures"
   run_selected_test test_mcp_keychain_slots_are_separate_from_runtime_auth "test_mcp_keychain_slots_are_separate_from_runtime_auth"
   run_selected_test test_mcp_credential_commands_use_keychain_without_printing_values "test_mcp_credential_commands_use_keychain_without_printing_values"
   run_selected_test test_mcp_http_doctor_and_dry_run_redact_upstream_details "test_mcp_http_doctor_and_dry_run_redact_upstream_details"

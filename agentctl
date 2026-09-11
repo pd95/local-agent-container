@@ -30,6 +30,13 @@ MCP_GUEST_EXEC_PID=""
 MCP_LEASE_FILE=""
 MCP_LOCK_DIR=""
 MCP_LOCK_TOKEN=""
+MCP_DEFINITION_CONTAINER=""
+MCP_DEFINITION_OLD_REGISTRY=""
+MCP_DEFINITION_WAS_RUNNING=0
+MCP_DEFINITION_REGISTRY_CHANGED=0
+MCP_DEFINITION_RELAY_STOPPED=0
+MCP_DEFINITION_ACTIVATION_COMMITTED=0
+MCP_DEFINITION_STAGE=""
 OLLAMA_LISTENER_LOCK_DIR=""
 OLLAMA_LISTENER_STARTED_BASE_URL=""
 OLLAMA_LISTENER_REMINDER_REPORTED=0
@@ -907,6 +914,10 @@ mcp_credential_account() { printf 'mcp-credential-%s\n' "$1"; }
 mcp_validate_credential_id() {
   printf '%s' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$' || die "Invalid MCP credential identifier: $1"
 }
+
+mcp_validate_server_name() {
+  printf '%s' "$1" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$' || die "Invalid MCP server name"
+}
 mcp_keychain_run() {
   local credential="$1"; shift
   mcp_validate_credential_id "$credential"
@@ -1096,13 +1107,24 @@ mcp_prepare_log_file() {
   : >"$path"; chmod 600 "$path"
 }
 
-mcp_persist_registry() {
-  local name="$1" path temp safe
+mcp_safe_config_json() {
+  local config_json="${1:-$MCP_CONFIG_JSON}"
+  printf '%s' "$config_json" | jq -c '[.[]|del(.env,.inherited_env,.headers,.resolved_headers,.missing_credentials,.missing_env_vars,.invalid_credentials,.invalid_env_vars)]'
+}
+
+mcp_write_registry_json() {
+  local name="$1" registry_json="$2" path="" temp=""
   mcp_prepare_private_dir "$(mcp_registry_dir)"
   path="$(mcp_registry_path "$name")"; temp="${path}.tmp.$$"
-  safe="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c '[.[]|del(.env,.inherited_env,.headers,.resolved_headers,.missing_credentials,.missing_env_vars,.invalid_credentials,.invalid_env_vars)]')"
-  jq -n --arg name "$name" --argjson port "$MCP_PORT" --argjson servers "$safe" '{schema_version:2,container:$name,port:$port,servers:$servers}' >"$temp"
+  printf '%s\n' "$registry_json" >"$temp"
   chmod 600 "$temp"; mv "$temp" "$path"
+}
+
+mcp_persist_registry() {
+  local name="$1" safe="" registry_json=""
+  safe="$(mcp_safe_config_json)"
+  registry_json="$(jq -cn --arg name "$name" --argjson port "$MCP_PORT" --argjson servers "$safe" '{schema_version:2,container:$name,port:$port,servers:$servers}')"
+  mcp_write_registry_json "$name" "$registry_json"
 }
 
 mcp_config_fingerprint() {
@@ -2195,7 +2217,7 @@ Commands:
   host-address  Print the current host gateway for an Apple container network
   ollama     Manage Ollama listeners started by agentctl
   network    Manage Apple container networks used by agentctl
-  mcp        Manage host MCP credentials
+  mcp        Manage container MCP definitions and host credentials
   remote-control  Manage experimental Codex Remote Control
   system-manifest  Print a container package manifest
   upgrade    Recreate a container from the latest image while preserving config
@@ -2534,10 +2556,17 @@ EOF
 usage_mcp() {
   cat <<EOF
 Usage:
+  $CLI_NAME mcp add [--name NAME] VALUE
+  $CLI_NAME mcp remove [--name NAME] SERVER
+  $CLI_NAME mcp list [--name NAME]
   $CLI_NAME mcp credential set ID [--stdin]
   $CLI_NAME mcp credential status ID
   $CLI_NAME mcp credential delete ID
   $CLI_NAME mcp credential list
+
+Definition commands target the container selected by the current workdir unless
+--name is provided. VALUE accepts xcode, inline JSON, or @/path/to/private.json.
+Changing an existing definition requires remove followed by add.
 
 Named MCP credentials are stored in macOS Keychain. Values are never printed.
 Use --stdin to pipe a value from a password manager without placing it in shell history.
@@ -9415,11 +9444,11 @@ mcp_report_credential_restarts() {
   done < <(mcp_credential_references "$credential" | LC_ALL=C sort -u)
 }
 
-mcp_cmd() {
-  local group="${1:-}" action="${2:-}" credential="${3:-}" stdin_mode=0 value="" status=0 refs="" container=""
+mcp_credential_cmd() {
+  local action="${1:-}" credential="${2:-}" stdin_mode=0 value="" status=0 refs="" container=""
   require_jq
-  [ "$group" = credential ] || { usage_mcp; [ "$group" = --help ] || [ "$group" = -h ] || [ -z "$group" ] || return 1; return 0; }
-  shift 2
+  [ -n "$action" ] || { usage_mcp; return 0; }
+  shift
   case "$action" in
     set)
       credential="${1:-}"; [ -n "$credential" ] || die "Missing MCP credential identifier"; shift
@@ -9460,6 +9489,221 @@ mcp_cmd() {
       ;;
     --help|-h|"") usage_mcp ;;
     *) die "Unknown MCP credential action: $action" ;;
+  esac
+}
+
+mcp_validate_definition_registry() {
+  local name="$1" registry="$2"
+  mcp_validate_private_file "$registry" "Managed MCP registry"
+  jq -e --arg name "$name" '
+    (.schema_version==1 or .schema_version==2) and .container==$name and
+    (.port|type)=="number" and .port>=1024 and .port<=65535 and
+    (.servers|type)=="array" and
+    ((.servers|map(.name)|length) == (.servers|map(.name)|unique|length)) and
+    all(.servers[];
+      (.name|type)=="string" and (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")) and
+      ((.transport // "stdio")=="stdio" or .transport=="http"))
+  ' "$registry" >/dev/null 2>&1 \
+    || die "Invalid managed MCP registry schema or container identity: $registry"
+}
+
+mcp_definition_target_prepare() {
+  local name="$1" registry=""
+  container_exists "$name" || die "Container not found: $name"
+  container_has_mcp_wiring "$name" \
+    || die "Container $name does not have managed MCP wiring. Recreate it with: ${CLI_NAME} upgrade --name $name --enable-mcp"
+  registry="$(mcp_registry_path "$name")"
+  [ -f "$registry" ] && [ ! -L "$registry" ] \
+    || die "Container $name has managed MCP wiring but its private host registry is unavailable. Reconfigure it with: ${CLI_NAME} upgrade --name $name --mcp VALUE"
+  mcp_validate_definition_registry "$name" "$registry"
+  MCP_PORT="$(jq -r '.port' "$registry")"; mcp_validate_port "$MCP_PORT"
+  mcp_load_registry_config "$registry"
+}
+
+mcp_definition_reject_transient_values() {
+  local config_json="$1"
+  if printf '%s' "$config_json" | jq -e 'any(.[]; ((.env // {})|length)>0)' >/dev/null; then
+    die "Persistent MCP definitions cannot contain literal env values; use env_vars so values are resolved when the relay starts"
+  fi
+  if printf '%s' "$config_json" | jq -e 'any(.[]; ((.headers // {})|length)>0)' >/dev/null; then
+    die "Persistent MCP definitions cannot contain literal HTTP headers; use header_env_vars, header_keychain_credentials, bearer_token_env_var, or bearer_token_keychain"
+  fi
+}
+
+mcp_definition_list() {
+  local name="$1" entry="" route="" transport="" url="" target="" rows=""
+  mcp_definition_target_prepare "$name"
+  if [ "$(printf '%s' "$MCP_CONFIG_JSON" | jq 'length')" -eq 0 ]; then
+    printf 'No managed MCP definitions for %s.\n' "$name"
+    return 0
+  fi
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    route="$(printf '%s' "$entry" | jq -r .name)"
+    transport="$(printf '%s' "$entry" | jq -r '.transport // "stdio"')"
+    if [ "$transport" = http ]; then
+      url="$(printf '%s' "$entry" | jq -r .url)"
+      target="$(node -e 'const u=new URL(process.argv[1]);process.stdout.write(u.origin)' "$url" 2>/dev/null || printf invalid)"
+    else
+      target="host stdio"
+    fi
+    rows="${rows}${route}"$'\t'"${transport}"$'\t'"${target}"$'\n'
+  done < <(printf '%s' "$MCP_CONFIG_JSON" | jq -c 'sort_by(.name)[]')
+  { printf 'NAME\tTRANSPORT\tTARGET\n'; printf '%s' "$rows"; } | format_tsv_table
+}
+
+mcp_definition_mutation_cleanup() {
+  local exit_status="$?" restore_ok=1
+  set +e
+  [ -z "${MCP_DEFINITION_STAGE:-}" ] \
+    || warn "Managed MCP definition change failed during $MCP_DEFINITION_STAGE"
+  if [ "${MCP_DEFINITION_ACTIVATION_COMMITTED:-0}" -eq 0 ] \
+    && { [ "${MCP_DEFINITION_REGISTRY_CHANGED:-0}" -eq 1 ] || [ "${MCP_DEFINITION_RELAY_STOPPED:-0}" -eq 1 ]; }; then
+    warn "Recovering the previous managed MCP state after activation failed"
+    if [ "${MCP_DEFINITION_REGISTRY_CHANGED:-0}" -eq 1 ]; then
+      (mcp_stop_managed "$MCP_DEFINITION_CONTAINER") >/dev/null 2>&1 || true
+      if ! (mcp_write_registry_json "$MCP_DEFINITION_CONTAINER" "$MCP_DEFINITION_OLD_REGISTRY"); then
+        warn "Unable to restore the previous managed MCP registry: $(mcp_registry_path "$MCP_DEFINITION_CONTAINER")"
+        restore_ok=0
+      fi
+    fi
+    if [ "${MCP_DEFINITION_WAS_RUNNING:-0}" -eq 1 ] && [ "$restore_ok" -eq 1 ]; then
+      (mcp_start_from_registry "$MCP_DEFINITION_CONTAINER" \
+        && mcp_configure_guest "$MCP_DEFINITION_CONTAINER") >/dev/null 2>&1 \
+        || warn "Unable to restore the previous managed MCP relay; run: ${CLI_NAME} restart --name $MCP_DEFINITION_CONTAINER"
+    fi
+  fi
+  mcp_lock_release
+  remote_control_lock_release
+  return "$exit_status"
+}
+
+mcp_definition_mutate() {
+  local action="$1" name="$2" value="$3" registry="" relay_metadata="" relay_socket="" old_config='[]' additions='[]' entry="" route="" existing="" canonical_entry="" canonical_existing="" changed=0
+  MCP_DEFINITION_CONTAINER="$name"
+  MCP_DEFINITION_OLD_REGISTRY=""
+  MCP_DEFINITION_WAS_RUNNING=0
+  MCP_DEFINITION_REGISTRY_CHANGED=0
+  MCP_DEFINITION_RELAY_STOPPED=0
+  MCP_DEFINITION_ACTIVATION_COMMITTED=0
+  MCP_DEFINITION_STAGE="lock acquisition"
+  remote_control_lock_acquire "$name"
+  trap 'mcp_definition_mutation_cleanup' EXIT
+  mcp_lock_acquire "$name"
+  MCP_DEFINITION_STAGE="target validation"
+  mcp_definition_target_prepare "$name"
+  registry="$(mcp_registry_path "$name")"
+  MCP_DEFINITION_OLD_REGISTRY="$(jq -c . "$registry")"
+  container_running "$name" && MCP_DEFINITION_WAS_RUNNING=1
+  relay_metadata="$(mcp_runtime_dir)/mcp-$(mcp_identity_hash "$name").process.json"
+  relay_socket="$(mcp_socket_path "$name")"
+  if { [ -e "$relay_socket" ] || [ -L "$relay_socket" ]; } \
+    && { [ ! -e "$relay_metadata" ] && [ ! -L "$relay_metadata" ]; }; then
+    die "Managed MCP socket exists without ownership metadata for $name; inspect it with: ${CLI_NAME} doctor --host"
+  fi
+  old_config="$MCP_CONFIG_JSON"
+
+  case "$action" in
+    add)
+      MCP_DEFINITION_STAGE="definition validation"
+      MCP_CONFIG_JSON='[]'; MCP_REQUESTED=0
+      mcp_add_definition "$value"
+      additions="$MCP_CONFIG_JSON"
+      mcp_definition_reject_transient_values "$additions"
+      MCP_CONFIG_JSON="$old_config"
+      while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        route="$(printf '%s' "$entry" | jq -r .name)"
+        existing="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --arg name "$route" '.[] | select(.name==$name)' | head -n 1)"
+        if [ -n "$existing" ]; then
+          canonical_entry="$(mcp_safe_config_json "[$entry]" | jq -cS '.[0]')"
+          canonical_existing="$(mcp_safe_config_json "[$existing]" | jq -cS '.[0]')"
+          [ "$canonical_entry" = "$canonical_existing" ] \
+            || die "Managed MCP server $route already exists with a different definition; remove it before adding the replacement"
+          continue
+        fi
+        MCP_CONFIG_JSON="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --argjson entry "$entry" '.+[$entry]')"
+        changed=1
+      done < <(printf '%s' "$additions" | jq -c '.[]')
+      ;;
+    remove)
+      printf '%s' "$MCP_CONFIG_JSON" | jq -e --arg name "$value" 'any(.[]; .name==$name)' >/dev/null \
+        || die "Managed MCP server not found in $name: $value"
+      MCP_CONFIG_JSON="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --arg name "$value" 'map(select(.name!=$name))')"
+      changed=1
+      ;;
+  esac
+
+  if [ "$changed" -eq 0 ]; then
+    printf 'Managed MCP definition already configured in %s.\n' "$name"
+    mcp_lock_release; remote_control_lock_release; trap - EXIT
+    return 0
+  fi
+
+  MCP_DEFINITION_STAGE="active lease check"
+  mcp_require_no_active_leases "$name" "change managed MCP definitions for"
+  MCP_DEFINITION_STAGE="relay shutdown"
+  if [ "$MCP_DEFINITION_WAS_RUNNING" -eq 1 ] || [ -e "$relay_metadata" ] || [ -L "$relay_metadata" ]; then
+    # Set rollback intent before signaling the relay so an interrupted or
+    # partially failed shutdown still enters cleanup.
+    MCP_DEFINITION_RELAY_STOPPED=1
+    mcp_stop_managed "$name"
+  fi
+  MCP_DEFINITION_STAGE="registry persistence"
+  mcp_persist_registry "$name"
+  MCP_DEFINITION_REGISTRY_CHANGED=1
+  if [ "$MCP_DEFINITION_WAS_RUNNING" -eq 1 ]; then
+    MCP_DEFINITION_STAGE="relay startup"
+    mcp_start_from_registry "$name"
+    MCP_DEFINITION_STAGE="guest proxy startup"
+    mcp_configure_guest "$name"
+  fi
+  MCP_DEFINITION_ACTIVATION_COMMITTED=1
+  if [ "$MCP_DEFINITION_WAS_RUNNING" -eq 1 ]; then
+    MCP_DEFINITION_STAGE="Codex synchronization"
+    sync_codex_managed_mcp_from_registry "$name" 1 \
+      || die "Managed MCP definitions changed, but Codex synchronization is incomplete in $name; resolve the warning above and retry with ${CLI_NAME} run --name $name --cmd true"
+  fi
+  if [ "$action" = add ]; then
+    printf 'Added managed MCP definition(s) to %s.\n' "$name"
+  else
+    printf 'Removed managed MCP definition %s from %s.\n' "$value" "$name"
+  fi
+  MCP_DEFINITION_STAGE=""
+  mcp_lock_release; remote_control_lock_release; trap - EXIT
+}
+
+mcp_definition_cmd() {
+  local action="$1" name="" value=""
+  shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
+      --help|-h) usage_mcp; return 0 ;;
+      *) [ -z "$value" ] || die "Unexpected argument for mcp $action: $1"; value="$1"; shift ;;
+    esac
+  done
+  require_container
+  require_jq
+  [ -n "$name" ] || name="$(default_name "$DEFAULT_NAME_PREFIX")"
+  case "$action" in
+    list) [ -z "$value" ] || die "Unexpected argument for mcp list: $value"; mcp_definition_list "$name" ;;
+    add) [ -n "$value" ] || die "Missing MCP definition for add"; mcp_definition_mutate add "$name" "$value" ;;
+    remove)
+      [ -n "$value" ] || die "Missing MCP server name for remove"
+      mcp_validate_server_name "$value"
+      mcp_definition_mutate remove "$name" "$value"
+      ;;
+  esac
+}
+
+mcp_cmd() {
+  local action="${1:-}"
+  case "$action" in
+    credential) shift; mcp_credential_cmd "$@" ;;
+    add|remove|list) shift; mcp_definition_cmd "$action" "$@" ;;
+    --help|-h|help|"") usage_mcp ;;
+    *) die "Unknown MCP command: $action" ;;
   esac
 }
 
