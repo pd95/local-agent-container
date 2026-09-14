@@ -162,8 +162,18 @@ transfer path includes:
 - `~/.config/agentctl`
 - `~/.claude`
 - `~/.claude.json`
+- `~/.config/opencode`
+- `~/.local/share/opencode`
+- `~/.pi/agent`
+- `~/.qwen`
 - common shell startup files and history for `coder`, including `~/.profile`,
   `~/.bashrc`, `~/.bash_history`, and zsh/ash/sh equivalents
+
+Before removing the source container, `upgrade` compares its preservable
+installed-runtime state with the state archive. If any runtime state is missing
+or reduced, the upgrade stops with a diagnostic and leaves the source container
+available for inspection. Runtime path-enumeration failures likewise fail the
+backup instead of producing a successful partial archive.
 
 New containers and upgrades also persist an image baseline snapshot at
 `/etc/agentctl/system-manifest.json`. That lets later upgrades compare against

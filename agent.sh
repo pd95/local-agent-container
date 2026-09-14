@@ -842,7 +842,7 @@ state_runtime_paths() {
   ensure_runtime_known "$runtime"
   load_runtime_adapter "$runtime"
   if declare -F agent_runtime_state_paths >/dev/null 2>&1; then
-    agent_runtime_state_paths "$runtime"
+    agent_runtime_state_paths "$runtime" || return $?
   fi
   return 0
 }
@@ -851,19 +851,30 @@ state_legacy_paths() {
   local codex_home_dir="${HOME}/.codex"
   local claude_home_dir="${HOME}/.claude"
   local claude_home_state_file="${HOME}/.claude.json"
+  local codex_paths_file=""
   local path=""
 
   if [ -e "$codex_home_dir" ]; then
+    codex_paths_file="$(mktemp)"
+    if ! (
+      cd "$codex_home_dir" && \
+        find . -mindepth 1 -maxdepth 1 ! -name packages -exec basename {} \;
+    ) >"$codex_paths_file"; then
+      rm -f "$codex_paths_file"
+      return 1
+    fi
     while IFS= read -r path; do
       [ -n "$path" ] || continue
       printf '%s\n' ".codex/$path"
-    done < <(
-      cd "$codex_home_dir" && \
-        find . -mindepth 1 -maxdepth 1 ! -name packages -exec basename {} \;
-    )
+    done <"$codex_paths_file"
+    rm -f "$codex_paths_file"
   fi
-  [ -e "$claude_home_dir" ] && printf '%s\n' ".claude"
-  [ -e "$claude_home_state_file" ] && printf '%s\n' ".claude.json"
+  if [ -e "$claude_home_dir" ]; then
+    printf '%s\n' ".claude"
+  fi
+  if [ -e "$claude_home_state_file" ]; then
+    printf '%s\n' ".claude.json"
+  fi
   return 0
 }
 
@@ -885,7 +896,9 @@ state_shell_paths() {
     .zsh_history \
     .ash_history \
     .sh_history; do
-    [ -e "$HOME/$path" ] && printf '%s\n' "$path"
+    if [ -e "$HOME/$path" ]; then
+      printf '%s\n' "$path"
+    fi
   done
   return 0
 }
@@ -893,42 +906,73 @@ state_shell_paths() {
 state_export_paths() {
   local installed_runtimes=""
 
-  state_shell_paths
-  [ -e "$USER_CONFIG_DIR" ] && printf '%s\n' ".config/agentctl"
-  installed_runtimes="$(runtime_ids_installed)"
-  if [ -n "$installed_runtimes" ]; then
-    printf '%s\n' "$installed_runtimes" | while IFS= read -r runtime; do
-      [ -n "$runtime" ] || continue
-      state_runtime_paths "$runtime"
-    done
-  else
-    state_legacy_paths
+  state_shell_paths || return $?
+  if [ -e "$USER_CONFIG_DIR" ]; then
+    printf '%s\n' ".config/agentctl"
   fi
+  installed_runtimes="$(runtime_ids_installed)" || return $?
+  if [ -n "$installed_runtimes" ]; then
+    while IFS= read -r runtime; do
+      [ -n "$runtime" ] || continue
+      state_runtime_paths "$runtime" || return $?
+    done <<<"$installed_runtimes"
+  else
+    state_legacy_paths || return $?
+  fi
+  return 0
 }
 
 state_import_paths() {
   local installed_runtimes=""
 
   printf '%s\n' ".config/agentctl"
-  installed_runtimes="$(runtime_ids_installed)"
+  installed_runtimes="$(runtime_ids_installed)" || return $?
   if [ -n "$installed_runtimes" ]; then
-    printf '%s\n' "$installed_runtimes" | while IFS= read -r runtime; do
+    while IFS= read -r runtime; do
       [ -n "$runtime" ] || continue
-      state_runtime_paths "$runtime"
-    done
+      state_runtime_paths "$runtime" || return $?
+    done <<<"$installed_runtimes"
   else
     printf '%s\n' ".codex" ".claude" ".claude.json"
   fi
+  return 0
+}
+
+state_collect_paths() {
+  local generator="$1"
+  local output_file="$2"
+  local raw_file=""
+  local status=0
+
+  raw_file="$(mktemp)"
+  if "$generator" >"$raw_file"; then
+    if state_unique_paths <"$raw_file" >"$output_file"; then
+      :
+    else
+      status=$?
+    fi
+  else
+    status=$?
+  fi
+  rm -f "$raw_file"
+  return "$status"
 }
 
 state_export() {
   local -a paths=()
   local path=""
+  local paths_file=""
 
+  paths_file="$(mktemp)"
+  if ! state_collect_paths state_export_paths "$paths_file"; then
+    rm -f "$paths_file"
+    die "failed to enumerate state export paths"
+  fi
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     paths+=("$path")
-  done < <(state_export_paths | state_unique_paths)
+  done <"$paths_file"
+  rm -f "$paths_file"
 
   if [ "${#paths[@]}" -eq 0 ]; then
     return 0
@@ -940,6 +984,7 @@ state_export() {
 state_import() {
   local import_file=""
   local path=""
+  local paths_file=""
   local packages_backup=""
 
   if [ -t 0 ]; then
@@ -957,6 +1002,11 @@ state_import() {
     die "invalid state import archive"
   fi
 
+  paths_file="$(mktemp)"
+  if ! state_collect_paths state_import_paths "$paths_file"; then
+    rm -f "$paths_file" "$import_file"
+    die "failed to enumerate state import paths"
+  fi
   mkdir -p "$HOME"
   packages_backup="$(mktemp -d)"
   if [ -e "$HOME/.codex/packages" ]; then
@@ -966,7 +1016,8 @@ state_import() {
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     rm -rf "$HOME/$path"
-  done < <(state_import_paths | state_unique_paths)
+  done <"$paths_file"
+  rm -f "$paths_file"
   tar -C "$HOME" -xf "$import_file"
   rm -rf "$HOME/.codex/packages"
   if [ -e "$packages_backup/.codex/packages" ]; then

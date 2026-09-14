@@ -242,6 +242,7 @@ agent_runtime_state_paths() {
   [ "$runtime" = "claude" ] || die "unsupported runtime adapter: $runtime"
   [ -e "$CLAUDE_HOME_DIR" ] && printf '%s\n' ".claude"
   [ -e "$CLAUDE_HOME_STATE_FILE" ] && printf '%s\n' ".claude.json"
+  return 0
 }
 
 agent_runtime_auth_read() {

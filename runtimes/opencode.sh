@@ -179,6 +179,7 @@ agent_runtime_state_paths() {
   [ "$runtime" = "opencode" ] || die "unsupported runtime adapter: $runtime"
   [ -e "$(opencode_config_dir)" ] && printf '%s\n' ".config/opencode"
   [ -e "$(opencode_share_dir)" ] && printf '%s\n' ".local/share/opencode"
+  return 0
 }
 
 agent_runtime_auth_read() {

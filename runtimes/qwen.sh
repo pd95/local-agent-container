@@ -272,6 +272,7 @@ agent_runtime_state_paths() {
 
   [ "$runtime" = "qwen" ] || die "unsupported runtime adapter: $runtime"
   [ -e "$(qwen_config_dir)" ] && printf '%s\n' ".qwen"
+  return 0
 }
 
 agent_runtime_auth_read() {
