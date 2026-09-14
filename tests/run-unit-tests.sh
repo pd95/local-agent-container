@@ -4797,6 +4797,153 @@ test_images_list_falls_back_to_refs_when_metadata_is_unavailable() {
   assert_not_contains "CREATED"
 }
 
+test_images_prune_keeps_refs_for_container_digests() {
+  begin_test "images prune keeps all refs for running and stopped container digests"
+
+  load_agentctl_functions
+
+  local removed=""
+
+  require_container() { return 0; }
+  parse_image_list() {
+    printf '%s\n' \
+      agent-python \
+      agent-python:20260103-000000 \
+      agent-python:20260102-000000 \
+      agent-python:20260101-000000 \
+      agent-python:20251231-000000 \
+      agent-python:20251230-000000
+  }
+  image_list_json_required() {
+    cat <<'EOF'
+[
+  {"configuration":{"name":"agent-python:latest","descriptor":{"digest":"sha256:new"}}},
+  {"configuration":{"name":"agent-python:20260103-000000","descriptor":{"digest":"sha256:new"}}},
+  {"configuration":{"name":"docker.io/library/agent-python:20260102-000000","descriptor":{"digest":"sha256:used"}}},
+  {"configuration":{"name":"agent-python:20260101-000000","descriptor":{"digest":"sha256:used"}}},
+  {"configuration":{"name":"agent-python:20251231-000000","descriptor":{"digest":"sha256:running"}}},
+  {"configuration":{"name":"agent-python:20251230-000000","descriptor":{"digest":"sha256:unused"}}}
+]
+EOF
+  }
+  remove_image_ref() {
+    removed="${removed}${1}"$'\n'
+  }
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      "ls -a --quiet") printf '%s\n' unit-stopped unit-running ;;
+      "inspect unit-stopped")
+        printf '%s\n' '[{"configuration":{"image":{"reference":"agent-python:latest","descriptor":{"digest":"sha256:used"}}},"status":{"state":"stopped"}}]'
+        ;;
+      "inspect unit-running")
+        printf '%s\n' '[{"configuration":{"image":{"reference":"agent-plain:latest","descriptor":{"digest":"sha256:running"}}},"status":{"state":"running"}}]'
+        ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+
+  run_capture images_prune_cmd --image agent-python --keep 1 --dry-run
+  assert_status 0
+  assert_contains "Keeping image used by existing container: agent-python:20260102-000000"
+  assert_contains "Keeping image used by existing container: agent-python:20260101-000000"
+  assert_contains "Keeping image used by existing container: agent-python:20251231-000000"
+  assert_contains "Would remove image: agent-python:20251230-000000"
+  assert_not_contains "Would remove image: agent-python:20260102-000000"
+  [ -z "$removed" ] || fail "Dry-run unexpectedly removed images: $removed"
+
+  run_capture images_prune_cmd --image agent-python --keep 1
+  assert_status 0
+  assert_contains "Removed image: agent-python:20251230-000000"
+  [ "$removed" = $'agent-python:20251230-000000\n' ] \
+    || fail "Expected only the unused digest ref to be removed, got: $removed"
+}
+
+test_images_prune_without_containers_keeps_existing_behavior() {
+  begin_test "images prune removes normal candidates when no containers exist"
+
+  load_agentctl_functions
+
+  local removed=""
+
+  require_container() { return 0; }
+  parse_image_list() {
+    printf '%s\n' agent-python:20260102-000000 agent-python:20260101-000000
+  }
+  container_image_digests_in_use() { return 0; }
+  image_list_json_required() { fail "Prune should not request image metadata without containers"; }
+  remove_image_ref() { removed="${removed}${1}"$'\n'; }
+
+  run_capture images_prune_cmd --image agent-python --keep 1
+  assert_status 0
+  assert_contains "Removed image: agent-python:20260101-000000"
+  [ "$removed" = $'agent-python:20260101-000000\n' ] \
+    || fail "Expected normal prune behavior without containers, got: $removed"
+}
+
+test_image_refs_matching_container_digests_normalizes_backups_and_variants() {
+  begin_test "prune digest matching normalizes backup latest refs and variant digests"
+
+  load_agentctl_functions
+
+  matching_refs_wrapper() {
+    printf '%s\n' '[{"configuration":{"name":"agent-project-backup-20260101120000:latest","descriptor":{"digest":"sha256:backup-used"}}},{"reference":"agent-python:20260101-000000","variants":[{"descriptor":{"digest":"sha256:variant-used"}}]}]' \
+      | image_refs_matching_container_digests "$1" "$2"
+  }
+
+  run_capture matching_refs_wrapper \
+    $'agent-project-backup-20260101120000\nagent-python:20260101-000000' \
+    $'sha256:backup-used\nsha256:variant-used'
+  assert_status 0
+  [ "$RUN_OUTPUT" = $'agent-project-backup-20260101120000\nagent-python:20260101-000000' ] \
+    || fail "Expected normalized backup and variant matches, got: $RUN_OUTPUT"
+}
+
+test_images_prune_fails_closed_when_usage_metadata_is_unavailable() {
+  begin_test "images prune fails closed when container or image metadata is unavailable"
+
+  load_agentctl_functions
+
+  local removal_log
+  removal_log="$(mktemp "${TMPDIR:-/tmp}/agentctl-prune-removals.XXXXXX")"
+  register_dir_cleanup "$removal_log"
+
+  require_container() { return 0; }
+  parse_image_list() {
+    printf '%s\n' agent-python:20260102-000000 agent-python:20260101-000000
+  }
+  remove_image_ref() { printf '%s\n' "$1" >>"$removal_log"; }
+  container_image_digests_in_use() { return 1; }
+  prune_wrapper() { ( images_prune_cmd --image agent-python --keep 1 ); }
+
+  run_capture prune_wrapper
+  assert_status 1
+  assert_contains "Unable to determine image digests used by existing containers; refusing to prune images"
+  [ ! -s "$removal_log" ] || fail "Prune removed an image after container metadata failure"
+
+  container_image_digests_in_use() { printf '%s\n' sha256:used; }
+  image_list_json_required() { return 1; }
+
+  run_capture prune_wrapper
+  assert_status 1
+  assert_contains "Unable to read image metadata needed for safe pruning; refusing to prune images"
+  [ ! -s "$removal_log" ] || fail "Prune removed an image after image metadata read failure"
+
+  image_list_json_required() { printf '%s\n' 'not-json'; }
+
+  run_capture prune_wrapper
+  assert_status 1
+  assert_contains "Unable to match prune candidates to container image digests; refusing to prune images"
+  [ ! -s "$removal_log" ] || fail "Prune removed an image after image metadata failure"
+
+  image_list_json_required() { printf '%s\n' '[]'; }
+
+  run_capture prune_wrapper
+  assert_status 1
+  assert_contains "Unable to match prune candidates to container image digests; refusing to prune images"
+  [ ! -s "$removal_log" ] || fail "Prune removed an unresolved image candidate"
+}
+
 test_rm_help_reports_force_option() {
   begin_test "rm help reports the force option"
 
@@ -15015,6 +15162,10 @@ main() {
   run_selected_test test_images_print_metadata_uses_runtime_image_details "test_images_print_metadata_uses_runtime_image_details"
   run_selected_test test_images_list_defaults_to_metadata_and_supports_raw_output "test_images_list_defaults_to_metadata_and_supports_raw_output"
   run_selected_test test_images_list_falls_back_to_refs_when_metadata_is_unavailable "test_images_list_falls_back_to_refs_when_metadata_is_unavailable"
+  run_selected_test test_images_prune_keeps_refs_for_container_digests "test_images_prune_keeps_refs_for_container_digests"
+  run_selected_test test_images_prune_without_containers_keeps_existing_behavior "test_images_prune_without_containers_keeps_existing_behavior"
+  run_selected_test test_image_refs_matching_container_digests_normalizes_backups_and_variants "test_image_refs_matching_container_digests_normalizes_backups_and_variants"
+  run_selected_test test_images_prune_fails_closed_when_usage_metadata_is_unavailable "test_images_prune_fails_closed_when_usage_metadata_is_unavailable"
   run_selected_test test_rm_help_reports_force_option "test_rm_help_reports_force_option"
   run_selected_test test_agent_sh_runtime_info_reports_registry_metadata "test_agent_sh_runtime_info_reports_registry_metadata"
   run_selected_test test_agent_sh_codex_mcp_sync_reconciles_only_owned_servers "test_agent_sh_codex_mcp_sync_reconciles_only_owned_servers"

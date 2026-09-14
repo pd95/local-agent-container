@@ -93,6 +93,15 @@ ensure_agent_plain_image() {
   assert_status 0
 }
 
+ensure_agent_python_image() {
+  if image_exists agent-python; then
+    return 0
+  fi
+
+  run_capture "$AGENTCTL" build --image agent-python
+  assert_status 0
+}
+
 ensure_feature_fixture() {
   if [ -n "$FEATURE_FIXTURE_NAME" ] && container_exists "$FEATURE_FIXTURE_NAME"; then
     return 0
@@ -370,6 +379,84 @@ test_build_rebuild_stops_buildkit() {
     printf '%s\n' "$RUN_OUTPUT" >&2
     fail "Expected buildkit to be stopped after agentctl build"
   fi
+}
+
+test_images_prune_preserves_container_referenced_digest() {
+  begin_test "images prune preserves every ref for a stopped container digest"
+
+  local name
+  local family
+  local old_ref_one
+  local old_ref_two
+  local newest_ref
+  local latest_ref
+  local container_digest
+  local latest_digest
+
+  name="$(unique_name image-prune-container)"
+  family="agent-$(unique_name image-prune-family)"
+  old_ref_one="$family:20260101-000000"
+  old_ref_two="$family:20260102-000000"
+  newest_ref="$family:20260103-000000"
+  latest_ref="$family:latest"
+
+  ensure_agent_plain_image
+  ensure_agent_python_image
+  register_raw_container_cleanup "$name"
+
+  run_capture "$CONTAINER_CMD" image tag agent-plain:latest "$old_ref_one"
+  assert_status 0
+  register_image_cleanup "$old_ref_one"
+  run_capture "$CONTAINER_CMD" image tag agent-plain:latest "$old_ref_two"
+  assert_status 0
+  register_image_cleanup "$old_ref_two"
+  run_capture "$CONTAINER_CMD" image tag agent-plain:latest "$latest_ref"
+  assert_status 0
+  register_image_cleanup "$latest_ref"
+
+  run_capture "$CONTAINER_CMD" create --name "$name" "$latest_ref" sh -c 'sleep 3600'
+  assert_status 0
+  container_digest="$("$CONTAINER_CMD" inspect "$name" \
+    | jq -er '.[0].configuration.image.descriptor.digest')"
+
+  run_capture "$CONTAINER_CMD" image rm "$latest_ref"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" image tag agent-python:latest "$latest_ref"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" image tag agent-python:latest "$newest_ref"
+  assert_status 0
+  register_image_cleanup "$newest_ref"
+
+  latest_digest="$("$CONTAINER_CMD" image ls --format json | jq -er --arg ref "$latest_ref" '
+    .[]
+    | select(((.reference // .configuration.name // .configuration.reference // "")
+      | sub("^docker\\.io/library/"; "")) == $ref)
+    | (.descriptor.digest // .configuration.descriptor.digest)
+  ')"
+  [ "$container_digest" != "$latest_digest" ] \
+    || fail "Expected the stopped container digest to differ from current latest"
+
+  run_capture "$AGENTCTL" images prune --image "$family" --keep 1 --dry-run
+  assert_status 0
+  assert_contains "Keeping image used by existing container: $old_ref_two"
+  assert_contains "Keeping image used by existing container: $old_ref_one"
+  assert_not_contains "Would remove image: $old_ref_two"
+  assert_not_contains "Would remove image: $old_ref_one"
+
+  run_capture "$AGENTCTL" images prune --image "$family" --keep 1
+  assert_status 0
+  assert_contains "Keeping image used by existing container: $old_ref_two"
+  assert_contains "Keeping image used by existing container: $old_ref_one"
+  assert_contains "No images to prune"
+
+  run_capture "$CONTAINER_CMD" image inspect "$old_ref_one" "$old_ref_two"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" start "$name"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" exec "$name" true
+  assert_status 0
+  run_capture "$CONTAINER_CMD" stop "$name"
+  assert_status 0
 }
 
 test_upgrade_no_backup_preserves_state() {
@@ -1834,6 +1921,7 @@ main() {
   run_selected_test test_temp_run_removes_container "run --temp removes the named container" smoke
   run_selected_test test_named_run_persists_until_rm "named run persists until explicit removal" smoke
   run_selected_test test_build_rebuild_stops_buildkit "build --rebuild stops buildkit after a successful build" full
+  run_selected_test test_images_prune_preserves_container_referenced_digest "images prune preserves every ref for a stopped container digest" full
   run_selected_test test_upgrade_no_backup_preserves_state "upgrade --no-backup preserves state without creating backup images" full
   run_selected_test test_upgrade_restores_tagged_apk_packages_through_recovery "upgrade defers and restores tagged APK packages through recovery" full
   run_selected_test test_upgrade_batches_dpkg_recovery "upgrade restores DPKG packages in one recovery transaction" full

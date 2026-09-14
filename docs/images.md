@@ -315,8 +315,16 @@ agentctl images prune --keep 1 --dry-run
 agentctl images rm --image agent-custom --dry-run
 ```
 
-- `agentctl images prune`: remove old timestamp tags while keeping stable tags
-- `agentctl images rm --image <name>`: remove an image family entirely
+- `agentctl images prune`: remove old timestamp tags while keeping stable tags and
+  every tag whose immutable digest is used by an existing running or stopped
+  container
+- `agentctl images rm --image <name>`: explicitly remove an image family
+  entirely; unlike pruning, this command does not protect container-referenced
+  images
+
+Pruning fails without deleting anything when agentctl cannot verify container
+or image digest metadata. After the last container using a retained digest is
+upgraded or removed, a later prune can remove those old timestamp tags.
 
 ## Image-Owned and Active Configuration
 

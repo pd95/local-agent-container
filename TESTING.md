@@ -720,6 +720,15 @@ agentctl images prune --backup --keep 1 --dry-run
 Expected output should show `Would remove image:` lines only for older snapshot/backup
 refs and never stable tags.
 
+The full host suite also creates a stopped container whose configured `latest`
+reference is moved to a newer digest. Its image-prune regression verifies that
+all timestamp tags for the container's original immutable digest are retained
+and that the stopped container still starts after a real prune:
+
+```bash
+bash tests/run-tests.sh --tier full --filter "images prune"
+```
+
 ## Codex CLI sanity checks
 
 These steps confirm Codex itself can connect to the local model, execute shell commands,

@@ -2107,6 +2107,72 @@ image_list_json() {
   "$CONTAINER_CMD" image ls --format json 2>/dev/null || printf '[]\n'
 }
 
+image_list_json_required() {
+  "$CONTAINER_CMD" image ls --format json 2>/dev/null
+}
+
+container_image_digests_in_use() {
+  local container_ids=""
+  local container_id=""
+  local inspect_json=""
+  local digest=""
+  local digests=""
+
+  container_ids="$("$CONTAINER_CMD" ls -a --quiet 2>/dev/null)" || return 1
+  while IFS= read -r container_id; do
+    [ -n "$container_id" ] || continue
+    inspect_json="$("$CONTAINER_CMD" inspect "$container_id" 2>/dev/null)" || return 1
+    digest="$(printf '%s' "$inspect_json" | jq -er '
+      if type == "array" then (.[0] // {})
+      elif type == "object" then .
+      else error("invalid container inspect JSON")
+      end
+      | (.configuration // .) as $configuration
+      | ($configuration.image.descriptor.digest // .image.descriptor.digest // "")
+      | select(type == "string" and length > 0)
+    ')" || return 1
+    digests="${digests}${digest}"$'\n'
+  done <<< "$container_ids"
+
+  digests="${digests%$'\n'}"
+  [ -n "$digests" ] || return 0
+  printf '%s\n' "$digests" | sort -u
+}
+
+image_refs_matching_container_digests() {
+  local candidates="$1"
+  local container_digests="$2"
+
+  jq -r --arg candidates "$candidates" --arg container_digests "$container_digests" '
+    def norm:
+      if type == "string" then sub("^docker\\.io/library/"; "") else "" end;
+    def canonical_ref:
+      norm | if endswith(":latest") then rtrimstr(":latest") else . end;
+    def ref:
+      (.reference // .configuration.name // .configuration.reference // "") | canonical_ref;
+    def digests:
+      [(.descriptor.digest // .configuration.descriptor.digest // empty),
+       ((.variants // [])[] | .descriptor.digest // .digest // empty)]
+      | map(select(type == "string" and length > 0))
+      | unique;
+    if type != "array" then error("invalid image list JSON") else . end
+    | ($candidates | split("\n") | map(select(length > 0))) as $targets
+    | ($container_digests | split("\n") | map(select(length > 0)) | unique) as $used
+    | [.[] | select(type == "object") | {ref: ref, digests: digests}] as $images
+    | if any($targets[];
+        . as $target
+        | ([$images[] | select(.ref == $target) | .digests[]] | length) == 0)
+      then error("missing digest metadata for a prune candidate")
+      else $targets[] as $target
+        | select(any($images[];
+            select(.ref == $target)
+            | .digests[] as $digest
+            | $used | index($digest) != null))
+        | $target
+      end
+  '
+}
+
 image_matching_timestamp_ref() {
   local image="$1"
   local images_json
@@ -3206,6 +3272,10 @@ images_prune_cmd() {
   local ref=""
   local family=""
   local deletion_ref=""
+  local container_digests=""
+  local images_json=""
+  local protected_refs=""
+  local removable_refs=""
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -3270,6 +3340,27 @@ images_prune_cmd() {
   done
 
   to_remove="${to_remove%$'\n'}"
+  [ -z "$to_remove" ] && echo "No images to prune" && return 0
+
+  container_digests="$(container_image_digests_in_use)" \
+    || die "Unable to determine image digests used by existing containers; refusing to prune images"
+  if [ -n "$container_digests" ]; then
+    images_json="$(image_list_json_required)" \
+      || die "Unable to read image metadata needed for safe pruning; refusing to prune images"
+    protected_refs="$(printf '%s' "$images_json" \
+      | image_refs_matching_container_digests "$to_remove" "$container_digests")" \
+      || die "Unable to match prune candidates to container image digests; refusing to prune images"
+  fi
+
+  while IFS= read -r deletion_ref; do
+    [ -n "$deletion_ref" ] || continue
+    if [ -n "$protected_refs" ] && printf '%s\n' "$protected_refs" | grep -Fqx -- "$deletion_ref"; then
+      echo "Keeping image used by existing container: $deletion_ref"
+      continue
+    fi
+    removable_refs="${removable_refs}${deletion_ref}"$'\n'
+  done <<< "$to_remove"
+  to_remove="${removable_refs%$'\n'}"
   [ -z "$to_remove" ] && echo "No images to prune" && return 0
 
   while IFS= read -r deletion_ref; do
