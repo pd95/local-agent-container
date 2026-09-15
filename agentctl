@@ -3974,14 +3974,171 @@ run_auth_flow() {
   trap - EXIT INT TERM HUP
 }
 
+runtime_state_inventory_from_tar() {
+  local backup_file="$1"
+
+  if [ ! -s "$backup_file" ]; then
+    printf '%s\t0\n' codex claude opencode pi qwen
+    return 0
+  fi
+  tar -tf "$backup_file" 2>/dev/null | awk '
+    !/\/$/ && /^\.codex\// && !/^\.codex\/packages(\/|$)/ { codex++ }
+    !/\/$/ && (/^\.claude\// || $0 == ".claude.json") { claude++ }
+    !/\/$/ && (/^\.config\/opencode\// || /^\.local\/share\/opencode\//) { opencode++ }
+    !/\/$/ && /^\.pi\/agent\// { pi++ }
+    !/\/$/ && /^\.qwen\// { qwen++ }
+    END {
+      printf "codex\t%d\nclaude\t%d\nopencode\t%d\npi\t%d\nqwen\t%d\n",
+        codex + 0, claude + 0, opencode + 0, pi + 0, qwen + 0
+    }
+  '
+}
+
+runtime_state_inventory_from_root() {
+  local home_dir="$1"
+  local runtime=""
+  local count=0
+
+  if [ ! -d "$home_dir" ]; then
+    printf '%s\t0\n' codex claude opencode pi qwen
+    return 0
+  fi
+
+  for runtime in codex claude opencode pi qwen; do
+    case "$runtime" in
+      codex)
+        count="$(find "$home_dir/.codex" \
+          \( -path "$home_dir/.codex/packages" -o -path "$home_dir/.codex/packages/*" \) -prune -o \
+          ! -type d -print 2>/dev/null | wc -l | tr -d '[:space:]')"
+        ;;
+      claude)
+        count="$(find "$home_dir/.claude" ! -type d -print 2>/dev/null | wc -l | tr -d '[:space:]')"
+        [ ! -e "$home_dir/.claude.json" ] || count=$((count + 1))
+        ;;
+      opencode)
+        count="$(find "$home_dir/.config/opencode" "$home_dir/.local/share/opencode" \
+          ! -type d -print 2>/dev/null | wc -l | tr -d '[:space:]')"
+        ;;
+      pi)
+        count="$(find "$home_dir/.pi/agent" ! -type d -print 2>/dev/null | wc -l | tr -d '[:space:]')"
+        ;;
+      qwen)
+        count="$(find "$home_dir/.qwen" ! -type d -print 2>/dev/null | wc -l | tr -d '[:space:]')"
+        ;;
+    esac
+    printf '%s\t%s\n' "$runtime" "${count:-0}"
+  done
+}
+
+state_inventory_has_items() {
+  awk -F '\t' '$2 > 0 { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+runtime_state_inventory_from_container() {
+  local name="$1"
+  local installed_only="${2:-1}"
+
+  "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -lc '
+home=/home/coder
+installed_only="$1"
+count_tree() {
+  find "$@" ! -type d -print 2>/dev/null | wc -l | tr -d "[:space:]"
+}
+for runtime in codex claude opencode pi qwen; do
+  if [ "$installed_only" -eq 1 ] && ! command -v "$runtime" >/dev/null 2>&1; then
+    printf "%s\t0\n" "$runtime"
+    continue
+  fi
+  case "$runtime" in
+    codex)
+      count="$(find "$home/.codex" \
+        \( -path "$home/.codex/packages" -o -path "$home/.codex/packages/*" \) -prune -o \
+        ! -type d -print 2>/dev/null | wc -l | tr -d "[:space:]")"
+      ;;
+    claude)
+      count="$(count_tree "$home/.claude")"
+      [ ! -e "$home/.claude.json" ] || count=$((count + 1))
+      ;;
+    opencode)
+      count="$(count_tree "$home/.config/opencode" "$home/.local/share/opencode")"
+      ;;
+    pi) count="$(count_tree "$home/.pi/agent")" ;;
+    qwen) count="$(count_tree "$home/.qwen")" ;;
+  esac
+  printf "%s\t%s\n" "$runtime" "${count:-0}"
+done
+' sh "$installed_only"
+}
+
+verify_state_backup_inventory() {
+  local expected_inventory="$1"
+  local backup_file="$2"
+  local actual_inventory=""
+  local runtime=""
+  local expected=0
+  local actual=0
+  local failed=0
+
+  actual_inventory="$(runtime_state_inventory_from_tar "$backup_file")" || return 2
+  while IFS=$'\t' read -r runtime expected; do
+    [ -n "$runtime" ] || continue
+    actual="$(printf '%s\n' "$actual_inventory" | awk -F '\t' -v runtime="$runtime" '$1 == runtime { print $2; exit }')"
+    actual="${actual:-0}"
+    if [ "$actual" -lt "$expected" ]; then
+      warn "Runtime state backup verification failed for $runtime: source has $expected preservable item(s), archive has $actual"
+      failed=1
+    fi
+  done <<<"$expected_inventory"
+  [ "$failed" -eq 0 ]
+}
+
+verify_restored_runtime_inventory() {
+  local name="$1"
+  local expected_inventory="$2"
+  local actual_inventory=""
+
+  actual_inventory="$(runtime_state_inventory_from_container "$name" 0)" || return 2
+  verify_state_inventory_counts "$expected_inventory" "$actual_inventory" "restore in $name"
+}
+
+verify_state_inventory_counts() {
+  local expected_inventory="$1"
+  local actual_inventory="$2"
+  local context="$3"
+  local runtime=""
+  local expected=0
+  local actual=0
+  local failed=0
+
+  while IFS=$'\t' read -r runtime expected; do
+    [ -n "$runtime" ] || continue
+    actual="$(printf '%s\n' "$actual_inventory" | awk -F '\t' -v runtime="$runtime" '$1 == runtime { print $2; exit }')"
+    actual="${actual:-0}"
+    if [ "$actual" -lt "$expected" ]; then
+      warn "Runtime state verification failed for $runtime during $context: expected at least $expected preservable item(s), found $actual"
+      failed=1
+    fi
+  done <<<"$expected_inventory"
+  [ "$failed" -eq 0 ]
+}
+
+SOURCE_RUNTIME_STATE_INVENTORY=""
+
 backup_codex_config() {
   local name="$1"
   local backup_file="$2"
+
   if container_supports_state_contract "$name"; then
+    SOURCE_RUNTIME_STATE_INVENTORY="$(runtime_state_inventory_from_container "$name" 1)" \
+      || die "Unable to inventory runtime state in $name before backup. The source container has not been removed."
     "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh state export >"$backup_file"
-    return 0
+  else
+    SOURCE_RUNTIME_STATE_INVENTORY="$(runtime_state_inventory_from_container "$name" 0)" \
+      || die "Unable to inventory runtime state in $name before backup. The source container has not been removed."
+    backup_known_state_from_container "$name" "$backup_file"
   fi
-  backup_known_state_from_container "$name" "$backup_file"
+  verify_state_backup_inventory "$SOURCE_RUNTIME_STATE_INVENTORY" "$backup_file" \
+    || die "User-state backup verification failed for $name. The source container has not been removed; inspect it and the backup diagnostics before retrying."
 }
 
 extract_export_root() {
@@ -4008,14 +4165,19 @@ backup_codex_config_from_export() {
 
   extract_export_root "$export_file" "$extract_root"
   home_dir="$extract_root/home/coder"
+  SOURCE_RUNTIME_STATE_INVENTORY="$(runtime_state_inventory_from_root "$home_dir")"
   [ -d "$home_dir" ] || return 0
 
   paths_file="$(mktemp "${TMPDIR:-/tmp}/agentctl-state-paths.XXXXXX")"
   for path in \
     .codex \
     .config/agentctl \
+    .config/opencode \
     .claude \
     .claude.json \
+    .local/share/opencode \
+    .pi/agent \
+    .qwen \
     .profile \
     .bashrc \
     .bash_profile \
@@ -4046,11 +4208,16 @@ backup_codex_config_from_export() {
   done
   if [ ! -s "$paths_file" ]; then
     rm -f "$paths_file"
+    verify_state_backup_inventory "$SOURCE_RUNTIME_STATE_INVENTORY" "$backup_file" \
+      || die "User-state backup verification failed for the exported filesystem. The source container has not been removed."
     return 0
   fi
 
   tar -C "$home_dir" -cf "$backup_file" -T "$paths_file" || tar_status=$?
   rm -f "$paths_file"
+  [ "$tar_status" -eq 0 ] || return "$tar_status"
+  verify_state_backup_inventory "$SOURCE_RUNTIME_STATE_INVENTORY" "$backup_file" \
+    || die "User-state backup verification failed for the exported filesystem. The source container has not been removed."
   return "$tar_status"
 }
 
@@ -4304,8 +4471,12 @@ cd /home/coder || exit 0
 for path in \
   .codex \
   .config/agentctl \
+  .config/opencode \
   .claude \
   .claude.json \
+  .local/share/opencode \
+  .pi/agent \
+  .qwen \
   .profile \
   .bashrc \
   .bash_profile \
@@ -10655,6 +10826,10 @@ upgrade_cmd() {
   restore_codex_config "$target_name" "$state_backup_file"
   verify_restored_runtime_state "$target_name" "$state_backup_file" \
     || die "Restored runtime state verification failed for $target_name; inspect the backup image before continuing."
+  if printf '%s\n' "$SOURCE_RUNTIME_STATE_INVENTORY" | state_inventory_has_items; then
+    verify_restored_runtime_inventory "$target_name" "$SOURCE_RUNTIME_STATE_INVENTORY" \
+      || die "Restored runtime state verification failed for $target_name; inspect the backup image before continuing."
+  fi
   local recovery_target_manifest=""
   local recovery_selected=""
   recovery_target_manifest="$(run_agent_sh_in_container "$target_name" recovery manifest 2>/dev/null || true)"

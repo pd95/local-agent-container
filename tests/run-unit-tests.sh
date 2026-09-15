@@ -8797,6 +8797,145 @@ test_agent_sh_pi_state_export_uses_runtime_hooks() {
   fi
 }
 
+test_agent_sh_state_export_continues_after_missing_optional_runtime_paths() {
+  begin_test "agent.sh state export checks every installed runtime when optional paths are absent"
+
+  local temp_home
+  local fake_bin
+  local runtime
+  local tar_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  tar_file="$temp_home/state.tar"
+  for runtime in claude codex opencode pi qwen; do
+    make_fake_runtime_bin "$temp_home" "$runtime" >/dev/null
+  done
+  fake_bin="$temp_home/bin"
+
+  mkdir -p \
+    "$temp_home/home/.claude" \
+    "$temp_home/home/.codex" \
+    "$temp_home/home/.config/opencode" \
+    "$temp_home/home/.qwen"
+  printf '%s' 'claude-state' >"$temp_home/home/.claude/settings.json"
+  printf '%s' 'codex-state' >"$temp_home/home/.codex/history.jsonl"
+  printf '%s' 'opencode-state' >"$temp_home/home/.config/opencode/opencode.json"
+  printf '%s' 'qwen-state' >"$temp_home/home/.qwen/settings.json"
+
+  env -i \
+    "HOME=$temp_home/home" \
+    "XDG_CONFIG_HOME=$temp_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state export >"$tar_file"
+
+  tar -tf "$tar_file" | grep -Fx '.claude/settings.json' >/dev/null || fail "Expected Claude state in multi-runtime export"
+  tar -tf "$tar_file" | grep -Fx '.codex/history.jsonl' >/dev/null || fail "Expected Codex state after missing optional Claude state"
+  tar -tf "$tar_file" | grep -Fx '.config/opencode/opencode.json' >/dev/null || fail "Expected partial OpenCode state in multi-runtime export"
+  tar -tf "$tar_file" | grep -Fx '.qwen/settings.json' >/dev/null || fail "Expected Qwen state after missing Pi state"
+}
+
+test_agent_sh_state_import_continues_after_missing_optional_runtime_paths() {
+  begin_test "agent.sh state import cleans every installed runtime when optional paths are absent"
+
+  local temp_home
+  local fake_bin
+  local runtime
+  local tar_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  tar_file="$temp_home/state.tar"
+  for runtime in claude codex opencode pi qwen; do
+    make_fake_runtime_bin "$temp_home" "$runtime" >/dev/null
+  done
+  fake_bin="$temp_home/bin"
+
+  mkdir -p \
+    "$temp_home/archive/.config/agentctl" \
+    "$temp_home/home/.claude" \
+    "$temp_home/home/.codex" \
+    "$temp_home/home/.config/opencode" \
+    "$temp_home/home/.qwen"
+  printf '%s' 'restored' >"$temp_home/archive/.config/agentctl/preferred-runtime"
+  printf '%s' 'stale-claude' >"$temp_home/home/.claude/settings.json"
+  printf '%s' 'stale-codex' >"$temp_home/home/.codex/history.jsonl"
+  printf '%s' 'stale-opencode' >"$temp_home/home/.config/opencode/opencode.json"
+  printf '%s' 'stale-qwen' >"$temp_home/home/.qwen/settings.json"
+  tar -C "$temp_home/archive" -cf "$tar_file" .config/agentctl
+
+  env -i \
+    "HOME=$temp_home/home" \
+    "XDG_CONFIG_HOME=$temp_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$TEST_ROOT/runtimes" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state import <"$tar_file"
+
+  [ ! -e "$temp_home/home/.claude/settings.json" ] || fail "Expected stale Claude state to be cleared"
+  [ ! -e "$temp_home/home/.codex/history.jsonl" ] || fail "Expected stale Codex state after Claude to be cleared"
+  [ ! -e "$temp_home/home/.config/opencode/opencode.json" ] || fail "Expected stale OpenCode state to be cleared"
+  [ ! -e "$temp_home/home/.qwen/settings.json" ] || fail "Expected stale Qwen state after missing Pi state to be cleared"
+  [ "$(cat "$temp_home/home/.config/agentctl/preferred-runtime")" = "restored" ] || fail "Expected imported agentctl state"
+}
+
+test_agent_sh_state_paths_fail_before_export_or_import_mutation() {
+  begin_test "agent.sh propagates runtime state hook failures before exporting or importing"
+
+  local temp_home
+  local fake_bin
+  local adapter_dir
+  local tar_file
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$(make_fake_runtime_bin "$temp_home" claude)"
+  adapter_dir="$temp_home/runtimes"
+  tar_file="$temp_home/state.tar"
+  mkdir -p "$adapter_dir" "$temp_home/archive/.config/agentctl" "$temp_home/home/.config/agentctl"
+  printf '%s' 'archive-state' >"$temp_home/archive/.config/agentctl/preferred-runtime"
+  printf '%s' 'original-state' >"$temp_home/home/.config/agentctl/preferred-runtime"
+  tar -C "$temp_home/archive" -cf "$tar_file" .config/agentctl
+  cat >"$adapter_dir/claude.sh" <<'EOF'
+agent_runtime_state_paths() {
+  return 42
+}
+EOF
+
+  run_capture env -i \
+    "HOME=$temp_home/home" \
+    "XDG_CONFIG_HOME=$temp_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$adapter_dir" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state export
+  assert_status 1
+  assert_contains "failed to enumerate state export paths"
+
+  if env -i \
+    "HOME=$temp_home/home" \
+    "XDG_CONFIG_HOME=$temp_home/home/.config" \
+    "PATH=$fake_bin:/usr/bin:/bin" \
+    "AGENTCTL_TOOLS_HOME=$temp_home/tools" \
+    "AGENTCTL_RUNTIME_REGISTRY_DIR=$TEST_ROOT/runtimes.d" \
+    "AGENTCTL_RUNTIME_ADAPTER_DIR=$adapter_dir" \
+    "AGENTCTL_FEATURE_REGISTRY_DIR=$TEST_ROOT/features.d" \
+    "AGENTCTL_FEATURE_ADAPTER_DIR=$TEST_ROOT/features" \
+    /bin/bash "$TEST_ROOT/agent.sh" state import <"$tar_file" >"$temp_home/import.log" 2>&1; then
+    fail "Expected state import to reject a failed runtime path hook"
+  fi
+  grep -Fq "failed to enumerate state import paths" "$temp_home/import.log" || fail "Expected state import path failure diagnostic"
+  [ "$(cat "$temp_home/home/.config/agentctl/preferred-runtime")" = "original-state" ] || fail "Expected failed import enumeration to preserve existing state"
+}
+
 test_backup_codex_config_from_export_excludes_codex_packages() {
   begin_test "export fallback backup excludes Codex package cache"
 
@@ -8819,11 +8958,19 @@ test_backup_codex_config_from_export_excludes_codex_packages() {
       "$extract_root/home/coder/.codex/packages/standalone/current/bin" \
       "$extract_root/home/coder/.codex/sessions" \
       "$extract_root/home/coder/.config/agentctl" \
+      "$extract_root/home/coder/.config/opencode" \
+      "$extract_root/home/coder/.local/share/opencode" \
+      "$extract_root/home/coder/.pi/agent/sessions" \
+      "$extract_root/home/coder/.qwen" \
       "$extract_root/opt/agentctl/codex"
     printf '%s' 'token' >"$extract_root/home/coder/.codex/auth.json"
     printf '%s' 'session' >"$extract_root/home/coder/.codex/sessions/session.jsonl"
     printf '%s' 'binary-cache' >"$extract_root/home/coder/.codex/packages/standalone/current/bin/codex"
     printf '%s' 'codex' >"$extract_root/home/coder/.config/agentctl/preferred-runtime"
+    printf '%s' 'opencode-config' >"$extract_root/home/coder/.config/opencode/opencode.json"
+    printf '%s' 'opencode-session' >"$extract_root/home/coder/.local/share/opencode/session.db"
+    printf '%s' 'pi-session' >"$extract_root/home/coder/.pi/agent/sessions/session.jsonl"
+    printf '%s' 'qwen-config' >"$extract_root/home/coder/.qwen/settings.json"
     printf '%s' 'tool-cache' >"$extract_root/opt/agentctl/codex/package"
   }
 
@@ -8833,10 +8980,95 @@ test_backup_codex_config_from_export_excludes_codex_packages() {
   tar -tf "$backup_file" | grep -Fx '.codex/auth.json' >/dev/null || fail "Expected Codex auth in export fallback backup"
   tar -tf "$backup_file" | grep -Fx '.codex/sessions/session.jsonl' >/dev/null || fail "Expected Codex sessions in export fallback backup"
   tar -tf "$backup_file" | grep -Fx '.config/agentctl/preferred-runtime' >/dev/null || fail "Expected agentctl state in export fallback backup"
+  tar -tf "$backup_file" | grep -Fx '.config/opencode/opencode.json' >/dev/null || fail "Expected OpenCode config in export fallback backup"
+  tar -tf "$backup_file" | grep -Fx '.local/share/opencode/session.db' >/dev/null || fail "Expected OpenCode data in export fallback backup"
+  tar -tf "$backup_file" | grep -Fx '.pi/agent/sessions/session.jsonl' >/dev/null || fail "Expected Pi state in export fallback backup"
+  tar -tf "$backup_file" | grep -Fx '.qwen/settings.json' >/dev/null || fail "Expected Qwen state in export fallback backup"
   if tar -tf "$backup_file" | grep -Eq '^\.codex/packages(/|$)|^opt/agentctl(/|$)'; then
     tar -tf "$backup_file" >&2
     fail "Did not expect Codex packages or tool home in export fallback backup"
   fi
+}
+
+test_verify_state_backup_inventory_rejects_omitted_runtime_state() {
+  begin_test "upgrade backup inventory rejects omitted source runtime state"
+
+  load_agentctl_functions
+
+  local temp_dir
+  local backup_file
+  local expected_inventory
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-state-inventory.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  backup_file="$temp_dir/state.tar"
+  mkdir -p "$temp_dir/home/.claude"
+  printf '%s' 'claude-state' >"$temp_dir/home/.claude/settings.json"
+  tar -C "$temp_dir/home" -cf "$backup_file" .claude
+  expected_inventory=$'codex\t3\nclaude\t1\nopencode\t0\npi\t0\nqwen\t0'
+
+  run_capture verify_state_backup_inventory "$expected_inventory" "$backup_file"
+  assert_status 1
+  assert_contains "Runtime state backup verification failed for codex: source has 3 preservable item(s), archive has 0"
+}
+
+test_verify_state_backup_inventory_accepts_complete_state_and_ignores_codex_packages() {
+  begin_test "upgrade backup inventory accepts complete runtime state without Codex packages"
+
+  load_agentctl_functions
+
+  local temp_dir
+  local backup_file
+  local expected_inventory
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-state-inventory.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  backup_file="$temp_dir/state.tar"
+  mkdir -p \
+    "$temp_dir/home/.codex/packages/standalone/current/bin" \
+    "$temp_dir/home/.codex/sessions" \
+    "$temp_dir/home/.config/opencode"
+  printf '%s' 'auth' >"$temp_dir/home/.codex/auth.json"
+  printf '%s' 'session' >"$temp_dir/home/.codex/sessions/session.jsonl"
+  printf '%s' 'package' >"$temp_dir/home/.codex/packages/standalone/current/bin/codex"
+  printf '%s' 'config' >"$temp_dir/home/.config/opencode/opencode.json"
+  tar -C "$temp_dir/home" -cf "$backup_file" .codex/auth.json .codex/sessions .config/opencode
+  expected_inventory=$'codex\t2\nclaude\t0\nopencode\t1\npi\t0\nqwen\t0'
+
+  run_capture verify_state_backup_inventory "$expected_inventory" "$backup_file"
+  assert_status 0
+}
+
+test_backup_codex_config_aborts_on_partial_state_export() {
+  begin_test "live state backup aborts when contract export omits source runtime state"
+
+  load_agentctl_functions
+
+  local temp_dir
+  local partial_archive
+  local backup_file
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-state-inventory.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  partial_archive="$temp_dir/partial.tar"
+  backup_file="$temp_dir/backup.tar"
+  mkdir -p "$temp_dir/home/.claude"
+  printf '%s' 'claude-state' >"$temp_dir/home/.claude/settings.json"
+  tar -C "$temp_dir/home" -cf "$partial_archive" .claude
+
+  container_supports_state_contract() { return 0; }
+  runtime_state_inventory_from_container() {
+    printf 'codex\t1\nclaude\t1\nopencode\t0\npi\t0\nqwen\t0\n'
+  }
+  CONTAINER_CMD=container
+  container() {
+    cat "$partial_archive"
+  }
+  backup_wrapper() {
+    ( backup_codex_config unit-test-container "$backup_file" )
+  }
+
+  run_capture backup_wrapper
+  assert_status 1
+  assert_contains "Runtime state backup verification failed for codex"
+  assert_contains "The source container has not been removed"
 }
 
 test_backup_known_state_from_container_excludes_codex_packages() {
@@ -15263,7 +15495,13 @@ main() {
   run_selected_test test_agent_sh_opencode_state_export_uses_runtime_hooks "test_agent_sh_opencode_state_export_uses_runtime_hooks"
   run_selected_test test_agent_sh_qwen_state_export_uses_runtime_hooks "test_agent_sh_qwen_state_export_uses_runtime_hooks"
   run_selected_test test_agent_sh_pi_state_export_uses_runtime_hooks "test_agent_sh_pi_state_export_uses_runtime_hooks"
+  run_selected_test test_agent_sh_state_export_continues_after_missing_optional_runtime_paths "test_agent_sh_state_export_continues_after_missing_optional_runtime_paths"
+  run_selected_test test_agent_sh_state_import_continues_after_missing_optional_runtime_paths "test_agent_sh_state_import_continues_after_missing_optional_runtime_paths"
+  run_selected_test test_agent_sh_state_paths_fail_before_export_or_import_mutation "test_agent_sh_state_paths_fail_before_export_or_import_mutation"
   run_selected_test test_backup_codex_config_from_export_excludes_codex_packages "test_backup_codex_config_from_export_excludes_codex_packages"
+  run_selected_test test_verify_state_backup_inventory_rejects_omitted_runtime_state "test_verify_state_backup_inventory_rejects_omitted_runtime_state"
+  run_selected_test test_verify_state_backup_inventory_accepts_complete_state_and_ignores_codex_packages "test_verify_state_backup_inventory_accepts_complete_state_and_ignores_codex_packages"
+  run_selected_test test_backup_codex_config_aborts_on_partial_state_export "test_backup_codex_config_aborts_on_partial_state_export"
   run_selected_test test_backup_known_state_from_container_excludes_codex_packages "test_backup_known_state_from_container_excludes_codex_packages"
   run_selected_test test_agent_sh_state_import_restores_known_user_state "test_agent_sh_state_import_restores_known_user_state"
   run_selected_test test_agent_sh_state_import_uses_installed_runtime_hooks "test_agent_sh_state_import_uses_installed_runtime_hooks"

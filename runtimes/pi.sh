@@ -264,6 +264,7 @@ agent_runtime_state_paths() {
 
   [ "$runtime" = "pi" ] || die "unsupported runtime adapter: $runtime"
   [ -e "$(pi_agent_dir)" ] && printf '%s\n' ".pi/agent"
+  return 0
 }
 
 agent_runtime_auth_read() {
