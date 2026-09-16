@@ -13163,6 +13163,7 @@ test_mcp_definition_commands_reject_transient_values_and_redact_list() {
 
   run_capture mcp_definition_list agent-unit
   assert_status 0; assert_contains "shell"; assert_contains "'/usr/local/bin/custom-mcp' 'serve' '--debug'"
+  assert_contains "Response timeout     360000ms"
   assert_contains "MCP_PROFILE (set)"; assert_contains "https://example.test"; assert_contains "Keychain web-token (present)"
   assert_contains "x-tenant <- environment MCP_TENANT (missing)"
   assert_not_contains "token=query-secret"
@@ -13188,10 +13189,16 @@ test_mcp_status_reports_safe_recent_events_without_affecting_health() {
   relay_log="$root/mcp-unit.log"; guest_log="$root/guest-unit.log"
   MCP_TEST_RELAY_LOG="$relay_log"; MCP_TEST_GUEST_LOG="$guest_log"
   printf '%s\n' \
-    '2026-09-16T12:00:00.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_response_timeout","server":"custom","timeout_ms":30000}' \
+    '2026-09-16T12:00:00.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_response_timeout","server":"custom","method":"unsafe\n\u001b[31mforged","timeout_ms":30000}' \
     '2026-09-16T12:00:01.000Z [agentctl-mcp-stderr] {"server":"custom","pid":12,"message":"raw-secret-diagnostic","truncated":false}' >"$relay_log.1"
   printf '%s\n' \
-    '2026-09-16T12:00:02.000Z [agentctl-mcp-event] {"level":"error","event":"http_response","server":"web","status":401,"body":"must-not-print"}' >"$relay_log"
+    '2026-09-16T12:00:02.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_request_failed","server":"one"}' \
+    '2026-09-16T12:00:02.100Z [agentctl-mcp-event] {"level":"error","event":"stdio_request_failed","server":"two"}' \
+    '2026-09-16T12:00:02.200Z [agentctl-mcp-event] {"level":"error","event":"stdio_request_failed","server":"three"}' \
+    '2026-09-16T12:00:02.300Z [agentctl-mcp-event] {"level":"error","event":"stdio_request_failed","server":"four"}' \
+    '2026-09-16T12:00:02.400Z [agentctl-mcp-event] {"level":"error","event":"stdio_request_failed","server":"five"}' \
+    '2026-09-16T12:00:02.500Z [agentctl-mcp-event] {"level":"error","event":"http_response","server":"web","status":401,"body":"must-not-print"}' \
+    '2026-09-16T12:00:02.600Z [agentctl-mcp-event] {"level":"error","event":"stdio_server_exited","server":"custom","code":null,"signal":"SIGABRT","reason":"relay_shutdown"}' >"$relay_log"
   printf '%s\n' \
     '2026-09-16T12:00:03.000Z [agentctl-mcp-event] {"level":"error","event":"guest_upstream_unavailable","code":"ECONNREFUSED","message":"private-detail"}' >"$guest_log"
   chmod 600 "$relay_log" "$relay_log.1" "$guest_log"
@@ -13203,7 +13210,10 @@ test_mcp_status_reports_safe_recent_events_without_affecting_health() {
   run_capture mcp_status agent-unit
   assert_status 0
   assert_contains "host relay healthy"; assert_contains "$relay_log"; assert_contains "$relay_log.1"
+  assert_contains "Latest request timeout"
   assert_contains "server response timed out after 30000ms"
+  assert_not_contains "forged"
+  assert_contains "server exited (code unknown, signal SIGABRT) during relay_shutdown"
   assert_contains "HTTP upstream returned status 401"
   assert_contains "guest proxy could not reach host relay"
   assert_contains "server emitted stderr; see host relay log"

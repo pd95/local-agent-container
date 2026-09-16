@@ -13,6 +13,9 @@ const socket = path.join(temporary, 'relay.sock');
 const config = path.join(temporary, 'config.json');
 const relayLog = path.join(temporary, 'relay.log');
 const starts=path.join(temporary,'starts'); const clientResponses=path.join(temporary,'client-responses');
+const slowStarts=path.join(temporary,'slow-starts'); const slowCancelled=path.join(temporary,'slow-cancelled');
+const slowHeartbeat=path.join(temporary,'slow-heartbeat'); const cleanEof=path.join(temporary,'clean-eof');
+const initializeEof=path.join(temporary,'initialize-eof'); const initializeStarts=path.join(temporary,'initialize-starts');
 const aborted=path.join(temporary,'http-aborted');
 const redirected=path.join(temporary,'http-redirected');
 const expectedAuthorizationHash=path.join(temporary,'expected-authorization.sha256');
@@ -22,8 +25,11 @@ const httpPort=Number(await new Promise((resolve,reject)=>{let text='';fakeHttp.
 const unusedServer=http.createServer(); await new Promise(resolve=>unusedServer.listen(0,'127.0.0.1',resolve)); const unusedPort=unusedServer.address().port; await new Promise(resolve=>unusedServer.close(resolve));
 const servers=[
   {name:'fake',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_STARTED:starts,AGENTCTL_FAKE_MCP_CLIENT_RESPONSE:clientResponses}},
-  {name:'slow-default',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1100'}},
+  {name:'slow-default',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1100',AGENTCTL_FAKE_MCP_STARTED:slowStarts,AGENTCTL_FAKE_MCP_CANCELLED:slowCancelled,AGENTCTL_FAKE_MCP_HEARTBEAT:slowHeartbeat,AGENTCTL_FAKE_MCP_EOF:cleanEof}},
   {name:'slow-override',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],timeout_ms:2000,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1100'}},
+  {name:'slow-initialize',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_DELAY_INITIALIZE_MS:'1100',AGENTCTL_FAKE_MCP_EOF:initializeEof,AGENTCTL_FAKE_MCP_STARTED:initializeStarts}},
+  {name:'backpressure',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_PAUSE_STDIN_AFTER_INITIALIZE:'1'}},
+  {name:'stubborn',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],env:{AGENTCTL_FAKE_MCP_IGNORE_EOF:'1',AGENTCTL_FAKE_MCP_IGNORE_SIGTERM:'1'}},
   {name:'http',transport:'http',url:`http://127.0.0.1:${httpPort}/mcp?fixed=1`,resolved_headers:{authorization:'Bearer configured-secret','x-tenant':'configured-tenant'}},
   {name:'redirect',transport:'http',url:`http://127.0.0.1:${httpPort}/redirect`,resolved_headers:{authorization:'Bearer redirect-secret'}},
   {name:'slow',transport:'http',url:`http://127.0.0.1:${httpPort}/slow`,resolved_headers:{}},
@@ -86,17 +92,80 @@ const session=initialized.headers['mcp-session-id']; assert.ok(session);
 assert.equal((await request('POST','/mcp/fake',{jsonrpc:'2.0',id:9,method:'tools/list'},{'mcp-session-id':'expired'})).status,404);
 const tools=await request('POST','/mcp/fake',{jsonrpc:'2.0',id:2,method:'tools/list'}, {'mcp-session-id':session});
 assert.equal(JSON.parse(tools.body).result.tools[0].name,'echo');
+let collisionReadyResolve; let collisionMessageResolve;
+const collisionReady=new Promise(resolve=>{collisionReadyResolve=resolve;});
+const collisionMessage=new Promise(resolve=>{collisionMessageResolve=resolve;});
+const collisionGet=http.request({socketPath:socket,path:'/mcp/fake',method:'GET',headers:{accept:'text/event-stream','mcp-session-id':session}},res=>{
+  let body=''; res.on('data',chunk=>{
+    body+=chunk; if(body.includes(': connected')) collisionReadyResolve();
+    const match=/data: (\{[^\n]+"method":"roots\/list"[^\n]+\})/.exec(body);
+    if(match){collisionMessageResolve(JSON.parse(match[1]));collisionGet.destroy();}
+  });
+});
+collisionGet.on('error',error=>{if(error.code!=='ECONNRESET')throw error;}); collisionGet.end();
+await collisionReady;
+const collisionCallPromise=request('POST','/mcp/fake',{jsonrpc:'2.0',id:201,method:'test/id-collision'}, {'mcp-session-id':session});
+const collidingServerRequest=await collisionMessage;
+assert.equal(Number.isSafeInteger(collidingServerRequest.id),true);
+assert.equal((await request('POST','/mcp/fake',{jsonrpc:'2.0',id:collidingServerRequest.id,result:{roots:[]}},{'mcp-session-id':session})).status,202);
+const collisionCall=await collisionCallPromise;
+assert.equal(JSON.parse(collisionCall.body).id,201); assert.deepEqual(JSON.parse(collisionCall.body).result,{collision:true});
+assert.match(fs.readFileSync(clientResponses,'utf8'),new RegExp(`^${collidingServerRequest.id}$`,'m'));
 const stderrResponse=await request('POST','/mcp/fake',{jsonrpc:'2.0',id:202,method:'test/stderr'}, {'mcp-session-id':session});
 assert.equal(stderrResponse.status,200);
 await new Promise(resolve=>setTimeout(resolve,20));
 assert.match(readRelayLogs(),/\[agentctl-mcp-stderr\].*external script failed safely/);
 assert.match(readRelayLogs(),/\[agentctl-mcp-stderr\].*second diagnostic line/);
 assert.match(readRelayLogs(),/\[agentctl-mcp-stderr\].*"truncated":true/);
-const timedOut=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:21,method:'tools/list'});
-assert.equal(timedOut.status,502); assert.match(timedOut.body,/MCP server response timed out/);
-const completedSlowCall=await request('POST','/mcp/slow-override',{jsonrpc:'2.0',id:22,method:'tools/list'});
-assert.equal(completedSlowCall.status,200); assert.equal(JSON.parse(completedSlowCall.body).result.tools[0].name,'echo');
-assert.match(readRelayLogs(),/"event":"stdio_response_timeout".*"timeout_ms":1000/);
+const slowInitialized=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:20,method:'initialize',params:{}});
+assert.equal(slowInitialized.status,200); const slowSession=slowInitialized.headers['mcp-session-id']; assert.ok(slowSession);
+for(let count=0;count<20 && !fs.existsSync(slowHeartbeat);count++) await new Promise(resolve=>setTimeout(resolve,10));
+const heartbeatBefore=fs.statSync(slowHeartbeat).size;
+const timedOut=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:21,method:'test/slow'},{'mcp-session-id':slowSession});
+assert.equal(timedOut.status,504); assert.match(timedOut.body,/MCP server response timed out/);
+const firstCancellation=JSON.parse(fs.readFileSync(slowCancelled,'utf8').trim().split('\n')[0]);
+assert.equal(Number.isSafeInteger(firstCancellation.requestId),true);
+const afterTimeout=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:21,method:'tools/list'},{'mcp-session-id':slowSession});
+assert.equal(afterTimeout.status,200); assert.equal(JSON.parse(afterTimeout.body).id,21);
+await new Promise(resolve=>setTimeout(resolve,150));
+assert.ok(fs.statSync(slowHeartbeat).size > heartbeatBefore);
+assert.equal(fs.readFileSync(slowStarts,'utf8').trim().split('\n').length,1);
+await new Promise(resolve=>{
+  const partial=http.request({host:'127.0.0.1',port:proxyPort,path:'/mcp/slow-default',method:'POST',headers:{'content-type':'application/json','content-length':'4096','mcp-session-id':slowSession}},()=>{});
+  partial.on('error',()=>resolve()); partial.write('{"jsonrpc":"2.0","id":230,"method":"test/slow"');
+  setTimeout(()=>partial.destroy(),20); setTimeout(resolve,150);
+});
+assert.equal(relay.exitCode,null);
+assert.equal((await request('GET','/.well-known/agentctl-mcp-health')).status,200);
+const afterPartialUpload=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:231,method:'tools/list'},{'mcp-session-id':slowSession});
+assert.equal(afterPartialUpload.status,200);
+const cancellationsBefore=fs.readFileSync(slowCancelled,'utf8').trim().split('\n').length;
+await new Promise(resolve=>{
+  const body=JSON.stringify({jsonrpc:'2.0',id:23,method:'test/slow'});
+  const disconnected=http.request({host:'127.0.0.1',port:proxyPort,path:'/mcp/slow-default',method:'POST',headers:{'content-type':'application/json','content-length':Buffer.byteLength(body),'mcp-session-id':slowSession}},()=>{});
+  disconnected.on('error',()=>resolve()); disconnected.end(body); setTimeout(()=>disconnected.destroy(),50); setTimeout(resolve,250);
+});
+for(let count=0;count<50 && fs.readFileSync(slowCancelled,'utf8').trim().split('\n').length===cancellationsBefore;count++) await new Promise(resolve=>setTimeout(resolve,10));
+assert.equal(fs.readFileSync(slowCancelled,'utf8').trim().split('\n').length,cancellationsBefore+1);
+const afterDisconnect=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:24,method:'tools/list'},{'mcp-session-id':slowSession});
+assert.equal(afterDisconnect.status,200); assert.equal(fs.readFileSync(slowStarts,'utf8').trim().split('\n').length,1);
+const completedSlowCall=await request('POST','/mcp/slow-override',{jsonrpc:'2.0',id:22,method:'test/slow'});
+assert.equal(completedSlowCall.status,200); assert.deepEqual(JSON.parse(completedSlowCall.body).result,{});
+const initializeTimedOut=await request('POST','/mcp/slow-initialize',{jsonrpc:'2.0',id:25,method:'initialize',params:{}});
+assert.equal(initializeTimedOut.status,504);
+for(let count=0;count<50 && !fs.existsSync(initializeEof);count++) await new Promise(resolve=>setTimeout(resolve,10));
+assert.equal(fs.readFileSync(initializeEof,'utf8'),'eof\n');
+await new Promise(resolve=>setTimeout(resolve,300));
+assert.equal(fs.readFileSync(initializeStarts,'utf8').trim().split('\n').length,1);
+const backpressureInitialized=await request('POST','/mcp/backpressure',{jsonrpc:'2.0',id:26,method:'initialize',params:{}});
+assert.equal(backpressureInitialized.status,200);
+const backpressureStarted=Date.now();
+const backpressureTimeout=await request('POST','/mcp/backpressure',{jsonrpc:'2.0',id:27,method:'test/backpressure',params:{blob:'x'.repeat(2*1024*1024)}},{'mcp-session-id':backpressureInitialized.headers['mcp-session-id']});
+assert.equal(backpressureTimeout.status,504);
+assert.ok(Date.now()-backpressureStarted < 1800);
+assert.match(readRelayLogs(),/"event":"stdio_response_timeout".*"cancellation":"requested".*"server_action":"preserved".*"timeout_ms":1000/);
+assert.match(readRelayLogs(),/"event":"stdio_response_timeout".*"method":"initialize".*"cancellation":"not_permitted".*"server_action":"stopping"/);
+assert.match(readRelayLogs(),/"event":"stdio_late_response_discarded"/);
 const sseMessage=new Promise((resolve,reject)=>{
   const get=http.request({socketPath:socket,path:'/mcp/fake',method:'GET',headers:{accept:'text/event-stream','mcp-session-id':session}},res=>{
     let body=''; res.on('data',chunk=>{body+=chunk; if(body.includes('notifications/test')){get.destroy();resolve(body);}});
@@ -155,7 +224,11 @@ assert.match(completedLogs,/"event":"http_response".*"status":207/);
 assert.match(completedLogs,/"event":"http_credentials_unavailable".*"status":503/);
 assert.match(completedLogs,/"event":"http_connection_failed"/);
 assert.doesNotMatch(completedLogs,/configured-secret|redirect-secret|client-secret|client-tenant|configured-tenant/);
+assert.equal((await request('POST','/mcp/stubborn',{jsonrpc:'2.0',id:30,method:'initialize',params:{}})).status,200);
 relay.kill('SIGTERM'); await new Promise(resolve=>relay.once('exit',resolve));
+assert.equal(fs.readFileSync(cleanEof,'utf8'),'eof\n');
+assert.match(readRelayLogs(),/"event":"stdio_server_stop_escalated".*"server":"stubborn".*"signal":"SIGTERM"/);
+assert.match(readRelayLogs(),/"event":"stdio_server_stop_escalated".*"server":"stubborn".*"signal":"SIGKILL"/);
 proxy.kill('SIGTERM'); await new Promise(resolve=>proxy.once('exit',resolve));
 fakeHttp.kill('SIGTERM'); await new Promise(resolve=>fakeHttp.once('exit',resolve));
 const rotationPath=path.join(temporary,'rotation.log');

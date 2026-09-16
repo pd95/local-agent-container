@@ -147,9 +147,16 @@ Stdio definitions accept:
 
 The Xcode preset enables `shared`, allowing reconnecting HTTP sessions to reuse
 one `xcrun mcpbridge` process and sets a 10-minute response timeout. Generic
-stdio definitions default to a 30-second response timeout and per-session
+stdio definitions default to a six-minute response timeout and per-session
 process isolation. Set `timeout_ms` when a known server has longer-running
 operations, for example `{"name":"builder","command":"/path/to/server","timeout_ms":600000}`.
+The response timeout is an absolute relay deadline; progress notifications do
+not extend it. Codex 0.154.0 defaults to a five-minute tool timeout, so calls
+that intentionally run longer must configure both Codex `tool_timeout_sec` and
+the managed definition's `timeout_ms`. Tool arguments such as
+`timeout_seconds` are application data and do not change either transport
+deadline.
+
 Literal `env` values live only for the active invocation.
 `env_vars` persists only selected host environment-variable names and resolves
 their current values whenever the host relay starts. Use it for host toolchain
@@ -255,6 +262,8 @@ owner-only.
 
 Use `agentctl mcp status` for a focused, read-only view of the host relay,
 guest proxy, guest-to-host route, and up to five recent sanitized error events.
+The latest retained stdio request timeout is shown separately so later errors
+cannot hide its deadline or cancellation outcome.
 It reports that server stderr occurred but directs you to the private relay log
 for its contents. Historical errors do not make the command fail. Current
 configuration or bridge-health problems do. A cleanly stopped container is
@@ -271,8 +280,11 @@ persisted relay, container, and guest proxy for its live checks, then restore
 the stopped state.
 
 Use `agentctl start`, `agentctl stop`, and `agentctl restart` for MCP-enabled
-containers so host relay supervision follows the container lifecycle. If the
-lower-level `container stop` command is used, `agentctl doctor --host`
+containers so host relay supervision follows the container lifecycle. During
+shutdown the relay closes each stdio server's input first, then escalates to
+`SIGTERM` and `SIGKILL` only if the server does not exit within the bounded
+grace periods. If the lower-level `container stop` command is used,
+`agentctl doctor --host`
 highlights the relay left behind and suggests:
 
 ```bash
