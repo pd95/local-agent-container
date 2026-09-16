@@ -27,6 +27,7 @@ MCP_RELAY_SOCKET=""
 MCP_RELAY_NONCE=""
 MCP_RELAY_METADATA=""
 MCP_GUEST_EXEC_PID=""
+MCP_LOG_MAX_BYTES=5242880
 MCP_LEASE_FILE=""
 MCP_LOCK_DIR=""
 MCP_LOCK_TOKEN=""
@@ -1064,6 +1065,8 @@ mcp_normalize_managed_path() { printf '%s\n' "$1" | sed 's#//*#/#g'; }
 mcp_paths_equal() { [ "$(mcp_normalize_managed_path "$1")" = "$(mcp_normalize_managed_path "$2")" ]; }
 mcp_runtime_dir() { mcp_normalize_managed_path "${TMPDIR:-/tmp}/agentctl-$(id -u)"; }
 mcp_log_dir() { printf '%s\n' "${AGENTCTL_MCP_LOG_DIR:-$(mcp_runtime_dir)}"; }
+mcp_relay_log_path() { printf '%s/mcp-%s.log\n' "$(mcp_log_dir)" "$(mcp_identity_hash "$1")"; }
+mcp_guest_log_path() { printf '%s/guest-%s.log\n' "$(mcp_log_dir)" "$(mcp_identity_hash "$1")"; }
 mcp_registry_dir() { printf '%s/Library/Application Support/agentctl/mcp\n' "${HOME}"; }
 mcp_identity_hash() { printf '%s' "$1" | cksum | awk '{printf "%08x%08x\n", $1, $2}'; }
 mcp_socket_path() { printf '%s/mcp-%s.sock\n' "$(mcp_runtime_dir)" "$(mcp_identity_hash "$1")"; }
@@ -1267,6 +1270,13 @@ mcp_prepare_log_file() {
   : >"$path"; chmod 600 "$path"
 }
 
+mcp_prepare_rotating_log_file() {
+  local path="$1" previous="${1}.1"
+  if [ -e "$path" ] || [ -L "$path" ]; then mcp_validate_private_file "$path" "Managed MCP log"; else : >"$path"; fi
+  if [ -e "$previous" ] || [ -L "$previous" ]; then mcp_validate_private_file "$previous" "Managed MCP previous log"; fi
+  chmod 600 "$path"
+}
+
 mcp_safe_config_json() {
   local config_json="${1:-$MCP_CONFIG_JSON}"
   printf '%s' "$config_json" | jq -c '[.[]|del(.env,.inherited_env,.headers,.resolved_headers,.missing_credentials,.missing_env_vars,.invalid_credentials,.invalid_env_vars)]'
@@ -1426,15 +1436,16 @@ mcp_start_relay() {
   MCP_RELAY_SOCKET="$(mcp_socket_path "$name")"
   [ ! -e "$MCP_RELAY_SOCKET" ] && [ ! -L "$MCP_RELAY_SOCKET" ] || die "Managed MCP socket path collision: $MCP_RELAY_SOCKET"
   MCP_RELAY_NONCE="${name}-$$-$(date +%s)-${RANDOM:-0}"
-  config="$dir/mcp-$(mcp_identity_hash "$name").lease.json"; log="$log_dir/mcp-$(mcp_identity_hash "$name").log"
+  config="$dir/mcp-$(mcp_identity_hash "$name").lease.json"; log="$(mcp_relay_log_path "$name")"
   [ ! -e "$config" ] && [ ! -L "$config" ] || die "Managed MCP lease path collision: $config"
   lease_prefix="mcp-$(mcp_identity_hash "$name").lease."
-  mcp_prepare_log_file "$log"
+  mcp_prepare_rotating_log_file "$log"
   jq -n --argjson servers "$MCP_CONFIG_JSON" --arg lease_dir "$dir" --arg lease_prefix "$lease_prefix" \
     --arg socket_path "$MCP_RELAY_SOCKET" --arg nonce "$MCP_RELAY_NONCE" --arg container "$name" \
-    '{schema_version:2,timeout_ms:30000,http_timeouts:{connect:10000,headers:30000,idle:300000,total:86400000},servers:$servers,lease_dir:$lease_dir,lease_prefix:$lease_prefix,ephemeral_env:any($servers[]; ((.env // {})|length)>0 or ((.headers // {})|length)>0),socket_path:$socket_path,nonce:$nonce,container:$container}' >"$config"; chmod 600 "$config"
+    --arg log_path "$log" --argjson log_max_bytes "$MCP_LOG_MAX_BYTES" \
+    '{schema_version:2,timeout_ms:30000,http_timeouts:{connect:10000,headers:30000,idle:300000,total:86400000},servers:$servers,lease_dir:$lease_dir,lease_prefix:$lease_prefix,ephemeral_env:any($servers[]; ((.env // {})|length)>0 or ((.headers // {})|length)>0),socket_path:$socket_path,nonce:$nonce,container:$container,log_path:$log_path,log_max_bytes:$log_max_bytes}' >"$config"; chmod 600 "$config"
   ( exec -a "agentctl-mcp-relay:$name" node "$SCRIPT_DIR/mcp/host-relay.mjs" "$config" ) \
-    </dev/null >>"$log" 2>&1 & MCP_RELAY_PID=$!
+    </dev/null >/dev/null 2>>"$log" & MCP_RELAY_PID=$!
   local tries=0; while [ "$tries" -lt 50 ] && [ ! -S "$MCP_RELAY_SOCKET" ]; do sleep 0.02; tries=$((tries+1)); done
   if ! { [ -S "$MCP_RELAY_SOCKET" ] && kill -0 "$MCP_RELAY_PID" 2>/dev/null; }; then
     kill "$MCP_RELAY_PID" 2>/dev/null || true; wait "$MCP_RELAY_PID" 2>/dev/null || true
@@ -1551,10 +1562,10 @@ mcp_configure_guest() {
   printf '{"schema_version":1,"port":%s,"socket_path":"%s"}\n' "$MCP_PORT" "$MCP_GUEST_SOCKET" >"$json"
   refresh_container_file "$name" "$json" "/etc/agentctl/mcp-bridge.json" "root:root" "644"; rm -f "$json"
   "$CONTAINER_CMD" exec "$name" sh -c 'pkill -f "[m]cp-guest-proxy.mjs" >/dev/null 2>&1 || true'
-  guest_log="$(mcp_log_dir)/guest-$(mcp_identity_hash "$name").log"
-  mcp_prepare_log_file "$guest_log"
+  guest_log="$(mcp_guest_log_path "$name")"
+  mcp_prepare_rotating_log_file "$guest_log"
   "$CONTAINER_CMD" exec "$name" node /usr/local/lib/agentctl/mcp-guest-proxy.mjs /etc/agentctl/mcp-bridge.json \
-    </dev/null >>"$guest_log" 2>&1 &
+    </dev/null 2>&1 | node "$SCRIPT_DIR/mcp/log-sink.mjs" "$guest_log" "$MCP_LOG_MAX_BYTES" &
   MCP_GUEST_EXEC_PID=$!
   while [ "$tries" -lt 50 ]; do
     if "$CONTAINER_CMD" exec "$name" sh -c \
@@ -2788,7 +2799,8 @@ usage_mcp() {
 Usage:
   $CLI_NAME mcp add [--name NAME] VALUE
   $CLI_NAME mcp remove [--name NAME] SERVER
-  $CLI_NAME mcp list [--name NAME]
+  $CLI_NAME mcp list [--name NAME] [SERVER]
+  $CLI_NAME mcp status [--name NAME]
   $CLI_NAME mcp credential set ID [--stdin]
   $CLI_NAME mcp credential status ID
   $CLI_NAME mcp credential delete ID
@@ -2797,6 +2809,10 @@ Usage:
 Definition commands target the container selected by the current workdir unless
 --name is provided. VALUE accepts xcode, inline JSON, or @/path/to/private.json.
 Changing an existing definition requires remove followed by add.
+
+List shows the exact stdio command line. Do not place secrets in MCP command
+arguments. Credential and environment values are never printed. Status checks
+only the managed bridge and retained logs; it does not contact MCP upstreams.
 
 Named MCP credentials are stored in macOS Keychain. Values are never printed.
 Use --stdin to pipe a value from a password manager without placing it in shell history.
@@ -7068,6 +7084,13 @@ host_doctor_mcp_status() {
     [ -z "$lock_output" ] || printf '%s\n' "$lock_output" | sed 's/^/    - /'
     printf '    %-22s %s\n' registry "$(mcp_registry_path "$name")"
     printf '    %-22s %s\n' socket "$(mcp_socket_path "$name")"
+    printf '    %-22s %s\n' 'host relay log' "$(mcp_relay_log_path "$name")"
+    [ ! -e "$(mcp_relay_log_path "$name").1" ] \
+      || printf '    %-22s %s\n' 'previous relay log' "$(mcp_relay_log_path "$name").1"
+    printf '    %-22s %s\n' 'guest proxy log' "$(mcp_guest_log_path "$name")"
+    [ ! -e "$(mcp_guest_log_path "$name").1" ] \
+      || printf '    %-22s %s\n' 'previous guest log' "$(mcp_guest_log_path "$name").1"
+    printf '    %-22s %s\n' 'recent MCP errors' "${CLI_NAME} mcp status --name $name"
     known_hashes="${known_hashes}${known_hashes:+$'\n'}$(mcp_identity_hash "$name")"
   done <<<"$names"
   for file in "$runtime_dir"/mcp-*; do
@@ -7080,7 +7103,7 @@ host_doctor_mcp_status() {
       status=1
     fi
   done
-  for file in "$log_dir"/mcp-*.log "$log_dir"/guest-*.log; do
+  for file in "$log_dir"/mcp-*.log "$log_dir"/mcp-*.log.1 "$log_dir"/guest-*.log "$log_dir"/guest-*.log.1; do
     [ -e "$file" ] || [ -L "$file" ] || continue
     if [ -L "$file" ] || [ ! -f "$file" ] || [ "$(host_path_uid "$file")" != "$(id -u)" ] || [ "$((8#$(host_path_mode "$file") & 077))" -ne 0 ]; then
       printf '  %-24s %s\n' logs "permissions too broad or ownership unsafe (expected owner-only 0600): $file"
@@ -9984,7 +10007,7 @@ mcp_definition_reject_transient_values() {
 }
 
 mcp_definition_list() {
-  local name="$1" entry="" route="" transport="" url="" target="" rows=""
+  local name="$1" wanted="${2:-}" entry="" route="" transport="" url="" origin="" command_line="" variable="" credential="" header="" found=0 refs=0
   mcp_definition_target_prepare "$name"
   if [ "$(printf '%s' "$MCP_CONFIG_JSON" | jq 'length')" -eq 0 ]; then
     printf 'No managed MCP definitions for %s.\n' "$name"
@@ -9993,16 +10016,95 @@ mcp_definition_list() {
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
     route="$(printf '%s' "$entry" | jq -r .name)"
+    [ -z "$wanted" ] || [ "$route" = "$wanted" ] || continue
+    found=1
     transport="$(printf '%s' "$entry" | jq -r '.transport // "stdio"')"
+    printf '%s\n' "$route"
+    printf '  %-20s %s\n' Transport "$transport"
     if [ "$transport" = http ]; then
       url="$(printf '%s' "$entry" | jq -r .url)"
-      target="$(node -e 'const u=new URL(process.argv[1]);process.stdout.write(u.origin)' "$url" 2>/dev/null || printf invalid)"
+      origin="$(node -e 'const u=new URL(process.argv[1]);process.stdout.write(u.origin)' "$url" 2>/dev/null || printf invalid)"
+      printf '  %-20s %s\n' 'Upstream origin' "$origin"
+      printf '  %-20s http://127.0.0.1:%s/mcp/%s\n' 'Guest route' "$MCP_PORT" "$route"
+      refs=0
+      variable="$(printf '%s' "$entry" | jq -r '.bearer_token_env_var // empty')"
+      if [ -n "$variable" ]; then
+        printf '  %-20s environment %s (%s)\n' 'Bearer token' "$variable" "$(if [ "${!variable+x}" = x ]; then printf set; else printf missing; fi)"
+        refs=1
+      fi
+      credential="$(printf '%s' "$entry" | jq -r '.bearer_token_keychain // empty')"
+      if [ -n "$credential" ]; then
+        printf '  %-20s Keychain %s (%s)\n' 'Bearer token' "$credential" "$(if mcp_keychain_exists "$credential"; then printf present; else printf missing; fi)"
+        refs=1
+      fi
+      while IFS=$'\t' read -r header variable; do
+        [ -n "$header" ] || continue
+        printf '  %-20s %s <- environment %s (%s)\n' 'Header credential' "$header" "$variable" "$(if [ "${!variable+x}" = x ]; then printf set; else printf missing; fi)"
+        refs=1
+      done < <(printf '%s' "$entry" | jq -r '(.header_env_vars // {})|to_entries[]|[.key,.value]|@tsv')
+      while IFS=$'\t' read -r header credential; do
+        [ -n "$header" ] || continue
+        printf '  %-20s %s <- Keychain %s (%s)\n' 'Header credential' "$header" "$credential" "$(if mcp_keychain_exists "$credential"; then printf present; else printf missing; fi)"
+        refs=1
+      done < <(printf '%s' "$entry" | jq -r '(.header_keychain_credentials // {})|to_entries[]|[.key,.value]|@tsv')
+      [ "$refs" -eq 1 ] || printf '  %-20s %s\n' Credentials none
     else
-      target="host stdio"
+      command_line="$(printf '%s' "$entry" | node "$SCRIPT_DIR/mcp/definition-helper.mjs" format-command)" \
+        || die "Unable to format managed MCP command"
+      printf '  %-20s %s\n' Command "$command_line"
+      if [ "$(printf '%s' "$entry" | jq -r '.cwd // empty')" = "" ]; then
+        printf '  %-20s %s\n' 'Working directory' inherited
+      else
+        printf '  %-20s %s\n' 'Working directory' 'configured (path hidden)'
+      fi
+      printf '  %-20s %s\n' 'Process model' "$(if printf '%s' "$entry" | jq -e '.shared_process // .shared // false' >/dev/null; then printf shared; else printf per-session; fi)"
+      printf '  %-20s %sms\n' 'Response timeout' "$(printf '%s' "$entry" | jq -r '.timeout_ms // 30000')"
+      refs=0
+      while IFS= read -r variable; do
+        [ -n "$variable" ] || continue
+        printf '  %-20s %s (%s)\n' 'Host environment' "$variable" "$(if [ "${!variable+x}" = x ]; then printf set; else printf missing; fi)"
+        refs=1
+      done < <(printf '%s' "$entry" | jq -r '(.env_vars // [])[]')
+      [ "$refs" -eq 1 ] || printf '  %-20s %s\n' 'Host environment' none
+      printf '  %-20s %s\n' Credentials none
     fi
-    rows="${rows}${route}"$'\t'"${transport}"$'\t'"${target}"$'\n'
+    printf '\n'
   done < <(printf '%s' "$MCP_CONFIG_JSON" | jq -c 'sort_by(.name)[]')
-  { printf 'NAME\tTRANSPORT\tTARGET\n'; printf '%s' "$rows"; } | format_tsv_table
+  [ -z "$wanted" ] || [ "$found" -eq 1 ] || die "Managed MCP server not found in $name: $wanted"
+}
+
+mcp_status() {
+  local name="$1" health="" health_status=0 relay_log guest_log events_json count index timestamp server message
+  mcp_definition_target_prepare "$name"
+  relay_log="$(mcp_relay_log_path "$name")"; guest_log="$(mcp_guest_log_path "$name")"
+  printf 'Managed MCP status for %s\n\n' "$name"
+  if health="$(doctor_mcp_status "$name")"; then health_status=0; else health_status=$?; fi
+  printf '%s\n' "$health" | sed 's/^/  /'
+  printf '\nLogs\n'
+  printf '  %-20s %s\n' 'Host relay' "$relay_log"
+  [ ! -e "${relay_log}.1" ] || printf '  %-20s %s\n' 'Previous host relay' "${relay_log}.1"
+  printf '  %-20s %s\n' 'Guest proxy' "$guest_log"
+  [ ! -e "${guest_log}.1" ] || printf '  %-20s %s\n' 'Previous guest proxy' "${guest_log}.1"
+  events_json="$(node "$SCRIPT_DIR/mcp/status-events.mjs" "${relay_log}.1" "$relay_log" "${guest_log}.1" "$guest_log")" \
+    || die "Unable to inspect managed MCP logs"
+  printf '\nRecent errors\n'
+  count="$(printf '%s' "$events_json" | jq '.errors|length')"
+  if [ "$count" -eq 0 ]; then printf '  none in retained logs\n'; else
+    index=0
+    while [ "$index" -lt "$count" ]; do
+      timestamp="$(printf '%s' "$events_json" | jq -r --argjson i "$index" '.errors[$i].timestamp')"
+      server="$(printf '%s' "$events_json" | jq -r --argjson i "$index" '.errors[$i].server')"
+      message="$(printf '%s' "$events_json" | jq -r --argjson i "$index" '.errors[$i].message')"
+      printf '  %s  %s  %s\n' "$timestamp" "$server" "$message"
+      index=$((index+1))
+    done
+  fi
+  timestamp="$(printf '%s' "$events_json" | jq -r '.latest_stderr.timestamp // empty')"
+  if [ -n "$timestamp" ]; then
+    server="$(printf '%s' "$events_json" | jq -r '.latest_stderr.server')"
+    printf '\nLatest server stderr\n  %s  %s  server emitted stderr; see host relay log\n' "$timestamp" "$server"
+  fi
+  return "$health_status"
 }
 
 mcp_definition_mutation_cleanup() {
@@ -10140,7 +10242,7 @@ mcp_definition_cmd() {
   require_jq
   [ -n "$name" ] || name="$(default_name "$DEFAULT_NAME_PREFIX")"
   case "$action" in
-    list) [ -z "$value" ] || die "Unexpected argument for mcp list: $value"; mcp_definition_list "$name" ;;
+    list) mcp_definition_list "$name" "$value" ;;
     add) [ -n "$value" ] || die "Missing MCP definition for add"; mcp_definition_mutate add "$name" "$value" ;;
     remove)
       [ -n "$value" ] || die "Missing MCP server name for remove"
@@ -10150,11 +10252,26 @@ mcp_definition_cmd() {
   esac
 }
 
+mcp_status_cmd() {
+  local name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
+      --help|-h) usage_mcp; return 0 ;;
+      *) die "Unexpected argument for mcp status: $1" ;;
+    esac
+  done
+  require_container; require_jq
+  [ -n "$name" ] || name="$(default_name "$DEFAULT_NAME_PREFIX")"
+  mcp_status "$name"
+}
+
 mcp_cmd() {
   local action="${1:-}"
   case "$action" in
     credential) shift; mcp_credential_cmd "$@" ;;
     add|remove|list) shift; mcp_definition_cmd "$action" "$@" ;;
+    status) shift; mcp_status_cmd "$@" ;;
     --help|-h|help|"") usage_mcp ;;
     *) die "Unknown MCP command: $action" ;;
   esac

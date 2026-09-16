@@ -41,6 +41,8 @@ After a container has MCP wiring, manage its definitions without recreating it:
 agentctl mcp add xcode
 agentctl mcp add @"$HOME/.config/agentctl/private-mcp.json"
 agentctl mcp list
+agentctl mcp list xcode
+agentctl mcp status
 agentctl mcp remove xcode
 ```
 
@@ -49,6 +51,15 @@ Adding an identical definition is a successful no-op. To change an existing
 definition, remove it and then add its replacement. Definition changes fail
 while an `agentctl run` MCP lease is active. Removing the final definition
 leaves the bridge wiring enabled so another definition can be added later.
+
+`mcp list` prints the complete shell-quoted command line for stdio definitions,
+along with process sharing, timeout, and required host variable names. For HTTP
+definitions it prints only the upstream origin, local guest route, and the
+names and presence of environment or Keychain credential references. It never
+prints credential values, environment values, configured header values, or
+HTTP URL paths and queries. Because stdio command arguments are intentionally
+visible, never put credentials or other secrets directly in `command` or
+`args`.
 
 Other runtimes currently require manual configuration using URLs such as:
 
@@ -235,13 +246,26 @@ Managed relays are container-scoped background services and normally appear
 with parent PID 1 after `agentctl` exits. Their process label includes the
 container name, for example `agentctl-mcp-relay:agent-project`.
 
-Relay log lines begin with an ISO-8601 UTC timestamp. A stdio timeout log also
-includes the configured deadline in milliseconds, making it possible to tell a
-slow tool call from an immediate bridge failure.
+Relay log lines begin with an ISO-8601 UTC timestamp. The relay records request
+lifecycle and sanitized HTTP outcomes, and prefixes every line written by a
+stdio server to stderr with its definition name and PID. HTTP bodies, headers,
+credential values, URL paths, and URL queries are not logged. Logs retain a
+5 MiB current generation and one 5 MiB previous generation. Both files are
+owner-only.
+
+Use `agentctl mcp status` for a focused, read-only view of the host relay,
+guest proxy, guest-to-host route, and up to five recent sanitized error events.
+It reports that server stderr occurred but directs you to the private relay log
+for its contents. Historical errors do not make the command fail. Current
+configuration or bridge-health problems do. A cleanly stopped container is
+reported as inactive without being started and is not considered unhealthy.
+The command never initializes a stdio server, invokes an MCP tool, or contacts
+an HTTP upstream.
 
 Use `agentctl doctor --host` for the authoritative mapping of relay PIDs,
-containers, definitions, leases, sockets, and host/guest route health. Health
-checks do not initialize a server or invoke MCP tools. For a stopped MCP-enabled
+containers, definitions, leases, sockets, host/guest route health, and relay
+and guest-proxy log paths. It does not print log contents or probe HTTP
+upstreams. Health checks do not initialize a server or invoke MCP tools. For a stopped MCP-enabled
 container, `agentctl doctor --name agent-project` may temporarily start the
 persisted relay, container, and guest proxy for its live checks, then restore
 the stopped state.

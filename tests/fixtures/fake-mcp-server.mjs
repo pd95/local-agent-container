@@ -8,6 +8,10 @@ const input = readline.createInterface({input:process.stdin});
 input.on('line', line => {
   const request = JSON.parse(line);
   if (request.method === 'test/crash') process.exit(23);
+  if (request.method === 'test/stderr') {
+    process.stderr.write('external script failed safely\nsecond diagnostic line\n');
+    process.stderr.write(`${'x'.repeat(17000)}\npartial diagnostic`);
+  }
   if (request.method === 'test/notify') {
     process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',method:'notifications/test',params:{ok:true}})}\n`);
     process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',id:'server-1',method:'roots/list',params:{}})}\n`);

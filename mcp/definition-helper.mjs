@@ -47,6 +47,18 @@ if (command === 'validate-header-value') {
   catch { fail('invalid header value'); }
   process.exit(0);
 }
+if (command === 'format-command') {
+  let definition;
+  try { definition=JSON.parse(input); } catch { fail('definition must be valid JSON'); }
+  const values=[definition.command,...(definition.args || [])];
+  if (values.some(value=>typeof value !== 'string')) fail('command and arguments must be strings');
+  const quote=value => {
+    if (!/[\u0000-\u001f\u007f]/.test(value)) return `'${value.replaceAll("'", `'\\''`)}'`;
+    return `$'${value.replaceAll('\\','\\\\').replaceAll("'","\\'").replaceAll('\n','\\n').replaceAll('\r','\\r').replaceAll('\t','\\t').replace(/[\u0000-\u001f\u007f]/g,character=>`\\x${character.charCodeAt(0).toString(16).padStart(2,'0')}`)}'`;
+  };
+  process.stdout.write(values.map(quote).join(' '));
+  process.exit(0);
+}
 if (command !== 'normalize-http') fail('unknown definition helper command');
 let definition;
 try { definition = JSON.parse(input); } catch { fail('definition must be valid JSON'); }
