@@ -92,6 +92,25 @@ const session=initialized.headers['mcp-session-id']; assert.ok(session);
 assert.equal((await request('POST','/mcp/fake',{jsonrpc:'2.0',id:9,method:'tools/list'},{'mcp-session-id':'expired'})).status,404);
 const tools=await request('POST','/mcp/fake',{jsonrpc:'2.0',id:2,method:'tools/list'}, {'mcp-session-id':session});
 assert.equal(JSON.parse(tools.body).result.tools[0].name,'echo');
+let collisionReadyResolve; let collisionMessageResolve;
+const collisionReady=new Promise(resolve=>{collisionReadyResolve=resolve;});
+const collisionMessage=new Promise(resolve=>{collisionMessageResolve=resolve;});
+const collisionGet=http.request({socketPath:socket,path:'/mcp/fake',method:'GET',headers:{accept:'text/event-stream','mcp-session-id':session}},res=>{
+  let body=''; res.on('data',chunk=>{
+    body+=chunk; if(body.includes(': connected')) collisionReadyResolve();
+    const match=/data: (\{[^\n]+"method":"roots\/list"[^\n]+\})/.exec(body);
+    if(match){collisionMessageResolve(JSON.parse(match[1]));collisionGet.destroy();}
+  });
+});
+collisionGet.on('error',error=>{if(error.code!=='ECONNRESET')throw error;}); collisionGet.end();
+await collisionReady;
+const collisionCallPromise=request('POST','/mcp/fake',{jsonrpc:'2.0',id:201,method:'test/id-collision'}, {'mcp-session-id':session});
+const collidingServerRequest=await collisionMessage;
+assert.equal(Number.isSafeInteger(collidingServerRequest.id),true);
+assert.equal((await request('POST','/mcp/fake',{jsonrpc:'2.0',id:collidingServerRequest.id,result:{roots:[]}},{'mcp-session-id':session})).status,202);
+const collisionCall=await collisionCallPromise;
+assert.equal(JSON.parse(collisionCall.body).id,201); assert.deepEqual(JSON.parse(collisionCall.body).result,{collision:true});
+assert.match(fs.readFileSync(clientResponses,'utf8'),new RegExp(`^${collidingServerRequest.id}$`,'m'));
 const stderrResponse=await request('POST','/mcp/fake',{jsonrpc:'2.0',id:202,method:'test/stderr'}, {'mcp-session-id':session});
 assert.equal(stderrResponse.status,200);
 await new Promise(resolve=>setTimeout(resolve,20));
@@ -104,7 +123,8 @@ for(let count=0;count<20 && !fs.existsSync(slowHeartbeat);count++) await new Pro
 const heartbeatBefore=fs.statSync(slowHeartbeat).size;
 const timedOut=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:21,method:'test/slow'},{'mcp-session-id':slowSession});
 assert.equal(timedOut.status,504); assert.match(timedOut.body,/MCP server response timed out/);
-assert.match(fs.readFileSync(slowCancelled,'utf8'),/"requestId":"agentctl:/);
+const firstCancellation=JSON.parse(fs.readFileSync(slowCancelled,'utf8').trim().split('\n')[0]);
+assert.equal(Number.isSafeInteger(firstCancellation.requestId),true);
 const afterTimeout=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:21,method:'tools/list'},{'mcp-session-id':slowSession});
 assert.equal(afterTimeout.status,200); assert.equal(JSON.parse(afterTimeout.body).id,21);
 await new Promise(resolve=>setTimeout(resolve,150));

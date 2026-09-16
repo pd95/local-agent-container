@@ -33,10 +33,16 @@ const DEFAULT_STDIO_TIMEOUT_MS = 360000;
 const CHILD_EOF_GRACE_MS = 1500;
 const CHILD_TERM_GRACE_MS = 500;
 const RELAY_SHUTDOWN_DEADLINE_MS = 2500;
-const RELAY_REQUEST_ID_PREFIX = 'agentctl:';
 let shuttingDown = false;
 let leaseMissingSince = null;
+let nextRelayRequestId = 1;
 function event(level, name, fields={}) { writeEvent(managedLog,level,name,fields); }
+
+function relayRequestId() {
+  const id=nextRelayRequestId;
+  nextRelayRequestId = nextRelayRequestId === Number.MAX_SAFE_INTEGER ? 1 : nextRelayRequestId + 1;
+  return id;
+}
 
 function stdioTimeout(definition) {
   const configured = definition.timeout_ms;
@@ -276,12 +282,12 @@ function startChild(definition) {
         if (state.pending) { const pending=state.pending; state.pending=null; pending.reject(new Error('invalid MCP JSON response')); }
         continue;
       }
-      if (state.pending && message.id === state.pending.id) {
+      const isResponse = message.id !== undefined && typeof message.method !== 'string' &&
+        (Object.hasOwn(message,'result') || Object.hasOwn(message,'error'));
+      if (isResponse && state.pending && message.id === state.pending.id) {
         const pending=state.pending; state.pending=null; pending.resolve(message);
       } else {
-        const isResponse = message.id !== undefined && typeof message.method !== 'string' &&
-          (Object.hasOwn(message,'result') || Object.hasOwn(message,'error'));
-        if (isResponse && typeof message.id === 'string' && message.id.startsWith(RELAY_REQUEST_ID_PREFIX)) {
+        if (isResponse) {
           event('info','stdio_late_response_discarded',{server:definition.name});
           continue;
         }
@@ -367,7 +373,7 @@ function transact(state, payload, timeoutConfig, abortSignal) {
   return new Promise((resolve, reject) => {
     const {timeoutMs,timeoutSource}=timeoutConfig;
     const clientId=payload.id;
-    const wireId=`${RELAY_REQUEST_ID_PREFIX}${randomUUID()}`;
+    const wireId=relayRequestId();
     const forwarded={...payload,id:wireId};
     let settled=false;
     let requestIssued=false;

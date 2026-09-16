@@ -30,6 +30,11 @@ input.on('line', line => {
     process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',id:'server-1',method:'roots/list',params:{}})}\n`);
     return;
   }
+  if (request.method === 'test/id-collision') {
+    process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',id:request.id,method:'roots/list',params:{}})}\n`);
+    setTimeout(()=>process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',id:request.id,result:{collision:true}})}\n`),50);
+    return;
+  }
   if (!request.method && request.id !== undefined && process.env.AGENTCTL_FAKE_MCP_CLIENT_RESPONSE) {
     fs.appendFileSync(process.env.AGENTCTL_FAKE_MCP_CLIENT_RESPONSE, `${request.id}\n`);
     return;
