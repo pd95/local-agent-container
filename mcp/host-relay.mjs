@@ -22,23 +22,40 @@ if (!socketPath || !nonce || !containerName) {
   process.exit(64);
 }
 const definitions = new Map(config.servers.map(server => [server.name, server]));
-const children = new Set();
+const childStates = new Set();
 const sessions = new Map();
 const serverChildren = new Map();
 const childQueues = new WeakMap();
 const connections = new Set();
 const httpAgent = new http.Agent({keepAlive:true});
 const httpsAgent = new https.Agent({keepAlive:true});
+const DEFAULT_STDIO_TIMEOUT_MS = 360000;
+const CHILD_EOF_GRACE_MS = 1500;
+const CHILD_TERM_GRACE_MS = 500;
+const RELAY_SHUTDOWN_DEADLINE_MS = 2500;
+const RELAY_REQUEST_ID_PREFIX = 'agentctl:';
 let shuttingDown = false;
 let leaseMissingSince = null;
 function event(level, name, fields={}) { writeEvent(managedLog,level,name,fields); }
 
-function stdioTimeoutMs(definition) {
+function stdioTimeout(definition) {
   const configured = definition.timeout_ms;
-  if (Number.isSafeInteger(configured) && configured >= 1000 && configured <= 3600000) return configured;
+  if (Number.isSafeInteger(configured) && configured >= 1000 && configured <= 3600000) {
+    return {timeoutMs:configured, timeoutSource:'definition'};
+  }
   const fallback = config.timeout_ms;
-  if (Number.isSafeInteger(fallback) && fallback >= 1000 && fallback <= 3600000) return fallback;
-  return 30000;
+  if (Number.isSafeInteger(fallback) && fallback >= 1000 && fallback <= 3600000) {
+    return {timeoutMs:fallback, timeoutSource:'default'};
+  }
+  return {timeoutMs:DEFAULT_STDIO_TIMEOUT_MS, timeoutSource:'default'};
+}
+
+class StdioResponseTimeoutError extends Error {
+  constructor() { super('MCP server response timed out'); this.name='StdioResponseTimeoutError'; }
+}
+
+class StdioClientDisconnectedError extends Error {
+  constructor() { super('MCP client disconnected'); this.name='StdioClientDisconnectedError'; }
 }
 
 function json(res, status, body) {
@@ -153,6 +170,50 @@ function proxyHttp(req, res, definition) {
 
 const protocolVersions=new Set(['2024-11-05','2025-03-26','2025-06-18']);
 
+function childRunning(state) {
+  return !state.failed && state.child.exitCode === null && state.child.signalCode === null;
+}
+
+function waitForChildExit(state, timeoutMs) {
+  return new Promise(resolve => {
+    if (!childRunning(state)) return resolve(true);
+    let settled=false;
+    let timer;
+    const finish = exited => {
+      if (settled) return;
+      settled=true;
+      clearTimeout(timer);
+      state.child.removeListener('exit',onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    state.child.once('exit',onExit);
+    if (!childRunning(state)) return finish(true);
+    timer=setTimeout(() => finish(false),timeoutMs);
+  });
+}
+
+function stopChild(state, reason) {
+  if (state.stopPromise) return state.stopPromise;
+  state.expectedExit=true;
+  state.stopReason=reason;
+  state.stopPromise=(async () => {
+    if (!childRunning(state)) return;
+    event('info','stdio_server_stop_requested',{server:state.definition.name,reason,phase:'stdin_eof'});
+    try { state.child.stdin.end(); } catch {}
+    if (await waitForChildExit(state,CHILD_EOF_GRACE_MS)) return;
+    state.stopSignals.add('SIGTERM');
+    event('error','stdio_server_stop_escalated',{server:state.definition.name,reason,signal:'SIGTERM'});
+    state.child.kill('SIGTERM');
+    if (await waitForChildExit(state,CHILD_TERM_GRACE_MS)) return;
+    state.stopSignals.add('SIGKILL');
+    event('error','stdio_server_stop_escalated',{server:state.definition.name,reason,signal:'SIGKILL'});
+    state.child.kill('SIGKILL');
+    await waitForChildExit(state,250);
+  })();
+  return state.stopPromise;
+}
+
 function startChild(definition) {
   const existing = definition.shared_process && serverChildren.get(definition.name);
   if (existing && !existing.failed && existing.child.exitCode === null && existing.child.signalCode === null) return existing;
@@ -166,12 +227,13 @@ function startChild(definition) {
     stdio: ['pipe', 'pipe', 'pipe']
   });
   event('info','stdio_server_started',{server:definition.name,pid:child.pid ?? null});
-  children.add(child);
   const state = {
     child, definition, buffer:Buffer.alloc(0), pending:null, streams:new Map(),
     cachedInitializeResponse:null, initializeRequest:null, initializePromise:null,
-    initializedNotified:false, primarySession:null, serverRequests:new Map(), failed:false, expectedExit:false
+    initializedNotified:false, primarySession:null, serverRequests:new Map(), failed:false, expectedExit:false,
+    restartAllowed:true, stopPromise:null, stopReason:null, stopSignals:new Set()
   };
+  childStates.add(state);
   if (definition.shared_process) serverChildren.set(definition.name, state);
   const stderrDecoder = new StringDecoder('utf8');
   let stderrBuffer='';
@@ -214,20 +276,26 @@ function startChild(definition) {
       if (state.pending && message.id === state.pending.id) {
         const pending=state.pending; state.pending=null; pending.resolve(message);
       } else {
-        const event = `event: message\ndata: ${JSON.stringify(message)}\n\n`;
+        const isResponse = message.id !== undefined && typeof message.method !== 'string' &&
+          (Object.hasOwn(message,'result') || Object.hasOwn(message,'error'));
+        if (isResponse && typeof message.id === 'string' && message.id.startsWith(RELAY_REQUEST_ID_PREFIX)) {
+          event('info','stdio_late_response_discarded',{server:definition.name});
+          continue;
+        }
+        const streamEvent = `event: message\ndata: ${JSON.stringify(message)}\n\n`;
         const isServerRequest = message.id !== undefined && typeof message.method === 'string';
         if (isServerRequest) {
           state.serverRequests.set(String(message.id), state.primarySession);
           const streams = state.streams.get(state.primarySession) || new Set();
-          for (const stream of streams) stream.write(event);
+          for (const stream of streams) stream.write(streamEvent);
         } else {
-          for (const streams of state.streams.values()) for (const stream of streams) stream.write(event);
+          for (const streams of state.streams.values()) for (const stream of streams) stream.write(streamEvent);
         }
       }
     }
   });
   child.once('exit', (code, signal) => {
-    children.delete(child);
+    childStates.delete(state);
     if (serverChildren.get(definition.name) === state) serverChildren.delete(definition.name);
     const activeSessions = [];
     for (const [session, sessionState] of sessions) {
@@ -235,10 +303,12 @@ function startChild(definition) {
     }
     if (state.pending) { const pending=state.pending; state.pending=null; pending.reject(new Error('MCP server exited before responding')); }
     for (const streams of state.streams.values()) for (const stream of streams) stream.end();
-    event(!shuttingDown && !state.expectedExit ? 'error' : 'info','stdio_server_exited',{
-      server:definition.name,code,signal:signal || 'none',expected:shuttingDown || state.expectedExit
+    const requestedSignal=signal && state.stopSignals.has(signal);
+    const expected=(shuttingDown || state.expectedExit) && ((code === 0 && !signal) || requestedSignal);
+    event(expected ? 'info' : 'error','stdio_server_exited',{
+      server:definition.name,code,signal:signal || 'none',expected,reason:state.stopReason || null
     });
-    if (!shuttingDown && definition.shared_process && activeSessions.length > 0) {
+    if (!shuttingDown && state.restartAllowed && definition.shared_process && activeSessions.length > 0) {
       setTimeout(async () => {
         if (shuttingDown || serverChildren.has(definition.name)) return;
         event('info','stdio_server_restarting',{server:definition.name,sessions:activeSessions.length});
@@ -246,15 +316,14 @@ function startChild(definition) {
         if (state.initializeRequest) {
           try {
             replacement.initializeRequest=state.initializeRequest;
-            replacement.cachedInitializeResponse=await queuedTransact(replacement, state.initializeRequest, stdioTimeoutMs(definition));
+            replacement.cachedInitializeResponse=await queuedTransact(replacement, state.initializeRequest, stdioTimeout(definition));
             if (state.initializedNotified) {
               await writeChild(replacement, {jsonrpc:'2.0',method:'notifications/initialized'});
               replacement.initializedNotified=true;
             }
           } catch (error) {
             event('error','stdio_reinitialize_failed',{server:definition.name});
-            replacement.expectedExit=true;
-            replacement.child.kill('SIGTERM');
+            void stopChild(replacement,'reinitialize_failed');
             return;
           }
         }
@@ -278,27 +347,75 @@ function writeChild(state, payload) {
   });
 }
 
-function transact(state, payload, timeoutMs = 30000) {
+function transact(state, payload, timeoutConfig, abortSignal) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      if (state.pending?.id === payload.id) state.pending=null;
-      event('error','stdio_response_timeout',{server:state.definition.name,timeout_ms:timeoutMs});
-      reject(new Error('MCP server response timed out'));
-    }, timeoutMs);
-    state.pending = {
-      id:payload.id,
-      resolve:value => { clearTimeout(timer); resolve(value); },
-      reject:error => { clearTimeout(timer); reject(error); }
+    const {timeoutMs,timeoutSource}=timeoutConfig;
+    const clientId=payload.id;
+    const wireId=`${RELAY_REQUEST_ID_PREFIX}${randomUUID()}`;
+    const forwarded={...payload,id:wireId};
+    let settled=false;
+    let requestIssued=false;
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      abortSignal?.removeEventListener('abort',onAbort);
     };
-    writeChild(state, payload).catch(error => {
-      if (state.pending?.id === payload.id) { state.pending=null; clearTimeout(timer); reject(error); }
+    const rejectPending = error => {
+      if (settled) return;
+      settled=true; cleanup(); reject(error);
+    };
+    const cancelPending = async cause => {
+      if (settled) return;
+      settled=true;
+      if (state.pending?.id === wireId) state.pending=null;
+      cleanup();
+      let cancellation='not_required';
+      let serverAction='preserved';
+      if (payload.method === 'initialize') {
+        cancellation='not_permitted';
+        serverAction='stopping';
+        state.restartAllowed=false;
+        void stopChild(state,`${cause}_during_initialize`);
+      } else if (requestIssued) {
+        try {
+          await writeChild(state,{jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:wireId,reason:cause === 'timeout' ? 'Agentctl response deadline exceeded' : 'MCP client disconnected'}});
+          cancellation='sent';
+        } catch {
+          cancellation='failed';
+        }
+      }
+      const fields={server:state.definition.name,method:payload.method || 'request',cancellation,server_action:serverAction};
+      if (cause === 'timeout') {
+        event('error','stdio_response_timeout',{...fields,timeout_ms:timeoutMs,timeout_source:timeoutSource});
+        reject(new StdioResponseTimeoutError());
+      } else {
+        event('error','stdio_client_disconnected',fields);
+        reject(new StdioClientDisconnectedError());
+      }
+    };
+    const onAbort = () => { void cancelPending('client_disconnect'); };
+    state.pending = {
+      id:wireId,
+      resolve:value => {
+        if (settled) return;
+        settled=true; cleanup(); resolve({...value,id:clientId});
+      },
+      reject:rejectPending
+    };
+    if (abortSignal?.aborted) return void cancelPending('client_disconnect');
+    abortSignal?.addEventListener('abort',onAbort,{once:true});
+    timer=setTimeout(() => { void cancelPending('timeout'); },timeoutMs);
+    requestIssued=true;
+    writeChild(state, forwarded).catch(error => {
+      if (state.pending?.id === wireId) state.pending=null;
+      rejectPending(error);
     });
   });
 }
 
-function queuedTransact(state, payload, timeoutMs) {
+function queuedTransact(state, payload, timeoutConfig, abortSignal) {
   const previous = childQueues.get(state) || Promise.resolve();
-  const current = previous.catch(() => {}).then(() => transact(state, payload, timeoutMs));
+  const current = previous.catch(() => {}).then(() => transact(state, payload, timeoutConfig, abortSignal));
   childQueues.set(state, current);
   current.finally(() => { if (childQueues.get(state) === current) childQueues.delete(state); }).catch(() => {});
   return current;
@@ -329,7 +446,7 @@ const server = http.createServer(async (req, res) => {
     if (state && state.primarySession === sessionId) {
       state.primarySession=[...sessions.entries()].find(([,candidate]) => candidate === state)?.[0] || null;
     }
-    if (state && !state.definition.shared_process && ![...sessions.values()].includes(state)) { state.expectedExit=true; state.child.kill('SIGTERM'); }
+    if (state && !state.definition.shared_process && ![...sessions.values()].includes(state)) void stopChild(state,'session_closed');
     res.writeHead(204); return res.end();
   }
   if (req.method === 'GET') {
@@ -378,7 +495,9 @@ const server = http.createServer(async (req, res) => {
       const cached = await state.initializePromise;
       res.setHeader('mcp-session-id', nextSession);
       return json(res, 200, {...cached,id:payload.id});
-    } catch (error) { return json(res, 502, {error:error.message}); }
+    } catch (error) {
+      return json(res, error instanceof StdioResponseTimeoutError ? 504 : 502, {error:error.message});
+    }
   }
   if (definition.shared_process && payload.method === 'initialize') state.initializeRequest=payload;
   if (definition.shared_process && payload.method === 'notifications/initialized') {
@@ -391,8 +510,12 @@ const server = http.createServer(async (req, res) => {
     try { await writeChild(state, payload); res.writeHead(202, {'mcp-session-id':nextSession}); return res.end(); }
     catch (error) { return json(res, 502, {error:error.message}); }
   }
+  const requestAbort=new AbortController();
+  const abortRequest=()=>requestAbort.abort();
+  req.once('aborted',abortRequest);
+  res.once('close',()=>{ if (!res.writableEnded) abortRequest(); });
   try {
-    let responsePromise = queuedTransact(state, payload, stdioTimeoutMs(definition));
+    let responsePromise = queuedTransact(state, payload, stdioTimeout(definition), requestAbort.signal);
     if (definition.shared_process && payload.method === 'initialize') state.initializePromise=responsePromise;
     const response = await responsePromise;
     if (definition.shared_process && payload.method === 'initialize') {
@@ -405,22 +528,54 @@ const server = http.createServer(async (req, res) => {
     }
     event('info','stdio_response',{server:definition.name,duration_ms:Date.now()-requestStarted});
     return json(res, 200, response);
-  } catch (error) { state.initializePromise=null; event('error','stdio_request_failed',{server:definition.name}); state.expectedExit=true; state.child.kill('SIGTERM'); sessions.delete(nextSession); return json(res, 502, {error:error.message}); }
+  } catch (error) {
+    state.initializePromise=null;
+    if (error instanceof StdioClientDisconnectedError) return;
+    if (error instanceof StdioResponseTimeoutError) {
+      if (res.destroyed) return;
+      return json(res, 504, {error:error.message});
+    }
+    event('error','stdio_request_failed',{server:definition.name,method:payload.method || 'request'});
+    void stopChild(state,'request_failed');
+    sessions.delete(nextSession);
+    if (!res.destroyed) return json(res, 502, {error:error.message});
+  }
 });
 
 function shutdown(signal='supervisor') {
   if (shuttingDown) return;
   shuttingDown = true;
   event('info','relay_stopping',{signal});
-  server.close(() => { try { fs.unlinkSync(socketPath); } catch {} process.exit(0); });
-  for (const child of children) child.kill('SIGTERM');
   httpAgent.destroy();
   httpsAgent.destroy();
-  setTimeout(() => {
-    for (const connection of connections) connection.destroy();
+  let finished=false;
+  let serverClosed=false;
+  const childStops=Promise.all([...childStates].map(state => stopChild(state,'relay_shutdown')));
+  const finish = exitCode => {
+    if (finished) return;
+    finished=true;
+    clearTimeout(deadline);
     try { fs.unlinkSync(socketPath); } catch {}
-    process.exit(1);
-  }, 2000);
+    process.exit(exitCode);
+  };
+  server.close(() => { serverClosed=true; });
+  const completion=setInterval(() => {
+    if (serverClosed && [...childStates].every(state => !childRunning(state))) {
+      clearInterval(completion);
+      void childStops.then(() => finish(0));
+    }
+  },25);
+  const deadline=setTimeout(() => {
+    clearInterval(completion);
+    for (const connection of connections) connection.destroy();
+    for (const state of childStates) {
+      if (!childRunning(state)) continue;
+      state.stopSignals.add('SIGKILL');
+      event('error','stdio_server_stop_escalated',{server:state.definition.name,reason:'relay_shutdown_deadline',signal:'SIGKILL'});
+      state.child.kill('SIGKILL');
+    }
+    finish(1);
+  }, RELAY_SHUTDOWN_DEADLINE_MS);
 }
 // The relay is container-scoped, not attached to an interactive agent session.
 // Only the verified supervisor terminates it with SIGTERM. In particular, do
