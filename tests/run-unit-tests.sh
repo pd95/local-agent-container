@@ -12973,9 +12973,15 @@ test_mcp_definition_parses_stdio_and_http_transports() {
   local executable http_definition
   executable="$(command -v sh)"
   MCP_CONFIG_JSON='[]'; MCP_REQUESTED=0
-  mcp_add_definition "{\"name\":\"stdio-explicit\",\"type\":\"stdio\",\"command\":\"$executable\",\"timeout_ms\":600000}"
-  printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[0].transport=="stdio" and .[0].name=="stdio-explicit" and .[0].timeout_ms==600000' >/dev/null || fail "Explicit stdio definition was not normalized: $MCP_CONFIG_JSON"
+  mcp_add_definition "{\"name\":\"stdio-explicit\",\"type\":\"stdio\",\"command\":\"$executable\",\"timeout_ms\":600000,\"max_timeout_ms\":7200000}"
+  printf '%s' "$MCP_CONFIG_JSON" | jq -e '.[0].transport=="stdio" and .[0].name=="stdio-explicit" and .[0].timeout_ms==600000 and .[0].max_timeout_ms==7200000' >/dev/null || fail "Explicit stdio definition was not normalized: $MCP_CONFIG_JSON"
   run_capture mcp_add_definition "{\"name\":\"bad-timeout\",\"command\":\"$executable\",\"timeout_ms\":999}"
+  assert_status 1
+  assert_contains "Invalid MCP server definition"
+  run_capture mcp_add_definition "{\"name\":\"bad-maximum\",\"command\":\"$executable\",\"max_timeout_ms\":86400001}"
+  assert_status 1
+  assert_contains "Invalid MCP server definition"
+  run_capture mcp_add_definition "{\"name\":\"bad-timeout-order\",\"command\":\"$executable\",\"timeout_ms\":600000,\"max_timeout_ms\":300000}"
   assert_status 1
   assert_contains "Invalid MCP server definition"
   mcp_keychain_exists() { return 1; }
@@ -13163,7 +13169,8 @@ test_mcp_definition_commands_reject_transient_values_and_redact_list() {
 
   run_capture mcp_definition_list agent-unit
   assert_status 0; assert_contains "shell"; assert_contains "'/usr/local/bin/custom-mcp' 'serve' '--debug'"
-  assert_contains "Response timeout     360000ms"
+  assert_contains "Idle timeout         360000ms"
+  assert_contains "Maximum duration     3600000ms"
   assert_contains "MCP_PROFILE (set)"; assert_contains "https://example.test"; assert_contains "Keychain web-token (present)"
   assert_contains "x-tenant <- environment MCP_TENANT (missing)"
   assert_not_contains "token=query-secret"
@@ -13189,7 +13196,7 @@ test_mcp_status_reports_safe_recent_events_without_affecting_health() {
   relay_log="$root/mcp-unit.log"; guest_log="$root/guest-unit.log"
   MCP_TEST_RELAY_LOG="$relay_log"; MCP_TEST_GUEST_LOG="$guest_log"
   printf '%s\n' \
-    '2026-09-16T12:00:00.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_response_timeout","server":"custom","method":"unsafe\n\u001b[31mforged","timeout_ms":30000}' \
+    '2026-09-16T12:00:00.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_response_timeout","server":"custom","method":"unsafe\n\u001b[31mforged","timeout_kind":"idle","timeout_ms":30000,"timeout_source":"definition","idle_timeout_ms":30000,"max_timeout_ms":3600000,"progress_updates":2}' \
     '2026-09-16T12:00:01.000Z [agentctl-mcp-stderr] {"server":"custom","pid":12,"message":"raw-secret-diagnostic","truncated":false}' >"$relay_log.1"
   printf '%s\n' \
     '2026-09-16T12:00:02.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_request_failed","server":"one"}' \
@@ -13211,13 +13218,19 @@ test_mcp_status_reports_safe_recent_events_without_affecting_health() {
   assert_status 0
   assert_contains "host relay healthy"; assert_contains "$relay_log"; assert_contains "$relay_log.1"
   assert_contains "Latest request timeout"
-  assert_contains "server response timed out after 30000ms"
+  assert_contains "server response idle timed out after 30000ms (definition); maximum 3600000ms; 2 progress updates"
   assert_not_contains "forged"
   assert_contains "server exited (code unknown, signal SIGABRT) during relay_shutdown"
   assert_contains "HTTP upstream returned status 401"
   assert_contains "guest proxy could not reach host relay"
   assert_contains "server emitted stderr; see host relay log"
   assert_not_contains "raw-secret-diagnostic"; assert_not_contains "must-not-print"; assert_not_contains "private-detail"
+
+  printf '%s\n' \
+    '2026-09-16T12:00:04.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_response_timeout","server":"custom","timeout_kind":"maximum","timeout_ms":3600000,"timeout_source":"default","idle_timeout_ms":30000,"max_timeout_ms":3600000,"progress_updates":12}' >>"$relay_log"
+  run_capture mcp_status agent-unit
+  assert_status 0
+  assert_contains "server response exceeded maximum duration after 3600000ms (default); idle 30000ms; 12 progress updates"
 
   doctor_mcp_status() { printf '%s\n' 'host relay unhealthy'; return 1; }
   run_capture mcp_status agent-unit

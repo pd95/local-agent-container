@@ -143,19 +143,33 @@ Stdio definitions accept:
 - `env`
 - `env_vars`
 - `shared`
-- `timeout_ms` (optional integer from 1,000 to 3,600,000)
+- `timeout_ms` (optional idle timeout in milliseconds from 1,000 to 3,600,000)
+- `max_timeout_ms` (optional maximum duration in milliseconds from 1,000 to
+  86,400,000; must be at least `timeout_ms`)
 
 The Xcode preset enables `shared`, allowing reconnecting HTTP sessions to reuse
-one `xcrun mcpbridge` process and sets a 10-minute response timeout. Generic
-stdio definitions default to a six-minute response timeout and per-session
-process isolation. Set `timeout_ms` when a known server has longer-running
-operations, for example `{"name":"builder","command":"/path/to/server","timeout_ms":600000}`.
-The response timeout is an absolute relay deadline; progress notifications do
-not extend it. Codex 0.154.0 defaults to a five-minute tool timeout, so calls
-that intentionally run longer must configure both Codex `tool_timeout_sec` and
-the managed definition's `timeout_ms`. Tool arguments such as
-`timeout_seconds` are application data and do not change either transport
-deadline.
+one `xcrun mcpbridge` process and sets a 10-minute idle timeout. Generic stdio
+definitions default to a six-minute idle timeout and per-session process
+isolation. Both use a one-hour maximum duration by default. For example, this
+definition permits a progressing operation to run for up to 30 minutes while
+requiring progress at least every 10 minutes:
+
+```json
+{"name":"builder","command":"/path/to/server","timeout_ms":600000,"max_timeout_ms":1800000}
+```
+
+The relay resets the idle timeout only for a valid `notifications/progress`
+message whose `progressToken` matches the active request. It preserves a token
+supplied by the client. When the client supplies none, the relay adds a private
+token on the stdio hop and consumes progress for that token locally. Stderr,
+raw stdout, unrelated JSON-RPC traffic, and progress with another token do not
+extend the request. The maximum duration never resets.
+
+Codex 0.154.0 defaults to a five-minute tool timeout, so calls that intentionally
+run longer must also configure Codex `tool_timeout_sec`. Codex can still stop
+waiting before either relay timeout. Tool arguments such as `timeout_seconds`
+are application data and do not change any transport deadline. HTTP routes
+continue to use their separate connection, header, idle, and total timeouts.
 
 Literal `env` values live only for the active invocation.
 `env_vars` persists only selected host environment-variable names and resolves

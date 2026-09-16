@@ -29,13 +29,16 @@ const childQueues = new WeakMap();
 const connections = new Set();
 const httpAgent = new http.Agent({keepAlive:true});
 const httpsAgent = new https.Agent({keepAlive:true});
-const DEFAULT_STDIO_TIMEOUT_MS = 360000;
+const DEFAULT_STDIO_IDLE_TIMEOUT_MS = 360000;
+const DEFAULT_STDIO_MAX_TIMEOUT_MS = 3600000;
+const MAX_STDIO_TIMEOUT_MS = 86400000;
 const CHILD_EOF_GRACE_MS = 1500;
 const CHILD_TERM_GRACE_MS = 500;
 const RELAY_SHUTDOWN_DEADLINE_MS = 2500;
 let shuttingDown = false;
 let leaseMissingSince = null;
 let nextRelayRequestId = 1;
+const relayProgressPrefix = `agentctl:${randomUUID()}:`;
 function event(level, name, fields={}) { writeEvent(managedLog,level,name,fields); }
 
 function relayRequestId() {
@@ -44,20 +47,41 @@ function relayRequestId() {
   return id;
 }
 
+function isProgressNotification(message) {
+  if (!message || typeof message !== 'object' || Array.isArray(message) || message.jsonrpc !== '2.0' ||
+      Object.hasOwn(message,'id') || message.method !== 'notifications/progress') return false;
+  const params=message.params;
+  if (!params || typeof params !== 'object' || Array.isArray(params)) return false;
+  if (typeof params.progressToken !== 'string' && !Number.isSafeInteger(params.progressToken)) return false;
+  if (!Number.isFinite(params.progress)) return false;
+  if (Object.hasOwn(params,'total') && !Number.isFinite(params.total)) return false;
+  if (Object.hasOwn(params,'message') && typeof params.message !== 'string') return false;
+  return true;
+}
+
 function stdioTimeout(definition) {
-  const configured = definition.timeout_ms;
-  if (Number.isSafeInteger(configured) && configured >= 1000 && configured <= 3600000) {
-    return {timeoutMs:configured, timeoutSource:'definition'};
-  }
-  const fallback = config.timeout_ms;
-  if (Number.isSafeInteger(fallback) && fallback >= 1000 && fallback <= 3600000) {
-    return {timeoutMs:fallback, timeoutSource:'default'};
-  }
-  return {timeoutMs:DEFAULT_STDIO_TIMEOUT_MS, timeoutSource:'default'};
+  const configuredIdle = definition.timeout_ms;
+  const fallbackIdle = config.timeout_ms;
+  const idleTimeoutMs = Number.isSafeInteger(configuredIdle) && configuredIdle >= 1000 && configuredIdle <= 3600000 ? configuredIdle :
+    Number.isSafeInteger(fallbackIdle) && fallbackIdle >= 1000 && fallbackIdle <= 3600000 ? fallbackIdle : DEFAULT_STDIO_IDLE_TIMEOUT_MS;
+  const configuredMax = definition.max_timeout_ms;
+  const fallbackMax = config.max_timeout_ms;
+  const maxTimeoutMs = Number.isSafeInteger(configuredMax) && configuredMax >= 1000 && configuredMax <= MAX_STDIO_TIMEOUT_MS ? configuredMax :
+    Number.isSafeInteger(fallbackMax) && fallbackMax >= 1000 && fallbackMax <= MAX_STDIO_TIMEOUT_MS ? fallbackMax : DEFAULT_STDIO_MAX_TIMEOUT_MS;
+  return {
+    idleTimeoutMs,
+    idleTimeoutSource:Number.isSafeInteger(configuredIdle) ? 'definition' : 'default',
+    maxTimeoutMs,
+    maxTimeoutSource:Number.isSafeInteger(configuredMax) ? 'definition' : 'default'
+  };
 }
 
 class StdioResponseTimeoutError extends Error {
-  constructor() { super('MCP server response timed out'); this.name='StdioResponseTimeoutError'; }
+  constructor(kind) {
+    super(kind === 'idle' ? 'MCP server response idle timed out' : 'MCP server response exceeded maximum duration');
+    this.name='StdioResponseTimeoutError';
+    this.kind=kind;
+  }
 }
 
 class StdioClientDisconnectedError extends Error {
@@ -282,6 +306,11 @@ function startChild(definition) {
         if (state.pending) { const pending=state.pending; state.pending=null; pending.reject(new Error('invalid MCP JSON response')); }
         continue;
       }
+      const progressToken = isProgressNotification(message) ? message.params.progressToken : undefined;
+      if (progressToken !== undefined) {
+        state.pending?.progress(progressToken);
+        if (typeof progressToken === 'string' && progressToken.startsWith(relayProgressPrefix)) continue;
+      }
       const isResponse = message.id !== undefined && typeof message.method !== 'string' &&
         (Object.hasOwn(message,'result') || Object.hasOwn(message,'error'));
       if (isResponse && state.pending && message.id === state.pending.id) {
@@ -371,15 +400,27 @@ function requestCancellation(state, requestId, reason) {
 
 function transact(state, payload, timeoutConfig, abortSignal) {
   return new Promise((resolve, reject) => {
-    const {timeoutMs,timeoutSource}=timeoutConfig;
+    const {idleTimeoutMs,idleTimeoutSource,maxTimeoutMs,maxTimeoutSource}=timeoutConfig;
     const clientId=payload.id;
     const wireId=relayRequestId();
-    const forwarded={...payload,id:wireId};
+    const requestParams = payload.params === undefined || payload.params === null ? {} : payload.params;
+    const requestMeta = requestParams && typeof requestParams === 'object' && !Array.isArray(requestParams) &&
+      requestParams._meta && typeof requestParams._meta === 'object' && !Array.isArray(requestParams._meta) ? requestParams._meta : {};
+    const clientProgressToken=requestMeta.progressToken;
+    const clientOwnsProgressToken=typeof clientProgressToken === 'string' || Number.isSafeInteger(clientProgressToken);
+    const progressToken=clientOwnsProgressToken ? clientProgressToken : `${relayProgressPrefix}${wireId}`;
+    const forwarded=requestParams && typeof requestParams === 'object' && !Array.isArray(requestParams) ?
+      {...payload,id:wireId,params:{...requestParams,_meta:{...requestMeta,progressToken}}} : {...payload,id:wireId};
     let settled=false;
     let requestIssued=false;
-    let timer;
+    let idleTimer;
+    let maxTimer;
+    let progressUpdates=0;
+    let lastProgressAt=null;
+    const startedAt=Date.now();
     const cleanup = () => {
-      clearTimeout(timer);
+      clearTimeout(idleTimer);
+      clearTimeout(maxTimer);
       abortSignal?.removeEventListener('abort',onAbort);
     };
     const rejectPending = error => {
@@ -399,20 +440,39 @@ function transact(state, payload, timeoutConfig, abortSignal) {
         state.restartAllowed=false;
         void stopChild(state,`${cause}_during_initialize`);
       } else if (requestIssued) {
-        cancellation=requestCancellation(state,wireId,cause === 'timeout' ? 'Agentctl response deadline exceeded' : 'MCP client disconnected') ? 'requested' : 'failed';
+        cancellation=requestCancellation(state,wireId,cause === 'client_disconnect' ? 'MCP client disconnected' : 'Agentctl response deadline exceeded') ? 'requested' : 'failed';
       }
       const fields={server:state.definition.name,method:payload.method || 'request',cancellation,server_action:serverAction};
-      if (cause === 'timeout') {
-        event('error','stdio_response_timeout',{...fields,timeout_ms:timeoutMs,timeout_source:timeoutSource});
-        reject(new StdioResponseTimeoutError());
+      if (cause === 'idle_timeout' || cause === 'max_timeout') {
+        const timeoutKind=cause === 'idle_timeout' ? 'idle' : 'maximum';
+        event('error','stdio_response_timeout',{
+          ...fields,timeout_kind:timeoutKind,
+          timeout_ms:timeoutKind === 'idle' ? idleTimeoutMs : maxTimeoutMs,
+          timeout_source:timeoutKind === 'idle' ? idleTimeoutSource : maxTimeoutSource,
+          idle_timeout_ms:idleTimeoutMs,max_timeout_ms:maxTimeoutMs,
+          duration_ms:Date.now()-startedAt,progress_updates:progressUpdates,
+          last_progress_ms_ago:lastProgressAt === null ? null : Date.now()-lastProgressAt
+        });
+        reject(new StdioResponseTimeoutError(timeoutKind === 'idle' ? 'idle' : 'maximum'));
       } else {
         event('error','stdio_client_disconnected',fields);
         reject(new StdioClientDisconnectedError());
       }
     };
     const onAbort = () => { void cancelPending('client_disconnect'); };
+    const armIdleTimer = () => {
+      clearTimeout(idleTimer);
+      idleTimer=setTimeout(() => { void cancelPending('idle_timeout'); },idleTimeoutMs);
+    };
     state.pending = {
       id:wireId,
+      progress:token => {
+        if (settled || token !== progressToken) return false;
+        progressUpdates++;
+        lastProgressAt=Date.now();
+        armIdleTimer();
+        return true;
+      },
       resolve:value => {
         if (settled) return;
         settled=true; cleanup(); resolve({...value,id:clientId});
@@ -421,7 +481,8 @@ function transact(state, payload, timeoutConfig, abortSignal) {
     };
     if (abortSignal?.aborted) return void cancelPending('client_disconnect');
     abortSignal?.addEventListener('abort',onAbort,{once:true});
-    timer=setTimeout(() => { void cancelPending('timeout'); },timeoutMs);
+    armIdleTimer();
+    maxTimer=setTimeout(() => { void cancelPending('max_timeout'); },maxTimeoutMs);
     requestIssued=true;
     writeChild(state, forwarded).catch(error => {
       if (state.pending?.id === wireId) state.pending=null;

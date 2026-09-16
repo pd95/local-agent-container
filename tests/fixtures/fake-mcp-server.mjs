@@ -46,7 +46,26 @@ input.on('line', line => {
   if (request.method === 'tools/call') result = {content:[{type:'text',text:JSON.stringify(request.params?.arguments || {})}]};
   const delayMs = request.method === 'test/slow' ? Number.parseInt(process.env.AGENTCTL_FAKE_MCP_DELAY_MS || '0', 10) :
     request.method === 'initialize' ? Number.parseInt(process.env.AGENTCTL_FAKE_MCP_DELAY_INITIALIZE_MS || '0', 10) : 0;
+  let progressTimer;
+  const progressIntervalMs=Number.parseInt(process.env.AGENTCTL_FAKE_MCP_PROGRESS_INTERVAL_MS || '0',10);
+  const requestedProgressToken=request.params?._meta?.progressToken;
+  const progressToken=process.env.AGENTCTL_FAKE_MCP_PROGRESS_TOKEN_OVERRIDE || requestedProgressToken;
+  if (request.method === 'test/slow' && Number.isSafeInteger(progressIntervalMs) && progressIntervalMs > 0 && progressToken !== undefined) {
+    let progress=0;
+    progressTimer=setInterval(()=>{
+      progress++;
+      const notification={jsonrpc:'2.0',method:'notifications/progress',params:{progressToken,progress,message:'still working'}};
+      switch (process.env.AGENTCTL_FAKE_MCP_PROGRESS_MODE) {
+        case 'missing-progress': delete notification.params.progress; break;
+        case 'nonnumeric-progress': notification.params.progress='working'; break;
+        case 'missing-jsonrpc': delete notification.jsonrpc; break;
+        case 'request-shaped': notification.id=9000+progress; break;
+      }
+      process.stdout.write(`${JSON.stringify(notification)}\n`);
+    },progressIntervalMs);
+  }
   const respond = () => {
+    clearInterval(progressTimer);
     process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',id:request.id,result})}\n`);
     if (request.method === 'initialize' && process.env.AGENTCTL_FAKE_MCP_PAUSE_STDIN_AFTER_INITIALIZE) input.pause();
   };

@@ -13,9 +13,15 @@ function summary(payload) {
     payload.cancellation === 'not_permitted' ? '; cancellation not permitted' : '';
   const serverAction=payload.server_action === 'preserved' ? '; server preserved' :
     payload.server_action === 'stopping' ? '; server stopping' : '';
+  const progress=Number.isSafeInteger(payload.progress_updates) ? `; ${payload.progress_updates} progress update${payload.progress_updates === 1 ? '' : 's'}` : '';
   switch (payload.event) {
     case 'stdio_server_exited': return `server exited (code ${payload.code ?? 'unknown'}, signal ${payload.signal || 'none'})${payload.reason ? ` during ${payload.reason}` : ''}`;
-    case 'stdio_response_timeout': return `server response timed out after ${payload.timeout_ms ?? 'unknown'}ms${payload.timeout_source ? ` (${payload.timeout_source})` : ''}${cancellation}${serverAction}`;
+    case 'stdio_response_timeout': {
+      const kind=payload.timeout_kind === 'idle' ? 'idle timed out' : payload.timeout_kind === 'maximum' ? 'exceeded maximum duration' : 'timed out';
+      const otherLimit=payload.timeout_kind === 'idle' && Number.isSafeInteger(payload.max_timeout_ms) ? `; maximum ${payload.max_timeout_ms}ms` :
+        payload.timeout_kind === 'maximum' && Number.isSafeInteger(payload.idle_timeout_ms) ? `; idle ${payload.idle_timeout_ms}ms` : '';
+      return `server response ${kind} after ${payload.timeout_ms ?? 'unknown'}ms${payload.timeout_source ? ` (${payload.timeout_source})` : ''}${otherLimit}${progress}${cancellation}${serverAction}`;
+    }
     case 'stdio_client_disconnected': return `request cancelled after client disconnect${cancellation}${serverAction}`;
     case 'stdio_cancellation_write_failed': return `request cancellation write failed (${payload.code || 'unknown'})`;
     case 'stdio_server_stop_escalated': return `server shutdown escalated to ${payload.signal || 'signal'}${payload.reason ? ` (${payload.reason})` : ''}`;

@@ -27,6 +27,10 @@ const servers=[
   {name:'fake',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_STARTED:starts,AGENTCTL_FAKE_MCP_CLIENT_RESPONSE:clientResponses}},
   {name:'slow-default',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1100',AGENTCTL_FAKE_MCP_STARTED:slowStarts,AGENTCTL_FAKE_MCP_CANCELLED:slowCancelled,AGENTCTL_FAKE_MCP_HEARTBEAT:slowHeartbeat,AGENTCTL_FAKE_MCP_EOF:cleanEof}},
   {name:'slow-override',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],timeout_ms:2000,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1100'}},
+  {name:'progress',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,timeout_ms:1000,max_timeout_ms:4000,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1600',AGENTCTL_FAKE_MCP_PROGRESS_INTERVAL_MS:'300'}},
+  {name:'wrong-progress',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],timeout_ms:1000,max_timeout_ms:4000,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1600',AGENTCTL_FAKE_MCP_PROGRESS_INTERVAL_MS:'300',AGENTCTL_FAKE_MCP_PROGRESS_TOKEN_OVERRIDE:'wrong-token'}},
+  ...['missing-progress','nonnumeric-progress','missing-jsonrpc','request-shaped'].map(mode=>({name:mode,transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],timeout_ms:1000,max_timeout_ms:4000,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1600',AGENTCTL_FAKE_MCP_PROGRESS_INTERVAL_MS:'300',AGENTCTL_FAKE_MCP_PROGRESS_MODE:mode}})),
+  {name:'maximum-progress',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],timeout_ms:1000,max_timeout_ms:1500,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'2200',AGENTCTL_FAKE_MCP_PROGRESS_INTERVAL_MS:'300'}},
   {name:'slow-initialize',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_DELAY_INITIALIZE_MS:'1100',AGENTCTL_FAKE_MCP_EOF:initializeEof,AGENTCTL_FAKE_MCP_STARTED:initializeStarts}},
   {name:'backpressure',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_PAUSE_STDIN_AFTER_INITIALIZE:'1'}},
   {name:'stubborn',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],env:{AGENTCTL_FAKE_MCP_IGNORE_EOF:'1',AGENTCTL_FAKE_MCP_IGNORE_SIGTERM:'1'}},
@@ -39,7 +43,7 @@ const servers=[
   {name:'missing',transport:'http',url:`http://127.0.0.1:${httpPort}/mcp?fixed=1`,resolved_headers:{},missing_credentials:['missing-secret']},
   {name:'failed',transport:'http',url:`http://127.0.0.1:${unusedPort}/mcp`,resolved_headers:{}}
 ];
-fs.writeFileSync(config, JSON.stringify({socket_path:socket,nonce:'test-nonce',container:'test-container',log_path:relayLog,log_max_bytes:5*1024*1024,timeout_ms:1000,http_timeouts:{connect:80,headers:80,idle:80,total:500},servers}), {mode:0o600});
+fs.writeFileSync(config, JSON.stringify({socket_path:socket,nonce:'test-nonce',container:'test-container',log_path:relayLog,log_max_bytes:5*1024*1024,timeout_ms:1000,max_timeout_ms:4000,http_timeouts:{connect:80,headers:80,idle:80,total:500},servers}), {mode:0o600});
 let relayLogs='';
 const relay = spawn(process.execPath, [path.join(root,'mcp/host-relay.mjs'),config], {stdio:['ignore','ignore','pipe']});
 relay.stderr.on('data',chunk=>{relayLogs+=chunk;});
@@ -122,7 +126,7 @@ assert.equal(slowInitialized.status,200); const slowSession=slowInitialized.head
 for(let count=0;count<20 && !fs.existsSync(slowHeartbeat);count++) await new Promise(resolve=>setTimeout(resolve,10));
 const heartbeatBefore=fs.statSync(slowHeartbeat).size;
 const timedOut=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:21,method:'test/slow'},{'mcp-session-id':slowSession});
-assert.equal(timedOut.status,504); assert.match(timedOut.body,/MCP server response timed out/);
+assert.equal(timedOut.status,504); assert.match(timedOut.body,/MCP server response idle timed out/);
 const firstCancellation=JSON.parse(fs.readFileSync(slowCancelled,'utf8').trim().split('\n')[0]);
 assert.equal(Number.isSafeInteger(firstCancellation.requestId),true);
 const afterTimeout=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:21,method:'tools/list'},{'mcp-session-id':slowSession});
@@ -151,6 +155,33 @@ const afterDisconnect=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id
 assert.equal(afterDisconnect.status,200); assert.equal(fs.readFileSync(slowStarts,'utf8').trim().split('\n').length,1);
 const completedSlowCall=await request('POST','/mcp/slow-override',{jsonrpc:'2.0',id:22,method:'test/slow'});
 assert.equal(completedSlowCall.status,200); assert.deepEqual(JSON.parse(completedSlowCall.body).result,{});
+const progressInitialized=await request('POST','/mcp/progress',{jsonrpc:'2.0',id:240,method:'initialize',params:{}});
+assert.equal(progressInitialized.status,200);
+const progressSession=progressInitialized.headers['mcp-session-id']; assert.ok(progressSession);
+let progressStreamBody=''; let progressConnectedResolve;
+const progressConnected=new Promise(resolve=>{progressConnectedResolve=resolve;});
+const progressGet=http.request({socketPath:socket,path:'/mcp/progress',method:'GET',headers:{accept:'text/event-stream','mcp-session-id':progressSession}},res=>{
+  res.on('data',chunk=>{progressStreamBody+=chunk;if(progressStreamBody.includes(': connected'))progressConnectedResolve();});
+});
+progressGet.on('error',error=>{if(error.code!=='ECONNRESET')throw error;}); progressGet.end();
+await progressConnected;
+const internallyProgressing=await request('POST','/mcp/progress',{jsonrpc:'2.0',id:241,method:'test/slow',params:{}},{'mcp-session-id':progressSession});
+assert.equal(internallyProgressing.status,200);
+assert.doesNotMatch(progressStreamBody,/notifications\/progress/);
+const clientProgressToken='client-progress-token';
+const externallyProgressing=await request('POST','/mcp/progress',{jsonrpc:'2.0',id:242,method:'test/slow',params:{_meta:{progressToken:clientProgressToken}}},{'mcp-session-id':progressSession});
+assert.equal(externallyProgressing.status,200);
+assert.match(progressStreamBody,/notifications\/progress/); assert.match(progressStreamBody,new RegExp(clientProgressToken));
+progressGet.destroy();
+const wrongProgress=await request('POST','/mcp/wrong-progress',{jsonrpc:'2.0',id:243,method:'test/slow',params:{}});
+assert.equal(wrongProgress.status,504); assert.match(wrongProgress.body,/idle timed out/);
+for(const [index,mode] of ['missing-progress','nonnumeric-progress','missing-jsonrpc','request-shaped'].entries()){
+  const malformedProgress=await request('POST',`/mcp/${mode}`,{jsonrpc:'2.0',id:250+index,method:'test/slow',params:{}});
+  assert.equal(malformedProgress.status,504,`${mode} must not extend the idle deadline`);
+  assert.match(malformedProgress.body,/idle timed out/);
+}
+const maximumProgress=await request('POST','/mcp/maximum-progress',{jsonrpc:'2.0',id:244,method:'test/slow',params:{}});
+assert.equal(maximumProgress.status,504); assert.match(maximumProgress.body,/exceeded maximum duration/);
 const initializeTimedOut=await request('POST','/mcp/slow-initialize',{jsonrpc:'2.0',id:25,method:'initialize',params:{}});
 assert.equal(initializeTimedOut.status,504);
 for(let count=0;count<50 && !fs.existsSync(initializeEof);count++) await new Promise(resolve=>setTimeout(resolve,10));
@@ -164,6 +195,7 @@ const backpressureTimeout=await request('POST','/mcp/backpressure',{jsonrpc:'2.0
 assert.equal(backpressureTimeout.status,504);
 assert.ok(Date.now()-backpressureStarted < 1800);
 assert.match(readRelayLogs(),/"event":"stdio_response_timeout".*"cancellation":"requested".*"server_action":"preserved".*"timeout_ms":1000/);
+assert.match(readRelayLogs(),/"event":"stdio_response_timeout".*"timeout_kind":"maximum".*"max_timeout_ms":1500.*"progress_updates":[1-9]/);
 assert.match(readRelayLogs(),/"event":"stdio_response_timeout".*"method":"initialize".*"cancellation":"not_permitted".*"server_action":"stopping"/);
 assert.match(readRelayLogs(),/"event":"stdio_late_response_discarded"/);
 const sseMessage=new Promise((resolve,reject)=>{
