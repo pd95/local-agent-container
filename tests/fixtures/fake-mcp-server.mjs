@@ -8,7 +8,7 @@ const input = readline.createInterface({input:process.stdin});
 let heartbeatTimer;
 if (process.env.AGENTCTL_FAKE_MCP_HEARTBEAT) {
   heartbeatTimer=setInterval(()=>fs.appendFileSync(process.env.AGENTCTL_FAKE_MCP_HEARTBEAT,'.'),20);
-} else if (process.env.AGENTCTL_FAKE_MCP_IGNORE_EOF) {
+} else if (process.env.AGENTCTL_FAKE_MCP_IGNORE_EOF || process.env.AGENTCTL_FAKE_MCP_PAUSE_STDIN_AFTER_INITIALIZE) {
   heartbeatTimer=setInterval(()=>{},1000);
 }
 if (process.env.AGENTCTL_FAKE_MCP_IGNORE_SIGTERM) process.on('SIGTERM',()=>{});
@@ -41,7 +41,10 @@ input.on('line', line => {
   if (request.method === 'tools/call') result = {content:[{type:'text',text:JSON.stringify(request.params?.arguments || {})}]};
   const delayMs = request.method === 'test/slow' ? Number.parseInt(process.env.AGENTCTL_FAKE_MCP_DELAY_MS || '0', 10) :
     request.method === 'initialize' ? Number.parseInt(process.env.AGENTCTL_FAKE_MCP_DELAY_INITIALIZE_MS || '0', 10) : 0;
-  const respond = () => process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',id:request.id,result})}\n`);
+  const respond = () => {
+    process.stdout.write(`${JSON.stringify({jsonrpc:'2.0',id:request.id,result})}\n`);
+    if (request.method === 'initialize' && process.env.AGENTCTL_FAKE_MCP_PAUSE_STDIN_AFTER_INITIALIZE) input.pause();
+  };
   if (Number.isSafeInteger(delayMs) && delayMs > 0) setTimeout(respond, delayMs);
   else respond();
 });

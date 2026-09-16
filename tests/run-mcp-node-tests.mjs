@@ -28,6 +28,7 @@ const servers=[
   {name:'slow-default',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1100',AGENTCTL_FAKE_MCP_STARTED:slowStarts,AGENTCTL_FAKE_MCP_CANCELLED:slowCancelled,AGENTCTL_FAKE_MCP_HEARTBEAT:slowHeartbeat,AGENTCTL_FAKE_MCP_EOF:cleanEof}},
   {name:'slow-override',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],timeout_ms:2000,env:{AGENTCTL_FAKE_MCP_DELAY_MS:'1100'}},
   {name:'slow-initialize',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_DELAY_INITIALIZE_MS:'1100',AGENTCTL_FAKE_MCP_EOF:initializeEof,AGENTCTL_FAKE_MCP_STARTED:initializeStarts}},
+  {name:'backpressure',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],shared_process:true,env:{AGENTCTL_FAKE_MCP_PAUSE_STDIN_AFTER_INITIALIZE:'1'}},
   {name:'stubborn',transport:'stdio',command:process.execPath,args:[path.join(root,'tests/fixtures/fake-mcp-server.mjs')],env:{AGENTCTL_FAKE_MCP_IGNORE_EOF:'1',AGENTCTL_FAKE_MCP_IGNORE_SIGTERM:'1'}},
   {name:'http',transport:'http',url:`http://127.0.0.1:${httpPort}/mcp?fixed=1`,resolved_headers:{authorization:'Bearer configured-secret','x-tenant':'configured-tenant'}},
   {name:'redirect',transport:'http',url:`http://127.0.0.1:${httpPort}/redirect`,resolved_headers:{authorization:'Bearer redirect-secret'}},
@@ -109,6 +110,15 @@ assert.equal(afterTimeout.status,200); assert.equal(JSON.parse(afterTimeout.body
 await new Promise(resolve=>setTimeout(resolve,150));
 assert.ok(fs.statSync(slowHeartbeat).size > heartbeatBefore);
 assert.equal(fs.readFileSync(slowStarts,'utf8').trim().split('\n').length,1);
+await new Promise(resolve=>{
+  const partial=http.request({host:'127.0.0.1',port:proxyPort,path:'/mcp/slow-default',method:'POST',headers:{'content-type':'application/json','content-length':'4096','mcp-session-id':slowSession}},()=>{});
+  partial.on('error',()=>resolve()); partial.write('{"jsonrpc":"2.0","id":230,"method":"test/slow"');
+  setTimeout(()=>partial.destroy(),20); setTimeout(resolve,150);
+});
+assert.equal(relay.exitCode,null);
+assert.equal((await request('GET','/.well-known/agentctl-mcp-health')).status,200);
+const afterPartialUpload=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:231,method:'tools/list'},{'mcp-session-id':slowSession});
+assert.equal(afterPartialUpload.status,200);
 const cancellationsBefore=fs.readFileSync(slowCancelled,'utf8').trim().split('\n').length;
 await new Promise(resolve=>{
   const body=JSON.stringify({jsonrpc:'2.0',id:23,method:'test/slow'});
@@ -127,7 +137,13 @@ for(let count=0;count<50 && !fs.existsSync(initializeEof);count++) await new Pro
 assert.equal(fs.readFileSync(initializeEof,'utf8'),'eof\n');
 await new Promise(resolve=>setTimeout(resolve,300));
 assert.equal(fs.readFileSync(initializeStarts,'utf8').trim().split('\n').length,1);
-assert.match(readRelayLogs(),/"event":"stdio_response_timeout".*"cancellation":"sent".*"server_action":"preserved".*"timeout_ms":1000/);
+const backpressureInitialized=await request('POST','/mcp/backpressure',{jsonrpc:'2.0',id:26,method:'initialize',params:{}});
+assert.equal(backpressureInitialized.status,200);
+const backpressureStarted=Date.now();
+const backpressureTimeout=await request('POST','/mcp/backpressure',{jsonrpc:'2.0',id:27,method:'test/backpressure',params:{blob:'x'.repeat(2*1024*1024)}},{'mcp-session-id':backpressureInitialized.headers['mcp-session-id']});
+assert.equal(backpressureTimeout.status,504);
+assert.ok(Date.now()-backpressureStarted < 1800);
+assert.match(readRelayLogs(),/"event":"stdio_response_timeout".*"cancellation":"requested".*"server_action":"preserved".*"timeout_ms":1000/);
 assert.match(readRelayLogs(),/"event":"stdio_response_timeout".*"method":"initialize".*"cancellation":"not_permitted".*"server_action":"stopping"/);
 assert.match(readRelayLogs(),/"event":"stdio_late_response_discarded"/);
 const sseMessage=new Promise((resolve,reject)=>{

@@ -235,6 +235,9 @@ function startChild(definition) {
   };
   childStates.add(state);
   if (definition.shared_process) serverChildren.set(definition.name, state);
+  child.stdin.on('error', error => {
+    if (!state.expectedExit && !shuttingDown) event('error','stdio_stdin_error',{server:definition.name,code:error.code || 'unknown'});
+  });
   const stderrDecoder = new StringDecoder('utf8');
   let stderrBuffer='';
   let stderrDropping=false;
@@ -347,6 +350,19 @@ function writeChild(state, payload) {
   });
 }
 
+function requestCancellation(state, requestId, reason) {
+  if (!childRunning(state)) return false;
+  try {
+    state.child.stdin.write(`${JSON.stringify({jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId,reason}})}\n`, error => {
+      if (error) event('error','stdio_cancellation_write_failed',{server:state.definition.name,code:error.code || 'unknown'});
+    });
+    return true;
+  } catch (error) {
+    event('error','stdio_cancellation_write_failed',{server:state.definition.name,code:error.code || 'unknown'});
+    return false;
+  }
+}
+
 function transact(state, payload, timeoutConfig, abortSignal) {
   return new Promise((resolve, reject) => {
     const {timeoutMs,timeoutSource}=timeoutConfig;
@@ -377,12 +393,7 @@ function transact(state, payload, timeoutConfig, abortSignal) {
         state.restartAllowed=false;
         void stopChild(state,`${cause}_during_initialize`);
       } else if (requestIssued) {
-        try {
-          await writeChild(state,{jsonrpc:'2.0',method:'notifications/cancelled',params:{requestId:wireId,reason:cause === 'timeout' ? 'Agentctl response deadline exceeded' : 'MCP client disconnected'}});
-          cancellation='sent';
-        } catch {
-          cancellation='failed';
-        }
+        cancellation=requestCancellation(state,wireId,cause === 'timeout' ? 'Agentctl response deadline exceeded' : 'MCP client disconnected') ? 'requested' : 'failed';
       }
       const fields={server:state.definition.name,method:payload.method || 'request',cancellation,server_action:serverAction};
       if (cause === 'timeout') {
@@ -468,8 +479,18 @@ const server = http.createServer(async (req, res) => {
   if (protocolVersion && !protocolVersions.has(protocolVersion)) return rpcError(res,400,null,-32600,'unsupported MCP protocol version');
   const requestStarted=Date.now();
   event('info','request_received',{server:match[1],transport:'stdio',method:req.method});
+  const requestAbort=new AbortController();
+  const abortRequest=()=>requestAbort.abort();
+  req.once('aborted',abortRequest);
+  res.once('close',()=>{ if (!res.writableEnded) abortRequest(); });
   const chunks = []; let size = 0;
-  for await (const chunk of req) { size += chunk.length; if (size > 8 * 1024 * 1024) return rpcError(res,413,null,-32600,'request too large'); chunks.push(chunk); }
+  try {
+    for await (const chunk of req) { size += chunk.length; if (size > 8 * 1024 * 1024) return rpcError(res,413,null,-32600,'request too large'); chunks.push(chunk); }
+  } catch (error) {
+    if (requestAbort.signal.aborted || req.aborted || error.code === 'ECONNRESET') return;
+    if (!res.destroyed) return rpcError(res,400,null,-32600,'request body could not be read');
+    return;
+  }
   let payload; try { payload = JSON.parse(Buffer.concat(chunks).toString()); } catch { return rpcError(res,400,null,-32700,'invalid JSON'); }
   event('info','stdio_message',{server:definition.name,method:typeof payload.method === 'string' ? payload.method : 'response'});
   if (sessionId && !sessions.has(sessionId)) return json(res, 404, {error:'unknown or expired MCP session'});
@@ -510,10 +531,6 @@ const server = http.createServer(async (req, res) => {
     try { await writeChild(state, payload); res.writeHead(202, {'mcp-session-id':nextSession}); return res.end(); }
     catch (error) { return json(res, 502, {error:error.message}); }
   }
-  const requestAbort=new AbortController();
-  const abortRequest=()=>requestAbort.abort();
-  req.once('aborted',abortRequest);
-  res.once('close',()=>{ if (!res.writableEnded) abortRequest(); });
   try {
     let responsePromise = queuedTransact(state, payload, stdioTimeout(definition), requestAbort.signal);
     if (definition.shared_process && payload.method === 'initialize') state.initializePromise=responsePromise;

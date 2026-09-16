@@ -13189,7 +13189,7 @@ test_mcp_status_reports_safe_recent_events_without_affecting_health() {
   relay_log="$root/mcp-unit.log"; guest_log="$root/guest-unit.log"
   MCP_TEST_RELAY_LOG="$relay_log"; MCP_TEST_GUEST_LOG="$guest_log"
   printf '%s\n' \
-    '2026-09-16T12:00:00.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_response_timeout","server":"custom","timeout_ms":30000}' \
+    '2026-09-16T12:00:00.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_response_timeout","server":"custom","method":"unsafe\n\u001b[31mforged","timeout_ms":30000}' \
     '2026-09-16T12:00:01.000Z [agentctl-mcp-stderr] {"server":"custom","pid":12,"message":"raw-secret-diagnostic","truncated":false}' >"$relay_log.1"
   printf '%s\n' \
     '2026-09-16T12:00:02.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_request_failed","server":"one"}' \
@@ -13212,6 +13212,7 @@ test_mcp_status_reports_safe_recent_events_without_affecting_health() {
   assert_contains "host relay healthy"; assert_contains "$relay_log"; assert_contains "$relay_log.1"
   assert_contains "Latest request timeout"
   assert_contains "server response timed out after 30000ms"
+  assert_not_contains "forged"
   assert_contains "server exited (code unknown, signal SIGABRT) during relay_shutdown"
   assert_contains "HTTP upstream returned status 401"
   assert_contains "guest proxy could not reach host relay"

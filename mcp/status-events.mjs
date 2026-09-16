@@ -7,20 +7,22 @@ let latestStderr=null;
 let latestTimeout=null;
 
 function summary(payload) {
-  const method=typeof payload.method === 'string' ? `${payload.method} ` : 'server response ';
-  const cancellation=payload.cancellation === 'sent' ? '; cancellation sent' :
+  const cancellation=payload.cancellation === 'requested' ? '; cancellation requested' :
+    payload.cancellation === 'sent' ? '; cancellation sent' :
     payload.cancellation === 'failed' ? '; cancellation failed' :
     payload.cancellation === 'not_permitted' ? '; cancellation not permitted' : '';
   const serverAction=payload.server_action === 'preserved' ? '; server preserved' :
     payload.server_action === 'stopping' ? '; server stopping' : '';
   switch (payload.event) {
     case 'stdio_server_exited': return `server exited (code ${payload.code ?? 'unknown'}, signal ${payload.signal || 'none'})${payload.reason ? ` during ${payload.reason}` : ''}`;
-    case 'stdio_response_timeout': return `${method}timed out after ${payload.timeout_ms ?? 'unknown'}ms${payload.timeout_source ? ` (${payload.timeout_source})` : ''}${cancellation}${serverAction}`;
-    case 'stdio_client_disconnected': return `${method}cancelled after client disconnect${cancellation}${serverAction}`;
+    case 'stdio_response_timeout': return `server response timed out after ${payload.timeout_ms ?? 'unknown'}ms${payload.timeout_source ? ` (${payload.timeout_source})` : ''}${cancellation}${serverAction}`;
+    case 'stdio_client_disconnected': return `request cancelled after client disconnect${cancellation}${serverAction}`;
+    case 'stdio_cancellation_write_failed': return `request cancellation write failed (${payload.code || 'unknown'})`;
     case 'stdio_server_stop_escalated': return `server shutdown escalated to ${payload.signal || 'signal'}${payload.reason ? ` (${payload.reason})` : ''}`;
     case 'stdio_request_failed': return 'server request failed';
     case 'stdio_reinitialize_failed': return 'shared server reinitialization failed';
     case 'stdio_spawn_error': return `server process failed (${payload.code || 'unknown'})`;
+    case 'stdio_stdin_error': return `server input failed (${payload.code || 'unknown'})`;
     case 'http_credentials_unavailable': return 'HTTP upstream credentials are unavailable';
     case 'http_response': return `HTTP upstream returned status ${payload.status ?? 'unknown'}`;
     case 'http_timeout': return `HTTP upstream ${payload.phase || 'request'} timeout`;
