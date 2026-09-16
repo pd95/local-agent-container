@@ -5,11 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import {spawn} from 'node:child_process';
+import {RotatingLog} from '../mcp/rotating-log.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'agentctl-mcp-test-'));
 const socket = path.join(temporary, 'relay.sock');
 const config = path.join(temporary, 'config.json');
+const relayLog = path.join(temporary, 'relay.log');
 const starts=path.join(temporary,'starts'); const clientResponses=path.join(temporary,'client-responses');
 const aborted=path.join(temporary,'http-aborted');
 const redirected=path.join(temporary,'http-redirected');
@@ -31,10 +33,11 @@ const servers=[
   {name:'missing',transport:'http',url:`http://127.0.0.1:${httpPort}/mcp?fixed=1`,resolved_headers:{},missing_credentials:['missing-secret']},
   {name:'failed',transport:'http',url:`http://127.0.0.1:${unusedPort}/mcp`,resolved_headers:{}}
 ];
-fs.writeFileSync(config, JSON.stringify({socket_path:socket,nonce:'test-nonce',container:'test-container',timeout_ms:1000,http_timeouts:{connect:80,headers:80,idle:80,total:500},servers}), {mode:0o600});
+fs.writeFileSync(config, JSON.stringify({socket_path:socket,nonce:'test-nonce',container:'test-container',log_path:relayLog,log_max_bytes:5*1024*1024,timeout_ms:1000,http_timeouts:{connect:80,headers:80,idle:80,total:500},servers}), {mode:0o600});
 let relayLogs='';
 const relay = spawn(process.execPath, [path.join(root,'mcp/host-relay.mjs'),config], {stdio:['ignore','ignore','pipe']});
 relay.stderr.on('data',chunk=>{relayLogs+=chunk;});
+const readRelayLogs=()=>`${fs.existsSync(`${relayLog}.1`)?fs.readFileSync(`${relayLog}.1`,'utf8'):''}${fs.existsSync(relayLog)?fs.readFileSync(relayLog,'utf8'):''}${relayLogs}`;
 for (let count=0; count<100 && !fs.existsSync(socket); count++) await new Promise(resolve => setTimeout(resolve, 10));
 assert.ok(fs.statSync(socket).isSocket());
 const portServer=http.createServer();
@@ -83,11 +86,17 @@ const session=initialized.headers['mcp-session-id']; assert.ok(session);
 assert.equal((await request('POST','/mcp/fake',{jsonrpc:'2.0',id:9,method:'tools/list'},{'mcp-session-id':'expired'})).status,404);
 const tools=await request('POST','/mcp/fake',{jsonrpc:'2.0',id:2,method:'tools/list'}, {'mcp-session-id':session});
 assert.equal(JSON.parse(tools.body).result.tools[0].name,'echo');
+const stderrResponse=await request('POST','/mcp/fake',{jsonrpc:'2.0',id:202,method:'test/stderr'}, {'mcp-session-id':session});
+assert.equal(stderrResponse.status,200);
+await new Promise(resolve=>setTimeout(resolve,20));
+assert.match(readRelayLogs(),/\[agentctl-mcp-stderr\].*external script failed safely/);
+assert.match(readRelayLogs(),/\[agentctl-mcp-stderr\].*second diagnostic line/);
+assert.match(readRelayLogs(),/\[agentctl-mcp-stderr\].*"truncated":true/);
 const timedOut=await request('POST','/mcp/slow-default',{jsonrpc:'2.0',id:21,method:'tools/list'});
 assert.equal(timedOut.status,502); assert.match(timedOut.body,/MCP server response timed out/);
 const completedSlowCall=await request('POST','/mcp/slow-override',{jsonrpc:'2.0',id:22,method:'tools/list'});
 assert.equal(completedSlowCall.status,200); assert.equal(JSON.parse(completedSlowCall.body).result.tools[0].name,'echo');
-assert.match(relayLogs,/response timed out after 1000ms/);
+assert.match(readRelayLogs(),/"event":"stdio_response_timeout".*"timeout_ms":1000/);
 const sseMessage=new Promise((resolve,reject)=>{
   const get=http.request({socketPath:socket,path:'/mcp/fake',method:'GET',headers:{accept:'text/event-stream','mcp-session-id':session}},res=>{
     let body=''; res.on('data',chunk=>{body+=chunk; if(body.includes('notifications/test')){get.destroy();resolve(body);}});
@@ -100,6 +109,7 @@ assert.equal((await request('POST','/mcp/fake',{jsonrpc:'2.0',id:'server-1',resu
 await new Promise(resolve=>setTimeout(resolve,20)); assert.match(fs.readFileSync(clientResponses,'utf8'),/server-1/);
 const crashed=await request('POST','/mcp/fake',{jsonrpc:'2.0',id:3,method:'test/crash'}, {'mcp-session-id':session});
 assert.equal(crashed.status,502);
+await new Promise(resolve=>setTimeout(resolve,20)); assert.match(readRelayLogs(),/partial diagnostic/);
 await new Promise(resolve=>setTimeout(resolve,500));
 const recovered=await request('POST','/mcp/fake',{jsonrpc:'2.0',id:4,method:'tools/list'}, {'mcp-session-id':session});
 assert.equal(recovered.status,200); assert.equal(JSON.parse(recovered.body).result.tools[0].name,'echo');
@@ -140,9 +150,25 @@ const totalStarted=Date.now(); await new Promise(resolve=>{request('POST','/mcp/
 assert.equal((await request('POST','/mcp/missing','{}')).status,503);
 assert.equal((await request('POST','/mcp/failed','{}')).status,502);
 assert.equal((await request('POST','/mcp/tls-failed','{}')).status,502);
-assert.doesNotMatch(relayLogs,/configured-secret|redirect-secret|client-secret|client-tenant|configured-tenant/);
+const completedLogs=readRelayLogs();
+assert.match(completedLogs,/"event":"http_response".*"status":207/);
+assert.match(completedLogs,/"event":"http_credentials_unavailable".*"status":503/);
+assert.match(completedLogs,/"event":"http_connection_failed"/);
+assert.doesNotMatch(completedLogs,/configured-secret|redirect-secret|client-secret|client-tenant|configured-tenant/);
 relay.kill('SIGTERM'); await new Promise(resolve=>relay.once('exit',resolve));
 proxy.kill('SIGTERM'); await new Promise(resolve=>proxy.once('exit',resolve));
 fakeHttp.kill('SIGTERM'); await new Promise(resolve=>fakeHttp.once('exit',resolve));
+const rotationPath=path.join(temporary,'rotation.log');
+const rotatingLog=new RotatingLog(rotationPath,80);
+rotatingLog.write(`${'a'.repeat(60)}\n`); rotatingLog.write(`${'b'.repeat(60)}\n`);
+assert.equal(fs.existsSync(`${rotationPath}.1`),true);
+assert.match(fs.readFileSync(`${rotationPath}.1`,'utf8'),/^a+/);
+assert.match(fs.readFileSync(rotationPath,'utf8'),/^b+/);
+const sinkPath=path.join(temporary,'sink.log');
+const sink=spawn(process.execPath,[path.join(root,'mcp/log-sink.mjs'),sinkPath],{stdio:['pipe','ignore','pipe']});
+sink.stdin.end(`${'c'.repeat(20000)}\nstill one line\n`);
+await new Promise((resolve,reject)=>{sink.once('error',reject);sink.once('exit',code=>code === 0 ? resolve() : reject(new Error(`log sink exited ${code}`)));});
+const sinkLines=fs.readFileSync(sinkPath,'utf8').trimEnd().split('\n');
+assert.equal(sinkLines.length,2); assert.match(sinkLines[0],/ \[truncated\]$/); assert.equal(sinkLines[1],'still one line');
 fs.rmSync(temporary,{recursive:true,force:true});
 console.log('MCP Node tests passed');

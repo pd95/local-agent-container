@@ -13148,25 +13148,71 @@ test_mcp_definition_command_dispatches_container_scoped_actions() {
 }
 
 test_mcp_definition_commands_reject_transient_values_and_redact_list() {
-  begin_test "managed MCP definition commands reject transient values and redact list output"
+  begin_test "managed MCP list shows commands and references while redacting secret values"
   load_agentctl_functions
   local root test_registry
   root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-list.XXXXXX")"; register_dir_cleanup "$root"
   test_registry="$root/agent-unit.json"
-  printf '%s\n' '{"schema_version":2,"container":"agent-unit","port":47123,"servers":[{"name":"shell","transport":"stdio","command":"/private/secret-command","args":["secret-argument"],"env_vars":[]},{"name":"web","transport":"http","url":"https://example.test/private/path?token=query-secret","bearer_token_keychain":"web-token"}]}' >"$test_registry"; chmod 600 "$test_registry"
+  printf '%s\n' '{"schema_version":2,"container":"agent-unit","port":47123,"servers":[{"name":"shell","transport":"stdio","command":"/usr/local/bin/custom-mcp","args":["serve","--debug"],"env_vars":["MCP_PROFILE"]},{"name":"web","transport":"http","url":"https://example.test/private/path?token=query-secret","bearer_token_keychain":"web-token","header_env_vars":{"x-tenant":"MCP_TENANT"}}]}' >"$test_registry"; chmod 600 "$test_registry"
   mcp_registry_path() { printf '%s\n' "$test_registry"; }
   container_exists() { return 0; }
   container_has_mcp_wiring() { return 0; }
+  mcp_keychain_exists() { return 0; }
+  local MCP_PROFILE=dev
+  export MCP_PROFILE
 
   run_capture mcp_definition_list agent-unit
-  assert_status 0; assert_contains "NAME"; assert_contains "shell"; assert_contains "host stdio"; assert_contains "https://example.test"
-  assert_not_contains "secret-command"; assert_not_contains "secret-argument"; assert_not_contains "private/path"; assert_not_contains "query-secret"; assert_not_contains "web-token"
+  assert_status 0; assert_contains "shell"; assert_contains "'/usr/local/bin/custom-mcp' 'serve' '--debug'"
+  assert_contains "MCP_PROFILE (set)"; assert_contains "https://example.test"; assert_contains "Keychain web-token (present)"
+  assert_contains "x-tenant <- environment MCP_TENANT (missing)"
+  assert_not_contains "token=query-secret"
+
+  run_capture mcp_definition_list agent-unit shell
+  assert_status 0; assert_contains "custom-mcp"; assert_not_contains "web-token"
+  attempt_list() ( mcp_definition_list "$@" )
+  run_capture attempt_list agent-unit missing
+  assert_status 1; assert_contains "Managed MCP server not found"
 
   attempt_reject_transient() ( mcp_definition_reject_transient_values "$1" )
   run_capture attempt_reject_transient '[{"name":"shell","transport":"stdio","env":{"TOKEN":"secret"}}]'
   assert_status 1; assert_contains "cannot contain literal env values"; assert_not_contains "secret"
   run_capture attempt_reject_transient '[{"name":"web","transport":"http","headers":{"authorization":"secret"}}]'
   assert_status 1; assert_contains "cannot contain literal HTTP headers"; assert_not_contains "secret"
+}
+
+test_mcp_status_reports_safe_recent_events_without_affecting_health() {
+  begin_test "managed MCP status reports safe recent events and log paths"
+  load_agentctl_functions
+  local root relay_log guest_log
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-status.XXXXXX")"; register_dir_cleanup "$root"
+  relay_log="$root/mcp-unit.log"; guest_log="$root/guest-unit.log"
+  MCP_TEST_RELAY_LOG="$relay_log"; MCP_TEST_GUEST_LOG="$guest_log"
+  printf '%s\n' \
+    '2026-09-16T12:00:00.000Z [agentctl-mcp-event] {"level":"error","event":"stdio_response_timeout","server":"custom","timeout_ms":30000}' \
+    '2026-09-16T12:00:01.000Z [agentctl-mcp-stderr] {"server":"custom","pid":12,"message":"raw-secret-diagnostic","truncated":false}' >"$relay_log.1"
+  printf '%s\n' \
+    '2026-09-16T12:00:02.000Z [agentctl-mcp-event] {"level":"error","event":"http_response","server":"web","status":401,"body":"must-not-print"}' >"$relay_log"
+  printf '%s\n' \
+    '2026-09-16T12:00:03.000Z [agentctl-mcp-event] {"level":"error","event":"guest_upstream_unavailable","code":"ECONNREFUSED","message":"private-detail"}' >"$guest_log"
+  chmod 600 "$relay_log" "$relay_log.1" "$guest_log"
+  mcp_definition_target_prepare() { MCP_PORT=47123; MCP_CONFIG_JSON='[]'; }
+  mcp_relay_log_path() { printf '%s\n' "$MCP_TEST_RELAY_LOG"; }
+  mcp_guest_log_path() { printf '%s\n' "$MCP_TEST_GUEST_LOG"; }
+  doctor_mcp_status() { printf '%s\n' 'host relay healthy' 'guest loopback proxy healthy'; return 0; }
+
+  run_capture mcp_status agent-unit
+  assert_status 0
+  assert_contains "host relay healthy"; assert_contains "$relay_log"; assert_contains "$relay_log.1"
+  assert_contains "server response timed out after 30000ms"
+  assert_contains "HTTP upstream returned status 401"
+  assert_contains "guest proxy could not reach host relay"
+  assert_contains "server emitted stderr; see host relay log"
+  assert_not_contains "raw-secret-diagnostic"; assert_not_contains "must-not-print"; assert_not_contains "private-detail"
+
+  doctor_mcp_status() { printf '%s\n' 'host relay unhealthy'; return 1; }
+  run_capture mcp_status agent-unit
+  assert_status 1
+  assert_contains "HTTP upstream returned status 401"
 }
 
 test_mcp_definition_commands_activate_running_registry_and_roll_back_failures() {
@@ -13361,6 +13407,11 @@ test_host_doctor_reports_mcp_inventory_and_orphans() {
   assert_contains "definitions: xcode"
   assert_contains "host relay inactive because the container is stopped"
   assert_contains "active leases: 0"
+  assert_contains "host relay log"
+  assert_contains "$logs_path_dir/mcp-$(mcp_identity_hash agent-unit).log"
+  assert_contains "guest proxy log"
+  assert_contains "$logs_path_dir/guest-$(mcp_identity_hash agent-unit).log"
+  assert_contains "$CLI_NAME mcp status --name agent-unit"
   assert_not_contains "secret-command"
   assert_not_contains "secret-argument"
   assert_not_contains "secret-value"
@@ -15609,6 +15660,7 @@ main() {
   run_selected_test test_mcp_definition_commands_manage_stopped_registry_without_starting_container "test_mcp_definition_commands_manage_stopped_registry_without_starting_container"
   run_selected_test test_mcp_definition_command_dispatches_container_scoped_actions "test_mcp_definition_command_dispatches_container_scoped_actions"
   run_selected_test test_mcp_definition_commands_reject_transient_values_and_redact_list "test_mcp_definition_commands_reject_transient_values_and_redact_list"
+  run_selected_test test_mcp_status_reports_safe_recent_events_without_affecting_health "test_mcp_status_reports_safe_recent_events_without_affecting_health"
   run_selected_test test_mcp_definition_commands_activate_running_registry_and_roll_back_failures "test_mcp_definition_commands_activate_running_registry_and_roll_back_failures"
   run_selected_test test_mcp_keychain_slots_are_separate_from_runtime_auth "test_mcp_keychain_slots_are_separate_from_runtime_auth"
   run_selected_test test_mcp_credential_commands_use_keychain_without_printing_values "test_mcp_credential_commands_use_keychain_without_printing_values"

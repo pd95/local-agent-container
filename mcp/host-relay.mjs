@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import {StringDecoder} from 'node:string_decoder';
+import {RotatingLog, writeEvent, writeServerStderr} from './rotating-log.mjs';
 
 const [,, configPath] = process.argv;
 if (!configPath) {
@@ -13,6 +15,7 @@ if (!configPath) {
 }
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
 const {socket_path:socketPath, nonce, container:containerName} = config;
+const managedLog = new RotatingLog(config.log_path, config.log_max_bytes);
 const bridgeVersion = 1;
 if (!socketPath || !nonce || !containerName) {
   console.error('MCP relay config requires socket_path, nonce, and container');
@@ -28,7 +31,7 @@ const httpAgent = new http.Agent({keepAlive:true});
 const httpsAgent = new https.Agent({keepAlive:true});
 let shuttingDown = false;
 let leaseMissingSince = null;
-function log(message) { process.stderr.write(`${new Date().toISOString()} [agentctl-mcp] ${message}\n`); }
+function event(level, name, fields={}) { writeEvent(managedLog,level,name,fields); }
 
 function stdioTimeoutMs(definition) {
   const configured = definition.timeout_ms;
@@ -78,8 +81,10 @@ function proxyFailure(res, status, message) {
 function proxyHttp(req, res, definition) {
   if ((definition.missing_credentials || []).length || (definition.missing_env_vars || []).length ||
       (definition.invalid_credentials || []).length || (definition.invalid_env_vars || []).length) {
+    event('error','http_credentials_unavailable',{server:definition.name,status:503});
     return json(res, 503, {error:'MCP upstream credential is unavailable on the host'});
   }
+  const started=Date.now();
   const target = new URL(definition.url);
   const targetHostname=target.hostname.startsWith('[') && target.hostname.endsWith(']') ? target.hostname.slice(1,-1) : target.hostname;
   const transport = target.protocol === 'https:' ? https : http;
@@ -95,7 +100,7 @@ function proxyHttp(req, res, definition) {
   const failTimeout = phase => {
     if (finished) return;
     timedOut=true; finished=true;
-    log(`HTTP upstream ${definition.name} ${phase} timeout`);
+    event('error','http_timeout',{server:definition.name,phase});
     upstream.destroy(new Error('timeout'));
     proxyFailure(res,504,'MCP upstream timed out');
   };
@@ -119,9 +124,12 @@ function proxyHttp(req, res, definition) {
     if (upstreamResponse.statusCode >= 300 && upstreamResponse.statusCode < 400) {
       upstreamResponse.resume();
       finished=true; clearTimers();
-      log(`HTTP upstream ${definition.name} redirect rejected`);
+      event('error','http_redirect_rejected',{server:definition.name,status:upstreamResponse.statusCode});
       return json(res,502,{error:'MCP upstream redirect was rejected'});
     }
+    event(upstreamResponse.statusCode >= 400 ? 'error' : 'info','http_response',{
+      server:definition.name,status:upstreamResponse.statusCode,duration_ms:Date.now()-started
+    });
     const responseHeaders=filteredHeaders(upstreamResponse.headers);
     res.writeHead(upstreamResponse.statusCode, upstreamResponse.statusMessage, responseHeaders);
     upstreamResponse.on('data',resetIdle);
@@ -133,7 +141,7 @@ function proxyHttp(req, res, definition) {
     if (finished) return;
     finished=true; clearTimers();
     if (!timedOut) {
-      log(`HTTP upstream ${definition.name} connection failed`);
+      event('error','http_connection_failed',{server:definition.name,code:error.code || 'unknown'});
       proxyFailure(res,502,'MCP upstream is unavailable');
     }
   });
@@ -157,15 +165,38 @@ function startChild(definition) {
     env: {...baseline, ...(definition.inherited_env || {}), ...(definition.env || {})},
     stdio: ['pipe', 'pipe', 'pipe']
   });
-  log(`starting server ${definition.name} (pid ${child.pid})`);
+  event('info','stdio_server_started',{server:definition.name,pid:child.pid ?? null});
   children.add(child);
   const state = {
     child, definition, buffer:Buffer.alloc(0), pending:null, streams:new Map(),
     cachedInitializeResponse:null, initializeRequest:null, initializePromise:null,
-    initializedNotified:false, primarySession:null, serverRequests:new Map(), failed:false
+    initializedNotified:false, primarySession:null, serverRequests:new Map(), failed:false, expectedExit:false
   };
   if (definition.shared_process) serverChildren.set(definition.name, state);
-  child.stderr.resume();
+  const stderrDecoder = new StringDecoder('utf8');
+  let stderrBuffer='';
+  let stderrDropping=false;
+  const stderrLimit=16384;
+  const emitStderr = (line,truncated=false) => writeServerStderr(managedLog,definition.name,child.pid ?? null,line,truncated);
+  child.stderr.on('data', chunk => {
+    stderrBuffer += stderrDecoder.write(chunk);
+    for (;;) {
+      const newline=stderrBuffer.indexOf('\n');
+      if (newline < 0) break;
+      const line=stderrBuffer.slice(0,newline).replace(/\r$/,'');
+      stderrBuffer=stderrBuffer.slice(newline+1);
+      if (!stderrDropping) emitStderr(line.length > stderrLimit ? line.slice(0,stderrLimit) : line,line.length > stderrLimit);
+      stderrDropping=false;
+    }
+    if (!stderrDropping && stderrBuffer.length > stderrLimit) {
+      emitStderr(stderrBuffer.slice(0,stderrLimit),true);
+      stderrBuffer=''; stderrDropping=true;
+    } else if (stderrDropping && stderrBuffer.length > stderrLimit) stderrBuffer='';
+  });
+  child.stderr.once('end',()=>{
+    stderrBuffer += stderrDecoder.end();
+    if (stderrBuffer && !stderrDropping) emitStderr(stderrBuffer.replace(/\r$/,''));
+  });
   child.stdout.on('data', chunk => {
     state.buffer = Buffer.concat([state.buffer, chunk]);
     for (;;) {
@@ -204,11 +235,13 @@ function startChild(definition) {
     }
     if (state.pending) { const pending=state.pending; state.pending=null; pending.reject(new Error('MCP server exited before responding')); }
     for (const streams of state.streams.values()) for (const stream of streams) stream.end();
-    log(`server ${definition.name} exited (code ${code}, signal ${signal || 'none'})`);
+    event(!shuttingDown && !state.expectedExit ? 'error' : 'info','stdio_server_exited',{
+      server:definition.name,code,signal:signal || 'none',expected:shuttingDown || state.expectedExit
+    });
     if (!shuttingDown && definition.shared_process && activeSessions.length > 0) {
       setTimeout(async () => {
         if (shuttingDown || serverChildren.has(definition.name)) return;
-        log(`restarting shared server ${definition.name} for ${activeSessions.length} active session(s)`);
+        event('info','stdio_server_restarting',{server:definition.name,sessions:activeSessions.length});
         const replacement = startChild(definition);
         if (state.initializeRequest) {
           try {
@@ -219,7 +252,8 @@ function startChild(definition) {
               replacement.initializedNotified=true;
             }
           } catch (error) {
-            log(`shared server ${definition.name} reinitialize failed: ${error.message}`);
+            event('error','stdio_reinitialize_failed',{server:definition.name});
+            replacement.expectedExit=true;
             replacement.child.kill('SIGTERM');
             return;
           }
@@ -232,7 +266,7 @@ function startChild(definition) {
     state.failed=true;
     if (serverChildren.get(definition.name) === state) serverChildren.delete(definition.name);
     if (state.pending) { const pending=state.pending; state.pending=null; pending.reject(new Error(`MCP server failed: ${error.message}`)); }
-    log(`server ${definition.name} error: ${error.message}`);
+    event('error','stdio_spawn_error',{server:definition.name,code:error.code || 'unknown'});
   });
   return state;
 }
@@ -248,7 +282,7 @@ function transact(state, payload, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       if (state.pending?.id === payload.id) state.pending=null;
-      log(`server ${state.definition.name} response timed out after ${timeoutMs}ms`);
+      event('error','stdio_response_timeout',{server:state.definition.name,timeout_ms:timeoutMs});
       reject(new Error('MCP server response timed out'));
     }, timeoutMs);
     state.pending = {
@@ -284,7 +318,7 @@ const server = http.createServer(async (req, res) => {
   const definition = definitions.get(match[1]);
   if (!definition) return json(res, 503, {error:`MCP server is not configured: ${match[1]}`});
   if ((definition.transport || 'stdio') === 'http') {
-    log(`request ${req.method} /mcp/${match[1]} (http)`);
+    event('info','request_received',{server:match[1],transport:'http',method:req.method});
     return proxyHttp(req,res,definition);
   }
   const sessionId = req.headers['mcp-session-id'];
@@ -295,7 +329,7 @@ const server = http.createServer(async (req, res) => {
     if (state && state.primarySession === sessionId) {
       state.primarySession=[...sessions.entries()].find(([,candidate]) => candidate === state)?.[0] || null;
     }
-    if (state && !state.definition.shared_process && ![...sessions.values()].includes(state)) state.child.kill('SIGTERM');
+    if (state && !state.definition.shared_process && ![...sessions.values()].includes(state)) { state.expectedExit=true; state.child.kill('SIGTERM'); }
     res.writeHead(204); return res.end();
   }
   if (req.method === 'GET') {
@@ -315,11 +349,12 @@ const server = http.createServer(async (req, res) => {
   if (!accept.includes('*/*') && !accept.includes('application/json') && !accept.includes('text/event-stream')) return rpcError(res,406,null,-32000,'unsupported Accept header');
   const protocolVersion=req.headers['mcp-protocol-version'];
   if (protocolVersion && !protocolVersions.has(protocolVersion)) return rpcError(res,400,null,-32600,'unsupported MCP protocol version');
-  log(`request ${req.method} /mcp/${match[1]}`);
+  const requestStarted=Date.now();
+  event('info','request_received',{server:match[1],transport:'stdio',method:req.method});
   const chunks = []; let size = 0;
   for await (const chunk of req) { size += chunk.length; if (size > 8 * 1024 * 1024) return rpcError(res,413,null,-32600,'request too large'); chunks.push(chunk); }
   let payload; try { payload = JSON.parse(Buffer.concat(chunks).toString()); } catch { return rpcError(res,400,null,-32700,'invalid JSON'); }
-  log(`message ${definition.name} ${payload.method || 'response'}`);
+  event('info','stdio_message',{server:definition.name,method:typeof payload.method === 'string' ? payload.method : 'response'});
   if (sessionId && !sessions.has(sessionId)) return json(res, 404, {error:'unknown or expired MCP session'});
   let state = sessionId && sessions.get(sessionId);
   if (!state) state = startChild(definition);
@@ -368,14 +403,15 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200, {'content-type':'text/event-stream','cache-control':'no-cache'});
       return res.end(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
     }
+    event('info','stdio_response',{server:definition.name,duration_ms:Date.now()-requestStarted});
     return json(res, 200, response);
-  } catch (error) { state.initializePromise=null; log(`server ${definition.name} request failed: ${error.message}`); state.child.kill('SIGTERM'); sessions.delete(nextSession); return json(res, 502, {error:error.message}); }
+  } catch (error) { state.initializePromise=null; event('error','stdio_request_failed',{server:definition.name}); state.expectedExit=true; state.child.kill('SIGTERM'); sessions.delete(nextSession); return json(res, 502, {error:error.message}); }
 });
 
 function shutdown(signal='supervisor') {
   if (shuttingDown) return;
   shuttingDown = true;
-  log(`relay shutting down (${signal})`);
+  event('info','relay_stopping',{signal});
   server.close(() => { try { fs.unlinkSync(socketPath); } catch {} process.exit(0); });
   for (const child of children) child.kill('SIGTERM');
   httpAgent.destroy();
@@ -390,8 +426,8 @@ function shutdown(signal='supervisor') {
 // Only the verified supervisor terminates it with SIGTERM. In particular, do
 // not turn a terminal SIGINT from one client into an outage for other clients.
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => log('ignoring interactive SIGINT'));
-process.on('SIGHUP', () => log('ignoring terminal SIGHUP'));
+process.on('SIGINT', () => event('info','signal_ignored',{signal:'SIGINT'}));
+process.on('SIGHUP', () => event('info','signal_ignored',{signal:'SIGHUP'}));
 if (config.ephemeral_env) {
   setInterval(() => {
     let live=false;
@@ -408,14 +444,14 @@ if (config.ephemeral_env) {
     } catch {}
     if (live) leaseMissingSince=null;
     else if (leaseMissingSince === null) leaseMissingSince=Date.now();
-    else if (Date.now()-leaseMissingSince > 3000) { log('no live leases remain; shutting down ephemeral relay'); shutdown(); }
+    else if (Date.now()-leaseMissingSince > 3000) { event('info','leases_expired'); shutdown(); }
   }, 1000).unref();
 }
-server.on('error', error => { console.error(`MCP relay: ${error.message}`); process.exit(1); });
+server.on('error', error => { event('error','relay_error',{code:error.code || 'unknown'}); process.exit(1); });
 server.on('connection', connection => {
   connections.add(connection);
   connection.once('close', () => connections.delete(connection));
 });
 // The containing host directory is owner-only (0700). The socket itself must
 // permit the explicitly mounted guest UID, which is not the macOS host UID.
-server.listen(socketPath, () => { fs.chmodSync(socketPath, 0o666); log('relay ready'); });
+server.listen(socketPath, () => { fs.chmodSync(socketPath, 0o666); event('info','relay_ready',{pid:process.pid}); });
