@@ -1310,8 +1310,35 @@ curl -fsS -X POST -H "content-type: application/json" \
 
   log "managed-mcp: listing live definitions"
   run_capture "$AGENTCTL" mcp list --name "$name"
-  assert_status 0; assert_contains "added"; assert_contains "host stdio"; assert_contains "http://127.0.0.1:$http_port"
-  assert_not_contains "/mcp?fixed=1"; assert_not_contains "$credential"
+  assert_status 0
+  assert_contains "added"
+  assert_contains "Transport            stdio"
+  assert_contains "Command              '$node_path' '$TEST_ROOT/tests/fixtures/fake-mcp-server.mjs'"
+  assert_contains "Upstream origin      http://127.0.0.1:$http_port"
+  assert_contains "Bearer token         Keychain $credential (present)"
+  assert_not_contains "/mcp?fixed=1"; assert_not_contains "$token"
+
+  run_capture "$AGENTCTL" mcp list --name "$name" added
+  assert_status 0
+  assert_contains "Command              '$node_path' '$TEST_ROOT/tests/fixtures/fake-mcp-server.mjs'"
+  assert_not_contains "http-fake"
+
+  log "managed-mcp: capturing server stderr and reporting bridge status"
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '
+curl -fsS -X POST -H "content-type: application/json" \
+  --data "{\"jsonrpc\":\"2.0\",\"id\":73,\"method\":\"test/stderr\"}" \
+  http://127.0.0.1:'"$port"'/mcp/fake >/dev/null
+  '
+  assert_status 0
+  run_capture "$AGENTCTL" mcp status --name "$name"
+  assert_status 0
+  assert_contains "host relay healthy"
+  assert_contains "guest loopback proxy healthy"
+  assert_contains "Latest server stderr"
+  assert_contains "server emitted stderr; see host relay log"
+  assert_not_contains "external script failed safely"
+  grep -Fq 'external script failed safely' "$debug_dir"/mcp-*.log \
+    || fail "Expected managed MCP relay log to contain server stderr"
 
   log "managed-mcp: verifying the added Codex endpoint and relay route"
   run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '
