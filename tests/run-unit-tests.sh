@@ -5963,6 +5963,7 @@ test_agent_sh_codex_refresh_selects_bundled_bwrap_and_warns() {
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
     AGENTCTL_TOOLS_HOME="$tools_home" \
+    AGENTCTL_ALPINE_RELEASE_FILE="$temp_home/not-alpine" \
     AGENTCTL_RUN_MODE=online \
     -- run exec-check
   assert_status 0
@@ -6641,16 +6642,19 @@ EOF
 }
 
 test_agent_sh_codex_run_defaults_to_workdir_cd() {
-  begin_test "agent.sh codex run injects --cd /workdir by default"
+  begin_test "agent.sh codex run injects Alpine daemon mode and --cd /workdir by default"
 
   local temp_home
+  local alpine_release_file
   local fake_bin
   local run_log
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
   register_dir_cleanup "$temp_home"
+  alpine_release_file="$temp_home/alpine-release"
   fake_bin="$temp_home/bin"
   run_log="$temp_home/codex-run.log"
   mkdir -p "$fake_bin"
+  : >"$alpine_release_file"
 
   cat >"$fake_bin/codex" <<EOF
 #!/bin/sh
@@ -6661,11 +6665,13 @@ EOF
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_ALPINE_RELEASE_FILE="$alpine_release_file" \
     AGENTCTL_RUN_MODE=online \
     -- run
   assert_status 0
   grep -Fxq "CODEX_HOME=$temp_home/home/.codex" "$run_log" || fail "Expected codex run to use user CODEX_HOME"
-  grep -Fq -- 'ARGS=--cd /workdir' "$run_log" || fail "Expected codex run to include --cd /workdir"
+  grep -Fxq -- 'ARGS=--cd /workdir --no-daemon' "$run_log" || fail "Expected Alpine Codex run to disable the native daemon and include --cd /workdir"
+  assert_contains "Codex native background daemon is incompatible with Alpine"
 }
 
 test_agent_sh_codex_run_repairs_broken_bundled_rg() {
@@ -6712,13 +6718,134 @@ EOF
     AGENTCTL_RUN_MODE=online \
     -- run
   assert_status 0
-  [ -L "$bundled_rg" ] || fail "Expected broken bundled rg to be replaced with a symlink"
-  case "$(readlink "$bundled_rg")" in
-    "$tools_home"/*) fail "Expected bundled rg to point outside tool home" ;;
-  esac
+  [ -f "$bundled_rg" ] || fail "Expected broken bundled rg to be replaced with a regular file"
+  [ ! -L "$bundled_rg" ] || fail "Expected repaired bundled rg to remain inside the Codex package"
   "$bundled_rg" --version >/dev/null 2>&1 || fail "Expected repaired bundled rg to execute"
   grep -Fxq "CODEX_HOME=$temp_home/home/.codex" "$run_log" || fail "Expected codex run to continue after rg repair"
-  assert_contains "Repaired Codex bundled ripgrep:"
+  assert_contains "Repaired Codex bundled ripgrep from system executable:"
+}
+
+test_agent_sh_codex_run_replaces_working_bundled_rg_symlink() {
+  begin_test "agent.sh Codex run replaces a working external bundled ripgrep symlink"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local run_log
+  local bundled_rg
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  run_log="$temp_home/codex-run.log"
+  bundled_rg="$tools_home/codex/packages/standalone/current/codex-path/rg"
+  mkdir -p "$fake_bin" "$(dirname "$bundled_rg")"
+
+  cat >"$fake_bin/codex" <<EOF
+#!/bin/sh
+printf 'CODEX_HOME=%s\nARGS=%s\n' "\$CODEX_HOME" "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  cat >"$fake_bin/rg" <<'EOF'
+#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' 'ripgrep 15.1.0'; exit 0 ;;
+esac
+exit 0
+EOF
+  chmod +x "$fake_bin/rg"
+  ln -s "$fake_bin/rg" "$bundled_rg"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    AGENTCTL_RUN_MODE=online \
+    -- run
+  assert_status 0
+  [ -f "$bundled_rg" ] || fail "Expected repaired bundled rg to be a regular file"
+  [ ! -L "$bundled_rg" ] || fail "Expected the external bundled rg symlink to be replaced"
+  "$bundled_rg" --version >/dev/null 2>&1 || fail "Expected migrated bundled rg to execute"
+  grep -Fxq "CODEX_HOME=$temp_home/home/.codex" "$run_log" || fail "Expected Codex run to continue after rg symlink migration"
+  assert_contains "Repaired Codex bundled ripgrep from system executable:"
+}
+
+test_agent_sh_codex_run_uses_running_shared_app_server_on_alpine() {
+  begin_test "agent.sh Codex run preserves a running shared App Server on Alpine"
+
+  local temp_home
+  local alpine_release_file
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  alpine_release_file="$temp_home/alpine-release"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/codex-run.log"
+  mkdir -p "$fake_bin"
+  : >"$alpine_release_file"
+
+  cat >"$fake_bin/codex" <<EOF
+#!/bin/sh
+if [ "\$*" = "app-server daemon version" ]; then
+  printf '%s\n' '{"status":"running"}'
+  exit 0
+fi
+printf '%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_ALPINE_RELEASE_FILE="$alpine_release_file" \
+    AGENTCTL_RUN_MODE=online \
+    -- run
+  assert_status 0
+  grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected Codex run to include --cd /workdir"
+  if grep -Fq -- '--no-daemon' "$run_log"; then
+    fail "Did not expect Codex to bypass a running shared App Server"
+  fi
+  assert_not_contains "Codex native background daemon is incompatible with Alpine"
+}
+
+test_agent_sh_codex_run_keeps_older_cli_compatible_on_alpine() {
+  begin_test "agent.sh Codex run does not pass unsupported Alpine daemon option"
+
+  local temp_home
+  local alpine_release_file
+  local fake_bin
+  local run_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  alpine_release_file="$temp_home/alpine-release"
+  fake_bin="$temp_home/bin"
+  run_log="$temp_home/codex-run.log"
+  mkdir -p "$fake_bin"
+  : >"$alpine_release_file"
+
+  cat >"$fake_bin/codex" <<EOF
+#!/bin/sh
+if [ "\$*" = "app-server daemon version" ] || [ "\$*" = "--no-daemon --version" ]; then
+  exit 2
+fi
+printf '%s\n' "\$*" >"$run_log"
+exit 0
+EOF
+  chmod +x "$fake_bin/codex"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_ALPINE_RELEASE_FILE="$alpine_release_file" \
+    AGENTCTL_RUN_MODE=online \
+    -- run
+  assert_status 0
+  grep -Fq -- '--cd /workdir' "$run_log" || fail "Expected Codex run to include --cd /workdir"
+  if grep -Fq -- '--no-daemon' "$run_log"; then
+    fail "Did not expect an unsupported --no-daemon option"
+  fi
+  assert_not_contains "Codex native background daemon is incompatible with Alpine"
 }
 
 test_agent_sh_codex_run_uses_runtime_profile_config() {
@@ -15824,6 +15951,9 @@ main() {
   run_selected_test test_agent_sh_pi_runtime_reset_config_writes_ollama_config "test_agent_sh_pi_runtime_reset_config_writes_ollama_config"
   run_selected_test test_agent_sh_codex_run_defaults_to_workdir_cd "test_agent_sh_codex_run_defaults_to_workdir_cd"
   run_selected_test test_agent_sh_codex_run_repairs_broken_bundled_rg "test_agent_sh_codex_run_repairs_broken_bundled_rg"
+  run_selected_test test_agent_sh_codex_run_replaces_working_bundled_rg_symlink "test_agent_sh_codex_run_replaces_working_bundled_rg_symlink"
+  run_selected_test test_agent_sh_codex_run_uses_running_shared_app_server_on_alpine "test_agent_sh_codex_run_uses_running_shared_app_server_on_alpine"
+  run_selected_test test_agent_sh_codex_run_keeps_older_cli_compatible_on_alpine "test_agent_sh_codex_run_keeps_older_cli_compatible_on_alpine"
   run_selected_test test_agent_sh_codex_run_uses_runtime_profile_config "test_agent_sh_codex_run_uses_runtime_profile_config"
   run_selected_test test_agent_sh_accepts_explicit_empty_runtime_config_json "test_agent_sh_accepts_explicit_empty_runtime_config_json"
   run_selected_test test_agent_sh_codex_run_uses_model_override "test_agent_sh_codex_run_uses_model_override"
