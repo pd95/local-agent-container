@@ -6166,7 +6166,8 @@ refresh_cmd() {
   refresh_container_tree "$name" "$SCRIPT_DIR/features.d" "/etc/agentctl/features.d" "root:root" "644" "755"
   "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'mkdir -p /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude && chown -R coder:coder /opt/agentctl' >/dev/null 2>&1 || true
   if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -x /usr/local/bin/agent.sh; then
-    "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh refresh >/dev/null 2>&1 || true
+    "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh refresh >/dev/null \
+      || die "Failed to refresh managed runtime launchers in $name"
   fi
   if [ "$reset_config" -eq 1 ]; then
     warn "refresh --reset-config will replace active Codex configuration in ~/.codex with refreshed defaults"

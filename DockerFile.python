@@ -59,4 +59,5 @@ RUN if [ -n "$AGENT_FEATURES" ]; then \
     fi
 
 USER coder
+RUN AGENTCTL_CODEX_DEFER_BWRAP_PROBE=1 bash /usr/local/bin/agent.sh refresh >/dev/null
 WORKDIR /workdir

@@ -202,13 +202,24 @@ codex_path="$(command -v codex)"
   exit 1
 }
 assert_not_under_home "$codex_path"
-
+[ "$(readlink "$codex_path")" = "/opt/agentctl/codex/launcher/codex" ] || {
+  printf "expected managed Codex launcher target, got %s\n" "$(readlink "$codex_path")" >&2
+  exit 1
+}
 codex --version
+case "$(cat /opt/agentctl/codex/launcher/bwrap-mode)" in
+  system|bundled) ;;
+  *) printf "invalid managed Codex bwrap mode\n" >&2; exit 1 ;;
+esac
+
+codex sandbox /bin/true
 CODEX_HOME=/home/coder/.codex codex app-server --help >/tmp/codex-app-server-help.txt
 agent.sh runtime update codex
 codex_after_update="$(command -v codex)"
 assert_not_under_home "$codex_after_update"
 [ "$codex_after_update" = "/opt/agentctl/bin/codex" ]
+[ "$(readlink "$codex_after_update")" = "/opt/agentctl/codex/launcher/codex" ]
+codex sandbox /bin/true
 
 test ! -e /home/coder/.codex/packages
 

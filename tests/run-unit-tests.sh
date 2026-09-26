@@ -136,6 +136,62 @@ EOF
   printf '%s\n' "$fake_bin"
 }
 
+make_fake_managed_codex() {
+  local temp_home="$1"
+  local system_status="$2"
+  local bundled_status="$3"
+  local fake_bin="$temp_home/bin"
+  local tools_home="$temp_home/tools"
+  local standalone="$tools_home/codex/packages/standalone/current"
+  local probe_log="$temp_home/codex-probe.log"
+
+  mkdir -p "$fake_bin" "$tools_home/bin" "$standalone/bin" "$standalone/codex-resources"
+  printf '%s\n' "$system_status" >"$temp_home/system-bwrap.status"
+  printf '%s\n' "$bundled_status" >"$temp_home/bundled-bwrap.status"
+  cat >"$fake_bin/bwrap" <<'EOF'
+#!/bin/sh
+if [ "${1:-}" = --version ]; then
+  printf '%s\n' 'bubblewrap system-test'
+fi
+exit 0
+EOF
+  cat >"$standalone/codex-resources/bwrap" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+  cat >"$standalone/bin/codex" <<EOF
+#!/bin/sh
+selected_bwrap="\$(command -v bwrap 2>/dev/null || true)"
+case "\${1:-}" in
+  sandbox)
+    printf 'probe:%s\n' "\$selected_bwrap" >>"$probe_log"
+    case "\$selected_bwrap" in
+      "$standalone/codex-resources/bwrap") status="\$(cat "$temp_home/bundled-bwrap.status")" ;;
+      *) status="\$(cat "$temp_home/system-bwrap.status")" ;;
+    esac
+    if [ "\$status" -ne 0 ]; then
+      if [ "\$status" -eq 2 ]; then
+        printf '%s\n' 'bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces.' >&2
+      else
+        printf 'sandbox probe failed through %s\n' "\$selected_bwrap" >&2
+      fi
+    fi
+    exit "\$status"
+    ;;
+  update)
+    printf 'update:CODEX_HOME=%s:CODEX_INSTALL_DIR=%s\n' "\${CODEX_HOME:-}" "\${CODEX_INSTALL_DIR:-}" >>"$probe_log"
+    exit 0
+    ;;
+  *)
+    printf 'run:%s:%s\n' "\$selected_bwrap" "\$*" >>"$probe_log"
+    exit 0
+    ;;
+esac
+EOF
+  chmod +x "$fake_bin/bwrap" "$standalone/codex-resources/bwrap" "$standalone/bin/codex"
+  ln -s "$standalone/bin/codex" "$tools_home/bin/codex"
+}
+
 file_mtime() {
   local path="$1"
 
@@ -5673,12 +5729,17 @@ EOF
 #!/bin/sh
 cat >/dev/null
 printf 'sh CODEX_HOME=%s\nCODEX_INSTALL_DIR=%s\nCODEX_NON_INTERACTIVE=%s\nPATH=%s\n' "\${CODEX_HOME:-}" "\${CODEX_INSTALL_DIR:-}" "\${CODEX_NON_INTERACTIVE:-}" "\$PATH" >>"$install_log"
-mkdir -p "\$CODEX_INSTALL_DIR"
-cat >"\$CODEX_INSTALL_DIR/codex" <<'SCRIPT'
+mkdir -p "\$CODEX_INSTALL_DIR" "\$CODEX_HOME/packages/standalone/current/bin" "\$CODEX_HOME/packages/standalone/current/codex-resources"
+cat >"\$CODEX_HOME/packages/standalone/current/bin/codex" <<'SCRIPT'
 #!/bin/sh
 exit 0
 SCRIPT
-chmod +x "\$CODEX_INSTALL_DIR/codex"
+cat >"\$CODEX_HOME/packages/standalone/current/codex-resources/bwrap" <<'SCRIPT'
+#!/bin/sh
+exit 0
+SCRIPT
+chmod +x "\$CODEX_HOME/packages/standalone/current/bin/codex" "\$CODEX_HOME/packages/standalone/current/codex-resources/bwrap"
+ln -s "\$CODEX_HOME/packages/standalone/current/bin/codex" "\$CODEX_INSTALL_DIR/codex"
 EOF
   chmod +x "$fake_bin/sh"
 
@@ -5689,8 +5750,11 @@ EOF
   assert_status 0
   grep -Fq 'https://chatgpt.com/codex/install.sh' "$install_log" || fail "Expected Codex standalone installer URL"
   grep -Fxq "sh CODEX_HOME=$tools_home/codex" "$install_log" || fail "Expected Codex installer to use tool CODEX_HOME"
-  grep -Fxq "CODEX_INSTALL_DIR=$tools_home/bin" "$install_log" || fail "Expected Codex installer to use tool bin install dir"
+  grep -Fxq "CODEX_INSTALL_DIR=$tools_home/codex/bin" "$install_log" || fail "Expected Codex installer to use private runtime bin dir"
   grep -Fxq 'CODEX_NON_INTERACTIVE=1' "$install_log" || fail "Expected non-interinteractive Codex installer"
+  [ -L "$tools_home/bin/codex" ] || fail "Expected public Codex launcher symlink"
+  [ "$(readlink "$tools_home/bin/codex")" = "$tools_home/codex/launcher/codex" ] || fail "Expected public Codex launcher to be agentctl-owned"
+  [ "$(cat "$tools_home/codex/launcher/bwrap-mode")" = system ] || fail "Expected successful system probe to select system bwrap"
 
   run_agent_sh_capture_env "$temp_home" \
     PATH="$fake_bin:/usr/bin:/bin" \
@@ -5789,6 +5853,7 @@ done
 mkdir -p "$target/bin" "$target/codex-path" "$target/codex-resources"
 printf '#!/bin/sh\nexit 0\n' >"$target/bin/codex"
 printf '#!/bin/sh\nexit 0\n' >"$target/codex-path/rg"
+printf '#!/bin/sh\nexit 0\n' >"$target/codex-resources/bwrap"
 printf '{}\n' >"$target/codex-package.json"
 EOF
   chmod +x "$fake_bin/tar"
@@ -5799,6 +5864,7 @@ EOF
     -- runtime install codex
   assert_status 0
   [ -L "$tools_home/bin/codex" ] || fail "Expected fallback install to create tool-bin codex symlink"
+  [ "$(readlink "$tools_home/bin/codex")" = "$tools_home/codex/launcher/codex" ] || fail "Expected fallback install to expose the managed launcher"
   [ -x "$tools_home/codex/packages/standalone/releases/0.139.0-aarch64-unknown-linux-musl/bin/codex" ] || fail "Expected fallback install to extract Codex package under tool home"
   [ ! -e "$temp_home/home/.codex/packages" ] || fail "Did not expect fallback install to write package cache under user Codex state"
   assert_contains "Falling back to direct Codex standalone package install."
@@ -5833,6 +5899,192 @@ EOF
   grep -Fxq "CODEX_HOME=$tools_home/codex" "$update_log" || fail "Expected codex update to use tool CODEX_HOME"
   grep -Fxq "CODEX_INSTALL_DIR=$tools_home/bin" "$update_log" || fail "Expected codex update to use tool install dir"
   grep -Fxq 'ARGS=update' "$update_log" || fail "Expected codex update to be invoked"
+}
+
+test_agent_sh_codex_refresh_keeps_working_system_bwrap() {
+  begin_test "agent.sh Codex refresh keeps a working system bwrap"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local probe_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-codex-bwrap-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  probe_log="$temp_home/codex-probe.log"
+  make_fake_managed_codex "$temp_home" 0 0
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- refresh
+  assert_status 0
+  [ "$(cat "$tools_home/codex/launcher/bwrap-mode")" = system ] || fail "Expected system bwrap mode"
+  [ "$(readlink "$tools_home/bin/codex")" = "$tools_home/codex/launcher/codex" ] || fail "Expected refresh to install the managed launcher"
+  assert_not_contains "using Codex bundled bwrap"
+
+  run_capture env PATH="$fake_bin:/usr/bin:/bin" "$tools_home/bin/codex" direct-check 'argument with spaces'
+  assert_status 0
+  grep -Fxq "run:$fake_bin/bwrap:direct-check argument with spaces" "$probe_log" || fail "Expected direct Codex to retain system bwrap"
+}
+
+test_agent_sh_codex_refresh_selects_bundled_bwrap_and_warns() {
+  begin_test "agent.sh Codex refresh selects bundled bwrap and warns when system bwrap fails"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local resources_dir
+  local resolved_resources_dir
+  local probe_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-codex-bwrap-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  resources_dir="$tools_home/codex/packages/standalone/current/codex-resources"
+  probe_log="$temp_home/codex-probe.log"
+  make_fake_managed_codex "$temp_home" 1 0
+  resolved_resources_dir="$(CDPATH= cd -- "$resources_dir" && pwd -P)"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- refresh
+  assert_status 0
+  [ "$(cat "$tools_home/codex/launcher/bwrap-mode")" = bundled ] || fail "Expected bundled bwrap mode"
+  assert_contains "system bwrap ($fake_bin/bwrap, bubblewrap system-test) cannot start the Codex sandbox"
+  assert_contains "using Codex bundled bwrap at $resources_dir/bwrap"
+
+  run_capture env PATH="$fake_bin:/usr/bin:/bin" "$tools_home/bin/codex" direct-check
+  assert_status 0
+  grep -Fxq "run:$resolved_resources_dir/bwrap:direct-check" "$probe_log" || fail "Expected direct Codex to prefer bundled bwrap"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    AGENTCTL_RUN_MODE=online \
+    -- run exec-check
+  assert_status 0
+  grep -Fq "run:$resolved_resources_dir/bwrap:--cd /workdir exec-check" "$probe_log" || fail "Expected agent.sh Codex launch to prefer bundled bwrap"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- refresh
+  assert_status 0
+  assert_contains "cannot start the Codex sandbox"
+}
+
+test_agent_sh_codex_refresh_fails_when_both_bwrap_probes_fail() {
+  begin_test "agent.sh Codex refresh fails when system and bundled bwrap probes fail"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local original_target
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-codex-bwrap-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  make_fake_managed_codex "$temp_home" 1 1
+  original_target="$(readlink "$tools_home/bin/codex")"
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- refresh
+  assert_status 1
+  assert_contains "Codex sandbox failed with both the system and bundled bwrap"
+  assert_contains "System bwrap probe stderr:"
+  assert_contains "Bundled bwrap probe stderr:"
+  [ "$(readlink "$tools_home/bin/codex")" = "$original_target" ] || fail "Expected failed probe to preserve the prior launcher"
+  [ ! -e "$tools_home/codex/launcher/bwrap-mode" ] || fail "Did not expect failed probe to persist a mode"
+}
+
+test_agent_sh_codex_image_build_defers_blocked_bwrap_probe() {
+  begin_test "agent.sh Codex image install defers a BuildKit-blocked bwrap probe"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-codex-bwrap-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  make_fake_managed_codex "$temp_home" 2 2
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    AGENTCTL_CODEX_DEFER_BWRAP_PROBE=1 \
+    -- refresh
+  assert_status 0
+  assert_contains "image build environment blocks user namespaces"
+  [ "$(cat "$tools_home/codex/launcher/bwrap-mode")" = pending ] || fail "Expected deferred bwrap mode"
+  [ "$(readlink "$tools_home/bin/codex")" = "$tools_home/codex/launcher/codex" ] || fail "Expected deferred probe to install the managed launcher"
+
+  printf '%s\n' 1 >"$temp_home/system-bwrap.status"
+  printf '%s\n' 0 >"$temp_home/bundled-bwrap.status"
+  run_capture env -i \
+    HOME="$temp_home/home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    AGENTCTL_AGENT_SH_PATH="$TEST_ROOT/agent.sh" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    AGENTCTL_FEATURE_REGISTRY_DIR="$TEST_ROOT/features.d" \
+    AGENTCTL_FEATURE_ADAPTER_DIR="$TEST_ROOT/features" \
+    "$tools_home/bin/codex" first-launch
+  assert_status 0
+  assert_contains "using Codex bundled bwrap"
+  [ "$(cat "$tools_home/codex/launcher/bwrap-mode")" = bundled ] || fail "Expected first launch to resolve deferred bundled mode"
+}
+
+test_agent_sh_codex_updates_reprobe_and_disable_bundled_bwrap() {
+  begin_test "agent.sh managed and direct Codex updates re-probe bwrap compatibility"
+
+  local temp_home
+  local fake_bin
+  local tools_home
+  local probe_log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-codex-bwrap-unit.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  fake_bin="$temp_home/bin"
+  tools_home="$temp_home/tools"
+  probe_log="$temp_home/codex-probe.log"
+  make_fake_managed_codex "$temp_home" 1 0
+
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- refresh
+  assert_status 0
+  [ "$(cat "$tools_home/codex/launcher/bwrap-mode")" = bundled ] || fail "Expected initial bundled mode"
+
+  printf '%s\n' 0 >"$temp_home/system-bwrap.status"
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    -- runtime update codex
+  assert_status 0
+  [ "$(cat "$tools_home/codex/launcher/bwrap-mode")" = system ] || fail "Expected managed update to disable bundled mode"
+  grep -Fxq "update:CODEX_HOME=$tools_home/codex:CODEX_INSTALL_DIR=$tools_home/codex/bin" "$probe_log" || fail "Expected managed update to use private installer paths"
+
+  printf '%s\n' 1 >"$temp_home/system-bwrap.status"
+  run_capture env -i \
+    HOME="$temp_home/home" \
+    PATH="$fake_bin:/usr/bin:/bin" \
+    AGENTCTL_TOOLS_HOME="$tools_home" \
+    AGENTCTL_AGENT_SH_PATH="$TEST_ROOT/agent.sh" \
+    AGENTCTL_RUNTIME_REGISTRY_DIR="$TEST_ROOT/runtimes.d" \
+    AGENTCTL_RUNTIME_ADAPTER_DIR="$TEST_ROOT/runtimes" \
+    AGENTCTL_FEATURE_REGISTRY_DIR="$TEST_ROOT/features.d" \
+    AGENTCTL_FEATURE_ADAPTER_DIR="$TEST_ROOT/features" \
+    "$tools_home/bin/codex" update
+  assert_status 0
+  assert_contains "cannot start the Codex sandbox"
+  [ "$(cat "$tools_home/codex/launcher/bwrap-mode")" = bundled ] || fail "Expected direct update to re-enable bundled mode"
 }
 
 test_agent_sh_opencode_runtime_install_uses_npm_prefix() {
@@ -12761,6 +13013,57 @@ test_refresh_failure_restores_temporarily_started_container() {
   unset -f failed_refresh
 }
 
+test_refresh_propagates_runtime_launcher_refresh_failure() {
+  begin_test "refresh propagates managed runtime launcher refresh failures"
+
+  load_agentctl_functions
+
+  local temp_dir lifecycle_file running_file
+  temp_dir="$(new_workdir)"
+  lifecycle_file="$temp_dir/lifecycle"
+  running_file="$temp_dir/running"
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { [ -f "$running_file" ]; }
+  remote_control_lock_acquire() { printf '%s\n' remote-lock >>"$lifecycle_file"; }
+  remote_control_lock_release() { printf '%s\n' remote-unlock >>"$lifecycle_file"; }
+  mcp_lock_acquire() { printf '%s\n' mcp-lock >>"$lifecycle_file"; }
+  mcp_lock_release() { printf '%s\n' mcp-unlock >>"$lifecycle_file"; }
+  mcp_require_no_active_leases() { printf 'lease-check:%s\n' "$2" >>"$lifecycle_file"; }
+  start_existing_container_managed() { : >"$running_file"; printf '%s\n' managed-start >>"$lifecycle_file"; }
+  remote_control_quiesce_preserving_desired() { printf '%s\n' remote-quiesce >>"$lifecycle_file"; }
+  stop_existing_container_safely() { rm -f "$running_file"; printf '%s\n' container-stop >>"$lifecycle_file"; }
+  mcp_stop_managed() { printf '%s\n' relay-stop >>"$lifecycle_file"; }
+  migrate_legacy_runtime_config_files() { :; }
+  refresh_container_file() { :; }
+  refresh_codex_config_files() { :; }
+  refresh_optional_runtime_default_files() { :; }
+  refresh_container_tree() { :; }
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = exec ] || fail "Unexpected container invocation: $*"
+    case "$*" in
+      *" test -x /usr/local/bin/agent.sh") return 0 ;;
+      *" bash /usr/local/bin/agent.sh refresh")
+        printf '%s\n' 'Error: Codex sandbox failed with both the system and bundled bwrap.' >&2
+        return 1
+        ;;
+      *) return 0 ;;
+    esac
+  }
+  failed_runtime_refresh() { ( refresh_cmd --name unit-test-container ); }
+
+  run_capture failed_runtime_refresh
+  assert_status 1
+  assert_contains "Codex sandbox failed with both the system and bundled bwrap"
+  assert_contains "Failed to refresh managed runtime launchers in unit-test-container"
+  assert_contains "Refresh failed after temporarily starting unit-test-container; restoring its stopped state"
+  [ ! -f "$running_file" ] || fail "Expected runtime refresh failure to restore stopped state"
+  [ "$(cat "$lifecycle_file")" = $'remote-lock\nmcp-lock\nlease-check:refresh\nmanaged-start\nremote-quiesce\ncontainer-stop\nrelay-stop\nmcp-unlock\nremote-unlock' ] \
+    || fail "Unexpected runtime-refresh cleanup lifecycle: $(cat "$lifecycle_file")"
+  unset -f failed_runtime_refresh
+}
+
 test_refresh_checks_container_state_under_lifecycle_locks() {
   begin_test "refresh checks container state after acquiring lifecycle locks"
 
@@ -15501,6 +15804,11 @@ main() {
   run_selected_test test_agent_sh_codex_runtime_install_runs_standalone_installer "test_agent_sh_codex_runtime_install_runs_standalone_installer"
   run_selected_test test_agent_sh_codex_runtime_install_falls_back_to_direct_package "test_agent_sh_codex_runtime_install_falls_back_to_direct_package"
   run_selected_test test_agent_sh_codex_runtime_update_calls_codex_update "test_agent_sh_codex_runtime_update_calls_codex_update"
+  run_selected_test test_agent_sh_codex_refresh_keeps_working_system_bwrap "test_agent_sh_codex_refresh_keeps_working_system_bwrap"
+  run_selected_test test_agent_sh_codex_refresh_selects_bundled_bwrap_and_warns "test_agent_sh_codex_refresh_selects_bundled_bwrap_and_warns"
+  run_selected_test test_agent_sh_codex_refresh_fails_when_both_bwrap_probes_fail "test_agent_sh_codex_refresh_fails_when_both_bwrap_probes_fail"
+  run_selected_test test_agent_sh_codex_image_build_defers_blocked_bwrap_probe "test_agent_sh_codex_image_build_defers_blocked_bwrap_probe"
+  run_selected_test test_agent_sh_codex_updates_reprobe_and_disable_bundled_bwrap "test_agent_sh_codex_updates_reprobe_and_disable_bundled_bwrap"
   run_selected_test test_agent_sh_opencode_runtime_install_uses_npm_prefix "test_agent_sh_opencode_runtime_install_uses_npm_prefix"
   run_selected_test test_agent_sh_opencode_runtime_update_uses_npm_prefix "test_agent_sh_opencode_runtime_update_uses_npm_prefix"
   run_selected_test test_agent_sh_qwen_runtime_install_uses_npm_prefix "test_agent_sh_qwen_runtime_install_uses_npm_prefix"
@@ -15667,6 +15975,7 @@ main() {
   run_selected_test test_refresh_updates_managed_files_without_recreate "test_refresh_updates_managed_files_without_recreate"
   run_selected_test test_refresh_restores_managed_mcp_for_stopped_container "test_refresh_restores_managed_mcp_for_stopped_container"
   run_selected_test test_refresh_failure_restores_temporarily_started_container "test_refresh_failure_restores_temporarily_started_container"
+  run_selected_test test_refresh_propagates_runtime_launcher_refresh_failure "test_refresh_propagates_runtime_launcher_refresh_failure"
   run_selected_test test_refresh_checks_container_state_under_lifecycle_locks "test_refresh_checks_container_state_under_lifecycle_locks"
   run_selected_test test_refresh_reset_config_applies_refreshed_codex_defaults "test_refresh_reset_config_applies_refreshed_codex_defaults"
   run_selected_test test_doctor_reports_state_permission_problems "test_doctor_reports_state_permission_problems"

@@ -63,4 +63,5 @@ EOF
 RUN ln -sf /etc/agentctl/image.md /home/coder/.codex/AGENTS.md
 
 USER coder
+RUN AGENTCTL_CODEX_DEFER_BWRAP_PROBE=1 bash /usr/local/bin/agent.sh refresh >/dev/null
 WORKDIR /workdir
