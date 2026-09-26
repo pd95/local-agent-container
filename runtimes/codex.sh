@@ -1,6 +1,226 @@
 CODEX_DEFAULT_PROFILE="${AGENTCTL_CODEX_PROFILE:-gpt-oss}"
 CODEX_DEFAULT_CONFIG_DIR="${AGENTCTL_CODEX_DEFAULT_CONFIG_DIR:-/etc/agentctl/codex}"
 
+codex_standalone_command() {
+  local install_home="$1"
+  local command_path="$install_home/packages/standalone/current/bin/codex"
+
+  [ -x "$command_path" ] || return 1
+  printf '%s\n' "$command_path"
+}
+
+codex_installer_bin_dir() {
+  printf '%s/bin\n' "$1"
+}
+
+codex_launcher_dir() {
+  printf '%s/launcher\n' "$1"
+}
+
+codex_bwrap_mode_file() {
+  printf '%s/bwrap-mode\n' "$(codex_launcher_dir "$1")"
+}
+
+codex_bundled_resources_dir() {
+  printf '%s/packages/standalone/current/codex-resources\n' "$1"
+}
+
+codex_path_without_entry() {
+  local path_value="$1"
+  local excluded="$2"
+  local remaining="$path_value"
+  local entry=""
+  local result=""
+  local last=0
+
+  while [ "$last" -eq 0 ]; do
+    case "$remaining" in
+      *:*)
+        entry="${remaining%%:*}"
+        remaining="${remaining#*:}"
+        ;;
+      *)
+        entry="$remaining"
+        last=1
+        ;;
+    esac
+    [ "$entry" = "$excluded" ] && continue
+    if [ -n "$result" ]; then
+      result="$result:$entry"
+    else
+      result="$entry"
+    fi
+  done
+  printf '%s\n' "$result"
+}
+
+codex_print_probe_log() {
+  local label="$1"
+  local path="$2"
+
+  printf '%s\n' "$label" >&2
+  if [ -s "$path" ]; then
+    sed -n '1,20p' "$path" >&2
+  else
+    printf '%s\n' '(no stderr output)' >&2
+  fi
+}
+
+codex_probe_bwrap_mode() {
+  local install_home="$1"
+  local codex_command=""
+  local resources_dir=""
+  local mode_file=""
+  local system_path=""
+  local system_bwrap=""
+  local system_version=""
+  local probe_dir=""
+  local next_mode=""
+  local temporary_mode=""
+
+  codex_command="$(codex_standalone_command "$install_home")" \
+    || die "managed standalone Codex binary is missing under $install_home"
+  resources_dir="$(codex_bundled_resources_dir "$install_home")"
+  mode_file="$(codex_bwrap_mode_file "$install_home")"
+  system_path="$(codex_path_without_entry "$PATH" "$resources_dir")"
+  [ -n "$system_path" ] || system_path="/usr/local/bin:/usr/bin:/bin"
+  probe_dir="$(mktemp -d)"
+
+  if PATH="$system_path" "$codex_command" sandbox /bin/true \
+      >"$probe_dir/system.stdout" 2>"$probe_dir/system.stderr"; then
+    next_mode="system"
+  elif [ -x "$resources_dir/bwrap" ] \
+      && PATH="$resources_dir:$system_path" "$codex_command" sandbox /bin/true \
+        >"$probe_dir/bundled.stdout" 2>"$probe_dir/bundled.stderr"; then
+    next_mode="bundled"
+    system_bwrap="$(PATH="$system_path" command -v bwrap 2>/dev/null || true)"
+    system_bwrap="${system_bwrap:-not found on PATH}"
+    system_version="$(PATH="$system_path" bwrap --version 2>/dev/null | head -n 1 || true)"
+    if [ -n "$system_version" ]; then
+      system_bwrap="$system_bwrap, $system_version"
+    fi
+    printf 'Warning: system bwrap (%s) cannot start the Codex sandbox; using Codex bundled bwrap at %s for Codex launches.\n' \
+      "$system_bwrap" "$resources_dir/bwrap" >&2
+  else
+    if [ "${AGENTCTL_CODEX_DEFER_BWRAP_PROBE:-0}" = "1" ] \
+        && [ -x "$resources_dir/bwrap" ] \
+        && grep -Fq 'No permissions to create a new namespace' "$probe_dir/system.stderr" \
+        && grep -Fq 'No permissions to create a new namespace' "$probe_dir/bundled.stderr"; then
+      next_mode="pending"
+      printf '%s\n' 'Warning: the image build environment blocks user namespaces; deferring Codex bwrap selection until the first Codex launch.' >&2
+    else
+      printf '%s\n' 'Error: Codex sandbox failed with both the system and bundled bwrap.' >&2
+      codex_print_probe_log 'System bwrap probe stderr:' "$probe_dir/system.stderr"
+      if [ -x "$resources_dir/bwrap" ]; then
+        codex_print_probe_log 'Bundled bwrap probe stderr:' "$probe_dir/bundled.stderr"
+      else
+        printf 'Bundled bwrap is missing or not executable: %s\n' "$resources_dir/bwrap" >&2
+      fi
+      rm -rf "$probe_dir"
+      return 1
+    fi
+  fi
+
+  mkdir -p "$(dirname "$mode_file")"
+  temporary_mode="$(mktemp "${mode_file}.tmp.XXXXXX")"
+  printf '%s\n' "$next_mode" >"$temporary_mode"
+  chmod 0644 "$temporary_mode"
+  mv -f "$temporary_mode" "$mode_file"
+  rm -rf "$probe_dir"
+}
+
+codex_write_managed_launcher() {
+  local install_home="$1"
+  local launcher_dir=""
+  local launcher_path=""
+  local temporary_launcher=""
+  local public_launcher=""
+  local installer_bin_dir=""
+  local codex_command=""
+
+  codex_command="$(codex_standalone_command "$install_home")" \
+    || die "managed standalone Codex binary is missing under $install_home"
+  launcher_dir="$(codex_launcher_dir "$install_home")"
+  launcher_path="$launcher_dir/codex"
+  public_launcher="$(agent_tools_bin_dir)/codex"
+  installer_bin_dir="$(codex_installer_bin_dir "$install_home")"
+  mkdir -p "$launcher_dir" "$installer_bin_dir" "$(agent_tools_bin_dir)"
+  ln -sfn "$codex_command" "$installer_bin_dir/codex"
+  temporary_launcher="$(mktemp "$launcher_dir/.codex.XXXXXX")"
+  cat >"$temporary_launcher" <<'EOF'
+#!/bin/sh
+set -eu
+
+launcher_path="$(readlink -f -- "$0" 2>/dev/null || printf '%s\n' "$0")"
+launcher_dir="$(CDPATH= cd -- "$(dirname -- "$launcher_path")" && pwd -P)"
+install_home="$(dirname -- "$launcher_dir")"
+codex_command="$install_home/packages/standalone/current/bin/codex"
+resources_dir="$install_home/packages/standalone/current/codex-resources"
+mode_file="$launcher_dir/bwrap-mode"
+
+[ -x "$codex_command" ] || {
+  printf 'Error: managed Codex binary is missing: %s\n' "$codex_command" >&2
+  exit 127
+}
+[ -f "$mode_file" ] || {
+  printf 'Error: Codex bwrap mode is missing; run agentctl refresh.\n' >&2
+  exit 1
+}
+mode="$(sed -n '1p' "$mode_file")"
+if [ "$mode" = pending ]; then
+  agent_sh_path="${AGENTCTL_AGENT_SH_PATH:-/usr/local/bin/agent.sh}"
+  [ -x "$agent_sh_path" ] || {
+    printf '%s\n' 'Error: deferred Codex sandbox probe is unavailable; run agentctl refresh.' >&2
+    exit 1
+  }
+  bash "$agent_sh_path" refresh >/dev/null
+  mode="$(sed -n '1p' "$mode_file")"
+fi
+case "$mode" in
+  system) ;;
+  bundled)
+    [ -x "$resources_dir/bwrap" ] || {
+      printf 'Error: bundled Codex bwrap is missing: %s\n' "$resources_dir/bwrap" >&2
+      exit 1
+    }
+    PATH="$resources_dir:$PATH"
+    export PATH
+    ;;
+  *)
+    printf 'Error: invalid Codex bwrap mode: %s\n' "$mode" >&2
+    exit 1
+    ;;
+esac
+
+if [ "${1:-}" = update ]; then
+  if CODEX_HOME="$install_home" CODEX_INSTALL_DIR="$install_home/bin" "$codex_command" "$@"; then
+    update_status=0
+  else
+    update_status=$?
+  fi
+  [ "$update_status" -eq 0 ] || exit "$update_status"
+  agent_sh_path="${AGENTCTL_AGENT_SH_PATH:-/usr/local/bin/agent.sh}"
+  [ -x "$agent_sh_path" ] || {
+    printf '%s\n' 'Error: Codex updated but the managed sandbox probe is unavailable.' >&2
+    exit 1
+  }
+  exec bash "$agent_sh_path" refresh >/dev/null
+fi
+
+exec "$codex_command" "$@"
+EOF
+  chmod 0755 "$temporary_launcher"
+  mv -f "$temporary_launcher" "$launcher_path"
+  ln -sfn "$launcher_path" "$public_launcher"
+}
+
+codex_configure_managed_launcher() {
+  local install_home="$1"
+
+  codex_probe_bwrap_mode "$install_home"
+  codex_write_managed_launcher "$install_home"
+}
+
 codex_normalize_release() {
   case "$1" in
     ""|latest) printf '%s\n' latest ;;
@@ -756,7 +976,7 @@ agent_runtime_install() {
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   install_home="$(runtime_tool_home "$runtime")"
-  install_dir="$(agent_tools_bin_dir)"
+  install_dir="$(codex_installer_bin_dir "$install_home")"
   mkdir -p "$install_home" "$install_dir"
   install_log="$(mktemp)"
   if ! {
@@ -781,6 +1001,7 @@ agent_runtime_install() {
   fi
   rm -f "$install_log"
   codex_repair_bundled_rg "$install_home"
+  codex_configure_managed_launcher "$install_home"
   runtime_command_path "$runtime" >/dev/null 2>&1 || die "codex installer finished but launcher was not found in $(agent_tools_bin_dir) or legacy user bin dirs"
   if [ "${AGENTCTL_SKIP_PREFERRED_SET:-0}" != "1" ]; then
     preferred_set "$runtime"
@@ -791,16 +1012,35 @@ agent_runtime_update() {
   local runtime="$1"
   local install_home=""
   local install_dir=""
+  local codex_command=""
 
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   install_home="$(runtime_tool_home "$runtime")"
-  install_dir="$(agent_tools_bin_dir)"
+  if codex_command="$(codex_standalone_command "$install_home" 2>/dev/null)"; then
+    install_dir="$(codex_installer_bin_dir "$install_home")"
+  else
+    codex_command="$(runtime_command_path "$runtime")" || die "runtime not installed: $runtime"
+    install_dir="$(agent_tools_bin_dir)"
+  fi
   mkdir -p "$install_home" "$install_dir"
   CODEX_HOME="$install_home" \
     CODEX_INSTALL_DIR="$install_dir" \
     PATH="$install_dir:$PATH" \
-    "$(runtime_command_path "$runtime")" update
+    "$codex_command" update
   codex_repair_bundled_rg "$install_home"
+  if codex_standalone_command "$install_home" >/dev/null 2>&1; then
+    codex_configure_managed_launcher "$install_home"
+  fi
+}
+
+agent_runtime_refresh() {
+  local runtime="$1"
+  local install_home=""
+
+  [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
+  install_home="$(runtime_tool_home "$runtime")"
+  codex_standalone_command "$install_home" >/dev/null 2>&1 || return 0
+  codex_configure_managed_launcher "$install_home"
 }
 
 agent_runtime_mcp_add() {

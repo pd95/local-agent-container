@@ -95,6 +95,7 @@ USER coder
 RUN HOME=/home/coder \
     XDG_CONFIG_HOME=/home/coder/.config \
     AGENTCTL_SKIP_PREFERRED_SET=1 \
+    AGENTCTL_CODEX_DEFER_BWRAP_PROBE=1 \
     AGENT_RUNTIMES="$AGENT_RUNTIMES" \
     AGENT_DEFAULT_RUNTIME="$AGENT_DEFAULT_RUNTIME" \
     bash -lc 'set -euo pipefail; IFS="," read -r -a runtimes <<<"$AGENT_RUNTIMES"; [ "${#runtimes[@]}" -gt 0 ] || { echo "No runtimes configured for image build" >&2; exit 1; }; for runtime in "${runtimes[@]}"; do bash /usr/local/bin/agent.sh runtime install "$runtime"; done'

@@ -177,6 +177,24 @@ included first:
 bash tests/run-integration-tests.sh --filter tool-home
 ```
 
+The same tool-home smoke verifies the managed Codex launcher and runs
+`codex sandbox /bin/true` before and after a runtime update. During image builds,
+runtime updates, and `agentctl refresh`, a host whose packaged `bwrap` cannot start
+the Codex sandbox should print a warning that the bundled Codex `bwrap` is active.
+Because BuildKit blocks user namespaces, image builds defer selection when neither
+probe can run there; the first Codex command in a running container completes the
+probe before invoking Codex.
+The system package must remain installed and continue resolving independently:
+
+```bash
+agentctl run --image agent-python --temp --workdir testing/agent-python --cmd \
+  bash -lc 'command -v bwrap && bwrap --version && readlink /opt/agentctl/bin/codex && cat /opt/agentctl/codex/launcher/bwrap-mode && codex sandbox /bin/true'
+```
+
+For an existing pre-fix container, run `agentctl refresh --name NAME`, confirm the
+warning and `bundled` mode when applicable, and repeat the sandbox probe. Refresh must
+repair the launcher without downloading a new Codex release.
+
 You can point the harness at another `agentctl` binary or container runtime command:
 
 ```bash

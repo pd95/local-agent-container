@@ -346,6 +346,7 @@ ensure_feature_known() {
 reset_runtime_hooks() {
   unset -f \
     agent_runtime_run \
+    agent_runtime_refresh \
     agent_runtime_install \
     agent_runtime_update \
     agent_runtime_reset_config \
@@ -1152,6 +1153,16 @@ runtime_mcp_sync() {
 }
 
 refresh_agent() {
+  local runtime=""
+
+  while IFS= read -r runtime; do
+    [ -n "$runtime" ] || continue
+    load_runtime_adapter "$runtime"
+    if declare -F agent_runtime_refresh >/dev/null 2>&1; then
+      agent_runtime_refresh "$runtime"
+    fi
+  done < <(runtime_ids_installed)
+
   jq -n \
     --arg preferred "$(runtime_preferred)" \
     --argjson runtimes "$(runtime_ids | jq -R . | jq -s .)" \
