@@ -1,6 +1,6 @@
 # Advanced container usage
 
-This page collects lower-level workflows that are useful for debugging or when
+This page collects specialized and lower-level workflows, including cases where
 you want to use Apple’s `container` CLI directly instead of `agentctl`.
 
 ## Run a throwaway container
@@ -45,6 +45,32 @@ container ls -a
 ```bash
 container exec -it "my-agent" bash
 ```
+
+## Forward the macOS SSH agent
+
+Use `--ssh` when trusted code inside the container must authenticate with an
+identity already available through the Mac's SSH agent:
+
+```bash
+# Create a container with SSH forwarding and install the SSH client feature.
+agentctl run --ssh
+
+# Add forwarding to an existing container by recreating it safely.
+agentctl upgrade --name agent-my-project --ssh
+
+# Remove forwarding while retaining SSH client commands.
+agentctl upgrade --name agent-my-project --no-ssh
+```
+
+Forwarding does not copy private keys, but code inside the container can ask the
+host agent to sign or authenticate with every identity it offers. Enable it only
+for trusted images and projects. The `ssh` feature installs client tools; it
+does not install an SSH server or weaken host-key checking.
+
+For an Xcode installation on another Mac or macOS VM, the managed MCP relay can
+instead run the local Mac's SSH client and carry `xcrun mcpbridge` over that
+connection. See [Remote Xcode MCP bridge over
+SSH](managed-mcp.md#remote-xcode-mcp-bridge-over-ssh).
 
 ## Bridge stdio protocols into a container
 

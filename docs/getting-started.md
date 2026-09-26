@@ -5,27 +5,58 @@ This guide is the longer version of the top-level README quick start.
 ## Prerequisites
 
 You need:
+
 - an Apple Silicon Mac running macOS 26
 - Apple's `container` CLI 1.1 or newer
+- Git for cloning the repository and selecting releases
 - the system Bash and Apple-provided `jq` (jq 1.6 or newer; macOS 26
   provides `jq 1.7.1-apple`)
 
-No Homebrew installation, host Python, host Node.js, or other package manager is
-required. Install Ollama only when using local-model workflows; online runtime
-workflows do not require it.
+No Homebrew installation, host Python, or other package manager is required for
+the baseline. Host Node.js is needed for the managed MCP bridge. Install Ollama
+only when using local-model workflows; online runtime workflows do not require
+it.
 
 Recommended memory:
+
 - for local-model workflows, plan for at least 32 GB RAM
 - online-only workflows may work with less memory, but that is not yet verified
   in the current docs/test matrix
 
 Install sources:
+
+- `agentctl`: <https://github.com/pd95/local-agent-container/releases>
 - `container`: <https://github.com/apple/container/releases>
 - Ollama: <https://ollama.com/download>
 
 ## Initial setup
 
-Open a Terminal in the repository root.
+Clone the repository rather than downloading a source archive. Keeping the Git
+metadata lets you select an exact agentctl release whenever you build or
+refresh a container:
+
+```bash
+git clone https://github.com/pd95/local-agent-container.git
+cd local-agent-container
+```
+
+The default checkout follows `main`. For a stable installation, select a
+published release tag. This example pins `v0.7.1`; replace it with the release
+you want:
+
+```bash
+release=v0.7.1
+git fetch origin tag "$release"
+git switch --detach "$release"
+```
+
+The detached checkout is intentional: release tags identify fixed source
+versions. To return to the development branch later, use:
+
+```bash
+git switch main
+git pull --ff-only
+```
 
 Make `agentctl` available on your `PATH`.
 
@@ -43,7 +74,16 @@ ln -sf "$PWD/agentctl" "$HOME/bin/agentctl"
 export PATH="$HOME/bin:$PATH"
 ```
 
-For local-model workflows, install Ollama and then run:
+Add the `PATH` export to `~/.zprofile` if `$HOME/bin` should remain available in
+new Terminal sessions.
+
+Start Apple's container service for both online and local workflows:
+
+```bash
+container system start
+```
+
+For local-model workflows, install Ollama and pull the models you plan to use:
 
 ```bash
 ollama pull gpt-oss:20b
@@ -52,7 +92,6 @@ ollama pull gemma4:26b-a4b-it-q4_K_M
 ollama pull qwen3.5:35b-a3b-coding-nvfp4
 # Smaller model for direct `agentctl run --model ...` testing
 ollama pull qwen3.5:9b-nvfp4
-container system start
 ```
 
 For the standard local endpoint, `agentctl run --start-ollama` starts a
@@ -178,6 +217,27 @@ agentctl refresh
 ```
 
 This is the normal non-destructive update path.
+
+To refresh a container from a particular release, select that release in the
+agentctl clone first. Then change to the project directory associated with the
+container before running `refresh`:
+
+```bash
+cd /path/to/local-agent-container
+git fetch origin --tags
+git switch --detach v0.7.1  # Replace with the desired release.
+
+cd /path/to/project
+agentctl refresh
+```
+
+The directory change matters because the current project directory normally
+selects the persistent container. If you instead target it explicitly, use
+`agentctl refresh --name <container>`.
+
+`refresh` updates repository-managed files in the existing container. It does
+not rebuild an image or change the container's image; follow the selected
+release's notes if it calls for `agentctl upgrade` or a new image build.
 
 Tracked image defaults live in `defaults/<runtime>/`. To maintain personal
 defaults without creating Git changes, copy the relevant file to the ignored

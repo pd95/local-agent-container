@@ -50,6 +50,26 @@ Running a selected runtime does not install it automatically:
 agentctl run --runtime claude
 ```
 
+## Update a runtime
+
+Update an installed runtime in the existing container selected by the current
+project directory:
+
+```bash
+agentctl runtime update codex
+```
+
+For Codex, `run --update` is the convenient update-and-launch form. It updates
+the Codex CLI in the target container immediately before starting the session
+and can be combined with online mode:
+
+```bash
+agentctl run --online --update
+```
+
+Runtime updates persist in a named container. They do not update the agentctl
+Git checkout or rebuild the container image.
+
 ## Select the preferred runtime
 
 Two equivalent commands exist:
