@@ -169,6 +169,12 @@ detached direct App Server because the current Codex PID-managed daemon startup
 is incompatible with that environment; other systems prefer the native daemon
 commands when available.
 
+Ordinary Alpine Codex sessions do not enable Remote Control. When no shared App
+Server is already healthy, agentctl passes `--no-daemon` to supported Codex
+versions so the interactive client avoids the same incompatible PID-managed
+startup path. If this Remote Control service is running, ordinary sessions keep
+Codex's normal server selection and can attach to its shared App Server instead.
+
 For the direct backend, stderr is stored at:
 
 ```text

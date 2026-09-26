@@ -97,6 +97,25 @@ Qwen Code and Pi are also wired as local-first Ollama runtimes. Qwen writes
 created at runtime when missing so mounted `/home/coder` state can use
 image-baked runtime tools without needing image-baked home config.
 
+## Codex background server on Alpine
+
+Current Codex releases can start a PID-managed App Server daemon for interactive
+sessions. That native daemon cannot reliably read the managed process start time
+inside Alpine containers. Agentctl therefore launches ordinary Codex sessions
+with `--no-daemon` on Alpine when the installed CLI supports that option.
+
+This fallback does not enable Remote Control and does not affect authentication,
+session persistence, or runtime tool use. Features that specifically require a
+shared background server remain unavailable for that session. When an
+agentctl-managed App Server is already healthy—for example, after an explicit
+`agentctl remote-control start`—agentctl leaves daemon selection unchanged so
+the local client can attach to the shared server.
+
+If the standalone Codex package ships a broken `rg`, agentctl repairs it by
+copying a working system executable into the package. Keeping the repaired path
+as a regular file is required because Codex rejects external package symlinks
+when installing its daemon payload.
+
 ## Related docs
 
 - [local-vs-online.md](local-vs-online.md)

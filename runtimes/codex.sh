@@ -359,11 +359,13 @@ codex_repair_bundled_rg() {
   local bundled_rg=""
   local bundled_rg_dir=""
   local system_rg=""
+  local temporary_rg=""
 
   bundled_rg="$install_home/packages/standalone/current/codex-path/rg"
   bundled_rg_dir="$(dirname "$bundled_rg")"
   [ -d "$bundled_rg_dir" ] || return 0
-  if [ -e "$bundled_rg" ] && "$bundled_rg" --version >/dev/null 2>&1; then
+  if [ -e "$bundled_rg" ] && [ ! -L "$bundled_rg" ] \
+      && "$bundled_rg" --version >/dev/null 2>&1; then
     return 0
   fi
   system_rg="$(codex_working_system_rg "$install_home" || true)"
@@ -371,9 +373,14 @@ codex_repair_bundled_rg() {
     printf 'Warning: Codex bundled ripgrep is not executable and no working system rg was found: %s\n' "$bundled_rg" >&2
     return 0
   fi
-  rm -f "$bundled_rg"
-  ln -s "$system_rg" "$bundled_rg"
-  printf 'Repaired Codex bundled ripgrep: %s -> %s\n' "$bundled_rg" "$system_rg" >&2
+  temporary_rg="$(mktemp "$bundled_rg_dir/.rg.XXXXXX")"
+  if ! cp "$system_rg" "$temporary_rg"; then
+    rm -f "$temporary_rg"
+    return 1
+  fi
+  chmod 0755 "$temporary_rg"
+  mv -f "$temporary_rg" "$bundled_rg"
+  printf 'Repaired Codex bundled ripgrep from system executable: %s\n' "$bundled_rg" >&2
 }
 
 codex_home_dir() {
@@ -408,6 +415,35 @@ codex_model_catalog_file() {
 
 codex_auth_file() {
   printf '%s\n' "$(codex_home_dir)/auth.json"
+}
+
+codex_shared_app_server_running() {
+  local codex_command="$1"
+  local status=""
+
+  status="$("$codex_command" app-server daemon version 2>/dev/null || true)"
+  case "$status" in
+    *'"status":"running"'*) return 0 ;;
+  esac
+  return 1
+}
+
+codex_prepare_alpine_daemon_mode() {
+  local codex_command="$1"
+  shift
+  local alpine_release_file="${AGENTCTL_ALPINE_RELEASE_FILE:-/etc/alpine-release}"
+  local arg=""
+
+  [ -f "$alpine_release_file" ] || return 0
+  codex_shared_app_server_running "$codex_command" && return 0
+  for arg in "$@"; do
+    case "$arg" in
+      --no-daemon|--remote|--remote=*) return 0 ;;
+    esac
+  done
+  "$codex_command" --no-daemon --version >/dev/null 2>&1 || return 0
+  printf '%s\n' 'Warning: Codex native background daemon is incompatible with Alpine; launching without it.' >&2
+  printf '%s\n' --no-daemon
 }
 
 codex_ensure_home_dir() {
@@ -919,6 +955,7 @@ agent_runtime_run() {
   [ "$runtime" = "codex" ] || die "unsupported runtime adapter: $runtime"
   local -a codex_args=()
   local codex_command=""
+  local daemon_mode=""
   local install_home=""
   local profile=""
 
@@ -929,6 +966,19 @@ agent_runtime_run() {
 
   if [ "$#" -gt 0 ]; then
     codex_args=("$@")
+  fi
+
+  if [ "${#codex_args[@]}" -gt 0 ]; then
+    daemon_mode="$(codex_prepare_alpine_daemon_mode "$codex_command" "${codex_args[@]}")"
+  else
+    daemon_mode="$(codex_prepare_alpine_daemon_mode "$codex_command")"
+  fi
+  if [ -n "$daemon_mode" ]; then
+    if [ "${#codex_args[@]}" -gt 0 ]; then
+      codex_args=("$daemon_mode" "${codex_args[@]}")
+    else
+      codex_args=("$daemon_mode")
+    fi
   fi
 
   if [ "${#codex_args[@]}" -eq 0 ]; then

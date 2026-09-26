@@ -195,6 +195,29 @@ For an existing pre-fix container, run `agentctl refresh --name NAME`, confirm t
 warning and `bundled` mode when applicable, and repeat the sandbox probe. Refresh must
 repair the launcher without downloading a new Codex release.
 
+For Codex 0.157.1 or newer in an Alpine container without Remote Control, run a normal
+interactive session and confirm it reports that the native background daemon is
+incompatible before opening successfully without attempting to install
+`~/.codex/packages/app-server-daemon`:
+
+```bash
+agentctl run --online
+```
+
+After a Codex update that requires the bundled-ripgrep repair, verify that the repaired
+package entry is a regular executable rather than a symlink and that another ordinary
+launch still succeeds:
+
+```bash
+agentctl run --cmd sh -lc \
+  'test -x /opt/agentctl/codex/packages/standalone/current/codex-path/rg && test ! -L /opt/agentctl/codex/packages/standalone/current/codex-path/rg'
+agentctl run --online
+```
+
+Also start Remote Control explicitly, open another normal local session, and confirm
+the local launch does not print the Alpine `--no-daemon` fallback warning because it
+attaches to the healthy shared App Server. Stop Remote Control after this check.
+
 You can point the harness at another `agentctl` binary or container runtime command:
 
 ```bash
