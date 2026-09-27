@@ -1245,6 +1245,7 @@ PY
 test_managed_mcp_bridge_lifecycle() {
   begin_test "managed MCP bridge exchanges traffic and survives start, restart, upgrade, and disable"
   local name workdir marker node_path definition added_definition replacement_definition registry port debug_dir http_pid http_port_file http_port credential token rotated_token expected_auth_file
+  local dry_run_containers_before dry_run_containers_after dry_run_inspect_before dry_run_inspect_after
 
   command -v node >/dev/null 2>&1 || fail "managed MCP integration test requires host Node.js"
   name="$(unique_name managed-mcp)"
@@ -1524,6 +1525,25 @@ jq -e ".error == \"MCP server is not configured: added\"" "$response_file" >/dev
   run_capture "$AGENTCTL" doctor --host
   assert_contains "Container $name"
   assert_contains "host relay inactive because the container is stopped"
+  log "managed-mcp: previewing an upgrade without starting the stopped source or relay"
+  dry_run_containers_before="$("$CONTAINER_CMD" ls -a --quiet | sort)"
+  dry_run_inspect_before="$("$CONTAINER_CMD" inspect "$name" | jq -cS .)"
+  run_capture "$AGENTCTL" upgrade --name "$name" --dry-run
+  assert_status 0
+  assert_contains 'Installed packages, runtimes, and features were not inspected because the source is stopped'
+  assert_contains 'Dry run complete: no container changes applied'
+  assert_not_contains 'Unable to inspect installed OS packages'
+  assert_not_contains 'not running'
+  assert_not_contains 'not a Unix socket'
+  container_running "$name" && fail "Upgrade dry-run started the source container"
+  dry_run_containers_after="$("$CONTAINER_CMD" ls -a --quiet | sort)"
+  dry_run_inspect_after="$("$CONTAINER_CMD" inspect "$name" | jq -cS .)"
+  [ "$dry_run_containers_before" = "$dry_run_containers_after" ] || fail "Dry-run changed the container inventory"
+  [ "$dry_run_inspect_before" = "$dry_run_inspect_after" ] || fail "Dry-run changed source container metadata"
+  [ "$(wc -l <"$marker" | tr -d ' ')" = "$starts_before_doctor" ] || fail "Dry-run started an MCP child"
+  run_capture "$AGENTCTL" doctor --host
+  assert_contains "Container $name"
+  assert_contains 'host relay inactive because the container is stopped'
   log "managed-mcp: replacing definitions during stopped-container upgrade"
   starts_before_doctor="$(wc -l <"$marker" | tr -d ' ')"
   port=48124

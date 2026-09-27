@@ -150,6 +150,18 @@ To preview the plan before recreating anything:
 agentctl upgrade --name my-project --new-name my-project-renamed --workdir /new/path/to/project --dry-run
 ```
 
+For a stopped source, dry-run reads container/image metadata and host
+configuration without starting containers, creating temporary image containers,
+or exporting the filesystem. Installed packages, runtimes, and features are
+reported as not inspected; recovery details are determined during the actual
+upgrade. Inherited SSH forwarding is shown, but the installed SSH client feature
+is unknown until source state can be inspected. Explicit `--ssh` still previews
+ensuring that feature is installed.
+
+A missing managed MCP relay socket is normal while the source is stopped and
+does not prevent the preview. Invalid user-managed sockets, workdirs, target
+images, and published-socket conflicts still report configuration errors.
+
 ## What Upgrade Preserves
 
 `upgrade` keeps the `/workdir` mount and named-container identity by default

@@ -10544,8 +10544,10 @@ upgrade_cmd() {
   mcp_target_port="$MCP_PORT"
 
   inspect_info="$("$CONTAINER_CMD" inspect "$name" 2>/dev/null | container_upgrade_info)"
-  current_socket_mappings="$(container_extra_mount_text "$name")"
-  preserved_socket_mappings="$(container_socket_mounts "$name" "$removed_socket_mappings")"
+  current_socket_mappings="$(container_extra_mount_text "$name")" \
+    || die "Unable to inspect extra mounts for $name"
+  preserved_socket_mappings="$(container_socket_mounts "$name" "$removed_socket_mappings")" \
+    || die "Unable to preserve extra mounts for $name"
   target_socket_mappings="$(merge_socket_mappings "$preserved_socket_mappings" "$requested_socket_mappings")"
   current_published_sockets="$(container_published_sockets "$name")"
   target_published_sockets="$(merge_published_sockets "$current_published_sockets" "$unpublished_sockets" "$requested_published_sockets")"
@@ -10647,29 +10649,23 @@ upgrade_cmd() {
     done <<<"$current_published_sockets"
   fi
   echo "Preparing upgrade preflight: $name -> $target_name" >&2
-  if [ "$was_running" -eq 0 ] && { { [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; } || [ "$source_requires_export" -eq 1 ]; }; then
+  if [ "$dry_run" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+    # Empty manifests trigger live inspection in the recovery helpers. A stopped
+    # preview must skip those helpers, including temporary image containers.
+    if { [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; } || [ "$source_requires_export" -eq 1 ]; then
+      backup_mode="export"
+    else
+      validate_published_host_paths_for_start "$current_published_sockets"
+      backup_mode="start"
+    fi
+    echo "Installed packages, runtimes, and features were not inspected because the source is stopped. Recovery details will be determined during the actual upgrade." >&2
+  elif [ "$was_running" -eq 0 ] && { { [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; } || [ "$source_requires_export" -eq 1 ]; }; then
     if [ -n "$workdir_override" ] && [ ! -e "$current_workdir" ]; then
       warn "Skipping package-loss warning because original /workdir source does not exist and $name is stopped"
     else
       warn "Skipping live package-loss preflight because removed published socket mappings make stopped source startup unsafe"
     fi
     backup_mode="export"
-  elif [ "$dry_run" -eq 1 ] && [ "$was_running" -eq 0 ]; then
-    validate_published_host_paths_for_start "$current_published_sockets"
-    preflight_target_manifest="$(image_system_manifest_json "$image" target 2>/dev/null || true)"
-    if [ "$current_image" = "$image" ] && [ -n "$preflight_target_manifest" ]; then
-      preflight_source_manifest="$preflight_target_manifest"
-    elif image_exists "$current_image"; then
-      preflight_source_manifest="$(image_system_manifest_json "$current_image" source 2>/dev/null || true)"
-    fi
-    added_runtimes_json="$(upgrade_added_runtimes_json "$name" "$current_image" "$image" \
-      "" "$preflight_source_manifest" "$preflight_target_manifest" 2>/dev/null || printf '[]\n')"
-    added_features_json="$(upgrade_added_features_json "$name" "$current_image" "$image" \
-      "" "$preflight_source_manifest" "$preflight_target_manifest" 2>/dev/null || printf '[]\n')"
-    warn_upgrade_package_loss "$name" "$current_image" "$image" \
-      "" "$preflight_source_manifest" "$preflight_target_manifest" "$target_name" \
-      "$added_features_json" "$package_warning_mode"
-    backup_mode="start"
   else
     if [ "$was_running" -eq 0 ] && container_has_mcp_wiring "$name"; then
       if [ "$mcp_current_enabled" -ne 1 ]; then
@@ -10716,7 +10712,11 @@ upgrade_cmd() {
   if [ "$copy_mode" -eq 0 ] && [ "$no_backup" -eq 0 ] && [ -z "$backup_image" ]; then
     backup_image="$(sanitize_image_name "${target_name}-backup-$(date -u +%Y%m%d%H%M%S)")"
   fi
-  if [ "$target_ssh" = "true" ] && [ "$ssh_enable_requested" -eq 0 ]; then
+  if [ "$dry_run" -eq 1 ] && [ "$was_running" -eq 0 ]; then
+    if [ "$target_ssh" = "true" ] && [ "$ssh_enable_requested" -eq 0 ]; then
+      echo "  SSH client feature: unknown (source stopped); preservation will be checked during the actual upgrade" >&2
+    fi
+  elif [ "$target_ssh" = "true" ] && [ "$ssh_enable_requested" -eq 0 ]; then
     if [ "$was_running" -eq 0 ] && [ "$backup_mode" = "export" ]; then
       allow_ssh_export_fallback=1
     fi

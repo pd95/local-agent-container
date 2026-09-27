@@ -11719,7 +11719,7 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
   run_capture upgrade_cmd --name unit-test-container --new-name renamed-container --image agent-python --workdir "$TEST_ROOT" --dry-run --unmount-socket /run/services/old.sock
   assert_status 0
   assert_contains "Preparing upgrade preflight: unit-test-container -> renamed-container"
-  assert_contains "Warning: Skipping package-loss warning because original /workdir source does not exist and unit-test-container is stopped"
+  assert_contains "Installed packages, runtimes, and features were not inspected because the source is stopped"
   assert_contains "Dry run: upgrade plan for unit-test-container -> renamed-container"
   assert_contains "  Source image: agent-python"
   assert_contains "  Target image: agent-python"
@@ -11820,46 +11820,122 @@ test_upgrade_copy_dry_run_reports_copy_plan() {
 }
 
 test_upgrade_stopped_dry_run_does_not_start_source() {
-  begin_test "upgrade stopped-source dry-run never starts or stops the source"
-
+  begin_test "stopped upgrade previews skip live and temporary-image inspection, including MCP and SSH"
   load_agentctl_functions
-
-  require_container() { return 0; }
-  default_name() { printf 'unit-test-container\n'; }
-  require_container_backup_support() { return 0; }
-  warn_upgrade_package_loss() { :; }
-  upgrade_added_runtimes_json() { printf '[]\n'; }
-  upgrade_added_features_json() { printf '[]\n'; }
-  image_system_manifest_json() { return 1; }
-  container_exists() { [ "$1" = "unit-test-container" ]; }
+  local dry_dir dry_workdir dry_ssh=false dry_published='' dry_mcp=0 dry_user_socket=0
+  # Keep socket fixtures below the macOS Unix-socket path limit even when a
+  # preceding test has supplied a long TMPDIR.
+  dry_dir="$(mktemp -d /tmp/agentctl-dry.XXXXXX)"
+  register_dir_cleanup "$dry_dir"
+  dry_workdir="$TEST_ROOT"
+  : >"$dry_dir/forbidden"
+  require_container() { :; }
+  require_container_backup_support() { :; }
+  require_container_ssh_support() { :; }
+  require_host_ssh_socket() { :; }
+  host_ssh_socket_available() { return 0; }
+  container_exists() { [ "$1" = unit-test-container ]; }
   container_running() { return 1; }
-  image_exists() { return 0; }
-  container_extra_mount_text() { :; }
-  container_socket_mounts() { :; }
-  container_published_sockets() { :; }
+  image_exists() { case "$1" in missing-image*) return 1 ;; *) return 0 ;; esac; }
+  container_published_sockets() { printf '%s' "$dry_published"; }
   container_shm_size() { :; }
-  container_ssh_enabled() { printf 'false\n'; }
+  container_ssh_enabled() { printf '%s\n' "$dry_ssh"; }
   container_network_specs() { printf 'default\n'; }
   validate_network_selection() { :; }
-  collect_upgrade_container_preflight() { fail "dry-run must not collect an exec-based stopped-source preflight"; }
-  sanitize_image_name() { printf '%s\n' "$1"; }
-  trap() { :; }
-
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
+  mcp_require_no_active_leases() { :; }
+  mcp_registry_path() { printf '%s/registry.json\n' "$dry_dir"; }
+  mcp_socket_path() { printf '%s/absent-mcp.sock\n' "$dry_dir"; }
+  mcp_start_from_registry() { printf 'mcp-start\n' >>"$dry_dir/forbidden"; return 1; }
+  mcp_stop_managed() { printf 'mcp-stop\n' >>"$dry_dir/forbidden"; return 1; }
+  recovery_write_ledger() { printf 'ledger-write\n' >>"$dry_dir/forbidden"; return 1; }
   CONTAINER_CMD=container
   container() {
     case "$1" in
-      inspect) printf '{}\n' ;;
-      start|stop) fail "dry-run must not mutate stopped source lifecycle: $*" ;;
-      *) fail "Unexpected container invocation: $*" ;;
+      inspect)
+        jq -cn --arg root "$dry_dir" --argjson mcp "$dry_mcp" --argjson user "$dry_user_socket" \
+          '[{configuration:{mounts:([if $mcp == 1 then {source:($root+"/absent-mcp.sock"),destination:"/run/agentctl/mcp-host.sock"} else empty end] + [if $user == 1 then {source:($root+"/absent-user.sock"),destination:"/run/user.sock"} else empty end])}}]'
+        ;;
+      *) printf '%s\n' "$*" >>"$dry_dir/forbidden"; return 1 ;;
     esac
   }
   container_upgrade_info() {
-    printf 'agent-python:latest\t%s\trw\t2\t4G\n' "$TEST_ROOT"
+    printf 'agent-python:latest\t%s\trw\t2\t4G\n' "$dry_workdir"
   }
+  # Keep the real package/runtime/feature/image helpers. Their swallowed failures
+  # must still fail the test through the file-backed forbidden-operation log.
+  preview_upgrade() { ( upgrade_cmd --name unit-test-container --dry-run "$@" ); }
 
-  run_capture upgrade_cmd --name unit-test-container --image agent-python --dry-run
+  run_capture preview_upgrade --image agent-python
   assert_status 0
-  assert_contains "Dry run complete: no container changes applied"
+  assert_contains 'Installed packages, runtimes, and features were not inspected because the source is stopped'
+  assert_contains 'Config backup: start the stopped source container'
+  assert_contains 'Dry run complete: no container changes applied'
+
+  dry_mcp=1
+  printf '%s\n' '{"schema_version":2,"port":47123,"servers":[]}' >"$dry_dir/registry.json"
+  chmod 600 "$dry_dir/registry.json"
+  run_capture preview_upgrade --image agent-swift --no-backup
+  assert_status 0
+  assert_contains 'MCP bridge: current=1 target=1'
+  assert_contains 'Backup image: skipped (--no-backup)'
+  assert_not_contains 'Unable to inspect'
+  assert_not_contains 'not running'
+  run_capture preview_upgrade --new-name copied-container --copy --image agent-swift
+  assert_status 0
+  assert_contains 'Actions: keep unit-test-container and create copied-container as a copy'
+
+  dry_ssh=true
+  run_capture preview_upgrade
+  assert_status 0
+  assert_contains 'SSH client feature: unknown (source stopped)'
+  assert_not_contains 'SSH client feature: ensure installed'
+  run_capture preview_upgrade --ssh
+  assert_status 0
+  assert_contains 'SSH client feature: ensure installed'
+  assert_not_contains 'SSH client feature: unknown'
+  run_capture preview_upgrade --no-ssh
+  assert_status 0
+  assert_contains 'SSH forwarding: enabled -> disabled'
+  assert_not_contains 'SSH client feature:'
+
+  dry_workdir="$dry_dir/missing-workdir"
+  run_capture preview_upgrade --workdir "$TEST_ROOT"
+  assert_status 0
+  assert_contains 'Config backup: export existing container filesystem'
+  assert_contains 'SSH client feature: unknown (source stopped)'
+  dry_workdir="$TEST_ROOT"
+  dry_published="$dry_dir/published.sock"$'\t'"/run/published.sock"
+  run_capture preview_upgrade --unpublish-socket "$dry_dir/published.sock"
+  assert_status 0
+  assert_contains 'Config backup: export existing container filesystem'
+  assert_contains 'SSH client feature: unknown (source stopped)'
+  dry_published=''
+
+  run_capture preview_upgrade --image missing-image
+  assert_status 1
+  assert_contains 'Image not found'
+  dry_workdir="$dry_dir/missing-workdir"
+  run_capture preview_upgrade
+  assert_status 1
+  assert_contains 'Preserved /workdir source does not exist'
+  dry_workdir="$TEST_ROOT"
+  dry_user_socket=1
+  run_capture preview_upgrade
+  assert_status 1
+  assert_contains 'Cannot preserve extra mount'
+  dry_user_socket=0
+  dry_published="$dry_dir/published.sock"$'\t'"/run/published.sock"
+  : >"$dry_dir/published.sock"
+  run_capture preview_upgrade
+  assert_status 1
+  assert_contains 'occupied published socket host path'
+  [ ! -s "$dry_dir/forbidden" ] || fail "Dry-run performed forbidden operations: $(cat "$dry_dir/forbidden")"
+  [ ! -e "$dry_dir/absent-mcp.sock" ] || fail "Dry-run created the managed MCP socket"
+  unset -f preview_upgrade
 }
 
 test_upgrade_warns_about_added_packages_missing_from_target_image() {
