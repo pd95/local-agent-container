@@ -494,7 +494,7 @@ test_upgrade_no_backup_preserves_state() {
   run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
   assert_status 0
   assert_contains "Skipping backup image export for $name"
-  assert_contains "Upgrade complete: $name (backup skipped)"
+  assert_upgrade_complete "$name (backup skipped)"
 
   if [ -n "$(list_backup_images "$backup_base")" ]; then
     printf '%s\n' "$(list_backup_images "$backup_base")" >&2
@@ -704,6 +704,7 @@ test_upgrade_with_backup_creates_recovery_image() {
   backup_image="$(extract_backup_image)"
   [ -n "$backup_image" ] || fail "Could not parse backup image name from upgrade output"
   register_backup_cleanup "$backup_image"
+  assert_upgrade_complete "$name (backup image: $backup_image)"
 
   if ! image_exists "$backup_image"; then
     printf '%s\n' "$RUN_OUTPUT" >&2
@@ -756,7 +757,7 @@ chown -R coder:coder /home/coder
 
   run_capture "$AGENTCTL" upgrade --name "$name" --image agent-python --mem 4G --backup-image "$backup_image"
   assert_status 0
-  assert_contains "Upgrade complete: $name (backup image: $backup_image)"
+  assert_upgrade_complete "$name (backup image: $backup_image)"
 
   if ! container_running "$name"; then
     run_capture "$AGENTCTL" start --name "$name"
@@ -890,7 +891,7 @@ test_upgrade_overwrite_config_restores_image_defaults() {
   run_capture "$AGENTCTL" upgrade --name "$name" --overwrite-config --no-backup
   assert_status 0
   assert_contains "Overwriting config.toml, default profiles, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $name"
-  assert_contains "Upgrade complete: $name (backup skipped)"
+  assert_upgrade_complete "$name (backup skipped)"
 
   run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo overwrite-config-ok; else exit 1; fi'
   assert_status 0

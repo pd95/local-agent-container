@@ -225,8 +225,25 @@ assert_matches() {
   fi
 }
 
+# A successful recreation can leave optional recovery actions deferred.
+# Keep failed recovery and unavailable outcome information visible as failures.
+assert_upgrade_complete() {
+  local expected="$1"
+  local line=""
+  local pattern='^Upgrade complete(; recovery incomplete \(0 failed, [0-9]+ deferred\))?: '
+  while IFS= read -r line; do
+    if [[ "$line" =~ $pattern ]] && [ "${line#*: }" = "$expected" ]; then
+      return 0
+    fi
+  done <<<"$RUN_OUTPUT"
+  printf '%s\n' "$RUN_OUTPUT" >&2
+  fail "Expected completed upgrade without failed recovery: $expected"
+}
+
 extract_backup_image() {
-  printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^Upgrade complete: .* (backup image: \(.*\))$/\1/p' | tail -n 1
+  printf '%s\n' "$RUN_OUTPUT" | sed -n \
+    -e 's/^Upgrade complete: .* (backup image: \(.*\))$/\1/p' \
+    -e 's/^Upgrade complete; recovery incomplete ([^)]*): .* (backup image: \(.*\))$/\1/p' | tail -n 1
 }
 
 cleanup() {

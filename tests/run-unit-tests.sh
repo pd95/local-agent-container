@@ -4462,11 +4462,11 @@ test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state() {
   assert_contains "Bootstrap complete: unit-bootstrap-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "apk add --no-cache bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm" || fail "Expected root bootstrap install commands"
-  printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
-  printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/runtimes.d" || fail "Expected bootstrap to install runtime manifests"
-  printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/features.d" || fail "Expected bootstrap to install feature manifests"
-  printf '%s\n' "$exec_log" | grep -Fq "file:/etc/agentctl/image.md" || fail "Expected bootstrap to install image metadata"
+  grep -Fq "apk add --no-cache bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm" <<<"$exec_log" || fail "Expected root bootstrap install commands"
+  grep -Fq "file:/usr/local/bin/agent.sh" <<<"$exec_log" || fail "Expected bootstrap to install agent.sh"
+  grep -Fq "tree:/etc/agentctl/runtimes.d" <<<"$exec_log" || fail "Expected bootstrap to install runtime manifests"
+  grep -Fq "tree:/etc/agentctl/features.d" <<<"$exec_log" || fail "Expected bootstrap to install feature manifests"
+  grep -Fq "file:/etc/agentctl/image.md" <<<"$exec_log" || fail "Expected bootstrap to install image metadata"
 }
 
 test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
@@ -4546,7 +4546,7 @@ test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
   printf '%s\n' "$create_log" | grep -Fq -- "--publish-socket $published_path:/run/bootstrap-service.sock" \
     || fail "Expected create to include the exact published socket mapping"
   printf '%s\n' "$create_log" | grep -Fq -- "docker.io/library/alpine:latest sh -c sleep infinity" || fail "Expected create to use requested image"
-  printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
+  grep -Fq "file:/usr/local/bin/agent.sh" <<<"$exec_log" || fail "Expected bootstrap to install agent.sh"
 }
 
 test_bootstrap_cmd_bootstraps_apt_container() {
@@ -4598,10 +4598,10 @@ test_bootstrap_cmd_bootstraps_apt_container() {
   assert_contains "Bootstrap complete: unit-bootstrap-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "apt-get install -y --no-install-recommends bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm ca-certificates" || fail "Expected apt bootstrap install commands"
-  printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
-  printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/runtimes.d" || fail "Expected bootstrap to install runtime manifests"
-  printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/features.d" || fail "Expected bootstrap to install feature manifests"
+  grep -Fq "apt-get install -y --no-install-recommends bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm ca-certificates" <<<"$exec_log" || fail "Expected apt bootstrap install commands"
+  grep -Fq "file:/usr/local/bin/agent.sh" <<<"$exec_log" || fail "Expected bootstrap to install agent.sh"
+  grep -Fq "tree:/etc/agentctl/runtimes.d" <<<"$exec_log" || fail "Expected bootstrap to install runtime manifests"
+  grep -Fq "tree:/etc/agentctl/features.d" <<<"$exec_log" || fail "Expected bootstrap to install feature manifests"
 }
 
 test_bootstrap_cmd_rejects_unsupported_base() {
@@ -13145,15 +13145,15 @@ test_refresh_updates_managed_files_without_recreate() {
   assert_contains "Refresh complete: unit-test-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/codex/config.toml" || fail "Expected refresh to update /etc/agentctl/codex/config.toml"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/codex/gpt-oss.config.toml" || fail "Expected refresh to update /etc/agentctl/codex/gpt-oss.config.toml"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/tooling-version" || fail "Expected refresh to update the agentctl tooling version marker"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/codexctl" || fail "Expected refresh to remove legacy Codex defaults"
-  printf '%s\n' "$exec_log" | grep -Fq "/usr/local/bin/agent.sh" || fail "Expected refresh to update agent.sh"
-  printf '%s\n' "$exec_log" | grep -Fq "/usr/local/lib/agentctl/runtimes" || fail "Expected refresh to update runtime adapters"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/runtimes.d" || fail "Expected refresh to update runtime registry"
-  printf '%s\n' "$exec_log" | grep -Fq "/usr/local/lib/agentctl/features" || fail "Expected refresh to update feature adapters"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/features.d" || fail "Expected refresh to update feature registry"
+  grep -Fq "/etc/agentctl/codex/config.toml" <<<"$exec_log" || fail "Expected refresh to update /etc/agentctl/codex/config.toml"
+  grep -Fq "/etc/agentctl/codex/gpt-oss.config.toml" <<<"$exec_log" || fail "Expected refresh to update /etc/agentctl/codex/gpt-oss.config.toml"
+  grep -Fq "/etc/agentctl/tooling-version" <<<"$exec_log" || fail "Expected refresh to update the agentctl tooling version marker"
+  grep -Fq "/etc/codexctl" <<<"$exec_log" || fail "Expected refresh to remove legacy Codex defaults"
+  grep -Fq "/usr/local/bin/agent.sh" <<<"$exec_log" || fail "Expected refresh to update agent.sh"
+  grep -Fq "/usr/local/lib/agentctl/runtimes" <<<"$exec_log" || fail "Expected refresh to update runtime adapters"
+  grep -Fq "/etc/agentctl/runtimes.d" <<<"$exec_log" || fail "Expected refresh to update runtime registry"
+  grep -Fq "/usr/local/lib/agentctl/features" <<<"$exec_log" || fail "Expected refresh to update feature adapters"
+  grep -Fq "/etc/agentctl/features.d" <<<"$exec_log" || fail "Expected refresh to update feature registry"
   assert_contains "Active runtime configuration was preserved"
   assert_contains "refresh --name unit-test-container --reset-config"
 }
@@ -16146,6 +16146,36 @@ test_upgrade_recovery_reports_export_capture_limitations() {
   ' >/dev/null || fail "Expected explicit manual recovery items for stopped export limitations, got: $RUN_OUTPUT"
 }
 
+test_upgrade_completion_test_helpers() {
+  begin_test "upgrade completion assertions accept deferred recovery but reject failures"
+  local completion="" output="" status=0
+  for completion in 'Upgrade complete' 'Upgrade complete; recovery incomplete (0 failed, 1 deferred)'; do
+    RUN_OUTPUT="build output
+$completion: fixture (backup image: fixture-backup)"
+    assert_upgrade_complete 'fixture (backup image: fixture-backup)'
+    [ "$(extract_backup_image)" = fixture-backup ] || fail "Could not extract backup from $completion"
+    RUN_OUTPUT="$completion: fixture (backup skipped)"
+    assert_upgrade_complete 'fixture (backup skipped)'
+  done
+  for completion in \
+    'Upgrade complete; recovery incomplete (1 failed, 0 deferred)' \
+    'Upgrade complete; recovery incomplete (ledger unavailable)' \
+    'Upgrade complete; recovery incomplete (target inspection failed)' \
+    'Upgrade complete; recovery incomplete (0 failed, bogus deferred)' \
+    'Not complete'; do
+    RUN_OUTPUT="$completion: fixture (backup image: fixture-backup)"
+    status=0
+    output="$(assert_upgrade_complete 'fixture (backup image: fixture-backup)' 2>&1)" || status=$?
+    [ "$status" -ne 0 ] || fail "Accepted invalid completion: $completion"
+  done
+  RUN_OUTPUT='Upgrade complete: another-container (backup image: fixture-backup)'
+  status=0
+  output="$(assert_upgrade_complete 'fixture (backup image: fixture-backup)' 2>&1)" || status=$?
+  [ "$status" -ne 0 ] || fail "Accepted completion for the wrong container"
+  RUN_OUTPUT='Upgrade complete; recovery incomplete (2 failed, 1 deferred): fixture (backup image: fixture-backup)'
+  [ "$(extract_backup_image)" = fixture-backup ] || fail "Lost backup reference when recovery failed"
+}
+
 main() {
   log "Using agentctl at $AGENTCTL"
   log "Using agentctl implementation at $AGENTCTL_IMPL"
@@ -16156,6 +16186,7 @@ main() {
     log "Running unit tests from: $TEST_START_FROM"
   fi
 
+  run_selected_test test_upgrade_completion_test_helpers "test_upgrade_completion_test_helpers"
   run_selected_test test_run_config_wires_runtime_config_json "test_run_config_wires_runtime_config_json"
   run_selected_test test_run_cmd_wires_ollama_host_to_custom_command "test_run_cmd_wires_ollama_host_to_custom_command"
   run_selected_test test_run_help_reports_generic_runtime_config "test_run_help_reports_generic_runtime_config"
