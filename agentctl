@@ -10967,6 +10967,7 @@ upgrade_cmd() {
   fi
   local recovery_target_manifest=""
   local recovery_selected=""
+  local recovery_completion=""
   recovery_target_manifest="$(run_agent_sh_in_container "$target_name" recovery manifest 2>/dev/null || true)"
   if [ -n "$recovery_ledger" ] && [ -n "$recovery_target_manifest" ]; then
     recovery_plan="$(recovery_plan_json "$recovery_ledger" "$recovery_target_manifest" "$restore_policy" "$image")"
@@ -10990,18 +10991,20 @@ upgrade_cmd() {
       local recovery_result_plan=""
       recovery_result_plan="$(printf '%s' "$recovery_ledger" | jq -c '.plans[-1]')"
       recovery_print_summary "$recovery_result_plan"
-      if [ "$recovery_apply_status" -ne 0 ]; then
-        warn "Some recovery actions failed; retry with: ${CLI_NAME} upgrade restore --name $target_name --interactive"
-      elif [ "$(recovery_unresolved_count "$recovery_result_plan")" -gt 0 ]; then
-        echo "Recovery has deferred actions. Resume with: ${CLI_NAME} upgrade restore --name $target_name --interactive" >&2
-      fi
+      recovery_plan="$recovery_result_plan"
     elif [ "$(printf '%s' "$recovery_plan" | jq -r '.actions | length')" -gt 0 ]; then
       recovery_print_summary "$recovery_plan"
-      echo "Recovery deferred. Resume with: ${CLI_NAME} upgrade restore --name $target_name --interactive" >&2
+    fi
+    recovery_report_outstanding "$target_name" "$recovery_plan"
+    recovery_completion="$(recovery_completion_suffix "$recovery_plan")"
+    if [ "${recovery_apply_status:-0}" -ne 0 ] && [ -z "$recovery_completion" ]; then
+      recovery_completion="; recovery incomplete (recovery operation failed)"
     fi
   elif [ -z "$recovery_ledger" ]; then
+    recovery_completion="; recovery incomplete (ledger unavailable)"
     warn "No live recovery ledger was captured for $name; use the backup image for this stopped-source recovery"
   else
+    recovery_completion="; recovery incomplete (target inspection failed)"
     warn "Unable to inspect recovery providers in target image $image; saved source ledger remains available in user state"
   fi
   warn_if_preferred_runtime_lost "$target_name" "$current_preferred_runtime" "$target_default_runtime"
@@ -11036,11 +11039,11 @@ upgrade_cmd() {
   fi
 
   if [ "$copy_mode" -eq 1 ]; then
-    echo "Copy complete: $target_name (source preserved)" >&2
+    echo "Copy complete${recovery_completion}: $target_name (source preserved)" >&2
   elif [ "$no_backup" -eq 0 ]; then
-    echo "Upgrade complete: $target_name (backup image: $backup_image)" >&2
+    echo "Upgrade complete${recovery_completion}: $target_name (backup image: $backup_image)" >&2
   else
-    echo "Upgrade complete: $target_name (backup skipped)" >&2
+    echo "Upgrade complete${recovery_completion}: $target_name (backup skipped)" >&2
   fi
   if [ "$copy_mode" -eq 0 ] && { [ "$mcp_disable_requested" -eq 1 ] || [ "$target_name" != "$name" ]; }; then
     mcp_stop_managed "$name"
@@ -11443,7 +11446,7 @@ recovery_mark_action_results() {
 recovery_print_plan() {
   local plan="$1"
   printf '%s\n' "Upgrade recovery plan:" >&2
-  printf '%s' "$plan" | jq -r '.actions[]? | "  [" + (if .default_selected and .status == "pending" then "x" else " " end) + "] " + .kind + ": " + .name + (if .version then " (" + .version + ")" else "" end) + " [" + .status + "]"' >&2
+  printf '%s' "$plan" | jq -r '.actions[]? | "  [" + (if .default_selected and .status == "pending" then "x" else " " end) + "] " + .kind + ": " + .name + (if .version then " (" + .version + ")" else "" end) + " [" + .status + "] (id: " + .id + ")"' >&2
 }
 
 recovery_print_summary() {
@@ -11451,15 +11454,43 @@ recovery_print_summary() {
   local counts=""
   local restored=0 failed=0 deferred=0
 
-  counts="$(printf '%s' "$plan" | jq -r '
+  counts="$(recovery_outcome_counts "$plan")"
+  IFS=$'\t' read -r restored failed deferred <<<"$counts"
+  printf 'Recovery summary: %s restored, %s failed, %s deferred.\n' \
+    "$restored" "$failed" "$deferred" >&2
+}
+
+recovery_outcome_counts() {
+  printf '%s' "$1" | jq -r '
     [(.actions // [])[] | .status] as $statuses
     | [($statuses | map(select(. == "restored")) | length),
        ($statuses | map(select(. == "failed")) | length),
        ($statuses | map(select(. != "restored" and . != "failed" and . != "dismissed")) | length)]
-    | @tsv')"
+    | @tsv'
+}
+
+recovery_report_outstanding() {
+  local name="$1" plan="$2" counts="" restored=0 failed=0 deferred=0
+  counts="$(recovery_outcome_counts "$plan")" || return 1
   IFS=$'\t' read -r restored failed deferred <<<"$counts"
-  printf 'Recovery summary: %s restored, %s failed, %s deferred.\n' \
-    "$restored" "$failed" "$deferred" >&2
+  if [ "$failed" -gt 0 ]; then
+    warn "Recovery has $failed failed action(s). Review the failures before retrying: ${CLI_NAME} upgrade restore --name $name --interactive"
+    echo "Inspect item IDs with --status; explicitly skip obsolete items with --dismiss ITEM_ID." >&2
+  fi
+  if [ "$deferred" -gt 0 ]; then
+    echo "Recovery has $deferred deferred action(s). Resume with: ${CLI_NAME} upgrade restore --name $name --interactive" >&2
+  fi
+  return 0
+}
+
+recovery_completion_suffix() {
+  local counts="" restored=0 failed=0 deferred=0
+  counts="$(recovery_outcome_counts "$1")" || return 1
+  IFS=$'\t' read -r restored failed deferred <<<"$counts"
+  if [ "$failed" -gt 0 ] || [ "$deferred" -gt 0 ]; then
+    printf '; recovery incomplete (%s failed, %s deferred)' "$failed" "$deferred"
+  fi
+  return 0
 }
 
 recovery_unresolved_count() {
@@ -11573,6 +11604,22 @@ recovery_os_package_restored() {
   esac
 }
 
+# Return 1 only for an unavailable request; metadata/transport failures return 2.
+# Policy output includes installed versions, so an installed automatic package
+# can still be passed to apt-get install to restore its manually requested state.
+recovery_dpkg_package_available() {
+  local name="$1" spec="$2" metadata="" package="${2%%=*}" version=""
+  case "$spec" in *=*) version="${spec#*=}" ;; esac
+  metadata="$("$CONTAINER_CMD" exec -u 0 "$name" env LC_ALL=C apt-cache policy "$package")" || return 2
+  printf '%s\n' "$metadata" | awk -v version="$version" '
+    NF { nonempty = 1 }
+    $1 == "Candidate:" && NF == 2 { candidate_seen = 1; if (version == "" && $2 != "(none)") found = 1 }
+    version != "" && ("v" $1) == ("v" version) && $2 ~ /^-?[0-9]+$/ { found = 1 }
+    version != "" && $1 == "***" && ("v" $2) == ("v" version) && $3 ~ /^-?[0-9]+$/ { found = 1 }
+    END { if (nonempty && !candidate_seen) exit 2; exit !found }
+  '
+}
+
 recovery_apply_os_package_batch() {
   local name="$1"
   local plan="$2"
@@ -11583,6 +11630,9 @@ recovery_apply_os_package_batch() {
   local -a ids=()
   local -a packages=()
   local -a versions=()
+  local -a available_packages=()
+  local -a availability=()
+  local probe_status=0 metadata_failed=0
 
   actions="$(printf '%s' "$plan" | jq -c --arg provider "$provider" --argjson selected "$selected_json" '
     .actions[] | . as $action
@@ -11606,22 +11656,50 @@ recovery_apply_os_package_batch() {
       "$CONTAINER_CMD" exec -u 0 "$name" apk add --no-cache "${packages[@]}" || install_status=$?
       ;;
     dpkg)
-      printf 'Restoring %s DPKG package(s) in one transaction.\n' "${#packages[@]}" >&2
-      "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"' sh "${packages[@]}" || install_status=$?
+      if "$CONTAINER_CMD" exec -u 0 "$name" apt-get update -o APT::Update::Error-Mode=any; then
+        while [ "$index" -lt "${#packages[@]}" ]; do
+          probe_status=0
+          recovery_dpkg_package_available "$name" "${packages[$index]}" || probe_status=$?
+          case "$probe_status" in
+            0) availability+=(available); available_packages+=("${packages[$index]}") ;;
+            1) availability+=(unavailable) ;;
+            *)
+              warn "Unable to inspect APT metadata; no DPKG packages will be installed in this recovery attempt"
+              install_status=1
+              metadata_failed=1
+              break
+              ;;
+          esac
+          index=$((index + 1))
+        done
+        if [ "$install_status" -eq 0 ] && [ "${#available_packages[@]}" -gt 0 ]; then
+          printf 'Restoring %s DPKG package(s) in one transaction.\n' "${#available_packages[@]}" >&2
+          "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"' sh "${available_packages[@]}" || install_status=$?
+        fi
+      else
+        warn "Unable to update APT metadata; no DPKG packages will be installed in this recovery attempt"
+        install_status=1
+        metadata_failed=1
+      fi
       ;;
     *) install_status=1 ;;
   esac
 
+  index=0
   while [ "$index" -lt "${#ids[@]}" ]; do
-    if [ "$install_status" -eq 0 ] \
+    if { [ "$install_status" -eq 0 ] && [ "${availability[$index]:-available}" = available ]; } \
       || recovery_os_package_restored "$name" "$provider" "${packages[$index]}" "${versions[$index]}" "$policy"; then
       recovery_record_action_result "${ids[$index]}" restored
     else
       recovery_record_action_result "${ids[$index]}" failed
+      if [ "${availability[$index]:-}" = unavailable ]; then
+        warn "Unavailable DPKG request: ${packages[$index]}. Review target repositories or explicitly dismiss it if obsolete; other available packages can still be restored."
+      fi
       result_status=1
     fi
     index=$((index + 1))
   done
+  [ "$metadata_failed" -eq 0 ] || result_status=1
   return "$result_status"
 }
 
@@ -11717,8 +11795,10 @@ recovery_apply_selected() {
   return "$status"
 }
 
-upgrade_restore_cmd() {
-  local name="" interactive=0 all=0 status_only=0 history=0 dry_run=0 policy="mixed" ledger="" plan="" was_running=0 selected="" dismiss_id=""
+# Scope EXIT/signal traps to this command, including early read-only returns.
+upgrade_restore_cmd() (
+  local name="" interactive=0 all=0 status_only=0 history=0 dry_run=0 policy="mixed" ledger="" plan="" selected="" dismiss_id=""
+  local policy_set=0 modes=0 temporary_start_attempted=0 recovery_apply_status=0 presence=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
@@ -11727,53 +11807,98 @@ upgrade_restore_cmd() {
       --status) status_only=1; shift ;;
       --history) history=1; shift ;;
       --dry-run) dry_run=1; shift ;;
-      --dismiss) [ "$#" -ge 2 ] || die "Missing value for --dismiss"; dismiss_id="$2"; shift 2 ;;
-      --restore-version-policy) [ "$#" -ge 2 ] || die "Missing value for --restore-version-policy"; policy="$2"; shift 2 ;;
+      --dismiss) [ "$#" -ge 2 ] && [ -n "$2" ] || die "Missing value for --dismiss"; dismiss_id="$2"; shift 2 ;;
+      --restore-version-policy) [ "$#" -ge 2 ] || die "Missing value for --restore-version-policy"; policy="$2"; policy_set=1; shift 2 ;;
       --help) echo "Usage: $CLI_NAME upgrade restore --name NAME [--interactive|--all-compatible|--status|--history|--dry-run|--dismiss ITEM_ID]"; return 0 ;;
       *) die "Unknown upgrade restore option: $1" ;;
     esac
   done
   case "$policy" in mixed|latest|locked) ;; *) die "Invalid --restore-version-policy: $policy" ;; esac
+  modes=$((interactive + all + status_only + history + dry_run))
+  [ -z "$dismiss_id" ] || modes=$((modes + 1))
+  [ "$modes" -le 1 ] || die "Cannot combine upgrade restore modes"
+  if [ "$policy_set" -eq 1 ] && { [ "$status_only" -eq 1 ] || [ "$history" -eq 1 ] || [ "$dry_run" -eq 1 ] || [ -n "$dismiss_id" ]; }; then
+    die "--restore-version-policy requires a recovery installation"
+  fi
+  require_container
   [ -n "$name" ] || name="$(default_name "$DEFAULT_NAME_PREFIX")"
   container_exists "$name" || die "Container not found: $name"
-  ledger="$(recovery_ledger_json "$name")" || die "No upgrade recovery ledger found in $name"
-  if [ "$history" -eq 1 ]; then printf '%s' "$ledger" | jq -r '.records[] | [.record_id, .source_image, .target_image, .captured_at] | @tsv'; return 0; fi
+
+  cleanup_upgrade_restore() {
+    local exit_status="$?" cleanup_status=0
+    trap - EXIT HUP INT TERM
+    if [ "$temporary_start_attempted" -eq 1 ]; then
+      if container_running "$name"; then
+        echo "Stopping container: $name" >&2
+        ( remote_control_quiesce_preserving_desired "$name" ) || cleanup_status=1
+        ( stop_existing_container_safely "$name" ) >/dev/null || cleanup_status=1
+      fi
+      ( mcp_stop_managed "$name" ) || cleanup_status=1
+    fi
+    mcp_lock_release || cleanup_status=1
+    remote_control_lock_release || cleanup_status=1
+    if [ "$cleanup_status" -ne 0 ]; then
+      warn "Unable to finish recovery cleanup for $name; check its container and managed service state"
+      [ "$exit_status" -ne 0 ] || exit_status=1
+    fi
+    exit "$exit_status"
+  }
+  trap cleanup_upgrade_restore EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  remote_control_lock_acquire "$name" || die "Unable to lock Remote Control for upgrade recovery: $name"
+  mcp_lock_acquire "$name" || die "Unable to lock managed MCP for upgrade recovery: $name"
+  if ! container_running "$name"; then
+    if [ "$dry_run" -eq 1 ]; then
+      die "Container $name is stopped; dry-run will not start it. Start it first with: ${CLI_NAME} start --name $name"
+    fi
+    mcp_require_no_active_leases "$name" 'restore recovery state in'
+    echo "Starting container for upgrade recovery: $name" >&2
+    temporary_start_attempted=1
+    start_existing_container_managed "$name" 0 0 >/dev/null || die "Unable to start container for upgrade recovery: $name"
+    ensure_started_container_is_running "$name" "upgrade recovery" || die "Container startup failed for upgrade recovery: $name"
+  fi
+
+  if ! ledger="$(recovery_ledger_json "$name")"; then
+    presence="$("$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+      if [ -e "$1" ] || [ -L "$1" ]; then printf present; else printf missing; fi
+    ' sh "$RECOVERY_LEDGER_FILE")" || die "Unable to inspect upgrade recovery ledger in $name (container exec failed)"
+    [ "$presence" != missing ] || die "No upgrade recovery ledger found in $name"
+    die "Unable to read upgrade recovery ledger in $name (permission or container exec failure)"
+  fi
+  printf '%s' "$ledger" | jq -e '
+    type == "object" and .ledger_schema_version == 1
+    and ((.records // []) | type == "array") and (.plans | type == "array")
+    and all(.plans[]; (.actions | type == "array") and all(.actions[]; type == "object" and (.id | type == "string") and (.status | type == "string")))
+  ' >/dev/null 2>&1 || die "Invalid or unsupported upgrade recovery ledger in $name"
+  if [ "$history" -eq 1 ]; then printf '%s' "$ledger" | jq -r '.records[]? | [.record_id, .source_image, .target_image, .captured_at] | @tsv'; return 0; fi
   plan="$(printf '%s' "$ledger" | jq -c '.plans[-1] // empty')"
   [ -n "$plan" ] || die "No recovery plan found in $name"
   if [ -n "$dismiss_id" ]; then
-    if container_running "$name"; then was_running=1; else start_existing_container_safely "$name" >/dev/null; fi
+    printf '%s' "$plan" | jq -e --arg id "$dismiss_id" 'any(.actions[]; .id == $id)' >/dev/null \
+      || die "Recovery item not found: $dismiss_id"
     ledger="$(printf '%s' "$ledger" | jq -c --arg id "$dismiss_id" '(.plans[-1].actions[] | select(.id == $id) | .status) = "dismissed"')"
-    recovery_write_ledger "$name" "$ledger"
-    [ "$was_running" -eq 1 ] || stop_existing_container_safely "$name" >/dev/null
+    recovery_write_ledger "$name" "$ledger" || die "Unable to save upgrade recovery ledger in $name"
     echo "Dismissed recovery item: $dismiss_id" >&2
     return 0
   fi
   if [ "$status_only" -eq 1 ] || [ "$dry_run" -eq 1 ]; then recovery_print_plan "$plan"; return 0; fi
-  if container_running "$name"; then was_running=1; else start_existing_container_safely "$name" >/dev/null; fi
   if [ "$all" -eq 1 ]; then selected="$(recovery_selected_ids "$plan" all)"; else selected="$(recovery_selected_ids "$plan" interactive)"; fi
-  if [ -z "$selected" ]; then
-    recovery_print_summary "$plan"
-    if [ "$(recovery_unresolved_count "$plan")" -gt 0 ]; then
-      echo "Recovery deferred: $name" >&2
-    else
-      echo "Recovery already complete: $name" >&2
-    fi
-  else
-    local recovery_apply_status=0
+  if [ -n "$selected" ]; then
     recovery_apply_selected "$name" "$plan" "$selected" "$policy" || recovery_apply_status=$?
-    ledger="$(recovery_mark_action_results "$ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")"
-    recovery_write_ledger "$name" "$ledger"
-    local recovery_result_plan=""
-    recovery_result_plan="$(printf '%s' "$ledger" | jq -c '.plans[-1]')"
-    recovery_print_summary "$recovery_result_plan"
-    if [ "$recovery_apply_status" -ne 0 ]; then
-      warn "Some recovery actions failed; retry with: ${CLI_NAME} upgrade restore --name $name --interactive"
-    elif [ "$(recovery_unresolved_count "$recovery_result_plan")" -gt 0 ]; then
-      echo "Recovery has deferred actions. Resume with: ${CLI_NAME} upgrade restore --name $name --interactive" >&2
-    fi
+    ledger="$(recovery_mark_action_results "$ledger" "$RECOVERY_RESTORED_IDS" "$RECOVERY_FAILED_IDS")" \
+      || die "Unable to update upgrade recovery results in $name"
+    recovery_write_ledger "$name" "$ledger" || die "Unable to save upgrade recovery ledger in $name"
+    plan="$(printf '%s' "$ledger" | jq -c '.plans[-1]')"
+  elif [ "$(recovery_unresolved_count "$plan")" -eq 0 ]; then
+    echo "Recovery already complete: $name" >&2
   fi
-  [ "$was_running" -eq 1 ] || stop_existing_container_safely "$name" >/dev/null
-}
+  recovery_print_summary "$plan"
+  recovery_report_outstanding "$name" "$plan"
+  [ "$recovery_apply_status" -eq 0 ] || return 1
+  return 0
+)
 
 rescue_cmd() {
   local image=""
