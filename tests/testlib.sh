@@ -116,11 +116,11 @@ register_dir_cleanup() {
 }
 
 container_exists() {
-  "$CONTAINER_CMD" ls -a 2>/dev/null | grep -q -E "(^|[[:space:]])$1([[:space:]]|$)"
+  "$CONTAINER_CMD" ls -a 2>/dev/null | grep -E "(^|[[:space:]])$1([[:space:]]|$)" >/dev/null
 }
 
 container_running() {
-  "$CONTAINER_CMD" ls 2>/dev/null | grep -q -E "(^|[[:space:]])$1([[:space:]]|$)"
+  "$CONTAINER_CMD" ls 2>/dev/null | grep -E "(^|[[:space:]])$1([[:space:]]|$)" >/dev/null
 }
 
 snapshot_container_names() {
@@ -201,9 +201,11 @@ assert_status() {
   fi
 }
 
+# Consume the whole stream: grep -q can close the pipe early and make
+# printf fail with SIGPIPE under pipefail, reversing assertion results.
 assert_contains() {
   local needle="$1"
-  if ! printf '%s' "$RUN_OUTPUT" | grep -Fq -- "$needle"; then
+  if ! printf '%s' "$RUN_OUTPUT" | grep -F -- "$needle" >/dev/null; then
     printf '%s\n' "$RUN_OUTPUT" >&2
     fail "Expected output to contain: $needle"
   fi
@@ -211,7 +213,7 @@ assert_contains() {
 
 assert_not_contains() {
   local needle="$1"
-  if printf '%s' "$RUN_OUTPUT" | grep -Fq -- "$needle"; then
+  if printf '%s' "$RUN_OUTPUT" | grep -F -- "$needle" >/dev/null; then
     printf '%s\n' "$RUN_OUTPUT" >&2
     fail "Did not expect output to contain: $needle"
   fi
@@ -219,7 +221,7 @@ assert_not_contains() {
 
 assert_matches() {
   local pattern="$1"
-  if ! printf '%s' "$RUN_OUTPUT" | grep -Eq -- "$pattern"; then
+  if ! printf '%s' "$RUN_OUTPUT" | grep -E -- "$pattern" >/dev/null; then
     printf '%s\n' "$RUN_OUTPUT" >&2
     fail "Expected output to match regex: $pattern"
   fi
@@ -275,7 +277,7 @@ cleanup() {
   done
 
   for name in $CLEANUP_RAW_CONTAINERS; do
-    if "$CONTAINER_CMD" ls 2>/dev/null | grep -q -E "(^|[[:space:]])$name([[:space:]]|$)"; then
+    if "$CONTAINER_CMD" ls 2>/dev/null | grep -E "(^|[[:space:]])$name([[:space:]]|$)" >/dev/null; then
       cleanup_log="$(mktemp "${TMPDIR:-/tmp}/agentctl-cleanup.XXXXXX")"
       if ! "$CONTAINER_CMD" stop "$name" >"$cleanup_log" 2>&1; then
         printf '[test] cleanup failed stopping raw container %s:\n' "$name" >&2
@@ -283,7 +285,7 @@ cleanup() {
       fi
       rm -f "$cleanup_log" >/dev/null 2>&1 || true
     fi
-    if "$CONTAINER_CMD" ls -a 2>/dev/null | grep -q -E "(^|[[:space:]])$name([[:space:]]|$)"; then
+    if "$CONTAINER_CMD" ls -a 2>/dev/null | grep -E "(^|[[:space:]])$name([[:space:]]|$)" >/dev/null; then
       cleanup_log="$(mktemp "${TMPDIR:-/tmp}/agentctl-cleanup.XXXXXX")"
       if ! "$CONTAINER_CMD" rm "$name" >"$cleanup_log" 2>&1; then
         printf '[test] cleanup failed removing raw container %s:\n' "$name" >&2

@@ -16146,6 +16146,57 @@ test_upgrade_recovery_reports_export_capture_limitations() {
   ' >/dev/null || fail "Expected explicit manual recovery items for stopped export limitations, got: $RUN_OUTPUT"
 }
 
+test_shared_assertions_handle_long_output() {
+  begin_test "shared assertions preserve results with long output and early matches"
+  local long_output="" status=0 assertion=""
+  long_output="$(awk 'BEGIN { print "early.literal[42]"; for (i=0; i<32768; i++) print "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789--"; print "last-marker" }')"
+  RUN_OUTPUT="$long_output"
+  assert_contains 'early.literal[42]'
+  assert_contains 'last-marker'
+  assert_matches '^early[.]literal\[42\]$'
+  assert_not_contains 'absent-marker'
+  assert_not_contains 'earlyXliteral4'
+  for assertion in contains_missing regex_missing negative_match; do
+    status=0
+    (
+      case "$assertion" in
+        contains_missing) assert_contains 'absent-marker' ;;
+        regex_missing) assert_matches '^absent-marker$' ;;
+        negative_match) assert_not_contains 'early.literal[42]' ;;
+      esac
+    ) >/dev/null 2>&1 || status=$?
+    [ "$status" -eq 1 ] || fail "Expected $assertion to fail, got $status"
+  done
+  RUN_OUTPUT='-leading-option'
+  assert_contains '-leading-option'
+  assert_matches '^-leading-option$'
+  RUN_OUTPUT=''
+  assert_not_contains 'absent-marker'
+  status=0
+  (assert_matches '^$') >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 1 ] || fail "Empty output must not acquire a synthetic blank line"
+}
+
+test_shared_container_checks_drain_long_output() {
+  begin_test "shared container checks consume long listings and preserve producer failures"
+  local fixture="" status=0 previous_container_cmd="$CONTAINER_CMD"
+  fixture="$(mktemp "${TMPDIR:-/tmp}/agentctl-listing.XXXXXX")"
+  register_dir_cleanup "$fixture"
+  awk 'BEGIN { print "fixture running"; for (i=0; i<32768; i++) print "another-container running padding-padding-padding-padding-padding" }' >"$fixture"
+  CONTAINER_CMD=unit_container_listing
+  unit_container_listing() { cat "$fixture"; }
+  container_exists fixture || fail "Lost existing container in long listing"
+  container_running fixture || fail "Lost running container in long listing"
+  if container_exists absent; then fail "Found an absent container"; fi
+  if container_running absent; then fail "Found an absent running container"; fi
+  unit_container_listing() { cat "$fixture"; return 7; }
+  status=0
+  container_exists fixture || status=$?
+  [ "$status" -eq 7 ] || fail "Lost listing command failure: $status"
+  CONTAINER_CMD="$previous_container_cmd"
+  unset -f unit_container_listing
+}
+
 test_upgrade_completion_test_helpers() {
   begin_test "upgrade completion assertions accept deferred recovery but reject failures"
   local completion="" output="" status=0
@@ -16186,6 +16237,8 @@ main() {
     log "Running unit tests from: $TEST_START_FROM"
   fi
 
+  run_selected_test test_shared_assertions_handle_long_output "test_shared_assertions_handle_long_output"
+  run_selected_test test_shared_container_checks_drain_long_output "test_shared_container_checks_drain_long_output"
   run_selected_test test_upgrade_completion_test_helpers "test_upgrade_completion_test_helpers"
   run_selected_test test_run_config_wires_runtime_config_json "test_run_config_wires_runtime_config_json"
   run_selected_test test_run_cmd_wires_ollama_host_to_custom_command "test_run_cmd_wires_ollama_host_to_custom_command"
