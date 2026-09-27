@@ -150,6 +150,18 @@ To preview the plan before recreating anything:
 agentctl upgrade --name my-project --new-name my-project-renamed --workdir /new/path/to/project --dry-run
 ```
 
+For a stopped source, dry-run reads container/image metadata and host
+configuration without starting containers, creating temporary image containers,
+or exporting the filesystem. Installed packages, runtimes, and features are
+reported as not inspected; recovery details are determined during the actual
+upgrade. Inherited SSH forwarding is shown, but the installed SSH client feature
+is unknown until source state can be inspected. Explicit `--ssh` still previews
+ensuring that feature is installed.
+
+A missing managed MCP relay socket is normal while the source is stopped and
+does not prevent the preview. Invalid user-managed sockets, workdirs, target
+images, and published-socket conflicts still report configuration errors.
+
 ## What Upgrade Preserves
 
 `upgrade` keeps the `/workdir` mount and named-container identity by default
@@ -216,20 +228,44 @@ agentctl upgrade restore --name my-project --dry-run
 agentctl upgrade restore --name my-project --all-compatible
 ```
 
-`--dry-run` prints the saved plan without changing the container.
+Status, history, dismissal, and restoration temporarily start a stopped container
+using its managed MCP setup, then return it to its stopped state. A container
+that was already running stays running. Startup, ledger read, and invalid-ledger
+errors are reported separately from a missing recovery ledger.
+
+`--dry-run` prints the saved plan without changing the container. If the
+container is stopped, it reports that you must start it first; dry-run never
+starts it automatically. Inspection and installation modes cannot be combined.
 `--all-compatible` restores its default-compatible items without a prompt. To
 permanently skip one item, use `agentctl upgrade restore --name my-project
 --dismiss ITEM_ID`; use `--status` or `--dry-run` to obtain its item ID.
 
-Selected DPKG packages are restored with one `apt-get update` and one batched
-`apt-get install` transaction. Selected APK packages are likewise passed to one
-`apk add` transaction. If a batch command fails after installing only some
+Selected DPKG packages are checked against APT metadata after one `apt-get
+update`. Available requests are restored in one batched `apt-get install`
+transaction. Unavailable names or locked versions remain failed, with a warning
+identifying each request, but do not block the available subset. No package
+replacement is guessed and no failed request is automatically dismissed.
+Retries check availability again. Metadata update or inspection failures stop
+the DPKG installation attempt instead of treating packages as unavailable.
+
+Selected APK packages are passed to one `apk add` transaction. If a batch command fails after installing only some
 packages, agentctl checks each requested package and records its individual
 restored or failed state in the recovery ledger. For a failed DPKG transaction,
 an already-installed dependency is considered restored only when it is also
 marked as manually requested; locked recovery also verifies the exact captured
-version. Each recovery attempt ends with restored, failed, and deferred counts;
-retry guidance is printed only while unresolved actions remain.
+version. Each recovery attempt ends with restored, failed, and deferred counts
+from the saved plan, including failures from earlier attempts. Follow-up messages
+distinguish failed actions from deferred actions. For an unavailable request,
+review the target repositories or explicitly dismiss the item if it is obsolete;
+retrying an unchanged request may fail again.
+
+Successful container recreation still returns exit status 0 when recovery is
+incomplete, but the final upgrade/copy message explicitly says `recovery
+incomplete` and includes the failed/deferred counts. Standalone `upgrade restore`
+returns status 1 if a selected action fails, after saving its results and
+cleaning up its temporary startup. Successful selected actions return 0 even
+when unselected failures remain in the saved plan. Inspection returns 0 when
+the inspection succeeds; operational errors return nonzero.
 
 Tagged APK packages are not selected by `--restore` or `--all-compatible` when
 their repository is absent from the target. Use interactive recovery to review

@@ -494,7 +494,7 @@ test_upgrade_no_backup_preserves_state() {
   run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
   assert_status 0
   assert_contains "Skipping backup image export for $name"
-  assert_contains "Upgrade complete: $name (backup skipped)"
+  assert_upgrade_complete "$name (backup skipped)"
 
   if [ -n "$(list_backup_images "$backup_base")" ]; then
     printf '%s\n' "$(list_backup_images "$backup_base")" >&2
@@ -569,7 +569,7 @@ printf "AGENTCTL_COMMUNITY_REPOSITORY=%s\n" "$community_repository"
 
   run_capture "$AGENTCTL" upgrade --name "$name" --image agent-plain --no-backup
   assert_status 0
-  assert_contains "Upgrade complete: $name (backup skipped)"
+  assert_contains "Upgrade complete; recovery incomplete (0 failed, 4 deferred): $name (backup skipped)"
   assert_contains "Upgrade recovery will offer 2 top-level apk package(s)"
   assert_contains "Recovery summary: 0 restored, 0 failed, 4 deferred."
   assert_not_contains "Manual package recovery remains unresolved"
@@ -630,6 +630,62 @@ dpkg -s sqlite3 >/dev/null
   assert_status 0
 }
 
+test_upgrade_recovery_unavailable_dpkg_and_stopped_status() {
+  begin_test "upgrade recovery skips unavailable DPKG requests and preserves stopped state"
+  local name workdir ledger
+  name="$(unique_name upgrade-dpkg-unavailable)"
+  workdir="$(new_workdir)"
+  register_container_cleanup "$name"
+  run_capture "$AGENTCTL" run --name "$name" --image agent-swift --workdir "$workdir" --cmd true
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  ledger='{"ledger_schema_version":1,"records":[],"plans":[{"plan_schema_version":1,"actions":[{"id":"os:dpkg:tree","kind":"os-package","provider":"dpkg","name":"tree","status":"pending","default_selected":true},{"id":"os:dpkg:agentctl-test-nonexistent-recovery-package","kind":"os-package","provider":"dpkg","name":"agentctl-test-nonexistent-recovery-package","status":"pending","default_selected":true}]}]}'
+  run_capture "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
+set -e
+if dpkg -s tree >/dev/null 2>&1; then echo "Fixture requires tree to be absent" >&2; exit 1; fi
+mkdir -p /home/coder/.config/agentctl/upgrade-recovery
+printf "%s\n" "$1" >/home/coder/.config/agentctl/upgrade-recovery/ledger.json
+chown -R coder:coder /home/coder/.config/agentctl/upgrade-recovery
+chmod 600 /home/coder/.config/agentctl/upgrade-recovery/ledger.json
+' sh "$ledger"
+  assert_status 0
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" upgrade restore --name "$name" --status
+  assert_status 0
+  assert_contains 'Upgrade recovery plan'
+  assert_contains "Starting container for upgrade recovery: $name"
+  container_running "$name" && fail "Recovery status left the container running"
+  run_capture "$AGENTCTL" upgrade restore --name "$name" --dry-run
+  assert_status 1
+  assert_contains 'dry-run will not start it'
+  container_running "$name" && fail "Recovery dry-run started the container"
+
+  run_capture "$AGENTCTL" upgrade restore --name "$name" --all-compatible
+  assert_status 1
+  assert_contains 'Restoring 1 DPKG package(s) in one transaction.'
+  assert_contains 'Unavailable DPKG request: agentctl-test-nonexistent-recovery-package'
+  assert_contains 'Recovery summary: 1 restored, 1 failed, 0 deferred.'
+  assert_not_contains 'deferred action(s)'
+  container_running "$name" && fail "Failed recovery left the container running"
+  run_capture "$AGENTCTL" upgrade restore --name "$name" --status
+  assert_status 0
+  assert_contains 'os-package: tree [restored]'
+  assert_contains 'os-package: agentctl-test-nonexistent-recovery-package [failed]'
+  run_capture "$AGENTCTL" upgrade restore --name "$name" --dismiss os:dpkg:agentctl-test-nonexistent-recovery-package
+  assert_status 0
+  container_running "$name" && fail "Dismiss left the container running"
+  run_capture "$AGENTCTL" upgrade restore --name "$name" --all-compatible
+  assert_status 0
+  assert_contains 'Recovery already complete'
+  assert_not_contains 'incomplete'
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" exec "$name" sh -c 'dpkg -s tree >/dev/null && apt-mark showmanual | grep -Fx tree'
+  assert_status 0
+}
+
 test_upgrade_with_backup_creates_recovery_image() {
   begin_test "upgrade creates a backup image by default"
   local name
@@ -648,6 +704,7 @@ test_upgrade_with_backup_creates_recovery_image() {
   backup_image="$(extract_backup_image)"
   [ -n "$backup_image" ] || fail "Could not parse backup image name from upgrade output"
   register_backup_cleanup "$backup_image"
+  assert_upgrade_complete "$name (backup image: $backup_image)"
 
   if ! image_exists "$backup_image"; then
     printf '%s\n' "$RUN_OUTPUT" >&2
@@ -700,7 +757,7 @@ chown -R coder:coder /home/coder
 
   run_capture "$AGENTCTL" upgrade --name "$name" --image agent-python --mem 4G --backup-image "$backup_image"
   assert_status 0
-  assert_contains "Upgrade complete: $name (backup image: $backup_image)"
+  assert_upgrade_complete "$name (backup image: $backup_image)"
 
   if ! container_running "$name"; then
     run_capture "$AGENTCTL" start --name "$name"
@@ -834,7 +891,7 @@ test_upgrade_overwrite_config_restores_image_defaults() {
   run_capture "$AGENTCTL" upgrade --name "$name" --overwrite-config --no-backup
   assert_status 0
   assert_contains "Overwriting config.toml, default profiles, local_models.json in ~/.codex/ and recreating ~/.codex/AGENTS.md in $name"
-  assert_contains "Upgrade complete: $name (backup skipped)"
+  assert_upgrade_complete "$name (backup skipped)"
 
   run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc 'if diff -q /etc/agentctl/codex/config.toml /home/coder/.codex/config.toml && diff -q /etc/agentctl/codex/gpt-oss.config.toml /home/coder/.codex/gpt-oss.config.toml && diff -q /etc/agentctl/codex/local_models.json /home/coder/.codex/local_models.json && test -L /home/coder/.codex/AGENTS.md && [ "$(readlink /home/coder/.codex/AGENTS.md)" = "/etc/agentctl/image.md" ]; then echo overwrite-config-ok; else exit 1; fi'
   assert_status 0
@@ -1189,6 +1246,7 @@ PY
 test_managed_mcp_bridge_lifecycle() {
   begin_test "managed MCP bridge exchanges traffic and survives start, restart, upgrade, and disable"
   local name workdir marker node_path definition added_definition replacement_definition registry port debug_dir http_pid http_port_file http_port credential token rotated_token expected_auth_file
+  local dry_run_containers_before dry_run_containers_after dry_run_inspect_before dry_run_inspect_after
 
   command -v node >/dev/null 2>&1 || fail "managed MCP integration test requires host Node.js"
   name="$(unique_name managed-mcp)"
@@ -1468,12 +1526,45 @@ jq -e ".error == \"MCP server is not configured: added\"" "$response_file" >/dev
   run_capture "$AGENTCTL" doctor --host
   assert_contains "Container $name"
   assert_contains "host relay inactive because the container is stopped"
+  log "managed-mcp: previewing an upgrade without starting the stopped source or relay"
+  dry_run_containers_before="$("$CONTAINER_CMD" ls -a --quiet | sort)"
+  dry_run_inspect_before="$("$CONTAINER_CMD" inspect "$name" | jq -cS .)"
+  run_capture "$AGENTCTL" upgrade --name "$name" --dry-run
+  assert_status 0
+  assert_contains 'Installed packages, runtimes, and features were not inspected because the source is stopped'
+  assert_contains 'Dry run complete: no container changes applied'
+  assert_not_contains 'Unable to inspect installed OS packages'
+  assert_not_contains 'not running'
+  assert_not_contains 'not a Unix socket'
+  container_running "$name" && fail "Upgrade dry-run started the source container"
+  dry_run_containers_after="$("$CONTAINER_CMD" ls -a --quiet | sort)"
+  dry_run_inspect_after="$("$CONTAINER_CMD" inspect "$name" | jq -cS .)"
+  [ "$dry_run_containers_before" = "$dry_run_containers_after" ] || fail "Dry-run changed the container inventory"
+  [ "$dry_run_inspect_before" = "$dry_run_inspect_after" ] || fail "Dry-run changed source container metadata"
+  [ "$(wc -l <"$marker" | tr -d ' ')" = "$starts_before_doctor" ] || fail "Dry-run started an MCP child"
+  run_capture "$AGENTCTL" doctor --host
+  assert_contains "Container $name"
+  assert_contains 'host relay inactive because the container is stopped'
   log "managed-mcp: replacing definitions during stopped-container upgrade"
   starts_before_doctor="$(wc -l <"$marker" | tr -d ' ')"
   port=48124
   run_capture "$AGENTCTL" upgrade --name "$name" --no-backup --mcp-port "$port" --mcp "$replacement_definition"
   assert_status 0
   [ "$(wc -l <"$marker" | tr -d ' ')" = "$starts_before_doctor" ] || fail "Stopped MCP upgrade preflight unexpectedly started the MCP child"
+
+  log "managed-mcp: inspecting recovery in a stopped container with an expired relay socket"
+  run_capture "$AGENTCTL" upgrade restore --name "$name" --status
+  assert_status 0
+  assert_contains 'Upgrade recovery plan'
+  assert_contains "Starting container for upgrade recovery: $name"
+  container_running "$name" && fail "Recovery status did not restore stopped MCP container state"
+  run_capture "$AGENTCTL" upgrade restore --name "$name" --history
+  assert_status 0
+  container_running "$name" && fail "Recovery history did not restore stopped MCP container state"
+  run_capture "$AGENTCTL" doctor --host
+  assert_contains "Container $name"
+  assert_contains 'host relay inactive because the container is stopped'
+  [ "$(wc -l <"$marker" | tr -d ' ')" = "$starts_before_doctor" ] || fail "Recovery inspection unexpectedly started the MCP child"
   run_capture "$AGENTCTL" start --name "$name"
   assert_status 0
   run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -lc '
@@ -1962,6 +2053,7 @@ main() {
   run_selected_test test_images_prune_preserves_container_referenced_digest "images prune preserves every ref for a stopped container digest" full
   run_selected_test test_upgrade_no_backup_preserves_state "upgrade --no-backup preserves state without creating backup images" full
   run_selected_test test_upgrade_restores_tagged_apk_packages_through_recovery "upgrade defers and restores tagged APK packages through recovery" full
+  run_selected_test test_upgrade_recovery_unavailable_dpkg_and_stopped_status "upgrade recovery skips unavailable DPKG requests and preserves stopped state" full
   run_selected_test test_upgrade_batches_dpkg_recovery "upgrade restores DPKG packages in one recovery transaction" full
   run_selected_test test_upgrade_with_backup_creates_recovery_image "upgrade creates a backup image by default" full
   run_selected_test test_upgrade_backup_restores_home_and_boots_rescue_image "upgrade backup restores home state and creates a bootable full-rootfs rescue image" full

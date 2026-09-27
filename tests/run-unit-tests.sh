@@ -4462,11 +4462,11 @@ test_bootstrap_cmd_bootstraps_alpine_container_and_restores_stopped_state() {
   assert_contains "Bootstrap complete: unit-bootstrap-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "apk add --no-cache bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm" || fail "Expected root bootstrap install commands"
-  printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
-  printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/runtimes.d" || fail "Expected bootstrap to install runtime manifests"
-  printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/features.d" || fail "Expected bootstrap to install feature manifests"
-  printf '%s\n' "$exec_log" | grep -Fq "file:/etc/agentctl/image.md" || fail "Expected bootstrap to install image metadata"
+  grep -Fq "apk add --no-cache bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm" <<<"$exec_log" || fail "Expected root bootstrap install commands"
+  grep -Fq "file:/usr/local/bin/agent.sh" <<<"$exec_log" || fail "Expected bootstrap to install agent.sh"
+  grep -Fq "tree:/etc/agentctl/runtimes.d" <<<"$exec_log" || fail "Expected bootstrap to install runtime manifests"
+  grep -Fq "tree:/etc/agentctl/features.d" <<<"$exec_log" || fail "Expected bootstrap to install feature manifests"
+  grep -Fq "file:/etc/agentctl/image.md" <<<"$exec_log" || fail "Expected bootstrap to install image metadata"
 }
 
 test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
@@ -4546,7 +4546,7 @@ test_bootstrap_cmd_creates_and_bootstraps_new_alpine_container() {
   printf '%s\n' "$create_log" | grep -Fq -- "--publish-socket $published_path:/run/bootstrap-service.sock" \
     || fail "Expected create to include the exact published socket mapping"
   printf '%s\n' "$create_log" | grep -Fq -- "docker.io/library/alpine:latest sh -c sleep infinity" || fail "Expected create to use requested image"
-  printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
+  grep -Fq "file:/usr/local/bin/agent.sh" <<<"$exec_log" || fail "Expected bootstrap to install agent.sh"
 }
 
 test_bootstrap_cmd_bootstraps_apt_container() {
@@ -4598,10 +4598,10 @@ test_bootstrap_cmd_bootstraps_apt_container() {
   assert_contains "Bootstrap complete: unit-bootstrap-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "apt-get install -y --no-install-recommends bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm ca-certificates" || fail "Expected apt bootstrap install commands"
-  printf '%s\n' "$exec_log" | grep -Fq "file:/usr/local/bin/agent.sh" || fail "Expected bootstrap to install agent.sh"
-  printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/runtimes.d" || fail "Expected bootstrap to install runtime manifests"
-  printf '%s\n' "$exec_log" | grep -Fq "tree:/etc/agentctl/features.d" || fail "Expected bootstrap to install feature manifests"
+  grep -Fq "apt-get install -y --no-install-recommends bash zsh file curl git ripgrep jq util-linux bubblewrap nodejs npm ca-certificates" <<<"$exec_log" || fail "Expected apt bootstrap install commands"
+  grep -Fq "file:/usr/local/bin/agent.sh" <<<"$exec_log" || fail "Expected bootstrap to install agent.sh"
+  grep -Fq "tree:/etc/agentctl/runtimes.d" <<<"$exec_log" || fail "Expected bootstrap to install runtime manifests"
+  grep -Fq "tree:/etc/agentctl/features.d" <<<"$exec_log" || fail "Expected bootstrap to install feature manifests"
 }
 
 test_bootstrap_cmd_rejects_unsupported_base() {
@@ -11322,7 +11322,7 @@ test_upgrade_uses_explicit_resource_overrides() {
 
   run_capture upgrade_cmd --name unit-test-container --cpu 6 --mem 12G --shm-size 2GiB
   assert_status 0
-  assert_contains "Upgrade complete: unit-test-container (backup image: unit-test-container-backup-20260406120000)"
+  assert_contains "Upgrade complete; recovery incomplete (ledger unavailable): unit-test-container (backup image: unit-test-container-backup-20260406120000)"
   assert_contains $'Starting container for state backup: unit-test-container\n\nBacking up user state from unit-test-container'
   assert_contains $'Stopping container: unit-test-container\n\nExporting container state to image: unit-test-container-backup-20260406120000'
   assert_contains $'Exporting container state to image: unit-test-container-backup-20260406120000\n\nRemoving container: unit-test-container'
@@ -11430,7 +11430,7 @@ test_upgrade_can_rename_container_during_recreation() {
   assert_contains "Recreating container: renamed-container"
   assert_contains "Starting container: renamed-container"
   assert_contains "Restoring user state into renamed-container"
-  assert_contains "Upgrade complete: renamed-container (backup skipped)"
+  assert_contains "Upgrade complete; recovery incomplete (ledger unavailable): renamed-container (backup skipped)"
   assert_contains "run --name renamed-container --reset-config"
   printf '%s\n' "$create_args" | grep -F -- "--name renamed-container" >/dev/null || fail "Expected create args to include renamed container, got: $create_args"
   printf '%s\n' "$rm_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected removal of source container, got: $rm_log"
@@ -11609,7 +11609,7 @@ test_upgrade_copy_keeps_running_source_container() {
   assert_contains "Creating copy: copied-container"
   assert_contains "Starting container: copied-container"
   assert_contains "Restoring user state into copied-container"
-  assert_contains "Copy complete: copied-container (source preserved)"
+  assert_contains "Copy complete; recovery incomplete (ledger unavailable): copied-container (source preserved)"
   printf '%s\n' "$create_args" | grep -F -- "--name copied-container" >/dev/null || fail "Expected create args to include copied container, got: $create_args"
   printf '%s\n' "$create_args" | grep -F -- "--network services,mtu=1400" >/dev/null \
     || fail "Expected copy to preserve network and MTU, got: $create_args"
@@ -11719,7 +11719,7 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
   run_capture upgrade_cmd --name unit-test-container --new-name renamed-container --image agent-python --workdir "$TEST_ROOT" --dry-run --unmount-socket /run/services/old.sock
   assert_status 0
   assert_contains "Preparing upgrade preflight: unit-test-container -> renamed-container"
-  assert_contains "Warning: Skipping package-loss warning because original /workdir source does not exist and unit-test-container is stopped"
+  assert_contains "Installed packages, runtimes, and features were not inspected because the source is stopped"
   assert_contains "Dry run: upgrade plan for unit-test-container -> renamed-container"
   assert_contains "  Source image: agent-python"
   assert_contains "  Target image: agent-python"
@@ -11820,46 +11820,122 @@ test_upgrade_copy_dry_run_reports_copy_plan() {
 }
 
 test_upgrade_stopped_dry_run_does_not_start_source() {
-  begin_test "upgrade stopped-source dry-run never starts or stops the source"
-
+  begin_test "stopped upgrade previews skip live and temporary-image inspection, including MCP and SSH"
   load_agentctl_functions
-
-  require_container() { return 0; }
-  default_name() { printf 'unit-test-container\n'; }
-  require_container_backup_support() { return 0; }
-  warn_upgrade_package_loss() { :; }
-  upgrade_added_runtimes_json() { printf '[]\n'; }
-  upgrade_added_features_json() { printf '[]\n'; }
-  image_system_manifest_json() { return 1; }
-  container_exists() { [ "$1" = "unit-test-container" ]; }
+  local dry_dir dry_workdir dry_ssh=false dry_published='' dry_mcp=0 dry_user_socket=0
+  # Keep socket fixtures below the macOS Unix-socket path limit even when a
+  # preceding test has supplied a long TMPDIR.
+  dry_dir="$(mktemp -d /tmp/agentctl-dry.XXXXXX)"
+  register_dir_cleanup "$dry_dir"
+  dry_workdir="$TEST_ROOT"
+  : >"$dry_dir/forbidden"
+  require_container() { :; }
+  require_container_backup_support() { :; }
+  require_container_ssh_support() { :; }
+  require_host_ssh_socket() { :; }
+  host_ssh_socket_available() { return 0; }
+  container_exists() { [ "$1" = unit-test-container ]; }
   container_running() { return 1; }
-  image_exists() { return 0; }
-  container_extra_mount_text() { :; }
-  container_socket_mounts() { :; }
-  container_published_sockets() { :; }
+  image_exists() { case "$1" in missing-image*) return 1 ;; *) return 0 ;; esac; }
+  container_published_sockets() { printf '%s' "$dry_published"; }
   container_shm_size() { :; }
-  container_ssh_enabled() { printf 'false\n'; }
+  container_ssh_enabled() { printf '%s\n' "$dry_ssh"; }
   container_network_specs() { printf 'default\n'; }
   validate_network_selection() { :; }
-  collect_upgrade_container_preflight() { fail "dry-run must not collect an exec-based stopped-source preflight"; }
-  sanitize_image_name() { printf '%s\n' "$1"; }
-  trap() { :; }
-
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
+  mcp_require_no_active_leases() { :; }
+  mcp_registry_path() { printf '%s/registry.json\n' "$dry_dir"; }
+  mcp_socket_path() { printf '%s/absent-mcp.sock\n' "$dry_dir"; }
+  mcp_start_from_registry() { printf 'mcp-start\n' >>"$dry_dir/forbidden"; return 1; }
+  mcp_stop_managed() { printf 'mcp-stop\n' >>"$dry_dir/forbidden"; return 1; }
+  recovery_write_ledger() { printf 'ledger-write\n' >>"$dry_dir/forbidden"; return 1; }
   CONTAINER_CMD=container
   container() {
     case "$1" in
-      inspect) printf '{}\n' ;;
-      start|stop) fail "dry-run must not mutate stopped source lifecycle: $*" ;;
-      *) fail "Unexpected container invocation: $*" ;;
+      inspect)
+        jq -cn --arg root "$dry_dir" --argjson mcp "$dry_mcp" --argjson user "$dry_user_socket" \
+          '[{configuration:{mounts:([if $mcp == 1 then {source:($root+"/absent-mcp.sock"),destination:"/run/agentctl/mcp-host.sock"} else empty end] + [if $user == 1 then {source:($root+"/absent-user.sock"),destination:"/run/user.sock"} else empty end])}}]'
+        ;;
+      *) printf '%s\n' "$*" >>"$dry_dir/forbidden"; return 1 ;;
     esac
   }
   container_upgrade_info() {
-    printf 'agent-python:latest\t%s\trw\t2\t4G\n' "$TEST_ROOT"
+    printf 'agent-python:latest\t%s\trw\t2\t4G\n' "$dry_workdir"
   }
+  # Keep the real package/runtime/feature/image helpers. Their swallowed failures
+  # must still fail the test through the file-backed forbidden-operation log.
+  preview_upgrade() { ( upgrade_cmd --name unit-test-container --dry-run "$@" ); }
 
-  run_capture upgrade_cmd --name unit-test-container --image agent-python --dry-run
+  run_capture preview_upgrade --image agent-python
   assert_status 0
-  assert_contains "Dry run complete: no container changes applied"
+  assert_contains 'Installed packages, runtimes, and features were not inspected because the source is stopped'
+  assert_contains 'Config backup: start the stopped source container'
+  assert_contains 'Dry run complete: no container changes applied'
+
+  dry_mcp=1
+  printf '%s\n' '{"schema_version":2,"port":47123,"servers":[]}' >"$dry_dir/registry.json"
+  chmod 600 "$dry_dir/registry.json"
+  run_capture preview_upgrade --image agent-swift --no-backup
+  assert_status 0
+  assert_contains 'MCP bridge: current=1 target=1'
+  assert_contains 'Backup image: skipped (--no-backup)'
+  assert_not_contains 'Unable to inspect'
+  assert_not_contains 'not running'
+  run_capture preview_upgrade --new-name copied-container --copy --image agent-swift
+  assert_status 0
+  assert_contains 'Actions: keep unit-test-container and create copied-container as a copy'
+
+  dry_ssh=true
+  run_capture preview_upgrade
+  assert_status 0
+  assert_contains 'SSH client feature: unknown (source stopped)'
+  assert_not_contains 'SSH client feature: ensure installed'
+  run_capture preview_upgrade --ssh
+  assert_status 0
+  assert_contains 'SSH client feature: ensure installed'
+  assert_not_contains 'SSH client feature: unknown'
+  run_capture preview_upgrade --no-ssh
+  assert_status 0
+  assert_contains 'SSH forwarding: enabled -> disabled'
+  assert_not_contains 'SSH client feature:'
+
+  dry_workdir="$dry_dir/missing-workdir"
+  run_capture preview_upgrade --workdir "$TEST_ROOT"
+  assert_status 0
+  assert_contains 'Config backup: export existing container filesystem'
+  assert_contains 'SSH client feature: unknown (source stopped)'
+  dry_workdir="$TEST_ROOT"
+  dry_published="$dry_dir/published.sock"$'\t'"/run/published.sock"
+  run_capture preview_upgrade --unpublish-socket "$dry_dir/published.sock"
+  assert_status 0
+  assert_contains 'Config backup: export existing container filesystem'
+  assert_contains 'SSH client feature: unknown (source stopped)'
+  dry_published=''
+
+  run_capture preview_upgrade --image missing-image
+  assert_status 1
+  assert_contains 'Image not found'
+  dry_workdir="$dry_dir/missing-workdir"
+  run_capture preview_upgrade
+  assert_status 1
+  assert_contains 'Preserved /workdir source does not exist'
+  dry_workdir="$TEST_ROOT"
+  dry_user_socket=1
+  run_capture preview_upgrade
+  assert_status 1
+  assert_contains 'Cannot preserve extra mount'
+  dry_user_socket=0
+  dry_published="$dry_dir/published.sock"$'\t'"/run/published.sock"
+  : >"$dry_dir/published.sock"
+  run_capture preview_upgrade
+  assert_status 1
+  assert_contains 'occupied published socket host path'
+  [ ! -s "$dry_dir/forbidden" ] || fail "Dry-run performed forbidden operations: $(cat "$dry_dir/forbidden")"
+  [ ! -e "$dry_dir/absent-mcp.sock" ] || fail "Dry-run created the managed MCP socket"
+  unset -f preview_upgrade
 }
 
 test_upgrade_warns_about_added_packages_missing_from_target_image() {
@@ -11961,7 +12037,7 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
   assert_contains "su-exec --name unit-test-container apt-get install -y tree"
   assert_not_contains "  - curl"
   assert_not_contains "  - bash"
-  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  assert_contains "Upgrade complete; recovery incomplete (ledger unavailable): unit-test-container (backup skipped)"
   assert_contains "Manual package recovery remains unresolved:"
   [ "$(printf '%s\n' "$RUN_OUTPUT" | grep -Fc "su-exec --name unit-test-container apt-get update")" -eq 1 ] \
     || fail "Expected one final apt-get update instruction"
@@ -12201,7 +12277,7 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   persist_container_system_manifest_baseline_from_image() { :; }
   recovery_prepare_upgrade() { printf '{"ledger_schema_version":1,"records":[{"record_id":"source","system":{"package_manager":"apk","installed_runtimes":["codex","claude"],"installed_features":["office"],"requested_packages":[]},"python_environment":null}],"plans":[]}' ; }
   recovery_plan_json() { printf '{"plan_schema_version":1,"actions":[{"id":"runtime:claude","kind":"runtime","name":"claude","default_selected":true,"status":"pending"},{"id":"feature:office","kind":"feature","name":"office","default_selected":true,"status":"pending"}]}' ; }
-  recovery_append_plan() { printf '%s\n' "$1"; }
+  recovery_append_plan() { jq -cn --argjson ledger "$1" --argjson plan "$2" '$ledger + {plans:[$plan]}'; }
   recovery_write_ledger() { :; }
   collect_upgrade_container_preflight() {
     UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":[]}'
@@ -12274,15 +12350,27 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
 
   run_capture upgrade_cmd --name unit-test-container --image agent-python --no-backup
   assert_status 0
-  assert_contains "Recovery deferred. Resume with:"
+  assert_contains "Recovery has 2 deferred action(s). Resume with:"
   [ -z "$user_call_log" ] || fail "Expected runtime reinstall to be deferred, got: $user_call_log"
   [ -z "$root_call_log" ] || fail "Expected feature reinstall to be deferred, got: $root_call_log"
-  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  assert_contains "Upgrade complete; recovery incomplete (0 failed, 2 deferred): unit-test-container (backup skipped)"
   printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
   printf '%s\n' "$rm_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected removal of source container, got: $rm_log"
   printf '%s\n' "$start_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected source container start for backup, got: $start_log"
   printf '%s\n' "$start_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected target container start after recreation, got: $start_log"
   printf '%s\n' "$stop_log" | grep -Fx -- "unit-test-container" >/dev/null || fail "Expected source container stop after backup, got: $stop_log"
+
+  recovery_apply_selected() {
+    RECOVERY_RESTORED_IDS=runtime:claude
+    RECOVERY_FAILED_IDS=feature:office
+    return 1
+  }
+  run_capture upgrade_cmd --name unit-test-container --image agent-python --no-backup --restore
+  assert_status 0
+  assert_contains "Recovery summary: 1 restored, 1 failed, 0 deferred."
+  assert_contains "Upgrade complete; recovery incomplete (1 failed, 0 deferred): unit-test-container (backup skipped)"
+  assert_not_contains "deferred action(s)"
+
 }
 
 test_upgrade_reinstalls_missing_default_runtime_after_restore() {
@@ -12365,7 +12453,7 @@ test_upgrade_reinstalls_missing_default_runtime_after_restore() {
 
   run_capture upgrade_cmd --name unit-test-container --image agent-python --no-backup
   assert_status 0
-  assert_contains "Recovery deferred. Resume with:"
+  assert_contains "Recovery has 1 deferred action(s). Resume with:"
   [ -z "$install_log" ] || fail "Expected runtime reinstall to be deferred, got: $install_log"
   printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
 }
@@ -12540,7 +12628,7 @@ test_upgrade_uses_stored_baseline_when_current_image_is_missing() {
   assert_contains "  - ripgrep"
   assert_contains "su-exec --name unit-test-container apk add --no-cache ripgrep"
   assert_not_contains "Current image agent-plain is not available locally"
-  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  assert_contains "Upgrade complete; recovery incomplete (ledger unavailable): unit-test-container (backup skipped)"
   printf '%s\n' "$create_log" | grep -F -- "--name unit-test-container" >/dev/null || fail "Expected recreate call for unit-test-container, got: $create_log"
   [ "$start_calls" -eq 2 ] || fail "Expected 2 start calls, got: $start_calls"
   [ "$stop_calls" -eq 2 ] || fail "Expected 2 stop calls, got: $stop_calls"
@@ -12619,7 +12707,7 @@ test_upgrade_accepts_workdir_override_when_original_mount_is_missing() {
   assert_status 0
   assert_contains "Warning: Skipping package-loss warning because original /workdir source does not exist and unit-test-container is stopped"
   assert_contains "Exporting container filesystem for state backup: unit-test-container"
-  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  assert_contains "Upgrade complete; recovery incomplete (target inspection failed): unit-test-container (backup skipped)"
   printf '%s\n' "$create_args" | grep -F -- "src=$TEST_ROOT,dst=/workdir" >/dev/null || fail "Expected recreated mount to use override workdir, got: $create_args"
   [ "$export_calls" -eq 1 ] || fail "Expected 1 export call, got: $export_calls"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call for recreated container, got: $start_calls"
@@ -12678,7 +12766,7 @@ test_upgrade_unpublishes_stale_mapping_without_starting_stopped_source() {
   assert_status 0
   assert_contains "Warning: Skipping live package-loss preflight because removed published socket mappings make stopped source startup unsafe"
   assert_contains "Exporting container filesystem for state backup: unit-test-container"
-  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  assert_contains "Upgrade complete; recovery incomplete (target inspection failed): unit-test-container (backup skipped)"
   [ "$start_calls" -eq 1 ] || fail "Expected only the recreated target to start, got: $start_calls starts"
   if printf '%s\n' "$create_args" | grep -F -- '--publish-socket' >/dev/null; then
     fail "Recreated container must not retain stale published mapping"
@@ -12762,7 +12850,7 @@ EOF
   run_capture upgrade_cmd --name unit-test-container --workdir "$TEST_ROOT" --no-backup
   assert_status 0
   assert_contains "Exporting container filesystem for state backup: unit-test-container"
-  assert_contains "Upgrade complete: unit-test-container (backup skipped)"
+  assert_contains "Upgrade complete; recovery incomplete (target inspection failed): unit-test-container (backup skipped)"
   assert_not_contains "Legacy source containers require a backup image for upgrade safety"
   printf '%s\n' "$create_args" | grep -F -- "src=$TEST_ROOT,dst=/workdir" >/dev/null || fail "Expected recreated mount to use override workdir, got: $create_args"
   [ "$export_calls" -eq 1 ] || fail "Expected 1 export call, got: $export_calls"
@@ -13057,15 +13145,15 @@ test_refresh_updates_managed_files_without_recreate() {
   assert_contains "Refresh complete: unit-test-container"
   [ "$start_calls" -eq 1 ] || fail "Expected 1 start call, got: $start_calls"
   [ "$stop_calls" -eq 1 ] || fail "Expected 1 stop call, got: $stop_calls"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/codex/config.toml" || fail "Expected refresh to update /etc/agentctl/codex/config.toml"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/codex/gpt-oss.config.toml" || fail "Expected refresh to update /etc/agentctl/codex/gpt-oss.config.toml"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/tooling-version" || fail "Expected refresh to update the agentctl tooling version marker"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/codexctl" || fail "Expected refresh to remove legacy Codex defaults"
-  printf '%s\n' "$exec_log" | grep -Fq "/usr/local/bin/agent.sh" || fail "Expected refresh to update agent.sh"
-  printf '%s\n' "$exec_log" | grep -Fq "/usr/local/lib/agentctl/runtimes" || fail "Expected refresh to update runtime adapters"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/runtimes.d" || fail "Expected refresh to update runtime registry"
-  printf '%s\n' "$exec_log" | grep -Fq "/usr/local/lib/agentctl/features" || fail "Expected refresh to update feature adapters"
-  printf '%s\n' "$exec_log" | grep -Fq "/etc/agentctl/features.d" || fail "Expected refresh to update feature registry"
+  grep -Fq "/etc/agentctl/codex/config.toml" <<<"$exec_log" || fail "Expected refresh to update /etc/agentctl/codex/config.toml"
+  grep -Fq "/etc/agentctl/codex/gpt-oss.config.toml" <<<"$exec_log" || fail "Expected refresh to update /etc/agentctl/codex/gpt-oss.config.toml"
+  grep -Fq "/etc/agentctl/tooling-version" <<<"$exec_log" || fail "Expected refresh to update the agentctl tooling version marker"
+  grep -Fq "/etc/codexctl" <<<"$exec_log" || fail "Expected refresh to remove legacy Codex defaults"
+  grep -Fq "/usr/local/bin/agent.sh" <<<"$exec_log" || fail "Expected refresh to update agent.sh"
+  grep -Fq "/usr/local/lib/agentctl/runtimes" <<<"$exec_log" || fail "Expected refresh to update runtime adapters"
+  grep -Fq "/etc/agentctl/runtimes.d" <<<"$exec_log" || fail "Expected refresh to update runtime registry"
+  grep -Fq "/usr/local/lib/agentctl/features" <<<"$exec_log" || fail "Expected refresh to update feature adapters"
+  grep -Fq "/etc/agentctl/features.d" <<<"$exec_log" || fail "Expected refresh to update feature registry"
   assert_contains "Active runtime configuration was preserved"
   assert_contains "refresh --name unit-test-container --reset-config"
 }
@@ -14335,6 +14423,10 @@ test_refresh_container_tree_suppresses_host_xattrs() {
         fail "Unexpected container copy invocation: $*"
         ;;
       exec)
+        if printf '%s\n' "$*" | grep -Fq 'tar -xf -'; then
+          [ "${2:-}" = -i ] || fail "Expected interactive exec for the archive input"
+          cat >"$temp_dir/received-stream"
+        fi
         if printf '%s\n' "$*" | grep -Fq 'candidate="$target.agentctl-stage.$$"'; then
           printf '/etc/agentctl/runtimes.agentctl-stage.test\n'
         fi
@@ -14364,6 +14456,7 @@ test_refresh_container_tree_suppresses_host_xattrs() {
   run_capture refresh_container_tree unit-test-container "$source_dir" /etc/agentctl/runtimes root:root 644 755
   unset -f tar
   assert_status 0
+  [ "$(cat "$temp_dir/received-stream")" = tar-stream ] || fail "Expected the guest to consume the archive stream"
   grep -Fq 'COPYFILE_DISABLE=1 args=--no-xattrs -C '"$source_dir"' -cf - .' "$tar_log" || fail "Expected refresh tar stream to disable xattrs, got: $(cat "$tar_log")"
 }
 
@@ -15404,6 +15497,11 @@ test_upgrade_restore_reports_completed_plan_without_deferral() {
   begin_test "upgrade restore reports an already-completed plan without deferral"
 
   load_agentctl_functions
+  require_container() { :; }
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
 
   container_exists() { return 0; }
   container_running() { return 0; }
@@ -15419,10 +15517,328 @@ test_upgrade_restore_reports_completed_plan_without_deferral() {
   assert_not_contains "Recovery deferred"
 }
 
+test_upgrade_recovery_dpkg_availability_uses_exact_versions() {
+  begin_test "DPKG availability honors candidates, architecture, locked versions and probe failures"
+  load_agentctl_functions
+  local apt_policy_output='' probe_failure=0 call_log="$(new_workdir)/calls"
+  CONTAINER_CMD=container
+  container() {
+    printf '%s\n' "$*" >>"$call_log"
+    [ "$probe_failure" -eq 0 ] || return 100
+    printf '%s\n' "$apt_policy_output"
+  }
+  apt_policy_output=$'example:arm64:\n  Installed: 1.0\n  Candidate: 2.0\n  Version table:\n     2.0 500\n        500 https://example.test stable/main arm64 Packages\n *** 1.0 100\n        100 /var/lib/dpkg/status'
+  run_capture recovery_dpkg_package_available unit-test-container example:arm64
+  assert_status 0
+  run_capture recovery_dpkg_package_available unit-test-container example:arm64=1.0
+  assert_status 0
+  run_capture recovery_dpkg_package_available unit-test-container example:arm64=2.0
+  assert_status 0
+  run_capture recovery_dpkg_package_available unit-test-container example:arm64=1.00
+  assert_status 1
+  run_capture recovery_dpkg_package_available unit-test-container example:arm64=3.0
+  assert_status 1
+  grep -Fq 'env LC_ALL=C apt-cache policy example:arm64' "$call_log" || fail "Architecture qualifier was lost"
+  apt_policy_output=$'example:\n  Installed: (none)\n  Candidate: (none)\n  Version table:'
+  run_capture recovery_dpkg_package_available unit-test-container example
+  assert_status 1
+  apt_policy_output=''
+  run_capture recovery_dpkg_package_available unit-test-container nonexistent
+  assert_status 1
+  apt_policy_output='unexpected output'
+  run_capture recovery_dpkg_package_available unit-test-container example
+  assert_status 2
+  probe_failure=1
+  run_capture recovery_dpkg_package_available unit-test-container example
+  assert_status 2
+}
+
+test_upgrade_recovery_dpkg_filters_unavailable_requests() {
+  begin_test "DPKG recovery restores available requests without obsolete package names blocking the batch"
+  load_agentctl_functions
+  local calls="$(new_workdir)/calls" available=0 update_failure=0 probe_failure=0
+  local plan='{"actions":[{"id":"os:dpkg:tree","kind":"os-package","provider":"dpkg","name":"tree"},{"id":"os:dpkg:obsolete","kind":"os-package","provider":"dpkg","name":"obsolete"}]}'
+  CONTAINER_CMD=container
+  container() {
+    printf '%s\n' "$*" >>"$calls"
+    case "$*" in
+      *"apt-get update -o APT::Update::Error-Mode=any") [ "$update_failure" -eq 0 ] ;;
+      *"apt-cache policy tree") printf 'tree:\n  Candidate: 2.0\n'; ;;
+      *"apt-cache policy obsolete")
+        [ "$probe_failure" -eq 0 ] || return 100
+        if [ "$available" -eq 1 ]; then printf 'obsolete:\n  Candidate: 1.0\n'; fi
+        ;;
+      *"apt-get install"*) return 0 ;;
+      *"dpkg-query"*) return 1 ;;
+      *) fail "Unexpected call: $*" ;;
+    esac
+  }
+  run_capture recovery_apply_selected unit-test-container "$plan" $'os:dpkg:tree\nos:dpkg:obsolete' mixed
+  assert_status 1
+  assert_contains 'Restoring 1 DPKG package(s) in one transaction.'
+  assert_contains 'Unavailable DPKG request: obsolete'
+  [ "$RECOVERY_RESTORED_IDS" = os:dpkg:tree ] || fail "Available package was not restored"
+  [ "$RECOVERY_FAILED_IDS" = os:dpkg:obsolete ] || fail "Missing package was not retained as failed"
+  [ "$(grep -c 'apt-get update' "$calls")" -eq 1 ] || fail "Expected one metadata update"
+  grep 'apt-get install' "$calls" | grep -q 'sh tree$' || fail "Unavailable package reached install"
+
+  # A later attempt must recheck availability, not permanently discard the item.
+  available=1
+  run_capture recovery_apply_selected unit-test-container "$plan" os:dpkg:obsolete mixed
+  assert_status 0
+  [ "$RECOVERY_RESTORED_IDS" = os:dpkg:obsolete ] || fail "Retry did not restore the now-available request"
+
+  available=0
+  : >"$calls"
+  run_capture recovery_apply_selected unit-test-container "$plan" os:dpkg:obsolete mixed
+  assert_status 1
+  if grep -q 'apt-get install' "$calls"; then fail "All-unavailable recovery attempted installation"; fi
+
+  update_failure=1
+  : >"$calls"
+  run_capture recovery_apply_selected unit-test-container "$plan" $'os:dpkg:tree\nos:dpkg:obsolete' mixed
+  assert_status 1
+  assert_contains 'Unable to update APT metadata'
+  assert_not_contains 'Unavailable DPKG request'
+  if grep -Eq 'apt-cache|apt-get install' "$calls"; then fail "Failed update was followed by metadata queries or install"; fi
+
+  update_failure=0
+  probe_failure=1
+  : >"$calls"
+  run_capture recovery_apply_selected unit-test-container "$plan" $'os:dpkg:tree\nos:dpkg:obsolete' mixed
+  assert_status 1
+  assert_contains 'Unable to inspect APT metadata'
+  if grep -q 'apt-get install' "$calls"; then fail "Incomplete metadata probes allowed installation"; fi
+}
+
+test_upgrade_recovery_dpkg_locked_missing_version_preserves_installed_state() {
+  begin_test "DPKG recovery keeps locked requests exact and accepts already satisfied manual packages"
+  load_agentctl_functions
+  local calls="$(new_workdir)/calls"
+  local plan='{"actions":[{"id":"os:dpkg:old","kind":"os-package","provider":"dpkg","name":"old","version":"1.0"},{"id":"os:dpkg:installed","kind":"os-package","provider":"dpkg","name":"installed","version":"1.0"},{"id":"os:dpkg:automatic","kind":"os-package","provider":"dpkg","name":"automatic","version":"1.0"}]}'
+  CONTAINER_CMD=container
+  container() {
+    printf '%s\n' "$*" >>"$calls"
+    case "$*" in
+      *"apt-get update -o APT::Update::Error-Mode=any") return 0 ;;
+      *"apt-cache policy old") printf 'old:\n  Candidate: 2.0\n  Version table:\n     2.0 500\n' ;;
+      *"apt-cache policy installed") printf 'installed:\n  Candidate: (none)\n' ;;
+      *"apt-cache policy automatic") printf 'automatic:\n  Candidate: 1.0\n  Version table:\n *** 1.0 100\n' ;;
+      *"apt-get install"*) return 0 ;;
+      *"dpkg-query"*" installed") printf 'ii \t1.0\n' ;;
+      *"dpkg-query"*" old") return 1 ;;
+      *"apt-mark showmanual") printf 'installed\n' ;;
+      *) fail "Unexpected call: $*" ;;
+    esac
+  }
+  run_capture recovery_apply_selected unit-test-container "$plan" $'os:dpkg:old\nos:dpkg:installed\nos:dpkg:automatic' locked
+  assert_status 1
+  assert_contains 'Unavailable DPKG request: old=1.0'
+  assert_not_contains 'Unavailable DPKG request: installed'
+  [ "$RECOVERY_FAILED_IDS" = os:dpkg:old ] || fail "Locked version mismatch was not retained"
+  [ "$RECOVERY_RESTORED_IDS" = $'os:dpkg:installed\nos:dpkg:automatic' ] || fail "Installed/manual package recovery was lost"
+  grep 'apt-get install' "$calls" | grep -q 'sh automatic=1.0$' || fail "Locked recovery silently changed requested versions"
+}
+
+# File-backed fixtures survive the command's subshell and exercise real cleanup.
+setup_upgrade_restore_fixture() {
+  restore_dir="$(new_workdir)"
+  printf '%s\n' '{"ledger_schema_version":1,"records":[],"plans":[{"actions":[{"id":"runtime:example","kind":"runtime","name":"example","status":"pending","default_selected":true}]}]}' >"$restore_dir/ledger"
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { [ -f "$restore_dir/running" ]; }
+  remote_control_lock_acquire() { printf '%s\n' remote-lock >>"$restore_dir/calls"; }
+  remote_control_lock_release() { printf '%s\n' remote-unlock >>"$restore_dir/calls"; }
+  mcp_lock_acquire() { printf '%s\n' mcp-lock >>"$restore_dir/calls"; }
+  mcp_lock_release() { printf '%s\n' mcp-unlock >>"$restore_dir/calls"; }
+  mcp_require_no_active_leases() { printf '%s\n' lease-check >>"$restore_dir/calls"; }
+  start_existing_container_managed() {
+    printf 'managed-start:%s\n' "$*" >>"$restore_dir/calls"
+    : >"$restore_dir/running"
+    [ "${restore_failure:-}" != start ]
+  }
+  ensure_started_container_is_running() { [ "${restore_failure:-}" != health ]; }
+  remote_control_quiesce_preserving_desired() { printf '%s\n' remote-quiesce >>"$restore_dir/calls"; }
+  stop_existing_container_safely() { printf '%s\n' stop >>"$restore_dir/calls"; rm -f "$restore_dir/running"; }
+  mcp_stop_managed() { printf '%s\n' relay-stop >>"$restore_dir/calls"; }
+  recovery_ledger_json() {
+    printf '%s\n' read >>"$restore_dir/calls"
+    [ "${restore_failure:-}" != read ] || return 1
+    cat "$restore_dir/ledger"
+  }
+  recovery_write_ledger() {
+    printf '%s\n' write >>"$restore_dir/calls"
+    [ "${restore_failure:-}" != write ] || return 1
+    printf '%s\n' "$2" >"$restore_dir/ledger"
+  }
+  recovery_selected_ids() { printf '%s' "${restore_selection-runtime:example}"; }
+  recovery_apply_selected() {
+    printf '%s\n' apply >>"$restore_dir/calls"
+    RECOVERY_RESTORED_IDS=''
+    RECOVERY_FAILED_IDS=''
+    case "${restore_failure:-}" in
+      apply) RECOVERY_FAILED_IDS=runtime:example; return 1 ;;
+      signal) sh -c 'kill -TERM "$PPID"'; return 0 ;;
+    esac
+    RECOVERY_RESTORED_IDS=runtime:example
+  }
+  CONTAINER_CMD=container
+  container() {
+    printf '%s\n' inspect-presence >>"$restore_dir/calls"
+    [ "${restore_failure:-}" != exec ] || return 1
+    if [ -f "$restore_dir/ledger" ]; then printf present; else printf missing; fi
+  }
+}
+
+test_upgrade_restore_preserves_stopped_and_running_state() {
+  begin_test "upgrade restore starts stopped containers with managed MCP and restores their prior state"
+  load_agentctl_functions
+  local restore_dir mode
+  setup_upgrade_restore_fixture
+  for mode in --status --history --interactive --all-compatible; do
+    : >"$restore_dir/calls"
+    run_capture upgrade_restore_cmd --name unit-test-container "$mode"
+    assert_status 0
+    [ ! -f "$restore_dir/running" ] || fail "Stopped state was not restored for $mode"
+    [ "$(head -4 "$restore_dir/calls")" = $'remote-lock\nmcp-lock\nlease-check\nmanaged-start:unit-test-container 0 0' ] || fail "Wrong managed startup order"
+    [ "$(tail -5 "$restore_dir/calls")" = $'remote-quiesce\nstop\nrelay-stop\nmcp-unlock\nremote-unlock' ] || fail "Wrong cleanup order"
+    if [ "$mode" = --status ] || [ "$mode" = --history ]; then
+      if grep -Eq '^(apply|write)$' "$restore_dir/calls"; then fail "Inspection changed recovery state"; fi
+    fi
+  done
+  run_capture upgrade_restore_cmd --name unit-test-container --dismiss runtime:example
+  assert_status 0
+  [ ! -f "$restore_dir/running" ] || fail "Dismiss did not restore stopped state"
+  jq -e '.plans[-1].actions[0].status == "dismissed"' "$restore_dir/ledger" >/dev/null || fail "Dismiss did not persist"
+
+  : >"$restore_dir/running"
+  : >"$restore_dir/calls"
+  run_capture upgrade_restore_cmd --name unit-test-container --status
+  assert_status 0
+  [ -f "$restore_dir/running" ] || fail "Initially running container was stopped"
+  if grep -Eq '^(managed-start|stop|relay-stop|remote-quiesce)' "$restore_dir/calls"; then fail "Running-container inspection changed lifecycle"; fi
+}
+
+test_upgrade_restore_dry_run_and_conflicting_options_do_not_mutate() {
+  begin_test "upgrade restore dry-run stays stopped and conflicting modes fail before mutation"
+  load_agentctl_functions
+  local restore_dir
+  setup_upgrade_restore_fixture
+  run_capture upgrade_restore_cmd --name unit-test-container --dry-run
+  assert_status 1
+  assert_contains 'dry-run will not start it'
+  assert_contains 'start --name unit-test-container'
+  if grep -Eq 'managed-start|^read$|^write$|^apply$' "$restore_dir/calls"; then fail "Stopped dry-run touched container state"; fi
+  : >"$restore_dir/running"
+  : >"$restore_dir/calls"
+  run_capture upgrade_restore_cmd --name unit-test-container --dry-run
+  assert_status 0
+  assert_contains 'Upgrade recovery plan'
+  if grep -Eq '^write$|^apply$' "$restore_dir/calls"; then fail "Running dry-run mutated recovery state"; fi
+  : >"$restore_dir/calls"
+  run_capture upgrade_restore_cmd --name unit-test-container --dry-run --dismiss runtime:example
+  assert_status 1
+  assert_contains 'Cannot combine upgrade restore modes'
+  [ ! -s "$restore_dir/calls" ] || fail "Conflicting options reached lifecycle work"
+  run_capture upgrade_restore_cmd --name unit-test-container --status --restore-version-policy locked
+  assert_status 1
+  assert_contains 'requires a recovery installation'
+}
+
+test_upgrade_restore_failures_cleanup_and_report_distinct_errors() {
+  begin_test "upgrade restore distinguishes ledger errors and cleans up startup, write and selected-action failures"
+  load_agentctl_functions
+  local restore_dir restore_failure expected
+  setup_upgrade_restore_fixture
+  for restore_failure in start health read write apply; do
+    : >"$restore_dir/calls"
+    run_capture upgrade_restore_cmd --name unit-test-container --all-compatible
+    assert_status 1
+    case "$restore_failure" in
+      start) expected='Unable to start container' ;;
+      health) expected='Container startup failed' ;;
+      read) expected='Unable to read upgrade recovery ledger' ;;
+      write) expected='Unable to save upgrade recovery ledger' ;;
+      apply) expected='Recovery has 1 failed action(s)' ;;
+    esac
+    assert_contains "$expected"
+    assert_not_contains 'No upgrade recovery ledger found'
+    [ ! -f "$restore_dir/running" ] || fail "Failure $restore_failure leaked running container"
+    [ "$(tail -3 "$restore_dir/calls")" = $'relay-stop\nmcp-unlock\nremote-unlock' ] || fail "Failure $restore_failure leaked services/locks"
+  done
+  jq -e '.plans[-1].actions[0].status == "failed"' "$restore_dir/ledger" >/dev/null || fail "Failed action was not saved before exit"
+  restore_failure=''
+  printf broken >"$restore_dir/ledger"
+  run_capture upgrade_restore_cmd --name unit-test-container --status
+  assert_status 1
+  assert_contains 'Invalid or unsupported upgrade recovery ledger'
+  [ ! -f "$restore_dir/running" ] || fail "Invalid ledger leaked running container"
+  printf '%s' '{"ledger_schema_version":1,"plans":[]}' >"$restore_dir/ledger"
+  run_capture upgrade_restore_cmd --name unit-test-container --status
+  assert_status 1
+  assert_contains 'No recovery plan found'
+  rm "$restore_dir/ledger"
+  run_capture upgrade_restore_cmd --name unit-test-container --status
+  assert_status 1
+  assert_contains 'No upgrade recovery ledger found'
+  restore_failure=exec
+  run_capture upgrade_restore_cmd --name unit-test-container --status
+  assert_status 1
+  assert_contains 'Unable to inspect upgrade recovery ledger'
+  assert_not_contains 'No upgrade recovery ledger found'
+  [ ! -f "$restore_dir/running" ] || fail "Ledger failures leaked running container"
+}
+
+test_upgrade_restore_interrupt_cleans_up() {
+  begin_test "upgrade restore interruption restores stopped state and releases managed services"
+  load_agentctl_functions
+  local restore_dir restore_failure=signal
+  setup_upgrade_restore_fixture
+  run_capture upgrade_restore_cmd --name unit-test-container --all-compatible
+  assert_status 143
+  [ ! -f "$restore_dir/running" ] || fail "Interrupt leaked running container"
+  [ "$(tail -5 "$restore_dir/calls")" = $'remote-quiesce\nstop\nrelay-stop\nmcp-unlock\nremote-unlock' ] || fail "Interrupt leaked managed services or locks"
+  restore_failure=''
+  remote_control_quiesce_preserving_desired() { die "Injected service cleanup failure"; }
+  run_capture upgrade_restore_cmd --name unit-test-container --status
+  assert_status 1
+  assert_contains 'Unable to finish recovery cleanup'
+  [ ! -f "$restore_dir/running" ] || fail "Cleanup error skipped container stop"
+  [ "$(tail -4 "$restore_dir/calls")" = $'stop\nrelay-stop\nmcp-unlock\nremote-unlock' ] || fail "Cleanup error skipped release of services or locks"
+}
+
+test_upgrade_restore_reports_saved_failures_after_successful_subset() {
+  begin_test "successful recovery subsets do not mislabel earlier failures as deferred"
+  load_agentctl_functions
+  local restore_dir restore_selection='runtime:example'
+  setup_upgrade_restore_fixture
+  jq -n '{ledger_schema_version:1, records:[], plans:[{actions:([range(52) | {id:("restored:" + tostring), status:"restored"}] + [{id:"runtime:example",status:"pending"},{id:"os:dpkg:libapt-pkg6.0t64",status:"failed"},{id:"os:dpkg:libassuan0",status:"failed"}])}]}' >"$restore_dir/ledger"
+  run_capture upgrade_restore_cmd --name unit-test-container --all-compatible
+  assert_status 0
+  assert_contains 'Recovery summary: 53 restored, 2 failed, 0 deferred.'
+  assert_contains 'Recovery has 2 failed action(s)'
+  assert_not_contains 'deferred action(s)'
+  run_capture recovery_completion_suffix "$(jq '.plans[-1]' "$restore_dir/ledger")"
+  assert_status 0
+  [ "$RUN_OUTPUT" = '; recovery incomplete (2 failed, 0 deferred)' ] || fail "Wrong completion suffix"
+  run_capture recovery_report_outstanding unit-test-container '{"actions":[{"status":"pending"},{"status":"failed"}]}'
+  assert_status 0
+  assert_contains '1 failed action(s)'
+  assert_contains '1 deferred action(s)'
+  run_capture recovery_report_outstanding unit-test-container '{"actions":[{"status":"pending"}]}'
+  assert_status 0
+  assert_contains '1 deferred action(s)'
+  assert_not_contains 'failed action(s)'
+  run_capture recovery_completion_suffix '{"actions":[{"status":"restored"},{"status":"dismissed"}]}'
+  assert_status 0
+  [ -z "$RUN_OUTPUT" ] || fail "Complete recovery should not have an incomplete suffix"
+}
+
 test_upgrade_recovery_batches_compatible_os_packages() {
   begin_test "upgrade recovery batches compatible DPKG and APK packages"
 
   load_agentctl_functions
+  recovery_dpkg_package_available() { return 0; }
 
   local call_log=""
   local plan='{"actions":[{"id":"os:dpkg:curl","kind":"os-package","name":"curl","provider":"dpkg"},{"id":"os:dpkg:tree","kind":"os-package","name":"tree","provider":"dpkg"},{"id":"os:apk:git","kind":"os-package","name":"git@edgecommunity=2.0","provider":"apk"},{"id":"os:apk:ripgrep","kind":"os-package","name":"ripgrep","provider":"apk"}]}'
@@ -15436,7 +15852,7 @@ test_upgrade_recovery_batches_compatible_os_packages() {
     $'os:dpkg:curl\nos:dpkg:tree\nos:apk:git\nos:apk:ripgrep' mixed
 
   assert_status 0
-  [ "$(printf '%s' "$call_log" | grep -Fc 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"')" -eq 1 ] \
+  [ "$(printf '%s' "$call_log" | grep -Fc 'DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"')" -eq 1 ] \
     || fail "Expected one batched APT transaction, got: $call_log"
   printf '%s' "$call_log" | grep -Fq "sh curl tree" \
     || fail "Expected both DPKG packages in one transaction, got: $call_log"
@@ -15476,6 +15892,7 @@ test_upgrade_recovery_verifies_each_package_after_batch_failure() {
   begin_test "upgrade recovery preserves per-package results after a failed batch"
 
   load_agentctl_functions
+  recovery_dpkg_package_available() { return 0; }
 
   local call_log=""
   local plan='{"actions":[{"id":"os:dpkg:curl","kind":"os-package","name":"curl","provider":"dpkg"},{"id":"os:dpkg:tree","kind":"os-package","name":"tree","provider":"dpkg"}]}'
@@ -15483,7 +15900,8 @@ test_upgrade_recovery_verifies_each_package_after_batch_failure() {
   container() {
     call_log="${call_log}$*"$'\n'
     case "$*" in
-      *"apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install"*) return 1 ;;
+      *"apt-get update -o APT::Update::Error-Mode=any") return 0 ;;
+      *"DEBIAN_FRONTEND=noninteractive apt-get install"*) return 1 ;;
       *"dpkg-query"*" curl") printf 'ii \t8.0\n'; return 0 ;;
       *"dpkg-query"*" tree") return 1 ;;
       *"apt-mark showmanual"*) printf 'curl\n'; return 0 ;;
@@ -15494,7 +15912,7 @@ test_upgrade_recovery_verifies_each_package_after_batch_failure() {
   run_capture recovery_apply_selected unit-test-container "$plan" $'os:dpkg:curl\nos:dpkg:tree' mixed
 
   assert_status 1
-  [ "$(printf '%s' "$call_log" | grep -Fc 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"')" -eq 1 ] \
+  [ "$(printf '%s' "$call_log" | grep -Fc 'DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"')" -eq 1 ] \
     || fail "Expected one failed APT transaction, got: $call_log"
   [ "$RECOVERY_RESTORED_IDS" = "os:dpkg:curl" ] \
     || fail "Expected installed package to be recorded as restored, got: $RECOVERY_RESTORED_IDS"
@@ -15506,12 +15924,14 @@ test_upgrade_recovery_rejects_false_success_after_failed_locked_batch() {
   begin_test "upgrade recovery rejects automatic and wrong-version packages after a failed locked batch"
 
   load_agentctl_functions
+  recovery_dpkg_package_available() { return 0; }
 
   local plan='{"actions":[{"id":"os:dpkg:auto","kind":"os-package","name":"auto","provider":"dpkg","version":"1.0"},{"id":"os:dpkg:wrong","kind":"os-package","name":"wrong","provider":"dpkg","version":"2.0"},{"id":"os:dpkg:exact","kind":"os-package","name":"exact","provider":"dpkg","version":"3.0"}]}'
   CONTAINER_CMD=container
   container() {
     case "$*" in
-      *"apt-get update &&"*) return 1 ;;
+      *"apt-get update -o APT::Update::Error-Mode=any") return 0 ;;
+      *"DEBIAN_FRONTEND=noninteractive apt-get install"*) return 1 ;;
       *"dpkg-query"*" auto") printf 'ii \t1.0\n'; return 0 ;;
       *"dpkg-query"*" wrong") printf 'ii \t1.5\n'; return 0 ;;
       *"dpkg-query"*" exact") printf 'ii \t3.0\n'; return 0 ;;
@@ -15726,6 +16146,87 @@ test_upgrade_recovery_reports_export_capture_limitations() {
   ' >/dev/null || fail "Expected explicit manual recovery items for stopped export limitations, got: $RUN_OUTPUT"
 }
 
+test_shared_assertions_handle_long_output() {
+  begin_test "shared assertions preserve results with long output and early matches"
+  local long_output="" status=0 assertion=""
+  long_output="$(awk 'BEGIN { print "early.literal[42]"; for (i=0; i<32768; i++) print "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789--"; print "last-marker" }')"
+  RUN_OUTPUT="$long_output"
+  assert_contains 'early.literal[42]'
+  assert_contains 'last-marker'
+  assert_matches '^early[.]literal\[42\]$'
+  assert_not_contains 'absent-marker'
+  assert_not_contains 'earlyXliteral4'
+  for assertion in contains_missing regex_missing negative_match; do
+    status=0
+    (
+      case "$assertion" in
+        contains_missing) assert_contains 'absent-marker' ;;
+        regex_missing) assert_matches '^absent-marker$' ;;
+        negative_match) assert_not_contains 'early.literal[42]' ;;
+      esac
+    ) >/dev/null 2>&1 || status=$?
+    [ "$status" -eq 1 ] || fail "Expected $assertion to fail, got $status"
+  done
+  RUN_OUTPUT='-leading-option'
+  assert_contains '-leading-option'
+  assert_matches '^-leading-option$'
+  RUN_OUTPUT=''
+  assert_not_contains 'absent-marker'
+  status=0
+  (assert_matches '^$') >/dev/null 2>&1 || status=$?
+  [ "$status" -eq 1 ] || fail "Empty output must not acquire a synthetic blank line"
+}
+
+test_shared_container_checks_drain_long_output() {
+  begin_test "shared container checks consume long listings and preserve producer failures"
+  local fixture="" status=0 previous_container_cmd="$CONTAINER_CMD"
+  fixture="$(mktemp "${TMPDIR:-/tmp}/agentctl-listing.XXXXXX")"
+  register_dir_cleanup "$fixture"
+  awk 'BEGIN { print "fixture running"; for (i=0; i<32768; i++) print "another-container running padding-padding-padding-padding-padding" }' >"$fixture"
+  CONTAINER_CMD=unit_container_listing
+  unit_container_listing() { cat "$fixture"; }
+  container_exists fixture || fail "Lost existing container in long listing"
+  container_running fixture || fail "Lost running container in long listing"
+  if container_exists absent; then fail "Found an absent container"; fi
+  if container_running absent; then fail "Found an absent running container"; fi
+  unit_container_listing() { cat "$fixture"; return 7; }
+  status=0
+  container_exists fixture || status=$?
+  [ "$status" -eq 7 ] || fail "Lost listing command failure: $status"
+  CONTAINER_CMD="$previous_container_cmd"
+  unset -f unit_container_listing
+}
+
+test_upgrade_completion_test_helpers() {
+  begin_test "upgrade completion assertions accept deferred recovery but reject failures"
+  local completion="" output="" status=0
+  for completion in 'Upgrade complete' 'Upgrade complete; recovery incomplete (0 failed, 1 deferred)'; do
+    RUN_OUTPUT="build output
+$completion: fixture (backup image: fixture-backup)"
+    assert_upgrade_complete 'fixture (backup image: fixture-backup)'
+    [ "$(extract_backup_image)" = fixture-backup ] || fail "Could not extract backup from $completion"
+    RUN_OUTPUT="$completion: fixture (backup skipped)"
+    assert_upgrade_complete 'fixture (backup skipped)'
+  done
+  for completion in \
+    'Upgrade complete; recovery incomplete (1 failed, 0 deferred)' \
+    'Upgrade complete; recovery incomplete (ledger unavailable)' \
+    'Upgrade complete; recovery incomplete (target inspection failed)' \
+    'Upgrade complete; recovery incomplete (0 failed, bogus deferred)' \
+    'Not complete'; do
+    RUN_OUTPUT="$completion: fixture (backup image: fixture-backup)"
+    status=0
+    output="$(assert_upgrade_complete 'fixture (backup image: fixture-backup)' 2>&1)" || status=$?
+    [ "$status" -ne 0 ] || fail "Accepted invalid completion: $completion"
+  done
+  RUN_OUTPUT='Upgrade complete: another-container (backup image: fixture-backup)'
+  status=0
+  output="$(assert_upgrade_complete 'fixture (backup image: fixture-backup)' 2>&1)" || status=$?
+  [ "$status" -ne 0 ] || fail "Accepted completion for the wrong container"
+  RUN_OUTPUT='Upgrade complete; recovery incomplete (2 failed, 1 deferred): fixture (backup image: fixture-backup)'
+  [ "$(extract_backup_image)" = fixture-backup ] || fail "Lost backup reference when recovery failed"
+}
+
 main() {
   log "Using agentctl at $AGENTCTL"
   log "Using agentctl implementation at $AGENTCTL_IMPL"
@@ -15736,6 +16237,9 @@ main() {
     log "Running unit tests from: $TEST_START_FROM"
   fi
 
+  run_selected_test test_shared_assertions_handle_long_output "test_shared_assertions_handle_long_output"
+  run_selected_test test_shared_container_checks_drain_long_output "test_shared_container_checks_drain_long_output"
+  run_selected_test test_upgrade_completion_test_helpers "test_upgrade_completion_test_helpers"
   run_selected_test test_run_config_wires_runtime_config_json "test_run_config_wires_runtime_config_json"
   run_selected_test test_run_cmd_wires_ollama_host_to_custom_command "test_run_cmd_wires_ollama_host_to_custom_command"
   run_selected_test test_run_help_reports_generic_runtime_config "test_run_help_reports_generic_runtime_config"
@@ -16086,6 +16590,14 @@ main() {
   run_selected_test test_upgrade_recovery_summary_counts_outcomes "test_upgrade_recovery_summary_counts_outcomes"
   run_selected_test test_upgrade_recovery_excludes_feature_owned_os_packages "test_upgrade_recovery_excludes_feature_owned_os_packages"
   run_selected_test test_upgrade_restore_reports_completed_plan_without_deferral "test_upgrade_restore_reports_completed_plan_without_deferral"
+  run_selected_test test_upgrade_recovery_dpkg_availability_uses_exact_versions "test_upgrade_recovery_dpkg_availability_uses_exact_versions"
+  run_selected_test test_upgrade_recovery_dpkg_filters_unavailable_requests "test_upgrade_recovery_dpkg_filters_unavailable_requests"
+  run_selected_test test_upgrade_recovery_dpkg_locked_missing_version_preserves_installed_state "test_upgrade_recovery_dpkg_locked_missing_version_preserves_installed_state"
+  run_selected_test test_upgrade_restore_preserves_stopped_and_running_state "test_upgrade_restore_preserves_stopped_and_running_state"
+  run_selected_test test_upgrade_restore_dry_run_and_conflicting_options_do_not_mutate "test_upgrade_restore_dry_run_and_conflicting_options_do_not_mutate"
+  run_selected_test test_upgrade_restore_failures_cleanup_and_report_distinct_errors "test_upgrade_restore_failures_cleanup_and_report_distinct_errors"
+  run_selected_test test_upgrade_restore_interrupt_cleans_up "test_upgrade_restore_interrupt_cleans_up"
+  run_selected_test test_upgrade_restore_reports_saved_failures_after_successful_subset "test_upgrade_restore_reports_saved_failures_after_successful_subset"
   run_selected_test test_upgrade_recovery_batches_compatible_os_packages "test_upgrade_recovery_batches_compatible_os_packages"
   run_selected_test test_upgrade_recovery_locked_apk_uses_captured_version_once "test_upgrade_recovery_locked_apk_uses_captured_version_once"
   run_selected_test test_upgrade_recovery_verifies_each_package_after_batch_failure "test_upgrade_recovery_verifies_each_package_after_batch_failure"
