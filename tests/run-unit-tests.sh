@@ -7069,8 +7069,8 @@ EOF
       and .supports_reasoning_summaries == true
       and .reasoning_summary_format == "none"
       and .default_reasoning_summary == "auto"
-      and .default_reasoning_level == "medium"
-      and (.supported_reasoning_levels | length) == 3)
+      and (.supported_reasoning_levels | length) == 0
+      and (has("default_reasoning_level") | not))
   ' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected Codex model catalog metadata to be generated"
   grep -Fq 'model_context_window = 131072' "$temp_home/home/.codex/config.toml" || fail "Expected root config override to be preserved"
   if grep -Fq 'model_context_window = 131072' "$temp_home/home/.codex/gpt-oss.config.toml"; then
@@ -7123,6 +7123,16 @@ EOF
   ' "$entry_file" >/dev/null || fail "Expected boolean thinking controls to map to none and high"
 
   cat >"$show_file" <<'EOF'
+{"capabilities":["thinking"],"thinking":{"values":[false,true],"default":false},"details":{"format":"safetensors"},"model_info":{"apertus1p5.context_length":262144}}
+EOF
+  codex_build_model_entry test:model "$show_file" "$entry_file"
+  jq -e '
+    .context_window == 262144 and
+    [.supported_reasoning_levels[].effort] == ["none", "high"] and
+    .default_reasoning_level == "none"
+  ' "$entry_file" >/dev/null || fail "Expected Apertus boolean controls to default to no thinking"
+
+  cat >"$show_file" <<'EOF'
 {"capabilities":["thinking"],"thinking":{"values":[false],"default":false},"details":{"format":"gguf"},"model_info":{"llama.context_length":8192}}
 EOF
   codex_build_model_entry test:model "$show_file" "$entry_file"
@@ -7141,6 +7151,17 @@ EOF
     [.supported_reasoning_levels[].effort] == ["high"] and
     (has("default_reasoning_level") | not)
   ' "$entry_file" >/dev/null || fail "Expected ambiguous high mapping to omit the default"
+
+  cat >"$show_file" <<'EOF'
+{"capabilities":["thinking"],"thinking":null,"details":{"format":"safetensors"},"model_info":{"apertus1p5.context_length":262144}}
+EOF
+  codex_build_model_entry test:model "$show_file" "$entry_file"
+  jq -e '
+    .context_window == 262144 and
+    .supported_reasoning_levels == [] and
+    .supports_reasoning_summaries == true and
+    (has("default_reasoning_level") | not)
+  ' "$entry_file" >/dev/null || fail "Expected absent thinking metadata to avoid invented effort levels"
 
   cat >"$show_file" <<'EOF'
 {"capabilities":[],"details":{"format":"gguf"},"parameters":"num_ctx 2048\n"}

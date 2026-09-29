@@ -826,11 +826,7 @@ codex_build_model_entry() {
           summaries: ($efforts | any(. != "none"))
         }
     elif ((.capabilities // []) | index("thinking")) then
-      {levels: [
-        {effort: "low", description: "Low reasoning effort"},
-        {effort: "medium", description: "Medium reasoning effort"},
-        {effort: "high", description: "High reasoning effort"}
-      ], default: "medium", summaries: true}
+      {levels: [], default: null, summaries: true}
     else
       {levels: [], default: null, summaries: false}
     end

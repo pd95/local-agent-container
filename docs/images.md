@@ -437,6 +437,8 @@ One local-model launch migration is an exception: Codex removes the old
 profiles, including edited copies. Other context overrides are preserved.
 The local model catalog uses the smaller of Ollama's advertised context length
 and a configured `num_ctx` when both are available.
+When Ollama reports a thinking capability without supported controls, Codex
+records the capability but does not offer guessed reasoning effort levels.
 
 To replace the active configuration with the refreshed defaults, use one of:
 
