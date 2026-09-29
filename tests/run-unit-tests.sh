@@ -7032,6 +7032,13 @@ model = "gpt-oss:20b"
 model_context_window = 131072
 EOF
 
+  cat >"$temp_home/home/.codex/gpt-oss.config.toml" <<'EOF'
+model_provider = "myollama"
+model = "gpt-oss:20b"
+model_context_window = 131072
+custom_setting = "preserved"
+EOF
+
   cat >"$temp_home/home/.codex/local_models.json" <<'EOF'
 {
   "models": [
@@ -7056,7 +7063,7 @@ EOF
     (.models[] | select(.slug == "other:model").unknown == "preserved") and
     (.models[] | select(.slug == "gpt-oss:20b")
       | .display_name == "gpt-oss:20b"
-      and .context_window == 32768
+      and .context_window == 8192
       and .base_instructions == "local instructions"
       and .input_modalities == ["text", "image"]
       and .supports_reasoning_summaries == true
@@ -7065,7 +7072,105 @@ EOF
       and .default_reasoning_level == "medium"
       and (.supported_reasoning_levels | length) == 3)
   ' "$temp_home/home/.codex/local_models.json" >/dev/null || fail "Expected Codex model catalog metadata to be generated"
+  grep -Fq 'model_context_window = 131072' "$temp_home/home/.codex/config.toml" || fail "Expected root config override to be preserved"
+  if grep -Fq 'model_context_window = 131072' "$temp_home/home/.codex/gpt-oss.config.toml"; then
+    fail "Expected local launch to remove the bundled profile context override"
+  fi
+  grep -Fq 'custom_setting = "preserved"' "$temp_home/home/.codex/gpt-oss.config.toml" || fail "Expected unrelated profile settings to be preserved"
   grep -Fq -- '--profile gpt-oss --cd /workdir' "$run_log" || fail "Expected codex run to launch after local metadata update"
+}
+
+test_agent_sh_codex_ollama_thinking_metadata() {
+  begin_test "Codex catalog uses Ollama thinking values and defaults"
+
+  local temp_dir show_file entry_file
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-thinking.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  show_file="$temp_dir/show.json"
+  entry_file="$temp_dir/entry.json"
+  . "$TEST_ROOT/runtimes/codex.sh"
+
+  cat >"$show_file" <<'EOF'
+{"capabilities":["thinking"],"thinking":{"values":["minimal","low","turbo"],"default":"turbo"},"details":{"format":"gguf"},"model_info":{"llama.context_length":8192},"parameters":"num_ctx 4096\n"}
+EOF
+  codex_build_model_entry test:model "$show_file" "$entry_file"
+  jq -e '
+    .context_window == 4096 and
+    [.supported_reasoning_levels[].effort] == ["minimal", "low", "turbo"] and
+    .default_reasoning_level == "turbo" and
+    .supports_reasoning_summaries == true
+  ' "$entry_file" >/dev/null || fail "Expected named Ollama efforts, default, and smaller configured context"
+
+  mkdir -p "$temp_dir/home/.codex"
+  cat >"$temp_dir/home/.codex/local_models.json" <<'EOF'
+{"models":[{"slug":"test:model","supported_reasoning_levels":[{"effort":"medium","description":"old"}],"default_reasoning_level":"medium","custom":"preserved"}]}
+EOF
+  HOME="$temp_dir/home" codex_upsert_model_catalog test:model "$entry_file" "$temp_dir"
+  jq -e '
+    .models[0].custom == "preserved" and
+    [.models[0].supported_reasoning_levels[].effort] == ["minimal", "low", "turbo"] and
+    .models[0].default_reasoning_level == "turbo"
+  ' "$temp_dir/home/.codex/local_models.json" >/dev/null || fail "Expected stale reasoning levels to be replaced without dropping custom catalog fields"
+
+  cat >"$show_file" <<'EOF'
+{"capabilities":["thinking"],"thinking":{"values":[false,true],"default":true},"details":{"format":"gguf"},"model_info":{"llama.context_length":8192}}
+EOF
+  codex_build_model_entry test:model "$show_file" "$entry_file"
+  jq -e '
+    [.supported_reasoning_levels[].effort] == ["none", "high"] and
+    .default_reasoning_level == "high" and
+    .supports_reasoning_summaries == true
+  ' "$entry_file" >/dev/null || fail "Expected boolean thinking controls to map to none and high"
+
+  cat >"$show_file" <<'EOF'
+{"capabilities":["thinking"],"thinking":{"values":[false],"default":false},"details":{"format":"gguf"},"model_info":{"llama.context_length":8192}}
+EOF
+  codex_build_model_entry test:model "$show_file" "$entry_file"
+  jq -e '
+    .supported_reasoning_levels == [] and
+    .supports_reasoning_summaries == false and
+    (has("default_reasoning_level") | not) and
+    (has("default_reasoning_summary") | not)
+  ' "$entry_file" >/dev/null || fail "Expected false-only metadata to disable reasoning controls"
+
+  cat >"$show_file" <<'EOF'
+{"capabilities":["thinking"],"thinking":{"values":[true,"high"],"default":true},"details":{"format":"gguf"},"model_info":{"llama.context_length":8192}}
+EOF
+  codex_build_model_entry test:model "$show_file" "$entry_file"
+  jq -e '
+    [.supported_reasoning_levels[].effort] == ["high"] and
+    (has("default_reasoning_level") | not)
+  ' "$entry_file" >/dev/null || fail "Expected ambiguous high mapping to omit the default"
+
+  cat >"$show_file" <<'EOF'
+{"capabilities":[],"details":{"format":"gguf"},"parameters":"num_ctx 2048\n"}
+EOF
+  codex_build_model_entry test:model "$show_file" "$entry_file"
+  jq -e '.context_window == 2048 and .supported_reasoning_levels == []' "$entry_file" >/dev/null || fail "Expected configured context when native length is unavailable"
+}
+
+test_agent_sh_codex_removes_bundled_context_overrides() {
+  begin_test "Codex local profiles drop only the bundled context override"
+
+  local temp_dir profile_dir
+  temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-context.XXXXXX")"
+  register_dir_cleanup "$temp_dir"
+  profile_dir="$temp_dir/home/.codex"
+  mkdir -p "$profile_dir"
+  . "$TEST_ROOT/runtimes/codex.sh"
+
+  printf 'model = "edited:model"\nmodel_context_window = 131072\n' >"$profile_dir/gpt-oss.config.toml"
+  printf 'model_context_window = 65536\n' >"$profile_dir/qwen.config.toml"
+  printf 'model_context_window = 131072\n' >"$profile_dir/gemma.config.toml"
+  printf 'model_context_window = 131072\n' >"$profile_dir/custom.config.toml"
+  HOME="$temp_dir/home" codex_remove_bundled_context_overrides
+
+  grep -Fq 'model = "edited:model"' "$profile_dir/gpt-oss.config.toml" || fail "Expected edited profile contents to be preserved"
+  if grep -Fq 'model_context_window' "$profile_dir/gpt-oss.config.toml" "$profile_dir/gemma.config.toml"; then
+    fail "Expected bundled 131072 overrides to be removed"
+  fi
+  grep -Fq 'model_context_window = 65536' "$profile_dir/qwen.config.toml" || fail "Expected explicit alternate context override to be preserved"
+  grep -Fq 'model_context_window = 131072' "$profile_dir/custom.config.toml" || fail "Expected custom profile override to be preserved"
 }
 
 test_agent_sh_codex_local_run_uses_ollama_host_env() {
@@ -16463,6 +16568,8 @@ main() {
   run_selected_test test_agent_sh_codex_run_uses_model_override "test_agent_sh_codex_run_uses_model_override"
   run_selected_test test_agent_sh_codex_online_run_skips_catalog_update "test_agent_sh_codex_online_run_skips_catalog_update"
   run_selected_test test_agent_sh_codex_local_run_updates_config_and_catalog "test_agent_sh_codex_local_run_updates_config_and_catalog"
+  run_selected_test test_agent_sh_codex_ollama_thinking_metadata "test_agent_sh_codex_ollama_thinking_metadata"
+  run_selected_test test_agent_sh_codex_removes_bundled_context_overrides "test_agent_sh_codex_removes_bundled_context_overrides"
   run_selected_test test_agent_sh_codex_local_run_uses_ollama_host_env "test_agent_sh_codex_local_run_uses_ollama_host_env"
   run_selected_test test_agent_sh_codex_local_run_config_ollama_host_overrides_env "test_agent_sh_codex_local_run_config_ollama_host_overrides_env"
   run_selected_test test_agent_sh_codex_local_run_reports_unreachable_ollama_host "test_agent_sh_codex_local_run_reports_unreachable_ollama_host"
