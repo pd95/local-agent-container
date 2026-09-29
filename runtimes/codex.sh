@@ -480,6 +480,28 @@ codex_copy_missing_default_profile_configs() {
   done
 }
 
+codex_remove_bundled_context_overrides() {
+  local profile=""
+  local profile_file=""
+  local tmp_file=""
+
+  for profile in gpt-oss qwen gemma; do
+    profile_file="$(codex_home_dir)/${profile}.config.toml"
+    [ -f "$profile_file" ] || continue
+    [ ! -L "$profile_file" ] || continue
+    if ! grep -Eq '^[[:space:]]*model_context_window[[:space:]]*=[[:space:]]*131072[[:space:]]*$' "$profile_file"; then
+      continue
+    fi
+    tmp_file="$(mktemp "${profile_file}.tmp.XXXXXX")"
+    cp -p "$profile_file" "$tmp_file"
+    if ! sed '/^[[:space:]]*model_context_window[[:space:]]*=[[:space:]]*131072[[:space:]]*$/d' "$profile_file" >"$tmp_file"; then
+      rm -f "$tmp_file"
+      die "failed to update Codex profile: $profile_file"
+    fi
+    mv -f "$tmp_file" "$profile_file"
+  done
+}
+
 codex_warn_mcp_config_reset() {
   local config_file="$1"
   local mcp_config=""
@@ -743,15 +765,15 @@ codex_build_model_entry() {
   local context_window=""
   local base_instructions=""
   local input_modalities=""
-  local reasoning_levels=""
-  local supports_reasoning_summaries="false"
-  local reasoning_defaults=""
+  local reasoning_contract=""
 
   context_window="$(jq -r '
     [ .model_info? // {} | to_entries[]
       | select(.key | test("\\.context_length$"))
       | .value
       | numbers
+      | floor
+      | select(. > 0)
     ] | max // 0
   ' "$show_file")"
   if [ "$(jq -r '.details.format // ""' "$show_file")" != "safetensors" ]; then
@@ -764,7 +786,8 @@ codex_build_model_entry() {
       | tonumber
       | floor
     ' "$show_file" 2>/dev/null | tail -n 1 || true)"
-    if [ -n "$num_ctx" ] && codex_parse_positive_int "$num_ctx" >/dev/null; then
+    if [ -n "$num_ctx" ] && codex_parse_positive_int "$num_ctx" >/dev/null \
+        && { [ "$context_window" -eq 0 ] || [ "$num_ctx" -lt "$context_window" ]; }; then
       context_window="$num_ctx"
     fi
   fi
@@ -780,22 +803,34 @@ codex_build_model_entry() {
       ["text"]
     end
   ' "$show_file")"
-  if jq -e '(.capabilities // []) | index("thinking")' "$show_file" >/dev/null; then
-    supports_reasoning_summaries="true"
-    reasoning_levels='[
-      {"effort":"low","description":"Low reasoning effort"},
-      {"effort":"medium","description":"Medium reasoning effort"},
-      {"effort":"high","description":"High reasoning effort"}
-    ]'
-    reasoning_defaults='{
-      "reasoning_summary_format": "none",
-      "default_reasoning_summary": "auto",
-      "default_reasoning_level": "medium"
-    }'
-  else
-    reasoning_levels='[]'
-    reasoning_defaults='{}'
-  fi
+  reasoning_contract="$(jq -c '
+    def effort:
+      if . == false then "none"
+      elif . == true then "high"
+      elif type == "string" and length > 0 then .
+      else null end;
+    if (.thinking | type) == "object" and (.thinking.values | type) == "array" then
+      (.thinking.values | map({raw: ., effort: (effort)}) | map(select(.effort != null))) as $entries
+      | (reduce $entries[] as $entry ([];
+          if any(.[]; . == $entry.effort) then . else . + [$entry.effort] end
+        )) as $efforts
+      | .thinking.default as $raw_default
+      | ($raw_default | effort) as $default
+      | {
+          levels: ($efforts | if . == ["none"] then [] else map({effort: ., description: (if . == "none" then "Turn reasoning off" else "Reasoning effort: \(.)" end)}) end),
+          default: (if $default != null
+            and ($entries | any(.raw == $raw_default))
+            and ($entries | map(select(.effort == $default)) | unique_by(.raw) | length) == 1
+            and $efforts != ["none"]
+            then $default else null end),
+          summaries: ($efforts | any(. != "none"))
+        }
+    elif ((.capabilities // []) | index("thinking")) then
+      {levels: [], default: null, summaries: true}
+    else
+      {levels: [], default: null, summaries: false}
+    end
+  ' "$show_file")"
 
   jq -n \
     --arg slug "$model" \
@@ -803,9 +838,7 @@ codex_build_model_entry() {
     --arg base_instructions "$base_instructions" \
     --argjson context_window "$context_window" \
     --argjson input_modalities "$input_modalities" \
-    --argjson supports_reasoning_summaries "$supports_reasoning_summaries" \
-    --argjson supported_reasoning_levels "$reasoning_levels" \
-    --argjson reasoning_defaults "$reasoning_defaults" \
+    --argjson reasoning_contract "$reasoning_contract" \
     '({
       slug: $slug,
       display_name: $display_name,
@@ -824,10 +857,15 @@ codex_build_model_entry() {
       support_verbosity: true,
       default_verbosity: "low",
       supports_parallel_tool_calls: false,
-      supports_reasoning_summaries: $supports_reasoning_summaries,
-      supported_reasoning_levels: $supported_reasoning_levels,
+      supports_reasoning_summaries: $reasoning_contract.summaries,
+      supported_reasoning_levels: $reasoning_contract.levels,
       experimental_supported_tools: []
-    } + $reasoning_defaults)' >"$entry_file"
+    } + (if $reasoning_contract.summaries then
+      {reasoning_summary_format: "none", default_reasoning_summary: "auto"}
+    else {} end)
+    + (if $reasoning_contract.default != null then
+      {default_reasoning_level: $reasoning_contract.default}
+    else {} end))' >"$entry_file"
 }
 
 codex_upsert_model_catalog() {
@@ -944,6 +982,7 @@ codex_prepare_local_ollama_model() {
   codex_show_model "$ollama_base_url" "$model" "$show_file"
   codex_build_model_entry "$model" "$show_file" "$entry_file"
   codex_upsert_model_catalog "$model" "$entry_file" "$tmp_dir"
+  codex_remove_bundled_context_overrides
   rm -rf "$tmp_dir"
   trap - EXIT
 }
