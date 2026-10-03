@@ -14586,8 +14586,8 @@ test_refresh_container_tree_suppresses_host_xattrs() {
   grep -Fq 'COPYFILE_DISABLE=1 args=--no-xattrs -C '"$source_dir"' -cf - .' "$tar_log" || fail "Expected refresh tar stream to disable xattrs, got: $(cat "$tar_log")"
 }
 
-test_refresh_container_copy_backend_stages_exact_managed_content() {
-  begin_test "refresh copy backend is cached, atomic, and exact"
+test_refresh_container_streaming_bypasses_broken_copy() {
+  begin_test "refresh streams exact content despite a silently broken copy backend"
 
   load_agentctl_functions
 
@@ -14598,7 +14598,7 @@ test_refresh_container_copy_backend_stages_exact_managed_content() {
   local target_tree
   local copy_help_calls=0
   local copy_calls=0
-  local interactive_calls=0
+  local interactive_log
   local current_owner
   refresh_test_mode() {
     case "$(uname -s)" in
@@ -14608,13 +14608,14 @@ test_refresh_container_copy_backend_stages_exact_managed_content() {
   }
   temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/agentctl refresh ünicode.XXXXXX")"
   register_dir_cleanup "$temp_dir"
+  interactive_log="$temp_dir/interactive.log"
   source_file="$temp_dir/source file ü.txt"
   source_tree="$temp_dir/source tree ü"
   target_file="$temp_dir/guest/managed file"
   target_tree="$temp_dir/guest/managed tree"
   current_owner="$(id -u):$(id -g)"
   mkdir -p "$source_tree/sub" "$target_tree"
-  printf 'new file\n' >"$source_file"
+  printf 'new file\000binary\377\n' >"$source_file"
   printf 'tree data\n' >"$source_tree/sub/file.txt"
   ln -s sub/file.txt "$source_tree/link"
   printf 'old file\n' >"$target_file"
@@ -14622,7 +14623,6 @@ test_refresh_container_copy_backend_stages_exact_managed_content() {
 
   CONTAINER_CMD=container
   container() {
-    local destination
     case "$1" in
       copy)
         if [ "${2:-}" = "--help" ]; then
@@ -14630,14 +14630,13 @@ test_refresh_container_copy_backend_stages_exact_managed_content() {
           return 0
         fi
         copy_calls=$((copy_calls + 1))
-        destination="${3#*:}"
-        cp -R -- "$2" "$destination"
-        printf 'copied to %s\n' "$destination"
+        # Model the upstream bug: report success without delivering anything.
+        return 0
         ;;
       exec)
         shift
         if [ "${1:-}" = "-i" ]; then
-          interactive_calls=$((interactive_calls + 1))
+          printf 'interactive\n' >>"$interactive_log"
           shift
         fi
         [ "${1:-}" = "-u" ] && shift 2
@@ -14652,20 +14651,21 @@ test_refresh_container_copy_backend_stages_exact_managed_content() {
 
   run_capture refresh_container_file unit-test-container "$source_file" "$target_file" "$current_owner" 600
   assert_status 0
-  [ -z "$RUN_OUTPUT" ] || fail "Expected container copy destination output to be suppressed, got: $RUN_OUTPUT"
-  [ "$(cat "$target_file")" = "new file" ] || fail "Expected copied file content"
+  [ -z "$RUN_OUTPUT" ] || fail "Expected managed streaming transfer to produce no output, got: $RUN_OUTPUT"
+  cmp "$source_file" "$target_file" || fail "Expected exact streamed file content"
   [ "$(refresh_test_mode "$target_file")" = "600" ] || fail "Expected copied file mode 600"
 
   run_capture refresh_container_tree unit-test-container "$source_tree" "$target_tree" "$current_owner" 640 750
   assert_status 0
+  cmp "$source_tree/sub/file.txt" "$target_tree/sub/file.txt" || fail "Expected exact streamed tree content"
   [ ! -e "$target_tree/stale.txt" ] || fail "Expected stale managed tree content to be removed"
   [ -L "$target_tree/link" ] || fail "Expected copied tree symlink to be preserved"
   [ "$(readlink "$target_tree/link")" = "sub/file.txt" ] || fail "Expected symlink target to be preserved"
   [ "$(refresh_test_mode "$target_tree/sub")" = "750" ] || fail "Expected copied directory mode 750"
   [ "$(refresh_test_mode "$target_tree/sub/file.txt")" = "640" ] || fail "Expected copied tree file mode 640"
-  [ "$copy_help_calls" -eq 1 ] || fail "Expected one cached copy capability check, got $copy_help_calls"
-  [ "$copy_calls" -eq 2 ] || fail "Expected two copy operations, got $copy_calls"
-  [ "$interactive_calls" -eq 0 ] || fail "Did not expect streaming fallback for copy-compatible paths"
+  [ "$copy_help_calls" -eq 0 ] || fail "Managed transfers must not probe the broken copy backend"
+  [ "$copy_calls" -eq 0 ] || fail "Managed transfers must bypass the broken copy backend"
+  [ "$(wc -l <"$interactive_log" | tr -d ' ')" -eq 2 ] || fail "Expected interactive streaming for both transfers"
   unset -f refresh_test_mode
 }
 
@@ -14783,8 +14783,8 @@ test_refresh_container_symlink_sources_use_streaming_fallback() {
   [ "$(wc -l <"$interactive_log" | tr -d ' ')" -eq 2 ] || fail "Expected symlink tree source to use interactive streaming"
 }
 
-test_refresh_container_copy_failure_cleans_stage_and_activation_rolls_back() {
-  begin_test "refresh copy failures clean staging and activation rolls back"
+test_refresh_container_stream_failure_cleans_stage_and_activation_rolls_back() {
+  begin_test "refresh stream failures clean staging and activation rolls back"
 
   load_agentctl_functions
 
@@ -14806,16 +14806,16 @@ test_refresh_container_copy_failure_cleans_stage_and_activation_rolls_back() {
   container() {
     local destination
     case "$1" in
-      copy)
-        if [ "${2:-}" = "--help" ]; then
-          return 0
-        fi
-        destination="${3#*:}"
-        printf 'partial\n' >"$destination"
-        return 1
-        ;;
+      copy) fail "Unexpected container copy invocation: $*" ;;
       exec)
         shift
+        if [ "${1:-}" = "-i" ]; then
+          [ "${2:-}" = "-u" ] || fail "Expected root streaming exec"
+          cat >/dev/null
+          destination="${9}"
+          printf 'partial\n' >"$destination"
+          return 1
+        fi
         [ "${1:-}" = "-u" ] && shift 2
         shift
         "$@"
@@ -14829,10 +14829,10 @@ test_refresh_container_copy_failure_cleans_stage_and_activation_rolls_back() {
   }
   run_capture refresh_copy_failure_call
   unset -f refresh_copy_failure_call
-  [ "$RUN_STATUS" -ne 0 ] || fail "Expected supported copy failure to be reported"
-  [ "$(cat "$target_file")" = "old" ] || fail "Expected copy failure to preserve the managed target"
+  [ "$RUN_STATUS" -ne 0 ] || fail "Expected streaming failure to be reported"
+  [ "$(cat "$target_file")" = "old" ] || fail "Expected streaming failure to preserve the managed target"
   if find "$temp_dir" -name 'target.txt.agentctl-stage.*' | grep -q .; then
-    fail "Expected partial copy staging path to be cleaned"
+    fail "Expected partial stream staging path to be cleaned"
   fi
 
   mkdir -p "$fake_bin"
@@ -14869,8 +14869,8 @@ EOF
   find "$temp_dir" -name 'target.txt.agentctl-backup.*' -exec /bin/rm -rf {} +
 }
 
-test_refresh_container_normalization_and_tree_copy_failures_clean_stages() {
-  begin_test "refresh normalization and tree copy failures clean staging"
+test_refresh_container_normalization_and_tree_stream_failures_clean_stages() {
+  begin_test "refresh normalization and tree stream failures clean staging"
 
   load_agentctl_functions
 
@@ -14897,23 +14897,21 @@ test_refresh_container_normalization_and_tree_copy_failures_clean_stages() {
   container() {
     local destination
     case "$1" in
-      copy)
-        if [ "${2:-}" = "--help" ]; then
-          return 0
-        fi
-        destination="${3#*:}"
-        if [ "$fail_tree_copy" -eq 1 ]; then
-          mkdir "$destination"
-          printf 'partial\n' >"$destination/partial.txt"
-          return 1
-        fi
-        cp -R -- "$2" "$destination"
-        ;;
+      copy) fail "Unexpected container copy invocation: $*" ;;
       exec)
         if [ "$fail_normalization" -eq 1 ] && printf '%s\n' "$*" | grep -Fq '[ -f "$2" ]'; then
           return 1
         fi
         shift
+        if [ "${1:-}" = "-i" ]; then
+          shift
+          if [ "$fail_tree_copy" -eq 1 ]; then
+            cat >/dev/null
+            destination="${8}"
+            printf 'partial\n' >"$destination/partial.txt"
+            return 1
+          fi
+        fi
         [ "${1:-}" = "-u" ] && shift 2
         shift
         "$@"
@@ -14944,6 +14942,24 @@ test_refresh_container_normalization_and_tree_copy_failures_clean_stages() {
   [ "$(cat "$target_tree/stale.txt")" = "stale" ] || fail "Expected tree copy failure to preserve target"
   if find "$temp_dir" -name 'target-tree.agentctl-stage.*' | grep -q .; then
     fail "Expected tree copy failure to clean partial stage"
+  fi
+
+  fail_tree_copy=0
+  refresh_tree_archive_failure_call() {
+    (
+      tar_create_tree_stream() {
+        command tar -C "$1" -cf - .
+        return 1
+      }
+      refresh_container_tree unit-test-container "$source_tree" "$target_tree" "$(id -u):$(id -g)" 644 755
+    )
+  }
+  run_capture refresh_tree_archive_failure_call
+  unset -f refresh_tree_archive_failure_call
+  [ "$RUN_STATUS" -ne 0 ] || fail "Expected archive producer failure even when guest extraction succeeds"
+  [ "$(cat "$target_tree/stale.txt")" = "stale" ] || fail "Expected archive producer failure to preserve target"
+  if find "$temp_dir" -name 'target-tree.agentctl-stage.*' | grep -q .; then
+    fail "Expected archive producer failure to clean staging"
   fi
 }
 
@@ -16785,11 +16801,11 @@ main() {
   run_selected_test test_container_state_permission_script_repairs_unreadable_state "test_container_state_permission_script_repairs_unreadable_state"
   run_selected_test test_refresh_container_file_streams_source_via_stdin "test_refresh_container_file_streams_source_via_stdin"
   run_selected_test test_refresh_container_tree_suppresses_host_xattrs "test_refresh_container_tree_suppresses_host_xattrs"
-  run_selected_test test_refresh_container_copy_backend_stages_exact_managed_content "test_refresh_container_copy_backend_stages_exact_managed_content"
+  run_selected_test test_refresh_container_streaming_bypasses_broken_copy "test_refresh_container_streaming_bypasses_broken_copy"
   run_selected_test test_refresh_container_colon_path_uses_streaming_fallback "test_refresh_container_colon_path_uses_streaming_fallback"
   run_selected_test test_refresh_container_symlink_sources_use_streaming_fallback "test_refresh_container_symlink_sources_use_streaming_fallback"
-  run_selected_test test_refresh_container_copy_failure_cleans_stage_and_activation_rolls_back "test_refresh_container_copy_failure_cleans_stage_and_activation_rolls_back"
-  run_selected_test test_refresh_container_normalization_and_tree_copy_failures_clean_stages "test_refresh_container_normalization_and_tree_copy_failures_clean_stages"
+  run_selected_test test_refresh_container_stream_failure_cleans_stage_and_activation_rolls_back "test_refresh_container_stream_failure_cleans_stage_and_activation_rolls_back"
+  run_selected_test test_refresh_container_normalization_and_tree_stream_failures_clean_stages "test_refresh_container_normalization_and_tree_stream_failures_clean_stages"
   run_selected_test test_system_manifest_starts_stopped_container_and_restores_state "test_system_manifest_starts_stopped_container_and_restores_state"
   run_selected_test test_runtime_cmd_starts_stopped_container_and_restores_state "test_runtime_cmd_starts_stopped_container_and_restores_state"
   run_selected_test test_runtime_cmd_propagates_exec_failures "test_runtime_cmd_propagates_exec_failures"

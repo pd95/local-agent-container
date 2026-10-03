@@ -4,6 +4,29 @@ This repository includes a small host-side integration test harness for `agentct
 Run these tests on the macOS host where Apple's `container` CLI is installed. Do not
 run them from inside a container.
 
+## Existing containers after an Apple runtime upgrade
+
+Apple container 1.4.1 and 1.5.0 can fail to copy files into or out of containers
+created with older runtimes because those containers retain their older guest
+agent ([upstream issue #2258](https://github.com/apple/container/issues/2258)).
+Managed file and tree transfers use `container exec -i` streaming to avoid this
+protocol mismatch. Unit coverage checks exact content, permissions, symlinks,
+stale-file removal, and preservation of existing targets after transfer failures.
+
+On the macOS host, use an existing affected managed container to verify the fix:
+
+```bash
+container --version
+container system version --format json
+./agentctl refresh --name agent-local-agent-container
+./agentctl doctor --name agent-local-agent-container
+```
+
+Then repeat the normal agent launch with Remote Control enabled and verify that
+helper installation succeeds. Use the host checkout containing this change;
+rebuilding images or recreating the affected container is not required. The
+workaround covers agentctl transfers; direct `container copy` remains affected.
+
 For user-facing setup and product docs, start with:
 - [README.md](README.md)
 - [docs/getting-started.md](docs/getting-started.md)
