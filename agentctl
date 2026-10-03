@@ -13,7 +13,6 @@ CLAUDE_MIN_INSTALL_MEM="4G"
 SYSTEM_BASELINE_MANIFEST_FILE="/etc/agentctl/system-manifest.json"
 RECOVERY_LEDGER_FILE="/home/coder/.config/agentctl/upgrade-recovery/ledger.json"
 SETPRIV_ARGS=(setpriv --inh-caps=-all --ambient-caps=-all --no-new-privs --)
-CONTAINER_COPY_SUPPORT=""
 SOCKET_MOUNTS_TEXT=""
 PUBLISHED_SOCKETS_TEXT=""
 SOCKET_PATH_MAX_BYTES=103
@@ -5471,17 +5470,6 @@ resolve_auth_image_for_container() {
   printf '%s\n' "$image"
 }
 
-container_copy_supported() {
-  if [ -z "$CONTAINER_COPY_SUPPORT" ]; then
-    if "$CONTAINER_CMD" copy --help >/dev/null 2>&1; then
-      CONTAINER_COPY_SUPPORT="yes"
-    else
-      CONTAINER_COPY_SUPPORT="no"
-    fi
-  fi
-  [ "$CONTAINER_COPY_SUPPORT" = "yes" ]
-}
-
 container_refresh_stage_path() {
   local name="$1"
   local target="$2"
@@ -5553,12 +5541,10 @@ refresh_container_file() {
 
   [ -f "$source" ] || die "Refresh source not found: $source"
   stage="$(container_refresh_stage_path "$name" "$target")" || die "Failed to prepare refresh staging path for $target"
-  if container_copy_supported && [[ "$source" != *:* ]] && [ ! -L "$source" ]; then
-    if ! "$CONTAINER_CMD" copy "$source" "$name:$stage" >/dev/null; then
-      cleanup_container_refresh_stage "$name" "$stage"
-      die "Failed to copy refresh source into $name: $source"
-    fi
-  elif ! "$CONTAINER_CMD" exec -i -u 0 "$name" sh -c 'cat > "$1"' sh "$stage" <"$source"; then
+  # Existing containers can retain a guest agent incompatible with the host's
+  # copy protocol after a runtime upgrade (apple/container#2258). Stream through
+  # exec instead; copy can even report success without delivering the file.
+  if ! "$CONTAINER_CMD" exec -i -u 0 "$name" sh -c 'cat > "$1"' sh "$stage" <"$source"; then
     cleanup_container_refresh_stage "$name" "$stage"
     die "Failed to stream refresh source into $name: $source"
   fi
@@ -5772,20 +5758,13 @@ refresh_container_tree() {
 
   [ -d "$source" ] || die "Refresh source directory not found: $source"
   stage="$(container_refresh_stage_path "$name" "$target")" || die "Failed to prepare refresh staging path for $target"
-  if container_copy_supported && [[ "$source" != *:* ]] && [ ! -L "$source" ]; then
-    if ! "$CONTAINER_CMD" copy "$source" "$name:$stage" >/dev/null; then
-      cleanup_container_refresh_stage "$name" "$stage"
-      die "Failed to copy refresh tree into $name: $source"
-    fi
-  else
-    if ! "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'mkdir "$1"' sh "$stage"; then
-      cleanup_container_refresh_stage "$name" "$stage"
-      die "Failed to create refresh tree staging directory: $target"
-    fi
-    if ! tar_create_tree_stream "$source" | "$CONTAINER_CMD" exec -i -u 0 "$name" sh -c 'tar -xf - -C "$1"' sh "$stage"; then
-      cleanup_container_refresh_stage "$name" "$stage"
-      die "Failed to stream refresh tree into $name: $source"
-    fi
+  if ! "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'mkdir "$1"' sh "$stage"; then
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to create refresh tree staging directory: $target"
+  fi
+  if ! tar_create_tree_stream "$source" | "$CONTAINER_CMD" exec -i -u 0 "$name" sh -c 'tar -xf - -C "$1"' sh "$stage"; then
+    cleanup_container_refresh_stage "$name" "$stage"
+    die "Failed to stream refresh tree into $name: $source"
   fi
   if ! "$CONTAINER_CMD" exec -u 0 "$name" sh -c '
     [ -d "$2" ] && [ ! -L "$2" ] &&

@@ -170,16 +170,15 @@ Limitations:
 
 ### Current agentctl state
 
-`doctor --host` detects the command. Managed host-to-container file and tree
-refreshes now select `container copy` automatically when the runtime supports
-the full command. Capability detection is cached so a refresh or bootstrap does
-not repeatedly invoke help.
+`doctor --host` detects the command, but managed file and tree refreshes use
+stdin and tar streaming through `container exec -i`. Apple container 1.4.1 and
+1.5.0 changed the copy protocol while existing containers retain their older
+guest agent. Copies can fail or report success without delivering data; see
+[Apple issue #2258](https://github.com/apple/container/issues/2258).
 
-Older runtimes retain the existing transports. Host source paths containing
-`:` also retain them because Apple's endpoint parser cannot represent those
-paths safely. File or directory symlinks used as the source root are streamed
-so refresh preserves the legacy behavior of installing the referenced content
-rather than a managed-target symlink.
+Streaming works with existing containers after the host runtime is upgraded,
+including source paths containing `:` and symlink source roots whose referenced
+content must be installed.
 
 The following flows deliberately remain streaming-based:
 
@@ -195,26 +194,23 @@ The stable managed refresh helpers select their transport internally:
 
 ```text
 host file/tree -> running container
-├── copy supported and source root representable: container copy
-└── otherwise: retained stdin/tar stream
+    -> stdin/tar stream through container exec -i
     -> unique sibling stage
     -> validate type and normalize ownership/modes
     -> backup old target, activate stage, remove backup
     -> restore backup if activation fails
 ```
 
-Copy failures are reported directly rather than retried through another
-backend. Partial stages are cleaned without touching the previous target.
+Streaming failures are reported directly. Partial stages are cleaned without touching the previous target.
 Managed directory trees are exact mirrors, so activation removes stale or
 locally modified files. Recursive normalization preserves symlinks within a
 tree without dereferencing them.
 
 ### Expected benefit
 
-The main benefit is simpler, more robust transfer with less dependence on guest
-utilities. It is not yet established that `cp` is faster. Directory copying may
-still use archive-like transport internally, and copying state out before
-packing it can add host I/O.
+Streaming avoids the copy protocol mismatch for existing containers after a
+host runtime upgrade. Files require guest `cat`; directory trees require guest
+`tar`. Transfer performance relative to `container copy` has not been measured.
 
 ### Remaining investigation
 
