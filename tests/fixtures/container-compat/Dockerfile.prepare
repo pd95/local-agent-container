@@ -1,0 +1,11 @@
+# Alpine 3.22.1 multi-platform index, verified against Docker Hub.
+FROM docker.io/library/alpine@sha256:4bcff63911fcb4448bd4fdacec207030997caf25e9bea4045fa6c8c44de311d1
+RUN apk add --no-cache bash util-linux coreutils musl-utils curl openssh-client nodejs jq git \
+ && addgroup -S coder \
+ && adduser -S -G coder -h /home/coder -s /bin/bash coder \
+ && mkdir -p /workdir /etc/agentctl /opt/agentctl/bin \
+ && chown -R coder:coder /workdir /home/coder /opt/agentctl
+USER coder
+WORKDIR /workdir
+ENV HOME=/home/coder
+CMD ["sh", "-c", "sleep infinity"]

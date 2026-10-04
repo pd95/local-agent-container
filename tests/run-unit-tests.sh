@@ -2344,6 +2344,58 @@ test_container_ssh_enabled_reads_inspect_shapes() {
   fi
 }
 
+test_configure_container_ssh_socket_preserves_private_access() {
+  begin_test "SSH socket setup grants the default guest user private access and rejects symlinks"
+  load_agentctl_functions
+  local socket_dir socket_file socket_pid ssh_test_enabled=true ssh_fixture_identity
+  local old_container_cmd="$CONTAINER_CMD" attempts=0
+  # Earlier fixtures may nest TMPDIR beyond Unix socket path length limits.
+  socket_dir="$(mktemp -d /tmp/agentctl-ssh-test.XXXXXX)"; socket_file="$socket_dir/agent.sock"
+  register_dir_cleanup "$socket_dir"
+  ssh_fixture_identity="$(id -u):$(id -g)"
+  node -e 'require("node:net").createServer().listen(process.argv[1])' "$socket_file" &
+  socket_pid=$!
+  register_pid_cleanup "$socket_pid"
+  until [ -S "$socket_file" ]; do
+    attempts=$((attempts+1)); [ "$attempts" -lt 30 ] || fail 'Socket fixture did not start'
+    command sleep 0.1
+  done
+  chmod 666 "$socket_file"
+  container_ssh_enabled() { printf '%s\n' "$ssh_test_enabled"; }
+  CONTAINER_CMD=container
+  container() {
+    [ "$1" = exec ] || fail "Unexpected SSH invocation: $*"
+    if [ "$2" = -u ]; then
+      [ "$3" = 0 ] || fail 'Socket setup did not use root'
+      local script="$7"
+      shift 8
+      [ "$1" = /var/host-services/ssh-auth.sock ] || fail 'Unexpected guest socket path'
+      bash -ec "$script" sh "$socket_file" "$2" "$3"
+    else
+      printf '%s\n' "$ssh_fixture_identity"
+    fi
+  }
+  attempt_ssh_setup() { (configure_container_ssh_socket "$@"); }
+  run_capture attempt_ssh_setup unit-test-container
+  assert_status 0
+  node -e 'const s=require("node:fs").statSync(process.argv[1]); if((s.mode&511)!==384 || s.uid!==process.getuid() || s.gid!==process.getgid()) process.exit(1)' "$socket_file" || fail 'Socket was not private to the guest identity'
+  mv "$socket_file" "$socket_dir/original.sock"
+  ln -s original.sock "$socket_file"
+  run_capture attempt_ssh_setup unit-test-container
+  assert_status 1
+  assert_contains 'Refusing symlink'
+  rm "$socket_file"
+  run_capture attempt_ssh_setup unit-test-container
+  assert_status 0
+  ssh_test_enabled=false
+  container() { fail 'Disabled SSH invoked guest exec'; }
+  run_capture attempt_ssh_setup unit-test-container
+  assert_status 0
+  kill "$socket_pid" 2>/dev/null || true
+  wait "$socket_pid" 2>/dev/null || true
+  CONTAINER_CMD="$old_container_cmd"
+}
+
 test_upgrade_ssh_feature_preservation_decision() {
   begin_test "upgrade ensures SSH client when forwarding is requested or preserved"
 
@@ -2526,6 +2578,7 @@ test_configure_container_host_alias_replaces_stale_entry() {
   begin_test "container host alias replaces a stale gateway entry"
 
   load_agentctl_functions
+  configure_container_ssh_socket() { :; }
 
   local temp_dir
   local hosts_file
@@ -3810,6 +3863,40 @@ test_run_cmd_stdio_suppresses_lifecycle_stdout() {
   if printf '%s\n' "$RUN_OUTPUT" | grep -Fq -- 'container-start-stdout'; then
     fail "Did not expect start stdout in run --stdio output: $RUN_OUTPUT"
   fi
+  CONTAINER_CMD="$old_container_cmd"
+}
+
+test_run_cmd_stdio_suppresses_existing_start_stdout() {
+  begin_test "run --stdio keeps restarted container names out of protocol stdout"
+  load_agentctl_functions
+  local workdir old_container_cmd="$CONTAINER_CMD"
+  workdir="$(new_workdir)"
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { return 1; }
+  validate_mount_mode() { :; }
+  validate_existing_container_shm_size() { :; }
+  validate_existing_container_networks() { :; }
+  validate_existing_container_ssh() { :; }
+  configure_container_host_alias() { :; }
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
+  mcp_require_no_active_leases() { :; }
+  start_existing_container_managed() { printf 'container-start-stdout\n'; }
+  CONTAINER_CMD=container
+  container() {
+    case "$1" in
+      exec) printf 'protocol-stdout\n'; return 21 ;;
+      stop) : ;;
+      *) fail "Unexpected container invocation: $*" ;;
+    esac
+  }
+  run_capture run_cmd --name unit-test-container --workdir "$workdir" --stdio --cmd cat
+  assert_status 21
+  assert_contains 'protocol-stdout'
+  assert_not_contains 'container-start-stdout'
   CONTAINER_CMD="$old_container_cmd"
 }
 
@@ -16369,6 +16456,13 @@ $completion: fixture (backup image: fixture-backup)"
   [ "$(extract_backup_image)" = fixture-backup ] || fail "Lost backup reference when recovery failed"
 }
 
+test_container_compat_harness() {
+  begin_test "real-runtime compatibility harness supervision and reporting"
+  run_capture env COMPAT_TEST_BASH="$BASH" "$BASH" "$TEST_ROOT/tests/run-container-compat-unit-tests.sh"
+  assert_status 0
+  assert_contains "Compatibility harness checks passed"
+}
+
 main() {
   log "Using agentctl at $AGENTCTL"
   log "Using agentctl implementation at $AGENTCTL_IMPL"
@@ -16379,6 +16473,7 @@ main() {
     log "Running unit tests from: $TEST_START_FROM"
   fi
 
+  run_selected_test test_container_compat_harness "test_container_compat_harness"
   run_selected_test test_shared_assertions_handle_long_output "test_shared_assertions_handle_long_output"
   run_selected_test test_shared_container_checks_drain_long_output "test_shared_container_checks_drain_long_output"
   run_selected_test test_upgrade_completion_test_helpers "test_upgrade_completion_test_helpers"
@@ -16461,6 +16556,7 @@ main() {
   run_selected_test test_shared_memory_size_helpers_normalize_and_compare_values "test_shared_memory_size_helpers_normalize_and_compare_values"
   run_selected_test test_container_shm_size_reads_apple_container_inspect_shape "test_container_shm_size_reads_apple_container_inspect_shape"
   run_selected_test test_container_ssh_enabled_reads_inspect_shapes "test_container_ssh_enabled_reads_inspect_shapes"
+  run_selected_test test_configure_container_ssh_socket_preserves_private_access "test_configure_container_ssh_socket_preserves_private_access"
   run_selected_test test_upgrade_ssh_feature_preservation_decision "test_upgrade_ssh_feature_preservation_decision"
   run_selected_test test_shared_memory_support_check_fails_before_use "test_shared_memory_support_check_fails_before_use"
   run_selected_test test_run_container_passes_shared_memory_size_to_create "test_run_container_passes_shared_memory_size_to_create"
@@ -16517,6 +16613,7 @@ main() {
   run_selected_test test_exec_cmd_stdio_requires_running_container "test_exec_cmd_stdio_requires_running_container"
   run_selected_test test_run_cmd_stdio_uses_interactive_without_tty "test_run_cmd_stdio_uses_interactive_without_tty"
   run_selected_test test_run_cmd_stdio_suppresses_lifecycle_stdout "test_run_cmd_stdio_suppresses_lifecycle_stdout"
+  run_selected_test test_run_cmd_stdio_suppresses_existing_start_stdout "test_run_cmd_stdio_suppresses_existing_start_stdout"
   run_selected_test test_run_container_stdio_detaches_pre_exec_stdin "test_run_container_stdio_detaches_pre_exec_stdin"
   run_selected_test test_run_cmd_stdio_requires_cmd "test_run_cmd_stdio_requires_cmd"
   run_selected_test test_run_cmd_stdio_rejects_shell "test_run_cmd_stdio_rejects_shell"

@@ -454,3 +454,4 @@ Start here, then move into the more specialized guides as needed:
 - [Unix-socket forwarding](docs/unix-sockets.md)
 - [Advanced container usage](docs/advanced-container-usage.md)
 - [Testing](TESTING.md)
+- [Apple container upgrades and compatibility](docs/apple-container-upgrades.md)

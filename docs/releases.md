@@ -44,7 +44,14 @@ refreshes without changing tracked project files.
 
    ```bash
    bash tests/run-tests.sh --tier full
+   bash tests/run-container-compat-tests.sh \
+     --assets-dir "$HOME/.cache/agentctl-container-compat/assets-1.3.1"
    ```
+
+   Prepare the compatibility fixture once as described in `TESTING.md`. When
+   changing the supported Apple runtime version, also verify retained containers
+   with the compatibility suite's baseline/candidate upgrade phases. Keep the
+   versioned reports with the release verification evidence.
 
 5. Merge the PR through GitHub and update local `main` with `git pull
    --ff-only`.

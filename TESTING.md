@@ -27,6 +27,160 @@ helper installation succeeds. Use the host checkout containing this change;
 rebuilding images or recreating the affected container is not required. The
 workaround covers agentctl transfers; direct `container copy` remains affected.
 
+## Apple container compatibility and regression suite
+
+For custom Homebrew tap installation, version switching, complete
+baseline-to-candidate command chains, report review, and recovery, see
+[Upgrade Apple container and verify agentctl compatibility](docs/apple-container-upgrades.md).
+
+Run the black-box runtime suite on the macOS host before considering a new
+Apple `container` version supported. It uses the real CLI, including calls
+through agentctl's production functions; it does not mock the runtime.
+The existing agentctl integration suite remains a separate release requirement.
+
+The host needs Bash 3.2 or newer, jq (the version required by agentctl), Node.js,
+and the standard macOS archive, process, checksum, SSH, and `script` tools.
+No Makefile or Python installation is needed. Run while the host is idle:
+do not switch versions or run other container builds during a suite run.
+
+Prepare the fixture once with the known-good CLI and API server active:
+
+```bash
+container --version
+container system status
+container system version --format json
+bash tests/run-container-compat-tests.sh --prepare \
+  --assets-dir "$HOME/.cache/agentctl-container-compat/assets-1.3.1"
+```
+
+Preparation explicitly pulls a digest-pinned Alpine base, installs the small
+fixture's tools, and saves a checksummed root filesystem under
+`~/.cache/agentctl-container-compat/assets-1.3.1` in these examples. It retains the pulled base as a
+preparation asset. No AI runtimes or credentials are needed. Subsequent runs
+build uniquely tagged local fixture images from that archive, with no package
+downloads. Every candidate run also pulls a uniquely named tiny OCI image from
+a repository-owned registry fixture bound to host loopback. Unique layer bytes
+force an actual download; the suite verifies the digest and recorded layer
+request, then removes the image. This needs no public registry or global registry
+configuration. Runtime-owned builder/init image caches may still need preparation
+when first using a different runtime version.
+
+Run all fresh-container contracts with each candidate's matching CLI/server pair:
+
+```bash
+bash tests/run-container-compat-tests.sh \
+  --assets-dir "$HOME/.cache/agentctl-container-compat/assets-1.3.1"
+```
+
+`CONTAINER_CMD=/absolute/path/to/container` selects a versioned CLI, and is
+also passed to agentctl. Switching the CLI alone does not switch the API server;
+the suite rejects mismatched or unknown versions. It never switches Homebrew
+formulae, starts the API server, or prunes global resources.
+
+To check retained guest agents across an upgrade, prepare dedicated fixtures
+with 1.3.1 active, then switch **both** CLI and API server on the host:
+
+```bash
+bash tests/run-container-compat-tests.sh --prepare-upgrade \
+  --assets-dir "$HOME/.cache/agentctl-container-compat/assets-1.3.1" \
+  --state-dir "$HOME/.cache/agentctl-container-compat/baseline-to-candidate"
+
+# Switch the host's CLI and API server to the candidate, then verify their versions.
+container --version
+container system status
+container system version --format json
+
+bash tests/run-container-compat-tests.sh --verify-upgrade \
+  --assets-dir "$HOME/.cache/agentctl-container-compat/assets-1.3.1" \
+  --state-dir "$HOME/.cache/agentctl-container-compat/baseline-to-candidate"
+```
+
+Preparation intentionally keeps running and stopped fixtures, their image,
+bind directories, and socket mappings. Verification checks those original
+containers and then runs every fresh contract. A host service restart may stop
+the originally running fixture; verification can start it again without
+recreating it. Once verification begins, its fixtures are cleaned up even when
+a test fails. Prepare a new state directory on the baseline for another attempt.
+Setup failures before verification begins preserve the fixtures for retry.
+
+Each run prints its report directory. `metadata.json` records versions, host
+details, git commit/dirty status, and the fixture checksum. `summary.json` gives
+the compatibility decision and per-test results. Each `operations/op.*`
+directory contains exact command arguments, exit status, process exit status,
+elapsed seconds, timeout/interruption flags, and separate lossless stdout/stderr.
+Public `agentctl` commands have their own operation records. Health checks after
+each case use a separate directory so failed-case captures remain available.
+Temporary build contexts and extracted filesystems are removed; diagnostics and
+small assertion inputs remain in the report. Failure messages show bounded
+previews and full-stream paths; binary data is displayed as hex rather than
+written directly to the terminal.
+
+Before scheduling cases, the suite checks that fixture metadata and helper files
+are readable by `coder`, and that its temporary, home, and work directories are
+writable. Fixture setup failures therefore stop the run before unrelated tests
+can report misleading runtime failures.
+
+A complete passing run has `compatible: true`. Capability-gated features absent
+from the runtime are reported as `unsupported`; their absence is permitted only
+where agentctl explicitly gates the feature. Advertised features must work, and
+failed capability probes fail the run instead of suppressing coverage. An absent
+optional subcommand must be confirmed by successful parent help.
+Direct `container copy` failures are prominent diagnostics, while agentctl's
+actual streamed file/tree transfers remain mandatory. The stream case requires a
+2 MiB managed file upload and byte-identical download through public agentctl,
+plus protocol replies while stdin remains open. Simultaneous bulk echo is a
+separate non-gating stress diagnostic: 1.3.1 has intermittently stalled in that
+pattern. Its timeout and byte counts remain visible; runtime health and cleanup
+must still pass. Fresh compatibility and retained-container compatibility are
+distinct: `--verify-upgrade` certifies both
+for the recorded baseline-to-candidate transition. No version has been newly
+certified merely by adding these tests.
+
+For focused debugging or resumption:
+
+```bash
+bash tests/run-container-compat-tests.sh --filter transfers \
+  --assets-dir "$HOME/.cache/agentctl-container-compat/assets-1.3.1"
+bash tests/run-container-compat-tests.sh --from recovery \
+  --assets-dir "$HOME/.cache/agentctl-container-compat/assets-1.3.1"
+```
+
+Filtered and resumed runs cannot certify a version. Recover abandoned resources
+using their printed report directory (or a retained upgrade state directory):
+
+```bash
+bash tests/run-container-compat-tests.sh --cleanup --state-dir /path/to/report
+```
+
+The runner serializes suite executions, rejects stale ordinary-run journals, and
+prints recovery commands when cleanup fails. Cleanup only uses recorded owned
+resources; it does not replay old helper PIDs. An abandoned lock can be removed
+with `--cleanup --state-dir "$HOME/.cache/agentctl-container-compat/lock"` once
+its owner is no longer running. An unresponsive API server requires user-side
+recovery before resource cleanup can succeed; no test can guarantee deletion
+while the runtime itself cannot answer commands.
+
+`--assets-dir` and `--output-dir` override persistent locations. The runner defaults
+to an `assets` directory; all documented certification workflows explicitly select
+`assets-1.3.1` so preparation, upgrades, and release checks reuse the same baseline. Choose a new
+assets directory and run `--prepare` again after changing the preparation
+definition or host architecture. Deadlines are configurable through
+`COMPAT_QUERY_TIMEOUT` (30 seconds), `COMPAT_LIFECYCLE_TIMEOUT` (120),
+`COMPAT_IMAGE_TIMEOUT` (600), `COMPAT_TEST_TIMEOUT` (900), and
+`COMPAT_KILL_GRACE` (5). The live protocol check also bounds reply waits and
+terminates its owned command tree before returning a failure. Queries include
+exec operations. Termination can take
+the grace period plus one second to reap children and finalize diagnostics.
+
+See [the runtime contract inventory](tests/container-compat/CONTRACTS.md) for
+coverage and boundaries. The local supervisor/journal/reporting regressions run
+as part of `bash tests/run-unit-tests.sh`, and can also run independently:
+
+```bash
+bash tests/run-container-compat-unit-tests.sh
+/workdir/.bin/bash3 tests/run-container-compat-unit-tests.sh
+```
+
 For user-facing setup and product docs, start with:
 - [README.md](README.md)
 - [docs/getting-started.md](docs/getting-started.md)
@@ -106,6 +260,12 @@ The SSH forwarding test requires a working host `SSH_AUTH_SOCK`. It rebuilds
 `agent-plain` with the SSH feature preinstalled, verifies non-root agent access,
 checks upgrade preservation, and then disables the relay while retaining the
 client feature:
+
+Agentctl assigns the guest relay socket to the container's default user with
+mode `0600` when preparing host integration for run, exec, start, or restart.
+Bootstrap and upgrade apply the same ownership setup. The host agent socket
+retains its permissions. Existing SSH-enabled containers can pick up the fix
+through `agentctl exec` or `agentctl restart`; no image rebuild is required.
 
 ```bash
 bash tests/run-tests.sh --tier full --filter ssh-forwarding
