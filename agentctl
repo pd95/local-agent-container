@@ -2067,6 +2067,26 @@ container_ssh_enabled() {
   '
 }
 
+configure_container_ssh_socket() {
+  local name="$1" enabled identity uid gid
+  enabled="$(container_ssh_enabled "$name")" || die "Unable to inspect SSH forwarding for container: $name"
+  [ "$enabled" = true ] || return 0
+  identity="$("$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -c 'printf "%s:%s\n" "$(id -u)" "$(id -g)"')" \
+    || die "Unable to determine the SSH socket user for container: $name"
+  uid="${identity%%:*}"; gid="${identity#*:}"
+  case "$uid" in ''|*[!0-9]*) die "Invalid SSH socket user for container: $name" ;; esac
+  case "$gid" in ''|*[!0-9]*) die "Invalid SSH socket user for container: $name" ;; esac
+  [ "$uid" != "$identity" ] || die "Invalid SSH socket user for container: $name"
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -ec '
+    socket="$1"
+    [ ! -L "$socket" ] || { echo "Refusing symlink at SSH socket path" >&2; exit 1; }
+    [ -S "$socket" ] || exit 0
+    chown "$2:$3" "$socket"
+    chmod 600 "$socket"
+  ' sh /var/host-services/ssh-auth.sock "$uid" "$gid" >/dev/null \
+    || die "Unable to grant the container user access to its SSH agent socket: $name"
+}
+
 guest_ssh_socket_available() {
   local name="$1"
   "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" sh -c 'socket="${SSH_AUTH_SOCK:-/var/host-services/ssh-auth.sock}"; [ -S "$socket" ]' >/dev/null 2>&1
@@ -6061,6 +6081,7 @@ bootstrap_cmd() {
 
   if [ "$ssh_requested" -eq 1 ]; then
     ensure_requested_feature_installed "$name" ssh
+    configure_container_ssh_socket "$name"
   fi
 
   if [ "$started_for_bootstrap" -eq 1 ] && [ "$was_running" -eq 0 ]; then
@@ -6755,6 +6776,8 @@ configure_container_host_alias() {
     exit "$status"
   ' sh "$host_address" "$CONTAINER_HOST_NAME" \
     || die "Unable to configure $CONTAINER_HOST_NAME in container: $name"
+  # Host integration is refreshed together on run, exec, start, and restart.
+  configure_container_ssh_socket "$name"
 }
 
 doctor_ssh_status() {
@@ -9193,7 +9216,11 @@ run_container() {
       # Mark ownership before the helper can start the container. Its guest
       # proxy or Remote Control setup may fail after the container is live.
       started=1
-      start_existing_container_managed "$actual_name" 1
+      if [ "$stdio" -eq 1 ]; then
+        start_existing_container_managed "$actual_name" 1 >/dev/null
+      else
+        start_existing_container_managed "$actual_name" 1
+      fi
       mcp_lock_release
       remote_control_lock_release
       started_with_managed_mcp=1
@@ -10920,6 +10947,7 @@ upgrade_cmd() {
 
   echo "Starting container: $target_name" >&2
   "$CONTAINER_CMD" start "$target_name" >/dev/null
+  if [ "$target_ssh" = true ]; then configure_container_ssh_socket "$target_name"; fi
   if [ "$mcp_target_enabled" -eq 1 ]; then
     mcp_configure_guest "$target_name"
     mcp_persist_registry "$target_name"
