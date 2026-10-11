@@ -30,7 +30,8 @@ You need:
   provides `jq 1.7.1-apple`)
 
 This baseline is Homebrew-free and does not require host-side Python or another
-package manager. The managed MCP bridge requires host-side Node.js. Ollama is
+package manager. The managed MCP bridge requires host-side Node.js; its optional
+`host-artifacts` server also requires host-side Python 3.8 or newer. Ollama is
 required only for local-model workflows; online runtime workflows do not need
 it.
 
@@ -240,7 +241,7 @@ For a new persistent container, the built-in `xcode` preset enables the managed
 MCP bridge and exposes the Mac's `xcrun mcpbridge` to Codex:
 
 ```bash
-agentctl run --image agent-python --online --mcp xcode
+agentctl run --image agent-python --online --mcp xcode --mcp host-artifacts
 ```
 
 An existing container created without MCP wiring needs a one-time upgrade.
@@ -249,6 +250,7 @@ Definitions can then be added without recreating it again:
 ```bash
 agentctl upgrade --enable-mcp
 agentctl mcp add xcode
+agentctl mcp add host-artifacts
 ```
 
 Add custom host MCP servers with an inline definition or a private definition
@@ -265,6 +267,10 @@ agentctl mcp status
 The host command remains outside the container and is reachable through a
 private managed bridge. See [docs/managed-mcp.md](docs/managed-mcp.md) for
 credentials, HTTP upstreams, lifecycle behavior, and additional definitions.
+
+Host artifacts use per-container source grants and the existing private MCP
+bridge. See [Host artifacts](docs/host-artifacts.md) for additional file/directory
+permissions and Xcode attachment export.
 
 ### Continue a project from your phone
 

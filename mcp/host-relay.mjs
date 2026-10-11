@@ -7,6 +7,8 @@ import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import {StringDecoder} from 'node:string_decoder';
 import {RotatingLog, writeEvent, writeServerStderr} from './rotating-log.mjs';
+import {effectivePolicy, isXcodePreset} from './artifact-policy.mjs';
+import {fileURLToPath} from 'node:url';
 
 const [,, configPath] = process.argv;
 if (!configPath) {
@@ -22,6 +24,10 @@ if (!socketPath || !nonce || !containerName) {
   process.exit(64);
 }
 const definitions = new Map(config.servers.map(server => [server.name, server]));
+const artifactDefinition = config.servers.find(server => server.builtin === 'host-artifacts');
+const artifactPolicy = artifactDefinition ? await effectivePolicy(config.servers, process.env.HOME) : null;
+const xcodeDefinition = config.servers.find(isXcodePreset);
+
 const childStates = new Set();
 const sessions = new Map();
 const serverChildren = new Map();
@@ -251,9 +257,14 @@ function startChild(definition) {
   for (const name of ['PATH', 'HOME', 'TMPDIR', 'USER', 'LOGNAME', 'SHELL', 'LANG']) {
     if (process.env[name] !== undefined) baseline[name] = process.env[name];
   }
-  const child = spawn(definition.command, definition.args || [], {
+  const builtin = definition.builtin === 'host-artifacts';
+  const artifactEnvironment = builtin ? {AGENTCTL_HOST_ARTIFACTS_CONFIG:JSON.stringify({
+    container:containerName, container_command:config.container_command, policy:artifactPolicy,
+    developer_dir:xcodeDefinition?.inherited_env?.DEVELOPER_DIR || xcodeDefinition?.env?.DEVELOPER_DIR || process.env.DEVELOPER_DIR
+  })} : {};
+  const child = spawn(builtin ? process.execPath : definition.command, builtin ? [fileURLToPath(new URL('./host-artifacts.mjs',import.meta.url))] : definition.args || [], {
     cwd: definition.cwd || undefined,
-    env: {...baseline, ...(definition.inherited_env || {}), ...(definition.env || {})},
+    env: {...baseline, ...(definition.inherited_env || {}), ...(definition.env || {}), ...artifactEnvironment},
     stdio: ['pipe', 'pipe', 'pipe']
   });
   event('info','stdio_server_started',{server:definition.name,pid:child.pid ?? null});
