@@ -579,3 +579,23 @@ test('retiring presets preserves explicit grants and removes stored preset entri
   assert.deepEqual(edited[0].grants,definition.grants);
   await assert.rejects(mutatePolicy([definition],'allow-preset','papageye'),/Unknown artifact preset/);
 });
+
+test('Xcode log grants accept BuildProject text logs with narrow directory and file boundaries',async ()=>{
+  const definition=await normalizeDefinition({name:'host-artifacts',type:'builtin'});
+  const xcode={name:'xcode',command:'/usr/bin/xcrun',args:['mcpbridge'],shared_process:true};
+  for (const definitions of [[definition,xcode],[{...definition,presets:['xcode']}]]) {
+    const policy=await effectivePolicy(definitions);
+    const grant=policy.grants.find(item=>item.id==='xcode-3');
+    assert.equal(grant.kind,'file-pattern');
+    const rule=new RegExp(grant.value);
+    for (const prefix of ['/var/folders','/private/var/folders']) {
+      const parent=`${prefix}/v1/wdvlbd5j7sj4kpz6c4d4k3680000gn/T/ActionArtifacts/default`;
+      for (const tool of ['BuildProject','GetBuildLog','RunAllTests','RunSomeTests']) {
+        assert.equal(rule.test(`${parent}/${tool}/BuildProject-Log-20261011-204049.txt`),true);
+      }
+      for (const invalid of ['BuildProject/nested/log.txt','BuildProject/log.png','BuildProjectOther/log.txt','RenderPreview/log.txt','BuildProject/.txt','BuildProject/log.txt/extra']) {
+        assert.equal(rule.test(`${parent}/${invalid}`),false);
+      }
+    }
+  }
+});

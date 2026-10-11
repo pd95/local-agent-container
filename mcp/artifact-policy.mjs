@@ -55,7 +55,7 @@ export function presetGrants(name) {
   const rules = [
     ['xcode-1', 'file-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/RenderPreview/[^/]+\\.png$'],
     ['xcode-2', 'file-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/DeviceInteractionSynthesize/[^/]+\\.(?:png|txt)$'],
-    ['xcode-3', 'file-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/(?:GetBuildLog|RunAllTests|RunSomeTests)/[^/]+\\.txt$'],
+    ['xcode-3', 'file-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/(?:BuildProject|GetBuildLog|RunAllTests|RunSomeTests)/[^/]+\\.txt$'],
     ['xcode-4', 'directory-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/(?:RunAllTests|RunSomeTests)/Test-[^/]+\\.xcresult$']
   ];
   return rules.map(([id,kind,value]) => ({id,kind,value,preset:name}));

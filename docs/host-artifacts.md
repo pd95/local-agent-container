@@ -31,7 +31,8 @@ is needed; `agentctl refresh` also updates the writer in existing MCP containers
 
 `host-artifacts` by itself grants **no host source access**. Enabling it alongside
 the built-in `xcode` preset automatically grants narrow access to Xcode preview
-PNGs, device interaction PNG/text artifacts, build/test console logs, and test
+PNGs, device interaction PNG/text artifacts, text logs from `BuildProject`,
+`GetBuildLog`, `RunAllTests` and `RunSomeTests`, and test
 result bundles directly under Xcode's `RunAllTests`/`RunSomeTests` ActionArtifacts directories. The order
 of registration does not matter. Removing `xcode` removes these derived grants.
 An explicitly granted `xcode` preset remains until revoked.
