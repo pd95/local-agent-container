@@ -71,7 +71,8 @@ http://127.0.0.1:47123/mcp/example
 ## Host artifact imports
 
 The built-in `host-artifacts` server imports approved host artifacts into
-`/workdir/.host-artifacts` and exports Xcode test attachments:
+`/workdir/.host-artifacts`. Pairing it with the built-in Xcode bridge also
+exposes `extract_xcode_test_attachments`:
 
 ```bash
 agentctl create --mcp xcode --mcp host-artifacts
@@ -81,8 +82,9 @@ agentctl mcp artifacts list
 ```
 
 It starts with no source grants. When the built-in `xcode` preset is also
-configured, narrow Xcode artifact rules activate automatically. Other paths and
-the PapagEye preset require explicit per-container host grants. The four grant
+configured, narrow Xcode ActionArtifacts rules activate automatically. Other
+paths, including DerivedData and application-specific directories, require
+explicit per-container host grants. The four grant
 types are exact files, exact directories, file regexes and directory regexes.
 
 See [Host artifacts](host-artifacts.md) for permission commands, MCP tool inputs,
