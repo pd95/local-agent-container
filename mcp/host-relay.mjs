@@ -25,7 +25,7 @@ if (!socketPath || !nonce || !containerName) {
 }
 const definitions = new Map(config.servers.map(server => [server.name, server]));
 const artifactDefinition = config.servers.find(server => server.builtin === 'host-artifacts');
-const artifactPolicy = artifactDefinition ? await effectivePolicy(config.servers, process.env.HOME) : null;
+const artifactPolicy = artifactDefinition ? await effectivePolicy(config.servers) : null;
 const xcodeDefinition = config.servers.find(isXcodePreset);
 
 const childStates = new Set();
@@ -259,7 +259,7 @@ function startChild(definition) {
   }
   const builtin = definition.builtin === 'host-artifacts';
   const artifactEnvironment = builtin ? {AGENTCTL_HOST_ARTIFACTS_CONFIG:JSON.stringify({
-    container:containerName, container_command:config.container_command, policy:artifactPolicy,
+    container:containerName, container_command:config.container_command, policy:artifactPolicy, xcode_enabled:Boolean(xcodeDefinition),
     developer_dir:xcodeDefinition?.inherited_env?.DEVELOPER_DIR || xcodeDefinition?.env?.DEVELOPER_DIR || process.env.DEVELOPER_DIR
   })} : {};
   const child = spawn(builtin ? process.execPath : definition.command, builtin ? [fileURLToPath(new URL('./host-artifacts.mjs',import.meta.url))] : definition.args || [], {

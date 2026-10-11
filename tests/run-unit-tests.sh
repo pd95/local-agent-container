@@ -13743,7 +13743,7 @@ test_mcp_http_definition_rejects_unsafe_urls_and_headers() {
 test_host_artifacts_cli_permissions_and_activation() {
   begin_test "host-artifacts grants persist per container and use managed activation rollback"
   load_agentctl_functions
-  local root test_registry source lifecycle fail_guest before grant_id definition_file
+  local root test_registry source lifecycle fail_guest before grant_id definition_file canonical_source
   root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-host-artifacts.XXXXXX")"; register_dir_cleanup "$root"
   test_registry="$root/agent-unit.json"; source="$root/source"; lifecycle="$root/lifecycle"; fail_guest="$root/fail-guest"
   mkdir "$source"; printf 'fixture\n' >"$source/file.txt"
@@ -13789,12 +13789,12 @@ test_host_artifacts_cli_permissions_and_activation() {
   run_capture artifact_command revoke "$grant_id"
   assert_status 0
   jq -e '.servers[0].grants|all(.kind!="directory")' "$test_registry" >/dev/null || fail "Grant revocation did not persist"
-  run_capture artifact_command allow-preset papageye
+  run_capture artifact_command allow-preset xcode
   assert_status 0
   run_capture artifact_command list --json
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -e '.presets[0].id=="preset:papageye" and (.grants|length)>0' >/dev/null || fail "Preset listing missing"
-  run_capture artifact_command revoke preset:papageye
+  printf '%s' "$RUN_OUTPUT" | jq -e '.presets[0].id=="preset:xcode" and (.grants|length)>0' >/dev/null || fail "Preset listing missing"
+  run_capture artifact_command revoke preset:xcode
   assert_status 0
   before="$(cat "$test_registry")"
   mcp_require_no_active_leases() { die "Cannot change while an MCP lease is active"; }
@@ -13822,7 +13822,9 @@ test_host_artifacts_cli_permissions_and_activation() {
   printf '%s\n' '{"name":"host-artifacts","type":"builtin","grants":[{"kind":"directory","value":"source"}]}' >"$definition_file"; chmod 600 "$definition_file"
   MCP_CONFIG_JSON='[]'
   mcp_add_definition "@$definition_file"
-  printf '%s' "$MCP_CONFIG_JSON" | jq -e --arg source "$source" '.[0].grants[0].value==$source' >/dev/null || fail "Relative grants did not resolve against the private definition file"
+  # macOS temporary paths may use /var while grants store /private/var.
+  canonical_source="$(CDPATH= cd -- "$source" && pwd -P)"
+  printf '%s' "$MCP_CONFIG_JSON" | jq -e --arg source "$canonical_source" '.[0].grants[0].value==$source' >/dev/null || fail "Relative grants did not resolve against the private definition file"
 }
 
 test_host_artifacts_guest_writer_is_refreshed_with_mcp() {
