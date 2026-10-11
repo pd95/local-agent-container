@@ -15,13 +15,15 @@ const optionalDestination={destinationName:{type:'string'},overwrite:{type:'bool
 const extraction={...optionalDestination,filter:{type:'string'},testId:{type:'string'},onlyFailures:{type:'boolean',default:false}};
 const schema = (properties, required) => ({type:'object',properties,required,additionalProperties:false});
 export const tools = [
-  {name:'import_artifact',description:'Import an approved host file or directory into this container’s /workdir/.host-artifacts. Use for host-only preview images, screenshots, logs, and result bundles.',inputSchema:schema({sourcePath:{type:'string'},...optionalDestination},['sourcePath'])},
-  {name:'extract_test_attachments',description:'Export retained Xcode test attachments from an approved .xcresult bundle. Optional filename glob, test identifier, and failures-only selection. Returns local paths to attachments and metadata.',inputSchema:schema({sourcePath:{type:'string'},...extraction},['sourcePath'])},
-  {name:'extract_test_attachments_from_log',description:'Find one unambiguous .xcresult path in an approved console log, authorize that bundle, and export its test attachments.',inputSchema:schema({consoleLogPath:{type:'string'},...extraction},['consoleLogPath'])},
+  {name:'import_artifact',description:'Import an approved host file or directory into this container’s /workdir/.host-artifacts. Use for host files such as images, logs, reports, documents, or directories.',inputSchema:schema({sourcePath:{type:'string'},...optionalDestination},['sourcePath'])},
+  {name:'extract_xcode_test_attachments',description:'Export retained Xcode test attachments from an approved .xcresult bundle. Optional filename glob, test identifier, and failures-only selection. Returns local paths to attachments and metadata.',inputSchema:schema({sourcePath:{type:'string'},...extraction},['sourcePath'])},
   {name:'host_artifacts_status',description:'List this container’s effective host artifact source grants and destination. Does not modify permissions or invoke Xcode.',inputSchema:schema({},[])}
 ];
-function validateArguments(name, args) {
-  const tool=tools.find(item => item.name === name);
+export function availableTools(config) {
+  return tools.filter(tool => tool.name !== 'extract_xcode_test_attachments' || config.xcode_enabled === true);
+}
+function validateArguments(config, name, args) {
+  const tool=availableTools(config).find(item => item.name === name);
   if (!tool) throw new Error('Unknown host-artifacts tool');
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Tool arguments must be an object');
   for (const [key,value] of Object.entries(args)) {
@@ -163,16 +165,6 @@ async function transfer(config,source,root,kind,destination,overwrite,signal,pro
   } catch (error) { operation.abort(); await result.catch(()=>{}); throw error; }
   finally { signal?.removeEventListener('abort',abort); }
 }
-export function resultBundleFromLog(text) {
-  const candidates=new Set();
-  for (const line of text.split(/\r?\n/)) {
-    const quoted=[...line.matchAll(/["'](\/[^"'\r\n]*?\.xcresult)["']/g)];
-    if (quoted.length) for (const match of quoted) candidates.add(match[1]);
-    else for (const match of line.matchAll(/(?:^|\s)(\/[^\r\n]*?\.xcresult)(?=$|\s)/g)) candidates.add(match[1]);
-  }
-  if (candidates.size !== 1) throw new Error('Console log must contain one unambiguous .xcresult path; supply sourcePath directly otherwise');
-  return [...candidates][0];
-}
 function readableFilename(value) {
   if (typeof value !== 'string' || !value || /[\x00-\x1f\x7f]/.test(value)) throw new Error('Invalid attachment name in export manifest');
   const name=value.replace(/[\\/:*?"<>|]/g,'-');
@@ -209,27 +201,11 @@ export async function prepareAttachments(exportRoot,outputRoot,manifest,sourcePa
   return metadata;
 }
 export async function callTool(config,name,args,signal,progress) {
-  validateArguments(name,args);
+  validateArguments(config,name,args);
   if (name === 'host_artifacts_status') return {container:config.container,destination:'/workdir/.host-artifacts',...config.policy};
-  if (name === 'extract_test_attachments_from_log') {
-    const log=await authorizeSource(args.consoleLogPath,config.policy,'file');
-    if (log.stats.size > 16 * 1024 * 1024) throw new Error('Console log is too large; supply the result bundle path directly');
-    const chunks=[];
-    let size=0;
-    for await (const frame of sourceFrames(log.sourcePath,log.root,signal,new Set(),'',undefined,'file')) {
-      if (frame.op !== 'data') continue;
-      const bytes=Buffer.from(frame.data,'base64'); size+=bytes.length;
-      if (size > 16 * 1024 * 1024) throw new Error('Console log is too large; supply the result bundle path directly');
-      chunks.push(bytes);
-    }
-    const sourcePath=resultBundleFromLog(Buffer.concat(chunks).toString());
-    const {consoleLogPath,...options}=args;
-    return callTool(config,'extract_test_attachments',{...options,sourcePath},signal,progress);
-  }
-  const source=await authorizeSource(args.sourcePath,config.policy,name === 'extract_test_attachments' ? 'directory' : undefined);
+  const source=await authorizeSource(args.sourcePath,config.policy,name === 'extract_xcode_test_attachments' ? 'directory' : undefined);
   if (name === 'import_artifact') {
-    let destination=args.destinationName || uniqueName(source.sourcePath);
-    if (source.kind === 'directory' && source.sourcePath.endsWith('.xcresult')) destination=`testbundles/${destination}`;
+    const destination=args.destinationName || uniqueName(source.sourcePath);
     const imported=await transfer(config,source.sourcePath,source.root,source.kind,destination,args.overwrite ?? false,signal,progress);
     return {...imported,sourcePath:source.sourcePath,modifiedAt:source.stats.mtime.toISOString()};
   }
@@ -297,7 +273,7 @@ export async function serve(config,input=process.stdin,output=process.stdout) {
         const protocol=request.params?.protocolVersion;
         send({jsonrpc:'2.0',id:request.id,result:{protocolVersion:protocols.has(protocol) ? protocol : '2025-03-26',capabilities:{tools:{}},serverInfo:{name:'host-artifacts',version:'1'}}});
       } else if (request.method === 'ping') send({jsonrpc:'2.0',id:request.id,result:{}});
-      else if (request.method === 'tools/list') send({jsonrpc:'2.0',id:request.id,result:{tools}});
+      else if (request.method === 'tools/list') send({jsonrpc:'2.0',id:request.id,result:{tools:availableTools(config)}});
       else if (request.method === 'tools/call') {
         const controller=new AbortController();
         const token=request.params?._meta?.progressToken;

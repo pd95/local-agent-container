@@ -4,8 +4,7 @@ import {createHash} from 'node:crypto';
 import {fileURLToPath} from 'node:url';
 
 const kinds = new Set(['file', 'directory', 'file-pattern', 'directory-pattern']);
-const presetNames = new Set(['xcode', 'papageye']);
-const escape = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const presetNames = new Set(['xcode']);
 export const inside = (candidate, root) => {
   const relative = path.relative(root, candidate);
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
@@ -40,7 +39,9 @@ export async function normalizeGrant(grant, {existing = false, base = process.cw
 }
 export async function normalizeDefinition(value, options = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).some(key => !['name','type','presets','grants'].includes(key)) || value.type !== 'builtin' || value.name !== 'host-artifacts') throw new Error('Invalid host-artifacts definition');
-  const presets = value.presets ?? [];
+  const storedPresets = value.presets ?? [];
+  // Retire the former application-specific preset without breaking stored policies.
+  const presets = options.existing && Array.isArray(storedPresets) ? storedPresets.filter(name => name !== 'papageye') : storedPresets;
   const grants = value.grants ?? [];
   if (!Array.isArray(presets) || presets.some(item => !presetNames.has(item)) || !Array.isArray(grants)) throw new Error('Invalid artifact presets or grants');
   const normalized = await Promise.all(grants.map(grant => normalizeGrant(grant, options)));
@@ -49,28 +50,24 @@ export async function normalizeDefinition(value, options = {}) {
 export function isXcodePreset(definition) {
   return definition.managed_preset === 'xcode' || (definition.name === 'xcode' && definition.command === '/usr/bin/xcrun' && JSON.stringify(definition.args) === '["mcpbridge"]' && definition.shared_process === true);
 }
-export function presetGrants(name, home) {
-  const homePattern = escape(home);
-  const rules = name === 'xcode' ? [
-    ['file-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/RenderPreview/RenderPreview[^/]*\\.png$'],
-    ['file-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/DeviceInteractionSynthesize/[^/]+\\.(?:png|txt)$'],
-    ['file-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/(?:GetBuildLog|RunAllTests|RunSomeTests)/[^/]+\\.txt$'],
-    ['directory-pattern', `^${homePattern}/Library/Developer/Xcode/DerivedData/[^/]+/Logs/Test/Test-[^/]+\\.xcresult$`]
-  ] : name === 'papageye' ? [
-    ['file-pattern', `^${homePattern}/Library/Application Support/PapagEye/Screenshots/[^/]+\\.(?:png|jpg|jpeg|json)$`],
-    ['file-pattern', `^${homePattern}/Library/Application Support/PapagEye/AuditLogs/[^/]+\\.jsonl$`]
-  ] : [];
-  if (!rules.length) throw new Error('Unknown artifact preset');
-  return rules.map(([kind,value], index) => ({id:`${name}-${index + 1}`,kind,value,preset:name}));
+export function presetGrants(name) {
+  if (name !== 'xcode') throw new Error('Unknown artifact preset');
+  const rules = [
+    ['xcode-1', 'file-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/RenderPreview/[^/]+\\.png$'],
+    ['xcode-2', 'file-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/DeviceInteractionSynthesize/[^/]+\\.(?:png|txt)$'],
+    ['xcode-3', 'file-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/(?:BuildProject|GetBuildLog|RunAllTests|RunSomeTests)/[^/]+\\.txt$'],
+    ['xcode-4', 'directory-pattern', '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/(?:RunAllTests|RunSomeTests)/Test-[^/]+\\.xcresult$']
+  ];
+  return rules.map(([id,kind,value]) => ({id,kind,value,preset:name}));
 }
-export async function effectivePolicy(definitions, home) {
+export async function effectivePolicy(definitions) {
   const definition = definitions.find(item => item.builtin === 'host-artifacts');
   if (!definition) throw new Error('Managed host-artifacts is not enabled');
   const explicit = await normalizeDefinition({name:'host-artifacts',type:'builtin',presets:definition.presets,grants:definition.grants}, {existing:true});
   const grants = explicit.grants.map(grant => ({...grant,origin:'explicit'}));
   const presets = explicit.presets.map(name => ({id:`preset:${name}`,name,origin:'explicit'}));
   if (definitions.some(isXcodePreset) && !explicit.presets.includes('xcode')) presets.push({id:'automatic:xcode',name:'xcode',origin:'automatic'});
-  for (const preset of presets) for (const grant of presetGrants(preset.name, home)) grants.push({...grant,origin:preset.origin});
+  for (const preset of presets) for (const grant of presetGrants(preset.name)) grants.push({...grant,origin:preset.origin});
   return {presets,grants};
 }
 export async function authorizeSource(value, policy, requiredKind) {
@@ -100,7 +97,7 @@ export async function authorizeSource(value, policy, requiredKind) {
   }
   throw new Error('Source path is not authorized by host-artifacts grants');
 }
-export async function mutatePolicy(definitions, action, value, home) {
+export async function mutatePolicy(definitions, action, value) {
   const definition = definitions.find(item => item.builtin === 'host-artifacts');
   if (!definition) throw new Error('Managed host-artifacts is not enabled');
   const normalized = await normalizeDefinition({name:'host-artifacts',type:'builtin',presets:definition.presets,grants:definition.grants}, {existing:true});
@@ -125,8 +122,8 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
     const value = JSON.parse(input);
     const [,,action,argument] = process.argv;
     const result = action === 'normalize' ? await normalizeDefinition(value, {base:argument || process.cwd()}) :
-      action === 'list' ? await effectivePolicy(value, process.env.HOME) :
-      await mutatePolicy(value, action, argument, process.env.HOME);
+      action === 'list' ? await effectivePolicy(value) :
+      await mutatePolicy(value, action, argument);
     process.stdout.write(`${JSON.stringify(result)}\n`);
   } catch (error) { console.error(error.message); process.exitCode=1; }
 }

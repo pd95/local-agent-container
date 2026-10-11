@@ -432,14 +432,15 @@ bash tests/run-tests.sh --tier full --filter managed-mcp
 The host-artifacts test imports an initially denied host fixture, grants/revokes
 access, checks automatic Xcode permissions, rejects destination symlinks, and
 verifies refresh, restart and copy behavior. It needs no Xcode attachment bundle.
-For real exporter verification, enable the server and grant a completed bundle:
+For real exporter verification, enable both integrations and grant a completed bundle:
 
 ```bash
+agentctl mcp add xcode
 agentctl mcp add host-artifacts
 agentctl mcp artifacts allow-directory "/absolute/path/to/Test-example.xcresult"
 ```
 
-Call `extract_test_attachments` from the container's MCP client, verify a passing
+Call `extract_xcode_test_attachments` from the container's MCP client, verify a passing
 `.keepAlways` screenshot and `metadata.json`, then repeat with `filter: "*.png"`
 and `onlyFailures: true`. For a bundle containing only a passing screenshot, the
 failures-only export should succeed with zero attachments. Do not commit personal

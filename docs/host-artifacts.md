@@ -1,8 +1,8 @@
 # Import host artifacts into a container
 
 The managed `host-artifacts` MCP server imports approved host files and directories
-into `/workdir/.host-artifacts`. It also exports retained Xcode test attachments
-using `xcrun xcresulttool`. Files reach the owning container through the existing
+into `/workdir/.host-artifacts`. When paired with the built-in Xcode bridge, it additionally exposes
+`extract_xcode_test_attachments` using `xcrun xcresulttool`. Files reach the owning container through the existing
 private Unix-socket MCP bridge; no host TCP listener is added.
 
 Host reads require Python 3.8 or newer (`python3` on the host's `PATH`), in
@@ -31,8 +31,9 @@ is needed; `agentctl refresh` also updates the writer in existing MCP containers
 
 `host-artifacts` by itself grants **no host source access**. Enabling it alongside
 the built-in `xcode` preset automatically grants narrow access to Xcode preview
-PNGs, device interaction PNG/text artifacts, build/test console logs, and test
-result bundles under the host user's standard Derived Data directory. The order
+PNGs, device interaction PNG/text artifacts, text logs from `BuildProject`,
+`GetBuildLog`, `RunAllTests` and `RunSomeTests`, and test
+result bundles directly under Xcode's `RunAllTests`/`RunSomeTests` ActionArtifacts directories. The order
 of registration does not matter. Removing `xcode` removes these derived grants.
 An explicitly granted `xcode` preset remains until revoked.
 
@@ -51,18 +52,17 @@ agentctl mcp artifacts allow-file "$HOME/Reports/latest.json"
 agentctl mcp artifacts allow-directory "$HOME/Reports/Exports"
 
 agentctl mcp artifacts allow-file-pattern \
-  '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/RenderPreview/RenderPreview[^/]*\.png$'
+  '^/(?:private/)?var/folders/.*/ActionArtifacts/[^/]+/RenderPreview/[^/]+\.png$'
 agentctl mcp artifacts allow-directory-pattern \
   '^/Users/[^/]+/Reports/Test-[^/]+\.xcresult$'
 
 # Named source rules, without requiring a corresponding upstream server.
 agentctl mcp artifacts allow-preset xcode
-agentctl mcp artifacts allow-preset papageye
 
 agentctl mcp artifacts list
 agentctl mcp artifacts list --json
 agentctl mcp artifacts revoke GRANT_ID
-agentctl mcp artifacts revoke preset:papageye
+agentctl mcp artifacts revoke preset:xcode
 ```
 
 `list` shows grant IDs, effective rules, and whether they are explicit or automatic.
@@ -87,10 +87,6 @@ continues to work after a source is deleted. Live changes use the normal managed
 MCP restart and rollback flow; an active `agentctl run` lease prevents changes.
 Changes to a stopped container do not start it.
 
-The `papageye` preset allows screenshot image/JSON files under the host user's
-`Library/Application Support/PapagEye/Screenshots` and JSONL audit logs under
-`Library/Application Support/PapagEye/AuditLogs`. It is always opt-in.
-
 ### Reusable definitions
 
 An owner-only private JSON file may describe the built-in server and its grants:
@@ -99,7 +95,6 @@ An owner-only private JSON file may describe the built-in server and its grants:
 {
   "name": "host-artifacts",
   "type": "builtin",
-  "presets": ["papageye"],
   "grants": [
     {"kind": "directory", "value": "/Users/you/Reports/Exports"},
     {"kind": "file-pattern", "value": "^/Users/you/Reports/[^/]+\\.json$"}
@@ -114,7 +109,8 @@ agentctl mcp add @"$HOME/.config/agentctl/artifacts.json"
 
 The four grant kinds are `file`, `directory`, `file-pattern`, and
 `directory-pattern`. Relative exact paths in a definition resolve against its
-parent directory. Only `xcode` and `papageye` are accepted as source presets.
+parent directory. Only `xcode` is accepted as a source preset. It grants source access;
+it does not enable the optional Xcode extraction tool.
 The built-in definition does not accept commands, environment values, destination
 roots or container identity overrides. Changes to an already registered
 server's grants should use the permission commands above.
@@ -135,8 +131,8 @@ container-local URL manually.
 }
 ```
 
-The destination is `/workdir/.host-artifacts/latest-screenshot.png`. Complete
-`.xcresult` bundles go under `.host-artifacts/testbundles/`. An omitted
+The destination is `/workdir/.host-artifacts/latest-screenshot.png`. Directories, including `.xcresult` bundles, are copied recursively to the
+requested destination. An omitted
 `destinationName` generates a unique name. Explicit names can contain relative
 subdirectories; traversal, absolute names and destination symlinks are rejected.
 
@@ -146,7 +142,24 @@ This is an on-demand import, not directory watching or bidirectional sync. Add
 `/.host-artifacts/` to a project’s `.gitignore` when imported artifacts should stay
 out of source control; the agentctl repository already includes that rule.
 
-### `extract_test_attachments`
+### `extract_xcode_test_attachments`
+
+This tool is advertised and callable only when the built-in Xcode integration is
+registered alongside host-artifacts. Generic installations expose only
+`import_artifact` and `host_artifacts_status`.
+
+There is no automatic access to DerivedData or discovery of bundles from logs.
+Authorize the actual bundle or your project's result directory explicitly,
+including when Xcode uses a custom DerivedData location:
+
+```bash
+agentctl mcp artifacts allow-directory "/absolute/project/results/Test-example.xcresult"
+```
+
+Xcode 27 can return an incomplete ActionArtifacts bundle lacking `Info.plist`.
+If extraction fails for that bundle, obtain the original result bundle path from
+Xcode's report or test log, authorize it explicitly, and call this tool with that
+path. The tool does not search for or substitute another bundle.
 
 ```json
 {
@@ -195,15 +208,6 @@ symlink checks, so the exporter cannot read an escaping link. This requires
 additional temporary disk space for the bundle and exported attachments.
 Staging is removed after success, failure or cancellation.
 
-### `extract_test_attachments_from_log`
-
-Use `consoleLogPath` instead of `sourcePath`, with the same extraction options.
-The log must be an approved regular file of at most 16 MiB and contain one
-unambiguous `.xcresult` path. Quoted paths and spaces are supported. The bundle
-must independently pass the source allowlist; permission to read the log does
-not grant access to a bundle mentioned in it. Supply `sourcePath` directly if a
-log contains multiple different bundle paths.
-
 ### `host_artifacts_status`
 
 Takes no arguments and reports the owning container, destination and effective
@@ -231,3 +235,20 @@ Do not remove an HTTP bridge that still serves other clients.
 Registries written by this version use schema 3, retaining readers for schemas
 1 and 2. Older agentctl versions cannot read a schema 3 registry; keep the updated
 host checkout when managing containers after a configuration change.
+
+### Updating existing installations
+
+After updating the host checkout, exit any active agent session for the affected
+container, then restart the managed bridge with `agentctl restart --name NAME`.
+Start a new agent session afterward so it discovers the updated tool list. This change requires no guest-script refresh, image rebuild or
+container replacement. Update agent instructions
+from `extract_test_attachments` to `extract_xcode_test_attachments`; the former
+name and `extract_test_attachments_from_log` are removed.
+
+The automatic DerivedData rule is removed. The generated Xcode grants are
+numbered `xcode-1` through `xcode-4`; the last rule now covers ActionArtifacts
+result bundles. Existing explicit file and
+directory grants remain in effect. The former PapagEye preset no longer grants
+access; stored entries are ignored and removed when permissions are next edited.
+New definitions and permission commands reject that preset. Configure any needed
+application paths through ordinary file or directory grants.

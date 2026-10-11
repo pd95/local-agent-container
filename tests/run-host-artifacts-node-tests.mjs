@@ -11,7 +11,7 @@ import {promisify} from 'node:util';
 import http from 'node:http';
 import {normalizeDefinition, normalizeGrant, effectivePolicy, authorizeSource, mutatePolicy, isXcodePreset} from '../mcp/artifact-policy.mjs';
 import {writeArtifacts} from '../mcp/host-artifacts-writer.mjs';
-import {callTool, resultBundleFromLog, prepareAttachments, sourceFrames, inspectWorkspace} from '../mcp/host-artifacts.mjs';
+import {callTool, availableTools, prepareAttachments, sourceFrames, inspectWorkspace} from '../mcp/host-artifacts.mjs';
 
 const root=path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const guestTest=(name,fn)=>test(name,{skip:process.platform !== 'linux' ? 'Linux guest writer; verified inside containers by macOS integration tests' : false},fn);
@@ -138,12 +138,44 @@ test('Xcode permissions derive in either order and preserve explicit presets aft
   const explicit=await mutatePolicy([definition,xcode],'allow-preset','xcode','/Users/test');
   const policy=await effectivePolicy(explicit.filter(item=>item.name!=='xcode'),'/Users/test');
   assert.equal(policy.presets[0].origin,'explicit');
+  assert.deepEqual(policy.grants.map(grant=>grant.id),['xcode-1','xcode-2','xcode-3','xcode-4']);
   assert.ok(policy.grants.every(item=>item.preset==='xcode'));
   const repeated=await mutatePolicy(explicit,'allow-preset','xcode','/Users/test');
   assert.deepEqual(repeated,explicit);
-  const papageye=await effectivePolicy([{...definition,presets:['papageye']}],'/Users/test');
-  assert.equal(papageye.grants.length,2);
+  await assert.rejects(normalizeDefinition({name:'host-artifacts',type:'builtin',presets:['papageye']}));
+  const retired=await effectivePolicy([{...definition,presets:['papageye']}],'/Users/test');
+  assert.deepEqual(retired.grants,[]);
   await assert.rejects(mutatePolicy([definition,xcode],'revoke','automatic:xcode','/Users/test'),/automatic/);
+});
+
+test('Xcode preview grants accept display-name PNGs while retaining directory and type boundaries',async ()=>{
+  const definition=await normalizeDefinition({name:'host-artifacts',type:'builtin'});
+  const xcode={name:'xcode',command:'/usr/bin/xcrun',args:['mcpbridge'],shared_process:true};
+  for (const definitions of [[definition,xcode],[{...definition,presets:['xcode']}]]) {
+    const policy=await effectivePolicy(definitions,'/Users/test');
+    const preview=new RegExp(policy.grants.find(grant=>grant.id==='xcode-1').value);
+    for (const prefix of ['/var/folders','/private/var/folders']) {
+      const directory=`${prefix}/v1/wdvlbd5j7sj4kpz6c4d4k3680000gn/T/ActionArtifacts/default/RenderPreview`;
+      for (const name of ['Settings - 2026-10-11 at 18.46.11.png','RenderPreview.png','Einstellungen Übersicht.png']) assert.equal(preview.test(`${directory}/${name}`),true);
+      for (const name of ['nested/Settings.png','Settings.txt','Settings.jpeg','.png','Settings.png/extra']) assert.equal(preview.test(`${directory}/${name}`),false);
+      assert.equal(preview.test(`${directory}Other/Settings.png`),false);
+    }
+  }
+});
+
+test('Xcode result grants include tool-returned ActionArtifacts bundles with narrow directory boundaries',async ()=>{
+  const definition=await normalizeDefinition({name:'host-artifacts',type:'builtin'});
+  const xcode={name:'xcode',command:'/usr/bin/xcrun',args:['mcpbridge'],shared_process:true};
+  for (const definitions of [[definition,xcode],[{...definition,presets:['xcode']}]]) {
+    const grants=(await effectivePolicy(definitions,'/Users/test')).grants.filter(grant=>grant.kind==='directory-pattern').map(grant=>new RegExp(grant.value));
+    const approved=name=>grants.some(rule=>rule.test(name));
+    assert.equal(approved('/Users/test/Library/Developer/Xcode/DerivedData/App-hash/Logs/Test/Test-App.xcresult'),false);
+    for (const prefix of ['/var/folders','/private/var/folders']) {
+      const parent=`${prefix}/v1/fixture/T/ActionArtifacts/default`;
+      for (const tool of ['RunAllTests','RunSomeTests']) assert.equal(approved(`${parent}/${tool}/Test-App - today.xcresult`),true);
+      for (const invalid of ['RenderPreview/Test-App.xcresult','RunSomeTests/nested/Test-App.xcresult','RunSomeTests/App.xcresult','RunSomeTests/Test-App.txt','RunSomeTests/Test-App.xcresult/Diagnostics']) assert.equal(approved(`${parent}/${invalid}`),false);
+    }
+  }
 });
 
 test('source traversal resolves internal links and rejects escapes, cycles and special files',async t=>{
@@ -440,8 +472,8 @@ guestTest('Xcode export preserves names, metadata, repeated runs and all attachm
   const f=await fixture(t), command=await commands(t,f), {policy}=await policyFor(f.source);
   const bundle=path.join(f.source,'Example.xcresult');await fs.mkdir(bundle);await fs.writeFile(path.join(bundle,'Info.plist'),'fixture');
   await fs.writeFile(path.join(f.directory,'export-input.json'),JSON.stringify(sampleManifest()));
-  const config={container:'own-container',container_command:command.container,xcrun_command:command.xcrun,policy};
-  const result=await callTool(config,'extract_test_attachments',{sourcePath:bundle,destinationName:'all'});
+  const config={container:'own-container',container_command:command.container,xcrun_command:command.xcrun,xcode_enabled:true,policy};
+  const result=await callTool(config,'extract_xcode_test_attachments',{sourcePath:bundle,destinationName:'all'});
   assert.equal(result.extractedCount,4);
   const metadata=JSON.parse(await fs.readFile(path.join(f.workdir,'.host-artifacts/test-results/all/metadata.json'),'utf8'));
   assert.equal(metadata.attachments[0].filename,'Screenshot_0_fixture.png');
@@ -450,26 +482,12 @@ guestTest('Xcode export preserves names, metadata, repeated runs and all attachm
   assert.equal(metadata.attachments[3].repetitionNumber,2);
   assert.equal(metadata.attachments[0].testIdentifierURL,'test://fixture/testOne');
   assert.equal(metadata.attachments[0].workspacePath,'/workdir/.host-artifacts/test-results/all/attachments/Screenshot_0_fixture.png');
-  const filtered=await callTool(config,'extract_test_attachments',{sourcePath:bundle,destinationName:'filtered',filter:'*.png',onlyFailures:true,testId:'Tests/testOne()'});
+  const filtered=await callTool(config,'extract_xcode_test_attachments',{sourcePath:bundle,destinationName:'filtered',filter:'*.png',onlyFailures:true,testId:'Tests/testOne()'});
   assert.equal(filtered.extractedCount,1);
-  const empty=await callTool(config,'extract_test_attachments',{sourcePath:bundle,destinationName:'empty',testId:'missing'});
+  const empty=await callTool(config,'extract_xcode_test_attachments',{sourcePath:bundle,destinationName:'empty',testId:'missing'});
   assert.equal(empty.extractedCount,0);
   process.env.ARTIFACT_TEST_EXPORT_FAIL='1';
-  await assert.rejects(callTool(config,'extract_test_attachments',{sourcePath:bundle}),/help export attachments/);
-});
-
-guestTest('log extraction authorizes the log and referenced result bundle independently',async t=>{
-  const f=await fixture(t), command=await commands(t,f);
-  const log=path.join(f.source,'console.txt'),bundle=path.join(f.directory,'Test With Spaces.xcresult');
-  await fs.mkdir(bundle);await fs.writeFile(log,`Result bundle: \"${bundle}\"\n`);
-  await fs.writeFile(path.join(f.directory,'export-input.json'),JSON.stringify(sampleManifest()));
-  const {definition,policy}=await policyFor(log,'file');
-  const config={container:'own-container',container_command:command.container,xcrun_command:command.xcrun,policy};
-  await assert.rejects(callTool(config,'extract_test_attachments_from_log',{consoleLogPath:log}),/not authorized/);
-  const granted=await mutatePolicy([definition],'allow-directory',bundle,os.homedir());
-  config.policy=await effectivePolicy(granted,os.homedir());
-  const result=await callTool(config,'extract_test_attachments_from_log',{consoleLogPath:log,destinationName:'from-log'});
-  assert.equal(result.extractedCount,4);assert.equal(result.sourcePath,bundle);
+  await assert.rejects(callTool(config,'extract_xcode_test_attachments',{sourcePath:bundle}),/help export attachments/);
 });
 
 test('manifest validation rejects outside paths and nonfiles',async t=>{
@@ -483,20 +501,13 @@ test('manifest validation rejects outside paths and nonfiles',async t=>{
   await assert.rejects(prepareAttachments(exported,output,{},'/bundle'),/manifest/);
 });
 
-test('log discovery supports spaces and rejects absent or ambiguous paths',async ()=>{
-  assert.equal(resultBundleFromLog('Result bundle written to:\n /Users/a/My Tests.xcresult\n'),'/Users/a/My Tests.xcresult');
-  assert.equal(resultBundleFromLog('Bundle: "/Users/a/My Tests.xcresult"'),'/Users/a/My Tests.xcresult');
-  await assert.rejects(async()=>resultBundleFromLog('no results'),/unambiguous/);
-  await assert.rejects(async()=>resultBundleFromLog('/a.xcresult\n/b.xcresult'),/unambiguous/);
-});
-
 test('cancelling an exporter terminates its subprocess and removes private staging',async t=>{
   const f=await fixture(t), command=await commands(t,f), {policy}=await policyFor(f.source);
   const bundle=path.join(f.source,'Example.xcresult');await fs.mkdir(bundle);
   await fs.writeFile(path.join(f.directory,'export-input.json'),'[]');
   process.env.ARTIFACT_TEST_EXPORT_HANG='1';
   const controller=new AbortController();
-  const operation=callTool({container:'own-container',container_command:command.container,xcrun_command:command.xcrun,policy},'extract_test_attachments',{sourcePath:bundle},controller.signal);
+  const operation=callTool({container:'own-container',container_command:command.container,xcrun_command:command.xcrun,xcode_enabled:true,policy},'extract_xcode_test_attachments',{sourcePath:bundle},controller.signal);
   const timer=setInterval(async()=>{const log=await fs.readFile(command.log,'utf8').catch(()=> '');if(log.includes('xcresulttool'))controller.abort();},20);
   try {await assert.rejects(operation,/cancelled/);}finally{clearInterval(timer);}
   assert.equal(await fs.stat(path.join(f.workdir,'.host-artifacts')).catch(()=>null),null);
@@ -512,18 +523,17 @@ test('stdio server initializes, lists tools and reports effective permissions',a
   const iterator=lines[Symbol.asyncIterator]();
   const request=async(id,method,params)=>{child.stdin.write(`${JSON.stringify({jsonrpc:'2.0',id,method,params})}\n`);return JSON.parse((await iterator.next()).value);};
   assert.equal((await request(1,'initialize',{protocolVersion:'2025-03-26'})).result.serverInfo.name,'host-artifacts');
-  assert.equal((await request(2,'tools/list',{})).result.tools.length,4);
+  assert.equal((await request(2,'tools/list',{})).result.tools.length,2);
   assert.equal((await request(3,'tools/call',{name:'host_artifacts_status',arguments:{}})).result.structuredContent.container,'own-container');
   assert.equal((await request(4,'tools/call',{name:'import_artifact',arguments:{}})).result.isError,true);
   child.stdin.end();await new Promise(resolve=>child.once('close',resolve));lines.close();
 });
 
-
-guestTest('managed Unix-socket relay launches the built-in server and imports without host TCP',async t=>{
+for (const paired of [false,true]) guestTest(`managed Unix-socket relay advertises ${paired ? 'Xcode' : 'generic'} tools and imports without host TCP`,async t=>{
   const f=await fixture(t), command=await commands(t,f), {definition}=await policyFor(f.source);
   const source=path.join(f.source,'file.txt');await fs.writeFile(source,'through the relay');
   const socket=path.join(f.directory,'relay.sock'),config=path.join(f.directory,'relay.json');
-  await fs.writeFile(config,JSON.stringify({socket_path:socket,nonce:'fixture-nonce',container:'own-container',container_command:command.container,servers:[definition],log_path:path.join(f.directory,'relay.log')}));
+  await fs.writeFile(config,JSON.stringify({socket_path:socket,nonce:'fixture-nonce',container:'own-container',container_command:command.container,servers:paired ? [definition,{name:'xcode',managed_preset:'xcode',command:'/usr/bin/xcrun',args:['mcpbridge'],shared_process:true}] : [definition],log_path:path.join(f.directory,'relay.log')}));
   let errors='';
   const relay=spawn(process.execPath,[path.join(root,'mcp/host-relay.mjs'),config],{stdio:['ignore','ignore','pipe']});
   relay.stderr.on('data',chunk=>{errors+=chunk;});
@@ -539,9 +549,53 @@ guestTest('managed Unix-socket relay launches the built-in server and imports wi
     const initialized=await request('POST',{jsonrpc:'2.0',id:1,method:'initialize',params:{protocolVersion:'2025-03-26'}});
     assert.equal(initialized.status,200);assert.equal(initialized.body.result.serverInfo.name,'host-artifacts');
     await request('POST',{jsonrpc:'2.0',method:'notifications/initialized'},initialized.session);
+    const listed=await request('POST',{jsonrpc:'2.0',id:3,method:'tools/list',params:{}},initialized.session);
+    assert.deepEqual(listed.body.result.tools.map(tool=>tool.name),paired ? ['import_artifact','extract_xcode_test_attachments','host_artifacts_status'] : ['import_artifact','host_artifacts_status']);
     const imported=await request('POST',{jsonrpc:'2.0',id:2,method:'tools/call',params:{name:'import_artifact',arguments:{sourcePath:source,destinationName:'relay.txt'}}},initialized.session);
     assert.equal(imported.status,200);assert.equal(imported.body.result.isError,undefined);
     assert.equal(await fs.readFile(path.join(f.workdir,'.host-artifacts/relay.txt'),'utf8'),'through the relay');
     await request('DELETE',null,initialized.session);
   } finally { relay.kill('SIGTERM');await closed; }
+});
+
+test('Xcode extraction is exposed only with the paired built-in integration',async ()=>{
+  const generic={policy:{presets:[{name:'xcode'}],grants:[]}};
+  assert.deepEqual(availableTools(generic).map(tool=>tool.name),['import_artifact','host_artifacts_status']);
+  assert.equal(availableTools({...generic,xcode_enabled:true}).length,3);
+  await assert.rejects(callTool(generic,'extract_xcode_test_attachments',{sourcePath:'/bundle.xcresult'}),/Unknown/);
+  for (const name of ['extract_test_attachments','extract_test_attachments_from_log']) {
+    await assert.rejects(callTool({...generic,xcode_enabled:true},name,{}),/Unknown/);
+  }
+});
+
+test('retiring presets preserves explicit grants and removes stored preset entries on edit',async t=>{
+  const f=await fixture(t), {definition}=await policyFor(f.source);
+  const legacy={...definition,presets:['papageye','xcode']};
+  const policy=await effectivePolicy([legacy],'/different/home');
+  assert.ok(!policy.grants.some(grant=>grant.value.includes('/DerivedData/') || grant.preset==='papageye'));
+  assert.equal((await authorizeSource(f.source,policy)).root,f.source);
+  const edited=await mutatePolicy([legacy],'allow-preset','xcode');
+  assert.deepEqual(edited[0].presets,['xcode']);
+  assert.deepEqual(edited[0].grants,definition.grants);
+  await assert.rejects(mutatePolicy([definition],'allow-preset','papageye'),/Unknown artifact preset/);
+});
+
+test('Xcode log grants accept BuildProject text logs with narrow directory and file boundaries',async ()=>{
+  const definition=await normalizeDefinition({name:'host-artifacts',type:'builtin'});
+  const xcode={name:'xcode',command:'/usr/bin/xcrun',args:['mcpbridge'],shared_process:true};
+  for (const definitions of [[definition,xcode],[{...definition,presets:['xcode']}]]) {
+    const policy=await effectivePolicy(definitions);
+    const grant=policy.grants.find(item=>item.id==='xcode-3');
+    assert.equal(grant.kind,'file-pattern');
+    const rule=new RegExp(grant.value);
+    for (const prefix of ['/var/folders','/private/var/folders']) {
+      const parent=`${prefix}/v1/wdvlbd5j7sj4kpz6c4d4k3680000gn/T/ActionArtifacts/default`;
+      for (const tool of ['BuildProject','GetBuildLog','RunAllTests','RunSomeTests']) {
+        assert.equal(rule.test(`${parent}/${tool}/BuildProject-Log-20261011-204049.txt`),true);
+      }
+      for (const invalid of ['BuildProject/nested/log.txt','BuildProject/log.png','BuildProjectOther/log.txt','RenderPreview/log.txt','BuildProject/.txt','BuildProject/log.txt/extra']) {
+        assert.equal(rule.test(`${parent}/${invalid}`),false);
+      }
+    }
+  }
 });
