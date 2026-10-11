@@ -13740,8 +13740,146 @@ test_mcp_http_definition_rejects_unsafe_urls_and_headers() {
   assert_contains "unknown HTTP definition field"
 }
 
-test_mcp_registry_v2_filters_secrets_and_reads_v1() {
-  begin_test "managed MCP registry v2 filters secrets and retains schema v1 compatibility"
+test_host_artifacts_cli_permissions_and_activation() {
+  begin_test "host-artifacts grants persist per container and use managed activation rollback"
+  load_agentctl_functions
+  local root test_registry source lifecycle fail_guest before grant_id definition_file
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-host-artifacts.XXXXXX")"; register_dir_cleanup "$root"
+  test_registry="$root/agent-unit.json"; source="$root/source"; lifecycle="$root/lifecycle"; fail_guest="$root/fail-guest"
+  mkdir "$source"; printf 'fixture\n' >"$source/file.txt"
+  printf '%s\n' '{"schema_version":2,"container":"agent-unit","port":47123,"servers":[]}' >"$test_registry"; chmod 600 "$test_registry"
+  mcp_registry_dir() { printf '%s\n' "$root"; }
+  mcp_registry_path() { printf '%s\n' "$test_registry"; }
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_has_mcp_wiring() { return 0; }
+  container_running() { return 1; }
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
+  mcp_require_no_active_leases() { :; }
+  mcp_stop_managed() { fail "Stopped artifact configuration must not stop a relay"; }
+  mcp_start_from_registry() { fail "Stopped artifact configuration must not start a relay"; }
+  mcp_configure_guest() { fail "Stopped artifact configuration must not start the guest proxy"; }
+  sync_codex_managed_mcp_from_registry() { fail "Stopped artifact configuration must defer runtime synchronization"; }
+  artifact_add() ( mcp_definition_mutate add agent-unit "$1" )
+  artifact_command() ( mcp_cmd artifacts "$@" --name agent-unit )
+
+  run_capture artifact_add host-artifacts
+  assert_status 0
+  jq -e '.schema_version==3 and .servers[0].builtin=="host-artifacts" and .servers[0].grants==[] and (.servers[0]|has("command")|not)' "$test_registry" >/dev/null || fail "Builtin definition did not persist safely"
+  run_capture artifact_command list --json
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.grants==[]' >/dev/null || fail "host-artifacts alone granted source access"
+  run_capture artifact_command allow-directory "$source"
+  assert_status 0
+  before="$(cat "$test_registry")"
+  run_capture artifact_command allow-directory "$source"
+  assert_status 0; assert_contains "already configured"
+  [ "$(cat "$test_registry")" = "$before" ] || fail "Repeated grant changed the registry"
+  run_capture artifact_command allow-file-pattern '['
+  assert_status 1
+  [ "$(cat "$test_registry")" = "$before" ] || fail "Invalid regex changed the registry"
+  run_capture artifact_command allow-file "$source"
+  assert_status 1
+  run_capture artifact_command allow-directory-pattern '^/somewhere/[^/]+\.xcresult$'
+  assert_status 0
+  grant_id="$(jq -r '.servers[0].grants[]|select(.kind=="directory")|.id' "$test_registry")"
+  run_capture artifact_command revoke "$grant_id"
+  assert_status 0
+  jq -e '.servers[0].grants|all(.kind!="directory")' "$test_registry" >/dev/null || fail "Grant revocation did not persist"
+  run_capture artifact_command allow-preset papageye
+  assert_status 0
+  run_capture artifact_command list --json
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.presets[0].id=="preset:papageye" and (.grants|length)>0' >/dev/null || fail "Preset listing missing"
+  run_capture artifact_command revoke preset:papageye
+  assert_status 0
+  before="$(cat "$test_registry")"
+  mcp_require_no_active_leases() { die "Cannot change while an MCP lease is active"; }
+  run_capture artifact_command allow-file "$source/file.txt"
+  assert_status 1; assert_contains "lease is active"
+  [ "$(cat "$test_registry")" = "$before" ] || fail "Active lease allowed a grant mutation"
+
+  mcp_require_no_active_leases() { :; }
+  container_running() { return 0; }
+  mcp_stop_managed() { printf 'stop\n' >>"$lifecycle"; }
+  mcp_start_from_registry() { mcp_load_registry_config "$test_registry"; printf 'start\n' >>"$lifecycle"; }
+  mcp_configure_guest() { printf 'guest\n' >>"$lifecycle"; if [ -e "$fail_guest" ]; then rm "$fail_guest"; die "simulated guest failure"; fi; }
+  sync_codex_managed_mcp_from_registry() { printf 'sync\n' >>"$lifecycle"; }
+  : >"$fail_guest"
+  run_capture artifact_command allow-file "$source/file.txt"
+  assert_status 1; assert_contains "Recovering the previous managed MCP state"
+  [ "$(cat "$test_registry")" = "$before" ] || fail "Failed activation did not restore artifact grants"
+  [ "$(cat "$lifecycle")" = $'stop\nstart\nguest\nstop\nstart\nguest' ] || fail "Incorrect artifact rollback lifecycle"
+  : >"$lifecycle"
+  run_capture artifact_command allow-file "$source/file.txt"
+  assert_status 0
+  [ "$(cat "$lifecycle")" = $'stop\nstart\nguest\nsync' ] || fail "Incorrect artifact activation lifecycle"
+
+  definition_file="$root/definition.json"
+  printf '%s\n' '{"name":"host-artifacts","type":"builtin","grants":[{"kind":"directory","value":"source"}]}' >"$definition_file"; chmod 600 "$definition_file"
+  MCP_CONFIG_JSON='[]'
+  mcp_add_definition "@$definition_file"
+  printf '%s' "$MCP_CONFIG_JSON" | jq -e --arg source "$source" '.[0].grants[0].value==$source' >/dev/null || fail "Relative grants did not resolve against the private definition file"
+}
+
+test_host_artifacts_guest_writer_is_refreshed_with_mcp() {
+  begin_test "host-artifacts guest writer is deployed with managed MCP wiring"
+  load_agentctl_functions
+  local root calls
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-artifact-refresh.XXXXXX")"; register_dir_cleanup "$root"
+  calls="$root/calls"
+  ensure_requested_feature_installed() { :; }
+  refresh_container_file() { printf '%s\n' "$3" >>"$calls"; }
+  mcp_guest_log_path() { printf '%s/log\n' "$root"; }
+  mcp_prepare_rotating_log_file() { :; }
+  artifact_fake_container() { return 0; }
+  CONTAINER_CMD=artifact_fake_container
+  mcp_configure_guest agent-unit
+  grep -Fxq '/usr/local/lib/agentctl/host-artifacts-writer.mjs' "$calls" || fail "Guest writer was not refreshed"
+  wait "$MCP_GUEST_EXEC_PID" || true
+}
+
+test_host_artifacts_refresh_updates_running_container_without_restart() {
+  begin_test "refresh deploys artifact writer to running containers without disrupting MCP leases"
+  load_agentctl_functions
+  local root calls
+  root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-artifact-live-refresh.XXXXXX")"; register_dir_cleanup "$root"
+  calls="$root/calls"
+  require_container() { :; }
+  container_exists() { return 0; }
+  container_running() { return 0; }
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
+  mcp_require_no_active_leases() { fail "Running refresh must preserve active leases"; }
+  start_existing_container_managed() { fail "Running refresh must not start the container"; }
+  mcp_configure_guest() { fail "Running refresh must not restart the guest proxy"; }
+  mcp_stop_managed() { fail "Running refresh must not stop the host relay"; }
+  refresh_container_file() { printf '%s\n' "$3" >>"$calls"; }
+  migrate_legacy_runtime_config_files() { :; }
+  refresh_codex_config_files() { :; }
+  refresh_optional_runtime_default_files() { :; }
+  refresh_container_tree() { :; }
+  sync_codex_managed_mcp_from_registry() { :; }
+  artifact_refresh_container() { [ "$1" = exec ] || fail "Unexpected lifecycle command: $*"; }
+  CONTAINER_CMD=artifact_refresh_container
+  run_capture refresh_cmd --name agent-unit
+  assert_status 0
+  grep -Fxq '/usr/local/lib/agentctl/host-artifacts-writer.mjs' "$calls" || fail "Running refresh did not deploy the writer"
+}
+
+test_host_artifacts_node_behavior() {
+  begin_test "host-artifacts Node tools enforce permissions and transfer through interactive stdin"
+  run_capture node "$TEST_ROOT/tests/run-host-artifacts-node-tests.mjs"
+  assert_status 0
+}
+
+test_mcp_registry_v3_filters_secrets_and_reads_v1() {
+  begin_test "managed MCP registry v3 filters secrets and retains schema v1 compatibility"
   load_agentctl_functions
   local root test_registry
   root="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-mcp-schema.XXXXXX")"; register_dir_cleanup "$root"
@@ -13750,8 +13888,8 @@ test_mcp_registry_v2_filters_secrets_and_reads_v1() {
   MCP_CONFIG_JSON='[{"name":"web","transport":"http","url":"https://example.test/mcp?private=query","headers":{"authorization":"literal-secret"},"resolved_headers":{"authorization":"Bearer resolved-secret"},"header_keychain_credentials":{"authorization":"web-token"},"missing_credentials":[],"missing_env_vars":[]}]'
   mcp_persist_registry agent-unit
   registry="$root/agent-unit.json"
-  jq -e '.schema_version==2 and .servers[0].header_keychain_credentials.authorization=="web-token" and (.servers[0]|has("headers")|not) and (.servers[0]|has("resolved_headers")|not)' "$registry" >/dev/null \
-    || fail "Unexpected registry v2 content: $(cat "$registry")"
+  jq -e '.schema_version==3 and .servers[0].header_keychain_credentials.authorization=="web-token" and (.servers[0]|has("headers")|not) and (.servers[0]|has("resolved_headers")|not)' "$registry" >/dev/null \
+    || fail "Unexpected registry v3 content: $(cat "$registry")"
   grep -Fq 'literal-secret' "$registry" && fail "Literal header leaked into registry"
   grep -Fq 'resolved-secret' "$registry" && fail "Resolved header leaked into registry"
   printf '%s\n' '{"schema_version":1,"container":"legacy","port":47123,"servers":[{"name":"old","command":"/bin/sh","args":[],"env_vars":[]}]}' >"$root/legacy.json"
@@ -16869,7 +17007,11 @@ main() {
   run_selected_test test_mcp_stop_managed_allows_relay_shutdown_grace_period "test_mcp_stop_managed_allows_relay_shutdown_grace_period"
   run_selected_test test_mcp_definition_parses_stdio_and_http_transports "test_mcp_definition_parses_stdio_and_http_transports"
   run_selected_test test_mcp_http_definition_rejects_unsafe_urls_and_headers "test_mcp_http_definition_rejects_unsafe_urls_and_headers"
-  run_selected_test test_mcp_registry_v2_filters_secrets_and_reads_v1 "test_mcp_registry_v2_filters_secrets_and_reads_v1"
+  run_selected_test test_host_artifacts_cli_permissions_and_activation "test_host_artifacts_cli_permissions_and_activation"
+  run_selected_test test_host_artifacts_guest_writer_is_refreshed_with_mcp "test_host_artifacts_guest_writer_is_refreshed_with_mcp"
+  run_selected_test test_host_artifacts_refresh_updates_running_container_without_restart "test_host_artifacts_refresh_updates_running_container_without_restart"
+  run_selected_test test_host_artifacts_node_behavior "test_host_artifacts_node_behavior"
+  run_selected_test test_mcp_registry_v3_filters_secrets_and_reads_v1 "test_mcp_registry_v3_filters_secrets_and_reads_v1"
   run_selected_test test_mcp_fingerprints_preserve_stdio_compatibility_and_detect_http_rotation "test_mcp_fingerprints_preserve_stdio_compatibility_and_detect_http_rotation"
   run_selected_test test_mcp_conflicting_active_relay_explains_how_to_reconfigure "test_mcp_conflicting_active_relay_explains_how_to_reconfigure"
   run_selected_test test_mcp_definition_commands_manage_stopped_registry_without_starting_container "test_mcp_definition_commands_manage_stopped_registry_without_starting_container"

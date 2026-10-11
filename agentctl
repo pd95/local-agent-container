@@ -1167,14 +1167,16 @@ mcp_load_registry_config() {
   schema="$(jq -r '.schema_version // empty' "$registry")"
   case "$schema" in
     1) MCP_CONFIG_JSON="$(jq -c '[.servers[] | .transport="stdio" | .env={} | .inherited_env={}]' "$registry")" ;;
-    2) MCP_CONFIG_JSON="$(jq -c '[.servers[] | if (.transport // "stdio")=="stdio" then .transport="stdio"|.env={}|.inherited_env={} else .headers={}|.resolved_headers={}|.missing_credentials=[]|.missing_env_vars=[]|.invalid_credentials=[]|.invalid_env_vars=[] end]' "$registry")" ;;
+    2|3) MCP_CONFIG_JSON="$(jq -c '[.servers[] | if (.transport // "stdio")=="stdio" then .transport="stdio"|.env={}|.inherited_env={} else .headers={}|.resolved_headers={}|.missing_credentials=[]|.missing_env_vars=[]|.invalid_credentials=[]|.invalid_env_vars=[] end]' "$registry")" ;;
     *) die "Unsupported managed MCP registry schema: $schema" ;;
   esac
 }
 
 mcp_definition_json() {
   local value="$1" raw="" base=""
-  if [ "$value" = xcode ]; then
+  if [ "$value" = host-artifacts ]; then
+    raw='{"name":"host-artifacts","type":"builtin"}'
+  elif [ "$value" = xcode ]; then
     raw='{"name":"xcode","command":"xcrun","args":["mcpbridge"],"shared":true,"timeout_ms":600000}'
   elif [ "${value#@}" != "$value" ]; then
     local file="${value#@}"
@@ -1192,7 +1194,7 @@ mcp_definition_json() {
     --argjson maximum "$MCP_MAX_STDIO_TIMEOUT_MS" '
     (if type == "array" then . else [.] end)[] |
     if type != "object" then error("server must be an object") else . end |
-    if (.type // "stdio") == "http" then .
+    if (.type // "stdio") == "http" or .type == "builtin" then .
     else
     if (.type // "stdio") != "stdio" then error("invalid type") else . end |
     if ((keys - ["name","type","command","args","cwd","env","env_vars","shared","timeout_ms","max_timeout_ms"])|length)>0 then error("unknown field") else . end |
@@ -1214,14 +1216,22 @@ mcp_definition_json() {
 }
 
 mcp_add_definition() {
-  local entries="" entry="" name="" command="" resolved="" cwd="" inherited='{}' transport=""
+  local entries="" entry="" name="" command="" resolved="" cwd="" inherited='{}' transport="" definition_base=""
+  if [ "${1#@}" != "$1" ]; then definition_base="$(CDPATH= cd -- "$(dirname -- "${1#@}")" && pwd -P)"; fi
   entries="$(mcp_definition_json "$1")" || return 1
   while IFS= read -r entry; do
     [ -n "$entry" ] || continue
+    if [ "$(printf '%s' "$entry" | jq -r '.type // empty')" = builtin ]; then
+      entry="$(printf '%s' "$entry" | node "$SCRIPT_DIR/mcp/artifact-policy.mjs" normalize "$definition_base")" || die "Invalid host-artifacts definition"
+    fi
     name="$(printf '%s' "$entry" | jq -r .name)"
     printf '%s' "$MCP_CONFIG_JSON" | jq -e --arg n "$name" 'any(.[]; .name==$n)' >/dev/null && die "Duplicate MCP server name: $name"
     if [ "$(printf '%s' "$entry" | jq -r '.type // empty')" = http ]; then
       entry="$(printf '%s' "$entry" | node "$SCRIPT_DIR/mcp/definition-helper.mjs" normalize-http 2>/dev/null)" || die "Invalid HTTP MCP server definition"
+      MCP_CONFIG_JSON="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --argjson item "$entry" '.+[$item]')"
+      continue
+    fi
+    if [ "$(printf '%s' "$entry" | jq -r '.builtin // empty')" = host-artifacts ]; then
       MCP_CONFIG_JSON="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --argjson item "$entry" '.+[$item]')"
       continue
     fi
@@ -1237,6 +1247,7 @@ mcp_add_definition() {
       if [ "${!name+x}" = x ]; then inherited="$(printf '%s' "$inherited" | jq -c --arg k "$name" --arg v "${!name}" '.+{($k):$v}')"; fi
     done < <(printf '%s' "$entry" | jq -r '.env_vars[]')
     entry="$(printf '%s' "$entry" | jq -c --arg cmd "$resolved" --arg cwd "$cwd" --argjson inherited "$inherited" '.command=$cmd | .cwd=(if $cwd=="" then null else $cwd end) | .inherited_env=$inherited | .shared_process=(.shared // false)')"
+    if [ "$1" = xcode ]; then entry="$(printf '%s' "$entry" | jq -c '.managed_preset="xcode"')"; fi
     MCP_CONFIG_JSON="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --argjson item "$entry" '.+[$item]')"
   done <<<"$entries"
   MCP_REQUESTED=1
@@ -1300,7 +1311,7 @@ mcp_write_registry_json() {
 mcp_persist_registry() {
   local name="$1" safe="" registry_json=""
   safe="$(mcp_safe_config_json)"
-  registry_json="$(jq -cn --arg name "$name" --argjson port "$MCP_PORT" --argjson servers "$safe" '{schema_version:2,container:$name,port:$port,servers:$servers}')"
+  registry_json="$(jq -cn --arg name "$name" --argjson port "$MCP_PORT" --argjson servers "$safe" '{schema_version:3,container:$name,port:$port,servers:$servers}')"
   mcp_write_registry_json "$name" "$registry_json"
 }
 
@@ -1449,10 +1460,11 @@ mcp_start_relay() {
   mcp_prepare_rotating_log_file "$log"
   jq -n --argjson servers "$MCP_CONFIG_JSON" --arg lease_dir "$dir" --arg lease_prefix "$lease_prefix" \
     --arg socket_path "$MCP_RELAY_SOCKET" --arg nonce "$MCP_RELAY_NONCE" --arg container "$name" \
+    --arg container_command "$(command -v "$CONTAINER_CMD")" \
     --arg log_path "$log" --argjson log_max_bytes "$MCP_LOG_MAX_BYTES" \
     --argjson timeout_ms "$MCP_DEFAULT_STDIO_IDLE_TIMEOUT_MS" \
     --argjson max_timeout_ms "$MCP_DEFAULT_STDIO_MAX_TIMEOUT_MS" \
-    '{schema_version:2,timeout_ms:$timeout_ms,max_timeout_ms:$max_timeout_ms,http_timeouts:{connect:10000,headers:30000,idle:300000,total:86400000},servers:$servers,lease_dir:$lease_dir,lease_prefix:$lease_prefix,ephemeral_env:any($servers[]; ((.env // {})|length)>0 or ((.headers // {})|length)>0),socket_path:$socket_path,nonce:$nonce,container:$container,log_path:$log_path,log_max_bytes:$log_max_bytes}' >"$config"; chmod 600 "$config"
+    '{schema_version:2,timeout_ms:$timeout_ms,max_timeout_ms:$max_timeout_ms,http_timeouts:{connect:10000,headers:30000,idle:300000,total:86400000},servers:$servers,container_command:$container_command,lease_dir:$lease_dir,lease_prefix:$lease_prefix,ephemeral_env:any($servers[]; ((.env // {})|length)>0 or ((.headers // {})|length)>0),socket_path:$socket_path,nonce:$nonce,container:$container,log_path:$log_path,log_max_bytes:$log_max_bytes}' >"$config"; chmod 600 "$config"
   ( exec -a "agentctl-mcp-relay:$name" node "$SCRIPT_DIR/mcp/host-relay.mjs" "$config" ) \
     </dev/null >/dev/null 2>>"$log" & MCP_RELAY_PID=$!
   local tries=0; while [ "$tries" -lt 50 ] && [ ! -S "$MCP_RELAY_SOCKET" ]; do sleep 0.02; tries=$((tries+1)); done
@@ -1567,6 +1579,7 @@ mcp_configure_guest() {
   local name="$1" json guest_log tries=0
   ensure_requested_feature_installed "$name" mcp-bridge
   refresh_container_file "$name" "$SCRIPT_DIR/mcp/guest-proxy.mjs" "/usr/local/lib/agentctl/mcp-guest-proxy.mjs" "root:root" "755"
+  refresh_container_file "$name" "$SCRIPT_DIR/mcp/host-artifacts-writer.mjs" "/usr/local/lib/agentctl/host-artifacts-writer.mjs" "root:root" "755"
   json="$(mktemp "${TMPDIR:-/tmp}/agentctl-mcp-guest.XXXXXX")"
   printf '{"schema_version":1,"port":%s,"socket_path":"%s"}\n' "$MCP_PORT" "$MCP_GUEST_SOCKET" >"$json"
   refresh_container_file "$name" "$json" "/etc/agentctl/mcp-bridge.json" "root:root" "644"; rm -f "$json"
@@ -2830,14 +2843,19 @@ Usage:
   $CLI_NAME mcp remove [--name NAME] SERVER
   $CLI_NAME mcp list [--name NAME] [SERVER]
   $CLI_NAME mcp status [--name NAME]
+  $CLI_NAME mcp artifacts <allow-file|allow-directory|allow-file-pattern|allow-directory-pattern|allow-preset> [--name NAME] VALUE
+  $CLI_NAME mcp artifacts list [--name NAME] [--json]
+  $CLI_NAME mcp artifacts revoke [--name NAME] GRANT_ID
   $CLI_NAME mcp credential set ID [--stdin]
   $CLI_NAME mcp credential status ID
   $CLI_NAME mcp credential delete ID
   $CLI_NAME mcp credential list
 
 Definition commands target the container selected by the current workdir unless
---name is provided. VALUE accepts xcode, inline JSON, or @/path/to/private.json.
+--name is provided. VALUE accepts xcode, host-artifacts, inline JSON, or @/path/to/private.json.
 Changing an existing definition requires remove followed by add.
+Artifact permissions are host-managed and container-specific. The xcode and
+host-artifacts presets together enable narrow Xcode artifact grants automatically.
 
 List shows the exact stdio command line. Do not place secrets in MCP command
 arguments. Credential and environment values are never printed. Status checks
@@ -6154,6 +6172,7 @@ refresh_cmd() {
   fi
 
   refresh_container_file "$name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
+  refresh_container_file "$name" "$SCRIPT_DIR/mcp/host-artifacts-writer.mjs" "/usr/local/lib/agentctl/host-artifacts-writer.mjs" "root:root" "755"
   migrate_legacy_runtime_config_files "$name"
   refresh_container_file "$name" "$SCRIPT_DIR/VERSION" "/etc/agentctl/tooling-version" "root:root" "644"
   refresh_codex_config_files "$name" "/etc/agentctl/codex" "root:root"
@@ -6892,7 +6911,7 @@ doctor_mcp_status() {
     printf '%s\n' "unsafe MCP registry ownership or permissions: $registry"; return 1
   fi
   if ! jq -e --arg name "$name" '
-    (.schema_version==1 or .schema_version==2) and .container==$name and (.port|type)=="number" and (.port>=1024 and .port<=65535) and
+    (.schema_version==1 or .schema_version==2 or .schema_version==3) and .container==$name and (.port|type)=="number" and (.port>=1024 and .port<=65535) and
     (.servers|type)=="array" and
     all(.servers[]; (.name|type)=="string" and (.name|test("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")) and
       ((.transport // "stdio")=="stdio" or .transport=="http") and
@@ -9989,7 +10008,7 @@ mcp_validate_definition_registry() {
   local name="$1" registry="$2"
   mcp_validate_private_file "$registry" "Managed MCP registry"
   jq -e --arg name "$name" '
-    (.schema_version==1 or .schema_version==2) and .container==$name and
+    (.schema_version==1 or .schema_version==2 or .schema_version==3) and .container==$name and
     (.port|type)=="number" and .port>=1024 and .port<=65535 and
     (.servers|type)=="array" and
     ((.servers|map(.name)|length) == (.servers|map(.name)|unique|length)) and
@@ -10065,6 +10084,10 @@ mcp_definition_list() {
         refs=1
       done < <(printf '%s' "$entry" | jq -r '(.header_keychain_credentials // {})|to_entries[]|[.key,.value]|@tsv')
       [ "$refs" -eq 1 ] || printf '  %-20s %s\n' Credentials none
+    elif [ "$(printf '%s' "$entry" | jq -r '.builtin // empty')" = host-artifacts ]; then
+      printf '  %-20s %s\n' 'Managed server' host-artifacts
+      printf '  %-20s %s\n' Destination /workdir/.host-artifacts
+      printf '  %-20s %s\n' Permissions "inspect with: $CLI_NAME mcp artifacts list --name $name"
     else
       command_line="$(printf '%s' "$entry" | node "$SCRIPT_DIR/mcp/definition-helper.mjs" format-command)" \
         || die "Unable to format managed MCP command"
@@ -10183,6 +10206,11 @@ mcp_definition_mutate() {
   old_config="$MCP_CONFIG_JSON"
 
   case "$action" in
+    artifacts-*)
+      MCP_DEFINITION_STAGE="artifact permission validation"
+      MCP_CONFIG_JSON="$(printf '%s' "$old_config" | node "$SCRIPT_DIR/mcp/artifact-policy.mjs" "${action#artifacts-}" "$value")" || die "Unable to change host artifact permissions"
+      [ "$MCP_CONFIG_JSON" = "$old_config" ] || changed=1
+      ;;
     add)
       MCP_DEFINITION_STAGE="definition validation"
       MCP_CONFIG_JSON='[]'; MCP_REQUESTED=0
@@ -10195,8 +10223,8 @@ mcp_definition_mutate() {
         route="$(printf '%s' "$entry" | jq -r .name)"
         existing="$(printf '%s' "$MCP_CONFIG_JSON" | jq -c --arg name "$route" '.[] | select(.name==$name)' | head -n 1)"
         if [ -n "$existing" ]; then
-          canonical_entry="$(mcp_safe_config_json "[$entry]" | jq -cS '.[0]')"
-          canonical_existing="$(mcp_safe_config_json "[$existing]" | jq -cS '.[0]')"
+          canonical_entry="$(mcp_safe_config_json "[$entry]" | jq -cS '.[0] | del(.managed_preset)')"
+          canonical_existing="$(mcp_safe_config_json "[$existing]" | jq -cS '.[0] | del(.managed_preset)')"
           [ "$canonical_entry" = "$canonical_existing" ] \
             || die "Managed MCP server $route already exists with a different definition; remove it before adding the replacement"
           continue
@@ -10243,7 +10271,9 @@ mcp_definition_mutate() {
     sync_codex_managed_mcp_from_registry "$name" 1 \
       || die "Managed MCP definitions changed, but Codex synchronization is incomplete in $name; resolve the warning above and retry with ${CLI_NAME} run --name $name --cmd true"
   fi
-  if [ "$action" = add ]; then
+  if [ "${action#artifacts-}" != "$action" ]; then
+    printf 'Updated host artifact permissions in %s.\n' "$name"
+  elif [ "$action" = add ]; then
     printf 'Added managed MCP definition(s) to %s.\n' "$name"
   else
     printf 'Removed managed MCP definition %s from %s.\n' "$value" "$name"
@@ -10290,9 +10320,47 @@ mcp_status_cmd() {
   mcp_status "$name"
 }
 
+mcp_artifacts_cmd() {
+  local action="${1:-}" name="" value="" json_mode=0 policy=""
+  [ -n "$action" ] || { usage_mcp; return 0; }
+  shift
+  case "$action" in
+    list|allow-file|allow-directory|allow-file-pattern|allow-directory-pattern|allow-preset|revoke) ;;
+    --help|-h) usage_mcp; return 0 ;;
+    *) die "Unknown artifact permission action: $action" ;;
+  esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) [ "$#" -ge 2 ] || die "Missing value for --name"; name="$2"; shift 2 ;;
+      --json) [ "$action" = list ] || die "--json is supported only by artifacts list"; json_mode=1; shift ;;
+      --help|-h) usage_mcp; return 0 ;;
+      *) [ -z "$value" ] || die "Unexpected artifact permission argument: $1"; value="$1"; shift ;;
+    esac
+  done
+  require_container; require_jq
+  command -v node >/dev/null 2>&1 || die "Host artifact permissions require Node.js"
+  [ -n "$name" ] || name="$(default_name "$DEFAULT_NAME_PREFIX")"
+  if [ "$action" = list ]; then
+    [ -z "$value" ] || die "artifacts list accepts no value"
+    mcp_definition_target_prepare "$name"
+    policy="$(printf '%s' "$MCP_CONFIG_JSON" | node "$SCRIPT_DIR/mcp/artifact-policy.mjs" list)" || die "Unable to read host artifact permissions"
+    if [ "$json_mode" -eq 1 ]; then printf '%s\n' "$policy"
+    else
+      printf 'Host artifact permissions for %s\n' "$name"
+      printf '%s' "$policy" | jq -r '.presets[] | "  \(.id)  preset \(.name) [\(.origin)]"'
+      printf '%s' "$policy" | jq -r '.grants[] | "  \(.id)  \(.kind) \(.value) [\(.origin)]"'
+      printf '%s' "$policy" | jq -e '.grants|length==0' >/dev/null && printf '%s\n' '  No source access granted.' || true
+    fi
+  else
+    [ -n "$value" ] || die "Missing value for artifacts $action"
+    mcp_definition_mutate "artifacts-$action" "$name" "$value"
+  fi
+}
+
 mcp_cmd() {
   local action="${1:-}"
   case "$action" in
+    artifacts) shift; mcp_artifacts_cmd "$@" ;;
     credential) shift; mcp_credential_cmd "$@" ;;
     add|remove|list) shift; mcp_definition_cmd "$action" "$@" ;;
     status) shift; mcp_status_cmd "$@" ;;

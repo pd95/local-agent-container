@@ -1350,7 +1350,7 @@ test "$(wc -l </workdir/mcp-started | tr -d " ")" = 1
   if grep -Fq -- "$marker" "$registry"; then
     fail "Literal MCP environment value was persisted in the registry"
   fi
-  jq -e --arg credential "$credential" '.schema_version==2 and any(.servers[]; .name=="http-fake" and .bearer_token_keychain==$credential and (has("resolved_headers")|not))' "$registry" >/dev/null \
+  jq -e --arg credential "$credential" '.schema_version==3 and any(.servers[]; .name=="http-fake" and .bearer_token_keychain==$credential and (has("resolved_headers")|not))' "$registry" >/dev/null \
     || fail "Expected safe HTTP credential reference in registry"
   grep -Fq -- "$token" "$registry" && fail "HTTP MCP Keychain value was persisted in the registry"
   if lsof -nP -iTCP:47123 -sTCP:LISTEN 2>/dev/null | grep -q agentctl; then fail "agentctl unexpectedly opened a host TCP listener on the guest MCP port"; fi
@@ -1598,6 +1598,100 @@ curl -fsS -X POST -H "content-type: application/json" \
     | [(.configuration.mounts // [])[] | (.destination // .dst // "")]
     | index("/run/agentctl/mcp-host.sock") == null
   ' >/dev/null || fail "Expected --disable-mcp to remove managed socket wiring"
+}
+
+test_host_artifacts_lifecycle() {
+  begin_test "host-artifacts imports authorized files and survives managed lifecycle changes"
+  local name workdir sources file arguments registry grant_id copy_name status_json
+  name="$(unique_name host-artifacts)"; copy_name="${name}-copy"
+  workdir="$(new_workdir)"; sources="$(new_workdir)"; file="$sources/artifact.txt"
+  registry="$HOME/Library/Application Support/agentctl/mcp/$name.json"
+  register_container_cleanup "$name"; register_container_cleanup "$copy_name"
+  cp "$TEST_ROOT/tests/fixtures/artifact-mcp-client.mjs" "$workdir/artifact-mcp-client.mjs"
+  printf 'approved host artifact\n' >"$file"
+  if ! image_exists agent-python; then
+    run_capture "$AGENTCTL" build --image agent-python --features mcp-bridge
+    assert_status 0
+  fi
+  run_capture "$AGENTCTL" run --name "$name" --image agent-python --workdir "$workdir" --mcp host-artifacts --cmd true
+  assert_status 0
+  # run restores the initial stopped state after its command exits. Subsequent
+  # MCP client calls need a detached start, including the denied-source check.
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  arguments="$(jq -cn --arg path "$file" '{sourcePath:$path,destinationName:"imported.txt"}')"
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- node /workdir/artifact-mcp-client.mjs \
+    http://127.0.0.1:47123/mcp/host-artifacts import_artifact "$arguments"
+  [ "$RUN_STATUS" -ne 0 ] || fail "Ungranted host source was imported"
+  assert_contains "Source path is not authorized by host-artifacts grants"
+  run_capture "$AGENTCTL" mcp artifacts allow-file --name "$name" "$file"
+  assert_status 0
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- node /workdir/artifact-mcp-client.mjs \
+    http://127.0.0.1:47123/mcp/host-artifacts import_artifact "$arguments"
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.result.structuredContent.workspacePath=="/workdir/.host-artifacts/imported.txt"' >/dev/null || fail "Imported artifact path missing"
+  cmp "$file" "$workdir/.host-artifacts/imported.txt" || fail "Imported artifact bytes differ"
+  run_capture "$AGENTCTL" mcp artifacts list --name "$name" --json
+  assert_status 0
+  grant_id="$(printf '%s' "$RUN_OUTPUT" | jq -r '.grants[]|select(.origin=="explicit")|.id')"
+  # Remove the managed helper while running, then prove refresh restores it
+  # without relying on the configure-on-start path.
+  run_capture "$CONTAINER_CMD" exec -u 0 "$name" rm /usr/local/lib/agentctl/host-artifacts-writer.mjs
+  assert_status 0
+  run_capture "$AGENTCTL" refresh --name "$name"
+  assert_status 0
+  arguments="$(jq -cn --arg path "$file" '{sourcePath:$path,destinationName:"after-running-refresh.txt"}')"
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- node /workdir/artifact-mcp-client.mjs \
+    http://127.0.0.1:47123/mcp/host-artifacts import_artifact "$arguments"
+  assert_status 0
+  cmp "$file" "$workdir/.host-artifacts/after-running-refresh.txt" || fail "Running refresh did not restore artifact imports"
+  if [ -x /usr/bin/xcrun ]; then
+    run_capture "$AGENTCTL" mcp add --name "$name" xcode
+    assert_status 0
+    run_capture "$AGENTCTL" mcp artifacts list --name "$name" --json
+    assert_status 0
+    printf '%s' "$RUN_OUTPUT" | jq -e 'any(.presets[]; .name=="xcode" and .origin=="automatic")' >/dev/null || fail "Xcode pair did not derive artifact permissions"
+    run_capture "$AGENTCTL" mcp remove --name "$name" xcode
+    assert_status 0
+  fi
+  run_capture "$AGENTCTL" stop --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" refresh --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" restart --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- node /workdir/artifact-mcp-client.mjs \
+    http://127.0.0.1:47123/mcp/host-artifacts host_artifacts_status
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e --arg id "$grant_id" 'any(.result.structuredContent.grants[]; .id==$id)' >/dev/null || fail "Grant did not survive restart"
+
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- sh -c 'mkdir /workdir/other; ln -s /workdir/other /workdir/.host-artifacts/escape'
+  assert_status 0
+  arguments="$(jq -cn --arg path "$file" '{sourcePath:$path,destinationName:"escape/file.txt"}')"
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- node /workdir/artifact-mcp-client.mjs \
+    http://127.0.0.1:47123/mcp/host-artifacts import_artifact "$arguments"
+  [ "$RUN_STATUS" -ne 0 ] || fail "Destination symlink was followed"
+  [ ! -e "$workdir/other/file.txt" ] || fail "Import escaped its destination"
+
+  run_capture "$AGENTCTL" upgrade --name "$name" --new-name "$copy_name" --copy --no-backup
+  assert_status 0
+  run_capture "$AGENTCTL" start --name "$copy_name"
+  assert_status 0
+  run_capture "$AGENTCTL" exec --name "$copy_name" --no-tty -- node /workdir/artifact-mcp-client.mjs \
+    http://127.0.0.1:47123/mcp/host-artifacts host_artifacts_status
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e --arg name "$copy_name" --arg id "$grant_id" '.result.structuredContent.container==$name and any(.result.structuredContent.grants[]; .id==$id)' >/dev/null || fail "Copy did not preserve grants or rebind the owning container"
+
+  run_capture "$AGENTCTL" mcp artifacts revoke --name "$name" "$grant_id"
+  assert_status 0
+  arguments="$(jq -cn --arg path "$file" '{sourcePath:$path,destinationName:"after-revoke.txt"}')"
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- node /workdir/artifact-mcp-client.mjs \
+    http://127.0.0.1:47123/mcp/host-artifacts import_artifact "$arguments"
+  [ "$RUN_STATUS" -ne 0 ] || fail "Revoked host source was imported"
+  assert_contains "Source path is not authorized by host-artifacts grants"
+  jq -e '.schema_version==3 and .servers[0].builtin=="host-artifacts"' "$registry" >/dev/null || fail "Builtin registry schema is incorrect"
 }
 
 test_published_socket_lifecycle() {
@@ -2073,6 +2167,7 @@ main() {
   run_selected_test test_ssh_feature_build_and_forwarding_lifecycle "SSH forwarding feature preinstall survives upgrade and can be disabled" full
   run_selected_test test_host_socket_mount_lifecycle "host Unix socket mount survives restart, upgrade, replacement, copy, and removal" full
   run_selected_test test_managed_mcp_bridge_lifecycle "managed MCP bridge exchanges traffic and survives start, restart, upgrade, and disable" full
+  run_selected_test test_host_artifacts_lifecycle "host-artifacts imports authorized files and survives managed lifecycle changes" full
   run_selected_test test_published_socket_lifecycle "container Unix socket publishing survives lifecycle and upgrade changes" full
   run_selected_test test_bootstrap_works_on_existing_alpine_container "bootstrap works on an existing Alpine container" full
   run_selected_test test_bootstrap_can_create_and_bootstrap_new_alpine_container "bootstrap can create and bootstrap a new Alpine container" full

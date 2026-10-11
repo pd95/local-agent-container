@@ -278,7 +278,13 @@ nonce health endpoint without making the relay a TCP listener:
 
 ```bash
 node tests/run-mcp-node-tests.mjs
+node tests/run-host-artifacts-node-tests.mjs
 ```
+
+The artifact suite requires host Python 3.8 or newer. Writer and end-to-end
+fake-container tests execute the Linux guest writer locally and run only on
+Linux; macOS runs the policy, reader and manifest tests, while the host integration
+suite exercises the writer inside real containers, including running-container refresh.
 
 The focused macOS MCP test writes redacted host-relay diagnostics beneath
 `./tmp/mcp/`. On failure it also prints the guest proxy log before cleanup.
@@ -407,6 +413,38 @@ You can point the harness at another `agentctl` binary or container runtime comm
 AGENTCTL=/path/to/agentctl CONTAINER_CMD=container \
   bash tests/run-tests.sh --tier full
 ```
+
+### Host artifacts
+
+Host artifact tests cover the four typed grants, automatic Xcode pairing,
+recursive source validation, destination symlink rejection, staging cleanup,
+interactive guest stdin, real Unix-socket relay routing, and mocked Xcode exports.
+They run as part of both shell unit suites and may also run directly as above.
+Fixtures use isolated workdirs and synthetic attachment data.
+
+Run the focused macOS lifecycle coverage after deploying the updated host files:
+
+```bash
+bash tests/run-tests.sh --tier full --filter host-artifacts
+bash tests/run-tests.sh --tier full --filter managed-mcp
+```
+
+The host-artifacts test imports an initially denied host fixture, grants/revokes
+access, checks automatic Xcode permissions, rejects destination symlinks, and
+verifies refresh, restart and copy behavior. It needs no Xcode attachment bundle.
+For real exporter verification, enable the server and grant a completed bundle:
+
+```bash
+agentctl mcp add host-artifacts
+agentctl mcp artifacts allow-directory "/absolute/path/to/Test-example.xcresult"
+```
+
+Call `extract_test_attachments` from the container's MCP client, verify a passing
+`.keepAlways` screenshot and `metadata.json`, then repeat with `filter: "*.png"`
+and `onlyFailures: true`. For a bundle containing only a passing screenshot, the
+failures-only export should succeed with zero attachments. Do not commit personal
+screenshots, result bundles or device identifiers as test fixtures. Run the full
+macOS suite for compatibility sign-off.
 
 ## Manual Remote Control smoke test
 

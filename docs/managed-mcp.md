@@ -68,6 +68,26 @@ http://127.0.0.1:47123/mcp/xcode
 http://127.0.0.1:47123/mcp/example
 ```
 
+## Host artifact imports
+
+The built-in `host-artifacts` server imports approved host artifacts into
+`/workdir/.host-artifacts` and exports Xcode test attachments:
+
+```bash
+agentctl create --mcp xcode --mcp host-artifacts
+agentctl mcp add host-artifacts
+agentctl mcp artifacts allow-directory "$HOME/Reports/Exports"
+agentctl mcp artifacts list
+```
+
+It starts with no source grants. When the built-in `xcode` preset is also
+configured, narrow Xcode artifact rules activate automatically. Other paths and
+the PapagEye preset require explicit per-container host grants. The four grant
+types are exact files, exact directories, file regexes and directory regexes.
+
+See [Host artifacts](host-artifacts.md) for permission commands, MCP tool inputs,
+attachment export behavior and migration from external `container-sync` servers.
+
 ## Remote Xcode MCP bridge over SSH
 
 When Xcode is installed on a macOS VM rather than on the Mac that runs the
