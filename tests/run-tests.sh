@@ -1951,7 +1951,7 @@ test_bootstrap_works_on_existing_debian_container() {
 
   run_capture "$AGENTCTL" runtime --name "$name" info codex
   assert_status 0
-  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "standalone-installer"' >/dev/null || fail "Expected runtime info JSON for codex after Debian bootstrap, got: $RUN_OUTPUT"
+  printf '%s' "$RUN_OUTPUT" | jq -er '.runtime == "codex" and .install_method == "standalone-installer" and .installed == false' >/dev/null || fail "Expected runtime info JSON for codex after Debian bootstrap, got: $RUN_OUTPUT"
 
   run_capture "$AGENTCTL" feature --name "$name" info office
   assert_status 0
@@ -1963,6 +1963,29 @@ test_bootstrap_works_on_existing_debian_container() {
 
   run_capture "$CONTAINER_CMD" exec "$name" sh -lc 'test -f /etc/agentctl/bootstrap.json && test -x /usr/local/bin/agent.sh && test -f /etc/agentctl/runtimes.d/codex.json && test -f /etc/agentctl/features.d/office.json'
   assert_status 0
+  # Native Codex daemon identity checks require ps, absent from Debian slim.
+  run_capture "$CONTAINER_CMD" exec -u 0 "$name" sh -c 'set -e; apt-get update; DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends procps; rm -rf /var/lib/apt/lists/*'
+  assert_status 0
+  # Bootstrap supplies adapters, not runtime executables. Install Codex before
+  # exercising the update path; a raw Debian exec also lacks the login PATH.
+  run_capture "$AGENTCTL" runtime --name "$name" install codex
+  assert_status 0
+  run_capture "$AGENTCTL" runtime --name "$name" info codex
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.installed == true' >/dev/null || fail "Expected installed Codex before daemon repair test"
+  # A restored home can retain launch logs while its package cache is excluded.
+  run_capture "$AGENTCTL" exec --no-tty --name "$name" -- sh -c 'mkdir -p "$HOME/.codex/app-server-daemon"; touch "$HOME/.codex/app-server-daemon/daemon.stderr.log"'
+  assert_status 0
+  run_capture "$AGENTCTL" runtime --name "$name" update codex
+  assert_status 0
+  run_capture "$AGENTCTL" exec --no-tty --name "$name" -- /opt/agentctl/bin/codex app-server daemon start
+  assert_status 0
+  run_capture "$AGENTCTL" exec --no-tty --name "$name" -- /opt/agentctl/bin/codex app-server daemon version
+  assert_status 0
+  printf '%s' "$RUN_OUTPUT" | jq -e '.status == "running"' >/dev/null || fail "Expected repaired native daemon to run"
+  run_capture "$AGENTCTL" exec --no-tty --name "$name" -- /opt/agentctl/bin/codex app-server daemon stop
+  assert_status 0
+
 }
 
 test_host_only_network_lifecycle_isolation_and_upgrade() {

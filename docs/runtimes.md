@@ -67,6 +67,17 @@ and can be combined with online mode:
 agentctl run --online --update
 ```
 
+On non-Alpine containers with a managed standalone Codex installation, these
+update commands also repair a missing daemon executable using the official
+daemon-only installer and its latest release channel. Working daemon packages
+retain their versions, and running servers are not restarted. A repair failure
+fails the update command even if the CLI update succeeded. Repair requires a
+compatible `flock` command and uses native daemon/install locks plus a guarded
+selection, preserving packages repaired or pinned concurrently. Failed or
+interrupted repairs restore the previous selection only while their own
+reservation remains selected. Ordinary startup,
+refresh, and direct `codex update` do not perform this repair.
+
 Runtime updates persist in a named container. They do not update the agentctl
 Git checkout or rebuild the container image.
 
