@@ -5957,6 +5957,210 @@ EOF
   assert_contains "Falling back to direct Codex standalone package install."
 }
 
+test_codex_daemon_selection_and_repair_guards() (
+  begin_test "Codex daemon selection preserves working packages and skips Alpine"
+  . "$TEST_ROOT/runtimes/codex.sh"
+  local fixture
+  fixture="$(mktemp -d)"
+  register_dir_cleanup "$fixture"
+  local fixture_home="$fixture/home"
+  mkdir -p "$fixture/bin"
+  printf '#!/bin/sh\nexit 0\n' >"$fixture/bin/flock"
+  chmod +x "$fixture/bin/flock"
+  export PATH="$fixture/bin:$PATH"
+  mkdir -p "$fixture_home/packages/standalone/current/bin" "$fixture_home/app-server-daemon"
+  printf '#!/bin/sh\nexit 0\n' >"$fixture_home/packages/standalone/current/bin/codex"
+  chmod +x "$fixture_home/packages/standalone/current/bin/codex"
+  : >"$fixture_home/app-server-daemon/app-server.stderr.log"
+  [ "$(codex_daemon_command "$fixture_home")" = "$fixture_home/packages/standalone/current/bin/codex" ] || fail "Expected legacy selection"
+  mkdir -p "$fixture_home/packages/app-server-daemon"
+  ln -s releases/missing "$fixture_home/packages/app-server-daemon/current"
+  [ "$(codex_daemon_command "$fixture_home")" = "$fixture_home/packages/app-server-daemon/current/bin/codex" ] || fail "Expected dangling dedicated selection to take precedence"
+  rm "$fixture_home/packages/app-server-daemon/current"
+  : >"$fixture_home/app-server-daemon/daemon.stderr.log"
+  [ "$(codex_daemon_command "$fixture_home")" = "$fixture_home/packages/app-server-daemon/current/bin/codex" ] || fail "Expected dedicated launch artifact precedence"
+  codex_home_dir() { printf '%s\n' "$fixture_home"; }
+  curl() { fail "Unexpected installer download"; }
+  flock() { command flock "$@"; }
+  : >"$fixture/alpine"
+  AGENTCTL_ALPINE_RELEASE_FILE="$fixture/alpine" codex_repair_missing_daemon /missing
+  AGENTCTL_ALPINE_RELEASE_FILE="$fixture/absent" codex_repair_missing_daemon /missing
+  cat >"$fixture/installer" <<'INSTALLER'
+# CODEX_INSTALL_DAEMON_ONLY
+set -eu
+[ "$CODEX_INSTALL_DAEMON_ONLY" = 1 ] || exit 4
+[ "$CODEX_RELEASE" = latest ] || exit 5
+[ "$CODEX_INSTALL_DEFER_SELECTION" = 0 ] || exit 6
+[ "$CODEX_INSTALL_IF_CURRENT" = 1 ] || exit 7
+[ "$CODEX_INSTALL_IF_LATEST" = 0 ] || exit 8
+root="$CODEX_HOME/packages/app-server-daemon"
+exec 9>>"$root/install.lock"
+flock -x -w 5 9
+[ "$(readlink "$root/current")" = "$root/releases/$CODEX_UPDATE_FROM_RELEASE" ] || exit 9
+mkdir -p "$root/releases/installed/bin"
+printf '#!/bin/sh\nexit 0\n' >"$root/releases/installed/bin/codex"
+chmod +x "$root/releases/installed/bin/codex"
+ln -sfn "$root/releases/installed" "$root/current"
+INSTALLER
+  fixture_codex() { printf '%s\n' --from-cli; }
+  curl() { cp "$fixture/installer" "$4"; }
+  AGENTCTL_ALPINE_RELEASE_FILE="$fixture/absent" codex_repair_missing_daemon fixture_codex
+  [ -x "$fixture_home/packages/app-server-daemon/current/bin/codex" ] || fail "Expected installed daemon"
+  curl() { fail "Working daemon must not be replaced"; }
+  AGENTCTL_ALPINE_RELEASE_FILE="$fixture/absent" codex_repair_missing_daemon fixture_codex
+  rm "$fixture_home/packages/app-server-daemon/current/bin/codex"
+  curl() { return 22; }
+  if AGENTCTL_ALPINE_RELEASE_FILE="$fixture/absent" codex_repair_missing_daemon fixture_codex; then
+    fail "Expected download failure to propagate"
+  fi
+  printf '# CODEX_INSTALL_DAEMON_ONLY CODEX_INSTALL_IF_CURRENT\nexit 7\n' >"$fixture/installer"
+  curl() { cp "$fixture/installer" "$4"; }
+  if AGENTCTL_ALPINE_RELEASE_FILE="$fixture/absent" codex_repair_missing_daemon fixture_codex; then
+    fail "Expected installer failure to propagate"
+  fi
+  printf '# CODEX_INSTALL_DAEMON_ONLY CODEX_INSTALL_IF_CURRENT\nexit 0\n' >"$fixture/installer"
+  if AGENTCTL_ALPINE_RELEASE_FILE="$fixture/absent" codex_repair_missing_daemon fixture_codex; then
+    fail "Expected missing executable verification to fail"
+  fi
+
+  [ "$(readlink "$fixture_home/packages/app-server-daemon/current")" = "$fixture_home/packages/app-server-daemon/releases/installed" ] || fail "Expected failed repair to restore prior selection"
+  if find "$fixture_home/packages/app-server-daemon/releases" -name 'agentctl-repair.*' | grep .; then
+    fail "Expected failed reservation cleanup"
+  fi
+  # A concurrent package publication supersedes the reservation. Never roll it back.
+  cat >"$fixture/installer" <<'INSTALLER'
+# CODEX_INSTALL_DAEMON_ONLY CODEX_INSTALL_IF_CURRENT
+set -eu
+root="$CODEX_HOME/packages/app-server-daemon"
+mkdir -p "$root/releases/concurrent/bin"
+printf '#!/bin/sh
+exit 0
+' >"$root/releases/concurrent/bin/codex"
+chmod +x "$root/releases/concurrent/bin/codex"
+ln -sfn "$root/releases/concurrent" "$root/current"
+printf 'preserved pin
+' >"$root/pin-marker"
+exit 1
+INSTALLER
+  AGENTCTL_ALPINE_RELEASE_FILE="$fixture/absent" codex_repair_missing_daemon fixture_codex
+  [ "$(readlink "$fixture_home/packages/app-server-daemon/current")" = "$fixture_home/packages/app-server-daemon/releases/concurrent" ] || fail "Concurrent selection was overwritten"
+  grep -Fxq 'preserved pin' "$fixture_home/packages/app-server-daemon/pin-marker" || fail "Concurrent pin metadata was changed"
+  # Termination must also restore a dangling selection and discard our reservation.
+  ln -sfn releases/missing "$fixture_home/packages/app-server-daemon/current"
+  printf '# CODEX_INSTALL_DAEMON_ONLY CODEX_INSTALL_IF_CURRENT
+kill -TERM "$PPID"
+exit 143
+' >"$fixture/installer"
+  if AGENTCTL_ALPINE_RELEASE_FILE="$fixture/absent" codex_repair_missing_daemon fixture_codex; then
+    fail "Expected interrupted repair to fail"
+  fi
+  [ "$(readlink "$fixture_home/packages/app-server-daemon/current")" = releases/missing ] || fail "Expected interrupt rollback"
+
+)
+
+test_agent_sh_codex_update_repairs_daemon_after_launcher_refresh() {
+  begin_test "agent.sh native Codex update repairs daemon after launcher refresh"
+  local temp_home
+  local tools_home
+  local fake_bin
+  local log
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/agent-sh-daemon-update.XXXXXX")"
+  register_dir_cleanup "$temp_home"
+  tools_home="$temp_home/tools"
+  fake_bin="$temp_home/bin"
+  log="$temp_home/calls"
+  make_fake_managed_codex "$temp_home" 0 0
+  mkdir -p "$temp_home/home/.codex/app-server-daemon"
+  : >"$temp_home/home/.codex/app-server-daemon/daemon.stderr.log"
+  cat >"$tools_home/codex/packages/standalone/current/bin/codex" <<'CLI'
+#!/bin/sh
+set -eu
+printf 'CLI_HOME=%s ARGS=%s\n' "${CODEX_HOME:-}" "$*" >>"$CODEX_TEST_ROOT/calls"
+case "$*" in
+  update) exit "${CODEX_TEST_UPDATE_STATUS:-0}" ;;
+  'sandbox /bin/true') exit 0 ;;
+  'app-server daemon pid-update-loop --check-package-ownership')
+    test -x "$CODEX_TEST_ROOT/tools/codex/launcher/codex"
+    ;;
+  'app-server daemon update --help') printf '%s\n' --from-cli ;;
+  *) exit 89 ;;
+esac
+CLI
+  cat >"$fake_bin/flock" <<'LOCK'
+#!/bin/sh
+printf 'LOCK %s\n' "$*" >>"$CODEX_TEST_ROOT/calls"
+exit 0
+LOCK
+  cat >"$fake_bin/curl" <<'CURL'
+#!/bin/sh
+printf '%s\n' download >>"$CODEX_TEST_ROOT/calls"
+cp "$CODEX_TEST_ROOT/installer" "$4"
+CURL
+  cat >"$temp_home/installer" <<'INSTALLER'
+#!/bin/sh
+# CODEX_INSTALL_DAEMON_ONLY
+set -eu
+test "$CODEX_HOME" = "$CODEX_TEST_ROOT/home/.codex"
+test "$CODEX_INSTALL_DAEMON_ONLY" = 1
+test "$CODEX_NON_INTERACTIVE" = 1
+test "$CODEX_RELEASE" = latest
+test "$CODEX_INSTALL_DEFER_SELECTION" = 0
+test "$CODEX_INSTALL_IF_CURRENT" = 1
+test "$CODEX_INSTALL_IF_LATEST" = 0
+root="$CODEX_HOME/packages/app-server-daemon"
+test "$(readlink "$root/current")" = "$root/releases/$CODEX_UPDATE_FROM_RELEASE"
+mkdir -p "$root/releases/installed/bin"
+printf '#!/bin/sh\n[ "$*" = --version ] || exit 99\nprintf "codex-cli fixture\n"\n' >"$root/releases/installed/bin/codex"
+chmod +x "$root/releases/installed/bin/codex"
+ln -sfn "$root/releases/installed" "$root/current"
+printf '%s\n' installed >>"$CODEX_TEST_ROOT/calls"
+INSTALLER
+  chmod +x "$fake_bin/flock" "$fake_bin/curl" "$tools_home/codex/packages/standalone/current/bin/codex"
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" AGENTCTL_TOOLS_HOME="$tools_home" \
+    CODEX_TEST_ROOT="$temp_home" AGENTCTL_ALPINE_RELEASE_FILE="$temp_home/not-alpine" \
+    CODEX_RELEASE=old CODEX_INSTALL_DEFER_SELECTION=1 \
+    CODEX_INSTALL_IF_CURRENT=0 CODEX_INSTALL_IF_LATEST=1 CODEX_UPDATE_FROM_RELEASE=old \
+    -- runtime update codex
+  assert_status 0
+  grep -Fxq "CLI_HOME=$tools_home/codex ARGS=update" "$log" || fail "Expected CLI update under tool home"
+  grep -Fxq installed "$log" || fail "Expected daemon installer"
+  [ -x "$tools_home/codex/launcher/codex" ] || fail "Expected refreshed launcher"
+  if grep -E 'ARGS=app-server daemon (start|stop|restart|update --from-cli)' "$log"; then
+    fail "Update must not issue lifecycle commands"
+  fi
+  # A working, older daemon requires no installer.
+  : >"$log"
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" AGENTCTL_TOOLS_HOME="$tools_home" \
+    CODEX_TEST_ROOT="$temp_home" AGENTCTL_ALPINE_RELEASE_FILE="$temp_home/not-alpine" \
+    -- runtime update codex
+  assert_status 0
+  if grep -Fxq download "$log"; then fail "Working daemon must not be replaced"; fi
+  # Working legacy selections also skip repair.
+  rm "$temp_home/home/.codex/packages/app-server-daemon/current"
+  rm "$temp_home/home/.codex/app-server-daemon/daemon.stderr.log"
+  mkdir -p "$temp_home/home/.codex/packages/standalone/current/bin"
+  printf '#!/bin/sh\nexit 0\n' >"$temp_home/home/.codex/packages/standalone/current/bin/codex"
+  chmod +x "$temp_home/home/.codex/packages/standalone/current/bin/codex"
+  : >"$temp_home/home/.codex/app-server-daemon/app-server.stderr.log"
+  : >"$log"
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" AGENTCTL_TOOLS_HOME="$tools_home" \
+    CODEX_TEST_ROOT="$temp_home" AGENTCTL_ALPINE_RELEASE_FILE="$temp_home/not-alpine" \
+    -- runtime update codex
+  assert_status 0
+  if grep -Fxq download "$log"; then fail "Working legacy daemon must not be replaced"; fi
+  # CLI failure stops before any launcher probe or daemon repair.
+  : >"$log"
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" AGENTCTL_TOOLS_HOME="$tools_home" \
+    CODEX_TEST_ROOT="$temp_home" AGENTCTL_ALPINE_RELEASE_FILE="$temp_home/not-alpine" \
+    CODEX_TEST_UPDATE_STATUS=42 -- runtime update codex
+  assert_status 42
+  [ "$(wc -l <"$log" | tr -d ' ')" = 1 ] || fail "CLI failure must prevent subsequent work"
+}
+
 test_agent_sh_codex_runtime_update_calls_codex_update() {
   begin_test "agent.sh codex runtime update calls codex update"
 
@@ -16813,6 +17017,8 @@ main() {
   run_selected_test test_agent_sh_claude_runtime_update_calls_claude_update "test_agent_sh_claude_runtime_update_calls_claude_update"
   run_selected_test test_agent_sh_codex_runtime_install_runs_standalone_installer "test_agent_sh_codex_runtime_install_runs_standalone_installer"
   run_selected_test test_agent_sh_codex_runtime_install_falls_back_to_direct_package "test_agent_sh_codex_runtime_install_falls_back_to_direct_package"
+  run_selected_test test_codex_daemon_selection_and_repair_guards "Codex daemon selection and repair guards"
+  run_selected_test test_agent_sh_codex_update_repairs_daemon_after_launcher_refresh "native Codex update repairs daemon after launcher refresh"
   run_selected_test test_agent_sh_codex_runtime_update_calls_codex_update "test_agent_sh_codex_runtime_update_calls_codex_update"
   run_selected_test test_agent_sh_codex_refresh_keeps_working_system_bwrap "test_agent_sh_codex_refresh_keeps_working_system_bwrap"
   run_selected_test test_agent_sh_codex_refresh_selects_bundled_bwrap_and_warns "test_agent_sh_codex_refresh_selects_bundled_bwrap_and_warns"

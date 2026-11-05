@@ -1131,3 +1131,15 @@ Expected output includes:
 - `Fixtures generated in /workdir/office_tool_tests/fixtures`
 - `PPTX verified.`
 - `All fixtures verified.`
+
+
+For the missing Codex daemon repair, use a disposable Ubuntu or Debian container
+with the current managed scripts. Preserve a daemon launch log while omitting
+the daemon package, run `agentctl runtime update codex`, and verify that
+`agentctl exec -- codex app-server daemon start` succeeds. The full-tier Debian
+bootstrap test covers this restored-home condition. Repeat the update with a
+working daemon and confirm its PID and selected package remain unchanged.
+
+Existing containers receive this fix with `agentctl refresh`, followed by
+`agentctl run --online --update`. No image rebuild or container recreation is
+required. Also verify an ordinary interactive launch on Ubuntu after the update.
