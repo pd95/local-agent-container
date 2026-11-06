@@ -2229,15 +2229,20 @@ image_refs_matching_container_digests() {
 image_matching_timestamp_ref() {
   local image="$1"
   local images_json
+  local exact_reference=""
+  exact_reference="$(image_unambiguous_reference "$image")"
   images_json="$(image_list_json)"
-  printf '%s' "$images_json" | jq -er --arg target "$image" '
+  printf '%s' "$images_json" | jq -er --arg target "$image" --arg exact "$exact_reference" '
     def norm: if type == "string" then sub("^docker\\.io/library/"; "") else "" end;
-    def ref: (.reference // .configuration.name // .configuration.reference // "") | norm;
+    def raw_ref: .reference // .configuration.name // .configuration.reference // "";
+    def ref: raw_ref | norm;
     def digests: [(.descriptor.digest // .configuration.descriptor.digest // empty), ((.variants // [])[] | .descriptor.digest // .digest // empty)] | unique;
     if type != "array" then error("invalid image list") else . end
     | (if ($target | contains(":")) then $target else $target + ":latest" end) as $latest
     | ($latest | rtrimstr(":" + (split(":")[-1]))) as $family
-    | ([.[] | select(type == "object") | select((ref == $target) or (ref == $latest)) | digests][0] // []) as $target_digests
+    | (([.[] | select(type == "object")
+          | select((raw_ref == $exact) or (raw_ref == ($exact + ":latest"))) | digests]
+        + [.[] | select(type == "object") | select((ref == $target) or (ref == $latest)) | digests])[0] // []) as $target_digests
     | if ($target_digests | length) == 0 then error("missing target digest") else . end
     | [.[] | select(type == "object")
         | select(((digests - $target_digests) | length) < (digests | length))
@@ -2284,7 +2289,8 @@ warn_legacy_compat_image_usage() {
   local image="$1"
   local family
 
-  family="${image%%:*}"
+  family="${image##*/}"
+  family="${family%%[:@]*}"
   if ! is_legacy_compat_image_family "$family"; then
     return 0
   fi
@@ -2293,16 +2299,64 @@ warn_legacy_compat_image_usage() {
   warn "Prefer agent-python plus runtime installation unless you are intentionally reusing an older office-focused setup."
 }
 
+# Prefer an exact registry-qualified local reference when an older short-name
+# annotation would otherwise shadow it. Keep legacy-only images usable.
+image_unambiguous_reference() {
+  local image="$1"
+  local inspect_json=""
+  local candidate=""
+  local exact_name=""
+  local requested_reference="$image"
+  local first_component="${image%%/*}"
+
+  if [ "$first_component" != "$image" ]; then
+    case "$first_component" in
+      *.*|*:*|localhost) printf '%s\n' "$image"; return 0 ;;
+    esac
+  fi
+  case "${image##*/}" in
+    *:*|*@*) ;;
+    *) requested_reference="${image}:latest" ;;
+  esac
+  if inspect_json="$("$CONTAINER_CMD" image inspect "$image" 2>/dev/null)"; then
+    candidate="$(printf '%s' "$inspect_json" | jq -er --arg requested "$requested_reference" '
+      (if type == "array" then .[0] else . end)
+      | (.configuration // .) as $image
+      | [$image.descriptor.annotations["io.containerd.image.name"], $image.reference, $image.name]
+      | map(select(type == "string" and endswith("/" + $requested)))
+      | .[0] // empty
+    ' 2>/dev/null || true)"
+    case "${candidate%%/*}" in
+      *.*|*:*|localhost) ;;
+      *) candidate="" ;;
+    esac
+    if [ -n "$candidate" ] && [ "$candidate" != "$image" ] \
+        && inspect_json="$("$CONTAINER_CMD" image inspect "$candidate" 2>/dev/null)"; then
+      exact_name="$(printf '%s' "$inspect_json" | jq -er --arg expected "$candidate" '
+        (if type == "array" then .[0] else . end)
+        | (.configuration // .)
+        | (.reference // .name // empty)
+        | select(. == $expected)
+      ' 2>/dev/null || true)"
+      if [ -n "$exact_name" ]; then
+        printf '%s\n' "$exact_name"
+        return 0
+      fi
+    fi
+  fi
+  printf '%s\n' "$image"
+}
+
 image_ref_for_runtime() {
   local image="$1"
   local preferred
   preferred="$(image_family_preferred "$image")"
   if image_exists "$preferred"; then
-    echo "$preferred"
+    image_unambiguous_reference "$preferred"
     return 0
   fi
   if image_exists "$image"; then
-    echo "$image"
+    image_unambiguous_reference "$image"
     return 0
   fi
   echo "$preferred"
@@ -3881,18 +3935,21 @@ build_cmd() {
     local base=""
     local existing_snapshot=""
     local image_features=""
+    local resolved_source=""
+    local resolved_base=""
+    local build_status=0
     file="$(dockerfile_name_for_image "$name")"
     file_path="$SCRIPT_DIR/$file"
     if [ "$rebuild" -eq 0 ] && [ "$default_runtime_overridden" -eq 0 ] && [ "$runtimes_overridden" -eq 0 ] && [ "$features_overridden" -eq 0 ] && image_exists "$name"; then
       if [ "$snapshot" -eq 1 ]; then
         echo "Snapshotting existing image tags: $name, $versioned_name"
-        "$CONTAINER_CMD" image tag "$name" "$versioned_name"
+        "$CONTAINER_CMD" image tag "$(image_unambiguous_reference "$name")" "$versioned_name" || return $?
         return 0
       fi
       existing_snapshot="$(image_matching_timestamp_ref "$name" 2>/dev/null || true)"
       if [ -z "$existing_snapshot" ]; then
         echo "Snapshotting missing image tag: $name, $versioned_name"
-        "$CONTAINER_CMD" image tag "$name" "$versioned_name"
+        "$CONTAINER_CMD" image tag "$(image_unambiguous_reference "$name")" "$versioned_name" || return $?
         return 0
       fi
       echo "Image already exists: $name (use --rebuild to rebuild)"
@@ -3925,8 +3982,53 @@ build_cmd() {
     else
       build_args+=("$context")
     fi
-    "$CONTAINER_CMD" "${build_args[@]}"
-    "$CONTAINER_CMD" image tag "$name" "$versioned_name"
+    base="$(base_image_from_file "$file_path")"
+    if [ -n "$base" ] && local_dockerfile_exists_for_image "$base"; then
+      resolved_base="$(image_ref_for_runtime "$base")"
+    fi
+    if [ -n "$resolved_base" ] && [ "$resolved_base" != "$base" ]; then
+      # Keep repository DockerFiles portable to legacy-only image stores. Only
+      # the temporary build file selects the exact local dependency reference.
+      if (
+        temporary_dockerfile="$(mktemp "${TMPDIR:-/tmp}/agentctl-build.XXXXXX")" || exit 1
+        trap 'rm -f "$temporary_dockerfile" "$temporary_dockerfile.dockerignore"' EXIT
+        awk -v original="$base" -v replacement="$resolved_base" '
+          toupper($1) == "FROM" && !replaced {
+            for (i = 2; i <= NF; i++) {
+              if ($i ~ /^--/) continue
+              if ($i == original) $i = replacement
+              replaced = 1
+              break
+            }
+          }
+          { print }
+        ' "$file_path" >"$temporary_dockerfile" || exit 1
+        if [ -f "$file_path.dockerignore" ]; then
+          cp "$file_path.dockerignore" "$temporary_dockerfile.dockerignore" || exit 1
+        fi
+        build_args[4]="$temporary_dockerfile"
+        "$CONTAINER_CMD" "${build_args[@]}"
+      ); then
+        build_status=0
+      else
+        build_status=$?
+      fi
+    elif "$CONTAINER_CMD" "${build_args[@]}"; then
+      build_status=0
+    else
+      build_status=$?
+    fi
+    if [ "$build_status" -ne 0 ]; then
+      stop_buildkit_container
+      printf 'Error: image build failed for %s (exit %s); existing image was not timestamp-tagged.\n' "$name" "$build_status" >&2
+      return "$build_status"
+    fi
+    resolved_source="$(image_unambiguous_reference "$name")"
+    if ! "$CONTAINER_CMD" image tag "$resolved_source" "$versioned_name"; then
+      stop_buildkit_container
+      printf 'Error: failed to timestamp-tag built image %s.\n' "$name" >&2
+      return 1
+    fi
   }
 
   if [ -n "$image" ]; then
@@ -3946,7 +4048,7 @@ build_cmd() {
 
   while IFS= read -r build_image; do
     [ -z "$build_image" ] && continue
-    build_one "$build_image" || return 1
+    build_one "$build_image" || return $?
   done <<< "$build_order_lines"
 
   stop_buildkit_container
@@ -8377,7 +8479,8 @@ feature_managed_packages_json() {
   local target_image="$2"
   local package_manager="$3"
   local registry_dir="${AGENTCTL_HOST_FEATURE_REGISTRY_DIR:-$SCRIPT_DIR/features.d}"
-  local target_family="${target_image%%:*}"
+  local target_family="${target_image##*/}"
+  target_family="${target_family%%[:@]*}"
   local packages_json='[]'
   local feature=""
   local manifest=""

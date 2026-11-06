@@ -3009,6 +3009,163 @@ test_build_help_reports_primary_base_images() {
   assert_contains "agent-office remains available only as a legacy compatibility image"
 }
 
+test_image_reference_prefers_exact_registry_image() {
+  begin_test "image references bypass stale short-name annotations and retain legacy fallback"
+  load_agentctl_functions
+  local fixture
+  fixture="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-image-ref.XXXXXX")"
+  register_dir_cleanup "$fixture"
+  local registry="docker.io/library"
+  local canonical_present=1
+  local inspect_calls="$fixture/inspect-calls"
+  mock_image_reference_container() {
+    printf '%s\n' "$*" >>"$inspect_calls"
+    [ "$1 $2" = 'image inspect' ] || return 1
+    case "$3" in
+      agent-plain|agent-plain:latest)
+        jq -cn --arg ref "$registry/agent-plain:latest" '[{configuration:{name:"agent-plain:latest",descriptor:{digest:"old",annotations:{"io.containerd.image.name":$ref}}}}]'
+        ;;
+      "$registry/agent-plain:latest")
+        [ "$canonical_present" -eq 1 ] || return 1
+        jq -cn --arg ref "$3" '[{configuration:{name:$ref,descriptor:{digest:"new",annotations:{"io.containerd.image.name":$ref}}}}]'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  CONTAINER_CMD=mock_image_reference_container
+  [ "$(image_ref_for_runtime agent-plain)" = docker.io/library/agent-plain:latest ] || fail "Expected exact new image"
+  [ "$(image_ref_for_runtime codex)" = docker.io/library/agent-plain:latest ] || fail "Expected family alias to select exact new image"
+  canonical_present=0
+  [ "$(image_ref_for_runtime agent-plain)" = agent-plain ] || fail "Expected legacy-only image fallback"
+  canonical_present=1
+  registry="registry.example:5000/team"
+  [ "$(image_ref_for_runtime agent-plain)" = registry.example:5000/team/agent-plain:latest ] || fail "Expected registry metadata rather than a hardcoded default"
+  : >"$inspect_calls"
+  [ "$(image_unambiguous_reference registry.example:5000/team/agent-plain:pinned)" = registry.example:5000/team/agent-plain:pinned ] || fail "Explicit qualified refs must be preserved"
+  [ ! -s "$inspect_calls" ] || fail "Explicit refs must not be reinterpreted"
+  registry="docker.io/library"
+  image_list_json() {
+    cat <<'JSON'
+[
+  {"configuration":{"name":"agent-plain:latest","descriptor":{"digest":"old"}}},
+  {"configuration":{"name":"agent-plain:20261105-220000","descriptor":{"digest":"old"}}},
+  {"configuration":{"name":"docker.io/library/agent-plain:latest","descriptor":{"digest":"new"}}},
+  {"configuration":{"name":"docker.io/library/agent-plain:20261106-080000","descriptor":{"digest":"new"}}}
+]
+JSON
+  }
+  [ "$(image_matching_timestamp_ref agent-plain)" = agent-plain:20261106-080000 ] || fail "Expected timestamp matching exact current image, not stale short-name digest"
+  mock_image_reference_container() {
+    case "$3" in
+      agent-plain:pinned)
+        printf '%s\n' '[{"configuration":{"name":"docker.io/library/agent-plain:pinned","descriptor":{"annotations":{"io.containerd.image.name":"docker.io/library/agent-plain:latest"}}}}]'
+        ;;
+      docker.io/library/agent-plain:pinned)
+        printf '%s\n' '[{"configuration":{"name":"docker.io/library/agent-plain:pinned"}}]'
+        ;;
+      *) fail "Pinned reference must not resolve through latest: $*" ;;
+    esac
+  }
+  [ "$(image_unambiguous_reference agent-plain:pinned)" = docker.io/library/agent-plain:pinned ] || fail "Expected pin preserved despite inherited latest annotation"
+  mock_image_reference_container() {
+    printf '%s\n' '[{"configuration":{"name":"library/agent-plain:latest","descriptor":{"annotations":{"io.containerd.image.name":"library/agent-plain:latest"}}}}]'
+  }
+  [ "$(image_unambiguous_reference agent-plain)" = agent-plain ] || fail "Namespace-only names are not registry-qualified references"
+  mock_image_reference_container() { printf '%s\n' invalid-json; }
+  [ "$(image_unambiguous_reference agent-plain)" = agent-plain ] || fail "Expected malformed metadata to retain original ref"
+}
+
+test_build_cmd_uses_exact_images_and_propagates_failures() {
+  begin_test "build selects exact images for tags and dependencies and propagates failures"
+  load_agentctl_functions
+  local fixture
+  fixture="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-build-reference.XXXXXX")"
+  register_dir_cleanup "$fixture"
+  local SCRIPT_DIR="$fixture/context"
+  mkdir -p "$SCRIPT_DIR/runtimes.d" "$SCRIPT_DIR/features.d"
+  cp "$TEST_ROOT/DockerFile" "$TEST_ROOT/DockerFile.python" "$SCRIPT_DIR/"
+  cp "$TEST_ROOT/runtimes.d/codex.json" "$SCRIPT_DIR/runtimes.d/"
+  cp "$TEST_ROOT/features.d/ssh.json" "$SCRIPT_DIR/features.d/"
+  printf '%s\n' excluded-file >"$SCRIPT_DIR/DockerFile.python.dockerignore"
+  local calls="$fixture/calls"
+  local mock_build_exit_status=0
+  local mock_tag_exit_status=0
+  require_container() { return 0; }
+  image_exists() { return 0; }
+  stop_buildkit_container() { printf '%s\n' cleanup >>"$calls"; }
+  image_unambiguous_reference() { printf 'docker.io/library/%s:latest\n' "$1"; }
+  mock_build_reference_container() {
+    printf '%s\n' "$*" >>"$calls"
+    case "$1" in
+      build)
+        cp "$5" "$fixture/$3.Dockerfile"
+        if [ -f "$5.dockerignore" ]; then cp "$5.dockerignore" "$fixture/$3.dockerignore"; fi
+        printf '%s\n' "$5" >>"$fixture/build-files"
+        return "$mock_build_exit_status"
+        ;;
+      image) return "$mock_tag_exit_status" ;;
+      *) return 1 ;;
+    esac
+  }
+  CONTAINER_CMD=mock_build_reference_container
+  run_capture build_cmd --image agent-plain --features ssh --rebuild
+  assert_status 0
+  grep -F 'image tag docker.io/library/agent-plain:latest agent-plain:' "$calls" >/dev/null || fail "Expected timestamp tag from new exact image"
+  grep -F -- '--build-arg AGENT_FEATURES=ssh' "$calls" >/dev/null || fail "Expected SSH build feature"
+
+  : >"$calls"
+  mock_build_exit_status=42
+  run_capture build_cmd --image agent-python --rebuild
+  assert_status 42
+  assert_contains 'image build failed for agent-plain'
+  if grep -F 'image tag' "$calls" >/dev/null || grep -F 'build -t agent-python' "$calls" >/dev/null; then
+    fail "Failed dependency must not be tagged or followed by dependent builds"
+  fi
+  grep -Fxq cleanup "$calls" || fail "Expected builder cleanup after failed build"
+
+  : >"$calls"
+  mock_build_exit_status=0
+  mock_tag_exit_status=19
+  run_capture build_cmd --image agent-plain --rebuild
+  assert_status 1
+  assert_contains 'failed to timestamp-tag'
+  grep -Fxq cleanup "$calls" || fail "Expected builder cleanup after failed tag"
+
+  : >"$calls"
+  run_capture build_cmd --image agent-plain --snapshot
+  assert_status 19
+  if grep -F 'build -t' "$calls" >/dev/null; then fail "Snapshot must not build an image"; fi
+
+  : >"$calls"
+  : >"$fixture/build-files"
+  mock_tag_exit_status=0
+  run_capture build_cmd --image agent-python --rebuild
+  assert_status 0
+  grep -Fxq 'FROM docker.io/library/agent-plain:latest' "$fixture/agent-python.Dockerfile" || fail "Expected exact local base in dependent build"
+  grep -Fxq excluded-file "$fixture/agent-python.dockerignore" || fail "Expected DockerFile-specific ignore rules preserved"
+  grep -Fxq 'FROM agent-plain' "$TEST_ROOT/DockerFile.python" || fail "Repository DockerFile must remain portable to legacy stores"
+  local build_file=""
+  while IFS= read -r build_file; do
+    case "$build_file" in
+      "$SCRIPT_DIR"/*) ;;
+      *)
+        [ ! -e "$build_file" ] && [ ! -e "$build_file.dockerignore" ] || fail "Expected temporary DockerFile and ignore cleanup"
+        ;;
+    esac
+  done <"$fixture/build-files"
+  : >"$calls"
+  : >"$fixture/build-files"
+  mock_build_exit_status=43
+  image_exists() { [ "$1" = agent-plain ]; }
+  image_matching_timestamp_ref() { printf '%s\n' agent-plain:20261106-080000; }
+  # Build the dependent image without rebuilding its already-present base.
+  run_capture build_cmd --image agent-python
+  assert_status 43
+  if grep -F 'image tag' "$calls" >/dev/null; then fail "Failed rewritten build must not be tagged"; fi
+  build_file="$(tail -n 1 "$fixture/build-files")"
+  [ ! -e "$build_file" ] || fail "Expected temporary DockerFile cleanup after failure"
+}
+
 test_build_cmd_passes_feature_list_only_to_requested_image() {
   begin_test "build_cmd passes features only to the requested final image"
 
@@ -12272,6 +12429,16 @@ test_upgrade_stopped_dry_run_does_not_start_source() {
   CONTAINER_CMD=container
   container() {
     case "$1" in
+      image)
+        # Image metadata lookup is read-only; live/temporary container probes
+        # must still be rejected by the forbidden-operation log below.
+        if [ "${2:-}" = inspect ]; then
+          jq -cn --arg image "$3" '[{configuration:{name:$image}}]'
+        else
+          printf '%s\n' "$*" >>"$dry_dir/forbidden"
+          return 1
+        fi
+        ;;
       inspect)
         jq -cn --arg root "$dry_dir" --argjson mcp "$dry_mcp" --argjson user "$dry_user_socket" \
           '[{configuration:{mounts:([if $mcp == 1 then {source:($root+"/absent-mcp.sock"),destination:"/run/agentctl/mcp-host.sock"} else empty end] + [if $user == 1 then {source:($root+"/absent-user.sock"),destination:"/run/user.sock"} else empty end])}}]'
@@ -16064,6 +16231,25 @@ test_upgrade_recovery_excludes_feature_owned_os_packages() {
   assert_contains "Upgrade recovery will offer 1 top-level apk package(s)"
   [ "$(printf '%s' "$recovery_plan" | jq '[.actions[] | select(.kind == "os-package" and .default_selected)] | length')" -eq 1 ] \
     || fail "Expected concise count to match the recovery plan"
+  local qualified_target=""
+  for qualified_target in docker.io/library/agent-python:latest registry.example:5000/team/agent-python:pinned registry.example/team/agent-python@sha256:1234; do
+    run_capture recovery_plan_json "$ledger" "$target" mixed "$qualified_target"
+    assert_status 0
+    printf '%s' "$RUN_OUTPUT" | jq -e '
+      any(.actions[]; .id == "feature:office")
+      and ([.actions[] | select(.kind == "os-package" and .default_selected)] | map(.name)) == ["tree"]
+      and all(.actions[]; .id != "os:apk:libreoffice" and .id != "os:apk:font-noto")
+    ' >/dev/null || fail "Qualified image lost feature package ownership: $RUN_OUTPUT"
+    run_capture warn_upgrade_package_loss \
+      unit-test-container agent-python "$qualified_target" \
+      '{"package_manager":"apk","packages":["tree","libreoffice","font-noto"],"requested_packages":["tree","libreoffice","font-noto"],"installed_features":["office"]}' \
+      '{"package_manager":"apk","packages":[],"requested_packages":[],"installed_features":[]}' \
+      '{"package_manager":"apk","packages":[],"requested_packages":[],"installed_features":[]}' \
+      unit-test-container '["office"]' summary
+    assert_status 0
+    assert_contains "Upgrade recovery will offer 1 top-level apk package(s)"
+  done
+
 }
 
 test_upgrade_restore_reports_completed_plan_without_deferral() {
@@ -16919,6 +17105,8 @@ main() {
   run_selected_test test_run_model_wires_selected_model "test_run_model_wires_selected_model"
   run_selected_test test_run_rejects_non_url_ollama_host "test_run_rejects_non_url_ollama_host"
   run_selected_test test_build_help_reports_primary_base_images "test_build_help_reports_primary_base_images"
+  run_selected_test test_image_reference_prefers_exact_registry_image "image references bypass stale annotations"
+  run_selected_test test_build_cmd_uses_exact_images_and_propagates_failures "build exact references and failure propagation"
   run_selected_test test_build_cmd_passes_feature_list_only_to_requested_image "test_build_cmd_passes_feature_list_only_to_requested_image"
   run_selected_test test_build_cmd_rejects_incompatible_feature "test_build_cmd_rejects_incompatible_feature"
   run_selected_test test_build_cmd_passes_runtime_list_build_args "test_build_cmd_passes_runtime_list_build_args"

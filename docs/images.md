@@ -336,6 +336,26 @@ agentctl rescue --image agent-my-project-backup-20260516113757 --name recover-my
 For a fuller recovery checklist, runtime state counting, and restore examples,
 see [rescue.md](rescue.md).
 
+## Local image references after an Apple runtime upgrade
+
+Apple container can retain an older short-name image alongside a newly built
+registry-qualified image, for example `agent-plain:latest` and
+`docker.io/library/agent-plain:latest`. Its short-name lookup may select the older
+image through a retained local-build annotation.
+
+Agentctl uses the exact registry-qualified local reference when image metadata
+identifies one for the requested repository and tag and that exact reference is
+present. This applies to run/upgrade image selection, timestamp tagging, and local
+base images in dependent builds. Explicit registry references and pinned tags
+remain explicit; images available only under legacy short names remain usable.
+Existing images and containers are preserved. Dependent builds use a temporary
+DockerFile with the resolved base reference and preserve its DockerFile-specific
+ignore rules; repository DockerFiles stay intact.
+
+Build failures stop before tagging the old image or building dependent images,
+and return the failed build's exit status. Check the build error before retrying;
+a successful timestamp tag alone does not mean an image was rebuilt.
+
 ## Snapshots, Rebuilds, and Cache
 
 Snapshot and rebuild options:
