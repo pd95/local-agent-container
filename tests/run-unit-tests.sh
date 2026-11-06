@@ -6114,6 +6114,55 @@ EOF
   assert_contains "Falling back to direct Codex standalone package install."
 }
 
+test_codex_restored_daemon_startup() (
+  begin_test "Codex startup repairs restored daemon state and respects bypasses"
+  . "$TEST_ROOT/runtimes/codex.sh"
+  local fixture calls=0 arg
+  fixture="$(mktemp -d)"
+  register_dir_cleanup "$fixture"
+  export AGENTCTL_ALPINE_RELEASE_FILE="$fixture/absent"
+  codex_home_dir() { printf '%s\n' "$fixture/home"; }
+  codex_repair_missing_daemon() { calls=$((calls + 1)); return 0; }
+  codex_prepare_restored_daemon fixture_codex
+  [ "$calls" -eq 0 ] || fail "A fresh home must use native initialization"
+  mkdir -p "$fixture/home/packages/standalone"
+  ln -s "$fixture/absent-package" "$fixture/home/packages/standalone/current"
+  codex_prepare_restored_daemon fixture_codex
+  [ "$calls" -eq 0 ] || fail "A dangling CLI cache alone must not trigger daemon repair"
+  rm "$fixture/home/packages/standalone/current"
+  mkdir -p "$fixture/home/packages/standalone/current/bin"
+  touch "$fixture/home/packages/standalone/current/bin/codex"
+  chmod +x "$fixture/home/packages/standalone/current/bin/codex"
+  codex_prepare_restored_daemon fixture_codex
+  [ "$calls" -eq 0 ] || fail "An executable CLI cache alone must use native initialization"
+  mkdir -p "$fixture/home/app-server-daemon"
+  touch "$fixture/home/app-server-daemon/daemon.stderr.log"
+  codex_prepare_restored_daemon fixture_codex --profile online
+  codex_prepare_restored_daemon fixture_codex resume --last
+  [ "$calls" -eq 2 ] || fail "Expected repair for launch and resume with restored logs"
+  codex_prepare_restored_daemon fixture_codex --profile review
+  codex_prepare_restored_daemon fixture_codex --cd plugin
+  codex_prepare_restored_daemon fixture_codex --profile=doctor
+  codex_prepare_restored_daemon fixture_codex -- doctor
+  [ "$calls" -eq 6 ] || fail "Option values and literal prompts must not be utilities"
+  for arg in --no-daemon --remote=unix:///tmp/server --remote --help --version exec review app-server doctor update plugin help; do
+    codex_prepare_restored_daemon fixture_codex "$arg"
+  done
+  [ "$calls" -eq 6 ] || fail "Explicit bypasses and utilities must skip repair"
+  touch "$AGENTCTL_ALPINE_RELEASE_FILE"
+  codex_prepare_restored_daemon fixture_codex
+  [ "$calls" -eq 6 ] || fail "Alpine must skip native daemon repair"
+  rm "$AGENTCTL_ALPINE_RELEASE_FILE"
+  codex_repair_missing_daemon() { return 1; }
+  if codex_prepare_restored_daemon fixture_codex; then
+    fail "Required startup repair failure must propagate"
+  fi
+  mkdir -p "$fixture/home/packages/app-server-daemon/current/bin"
+  touch "$fixture/home/packages/app-server-daemon/current/bin/codex"
+  chmod +x "$fixture/home/packages/app-server-daemon/current/bin/codex"
+  codex_prepare_restored_daemon fixture_codex
+)
+
 test_codex_daemon_selection_and_repair_guards() (
   begin_test "Codex daemon selection preserves working packages and skips Alpine"
   . "$TEST_ROOT/runtimes/codex.sh"
@@ -6240,6 +6289,10 @@ case "$*" in
     test -x "$CODEX_TEST_ROOT/tools/codex/launcher/codex"
     ;;
   'app-server daemon update --help') printf '%s\n' --from-cli ;;
+  '--cd /workdir')
+    test -x "$CODEX_HOME/packages/app-server-daemon/current/bin/codex"
+    printf '%s\n' launched >>"$CODEX_TEST_ROOT/calls"
+    ;;
   *) exit 89 ;;
 esac
 CLI
@@ -6286,6 +6339,17 @@ INSTALLER
   if grep -E 'ARGS=app-server daemon (start|stop|restart|update --from-cli)' "$log"; then
     fail "Update must not issue lifecycle commands"
   fi
+  # Restoring a home excludes packages. Managed startup must repair without update.
+  rm "$temp_home/home/.codex/packages/app-server-daemon/current"
+  : >"$log"
+  run_agent_sh_capture_env "$temp_home" \
+    PATH="$fake_bin:/usr/bin:/bin" AGENTCTL_TOOLS_HOME="$tools_home" \
+    CODEX_TEST_ROOT="$temp_home" AGENTCTL_ALPINE_RELEASE_FILE="$temp_home/not-alpine" \
+    AGENTCTL_RUN_MODE=online AGENTCTL_RUNTIME_OVERRIDE=codex -- run
+  assert_status 0
+  grep -Fxq installed "$log" || fail "Expected startup to repair restored daemon state"
+  grep -Fxq launched "$log" || fail "Expected session launch after repair"
+  if grep -Fq 'ARGS=update' "$log"; then fail "Startup must not update the CLI"; fi
   # A working, older daemon requires no installer.
   : >"$log"
   run_agent_sh_capture_env "$temp_home" \
@@ -12658,6 +12722,56 @@ test_upgrade_package_summary_uses_top_level_apk_count() {
   assert_not_contains "apk add --no-cache"
 }
 
+test_upgrade_recovery_repository_compatibility() {
+  begin_test "upgrade recovery gates fresh and inherited repositories by target package manager"
+  load_agentctl_functions
+  local ledger target plan pm kind incompatible compatible
+  ledger='{"records":[{"record_id":"source","system":{"package_manager":"dpkg","apk_repositories":["https://old.test/main"]},"apt_sources":["deb https://apt.test stable main"]}],"plans":[{"actions":[{"id":"apk-repository:inherited","kind":"apk-repository","name":"inherited","status":"failed","default_selected":true},{"id":"apt-source:inherited","kind":"apt-source","name":"inherited","status":"pending","default_selected":true}]}]}'
+  for pm in apk dpkg unknown; do
+    target="$(jq -cn --arg pm "$pm" '{system:{package_manager:$pm}}')"
+    plan="$(recovery_plan_json "$ledger" "$target" mixed)"
+    printf '%s' "$plan" | jq -e --arg pm "$pm" '
+      all(.actions[] | select(.kind == "apk-repository" or .kind == "apt-source");
+        .default_selected == false and
+        .status == (if (.kind == "apk-repository" and $pm == "apk") or
+                      (.kind == "apt-source" and $pm == "dpkg")
+                   then "requires-confirmation" else "incompatible" end))
+    ' >/dev/null || fail "Repository compatibility failed for $pm: $plan"
+    run_capture recovery_selected_ids "$plan" all
+    assert_status 0
+    [ -z "$RUN_OUTPUT" ] || fail "Repositories must require explicit confirmation"
+    run_capture recovery_ids_for_interactive_answer "$plan" "" all
+    assert_status 0
+    if [ "$pm" = dpkg ]; then
+      assert_not_contains "apk-repository:"
+    elif [ "$pm" = apk ]; then
+      assert_not_contains "apt-source:"
+    else
+      [ -z "$RUN_OUTPUT" ] || fail "Unknown targets must not select repositories"
+    fi
+  done
+}
+
+test_upgrade_recovery_repository_execution_guards() {
+  begin_test "upgrade recovery refuses stale repository actions without the package manager"
+  load_agentctl_functions
+  local fixture plan
+  fixture="$(mktemp -d)"
+  register_dir_cleanup "$fixture"
+  plan='{"actions":[{"id":"apk","kind":"apk-repository","name":"https://old.test/main"},{"id":"apt","kind":"apt-source","name":"deb https://old.test stable main"}]}'
+  CONTAINER_CMD=container
+  container() {
+    local script="" arg
+    for arg in "$@"; do script="$arg"; done
+    PATH="$fixture" /bin/sh -c "$script"
+  }
+  recovery_apply_os_package_batch() { return 0; }
+  run_capture recovery_apply_selected fixture "$plan" $'apk\napt' mixed
+  assert_status 1
+  [ -z "$RUN_OUTPUT" ] || fail "Repository guards must stop before file operations: $RUN_OUTPUT"
+  [ "$RECOVERY_FAILED_IDS" = $'apk\napt' ] || fail "Expected stale actions recorded as failed"
+}
+
 test_upgrade_recovery_plan_restores_missing_apk_repository_tags() {
   begin_test "upgrade recovery plan restores captured and default APK repository tags"
 
@@ -17205,6 +17319,7 @@ main() {
   run_selected_test test_agent_sh_claude_runtime_update_calls_claude_update "test_agent_sh_claude_runtime_update_calls_claude_update"
   run_selected_test test_agent_sh_codex_runtime_install_runs_standalone_installer "test_agent_sh_codex_runtime_install_runs_standalone_installer"
   run_selected_test test_agent_sh_codex_runtime_install_falls_back_to_direct_package "test_agent_sh_codex_runtime_install_falls_back_to_direct_package"
+  run_selected_test test_codex_restored_daemon_startup "Codex restored daemon startup"
   run_selected_test test_codex_daemon_selection_and_repair_guards "Codex daemon selection and repair guards"
   run_selected_test test_agent_sh_codex_update_repairs_daemon_after_launcher_refresh "native Codex update repairs daemon after launcher refresh"
   run_selected_test test_agent_sh_codex_runtime_update_calls_codex_update "test_agent_sh_codex_runtime_update_calls_codex_update"
@@ -17346,6 +17461,8 @@ main() {
   run_selected_test test_upgrade_stopped_dry_run_does_not_start_source "test_upgrade_stopped_dry_run_does_not_start_source"
   run_selected_test test_upgrade_warns_about_added_packages_missing_from_target_image "test_upgrade_warns_about_added_packages_missing_from_target_image"
   run_selected_test test_upgrade_package_summary_uses_top_level_apk_count "test_upgrade_package_summary_uses_top_level_apk_count"
+  run_selected_test test_upgrade_recovery_repository_compatibility "upgrade recovery repository compatibility"
+  run_selected_test test_upgrade_recovery_repository_execution_guards "upgrade recovery repository execution guards"
   run_selected_test test_upgrade_recovery_plan_restores_missing_apk_repository_tags "test_upgrade_recovery_plan_restores_missing_apk_repository_tags"
   run_selected_test test_upgrade_recovery_plan_reports_unknown_apk_repository_tags "test_upgrade_recovery_plan_reports_unknown_apk_repository_tags"
   run_selected_test test_upgrade_recovery_plan_keeps_inherited_tagged_packages_gated "test_upgrade_recovery_plan_keeps_inherited_tagged_packages_gated"

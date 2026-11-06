@@ -285,6 +285,11 @@ The version policy controls package restoration:
   restores the captured Python lock. It can fail when the target repository no
   longer provides a recorded version.
 
+Repository recovery is limited to the target package manager: APK repositories
+are incompatible with Debian targets, and APT sources are incompatible with Alpine
+targets. This also applies to actions inherited from earlier upgrades. Saved
+repository actions are checked again before writing target configuration.
+
 Custom repositories are recorded without credentials and require an explicit
 interactive selection before they are enabled. Package-manager transitions retain OS items as pending rather
 than guessing a cross-distribution package mapping. The backup image remains

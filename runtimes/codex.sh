@@ -1012,6 +1012,11 @@ agent_runtime_run() {
   else
     daemon_mode="$(codex_prepare_alpine_daemon_mode "$codex_command")"
   fi
+  if [ "${#codex_args[@]}" -gt 0 ]; then
+    codex_prepare_restored_daemon "$codex_command" "${codex_args[@]}" || return 1
+  else
+    codex_prepare_restored_daemon "$codex_command" || return 1
+  fi
   if [ -n "$daemon_mode" ]; then
     if [ "${#codex_args[@]}" -gt 0 ]; then
       codex_args=("$daemon_mode" "${codex_args[@]}")
@@ -1122,6 +1127,52 @@ codex_daemon_command() {
   fi
 }
 
+# Restored state omits packages but can retain native daemon selection artifacts.
+# Let Codex handle a genuinely fresh home; repair only an existing broken selection.
+codex_prepare_restored_daemon() {
+  local codex_command="$1"
+  shift
+  local arg="" state_home="" marker="" selected="" command_seen=0
+  while [ "$#" -gt 0 ]; do
+    arg="$1"
+    shift
+    case "$arg" in
+      --) break ;;
+      --no-daemon|--remote|--remote=*|--help|-h|--version|-V) return 0 ;;
+      --config|-c|--profile|-p|--model|-m|--cd|-C|--image|-i|--sandbox|-s|--ask-for-approval|-a|--local-provider|--add-dir|--enable|--disable|--remote-auth-token-env)
+        # Values such as a profile named "review" are not subcommands.
+        [ "$#" -gt 0 ] || return 0
+        shift
+        ;;
+      -*) ;;
+      *)
+        if [ "$command_seen" -eq 0 ]; then
+          command_seen=1
+          case "$arg" in
+            exec|e|review|login|logout|mcp|mcp-server|plugin|app-server|remote-control|completion|update|doctor|sandbox|debug|apply|a|queue|archive|delete|migrate-rollouts|migrate-nfs-db|unarchive|cloud|exec-server|features|help)
+              return 0 ;;
+          esac
+        fi
+        ;;
+    esac
+  done
+  [ ! -f "${AGENTCTL_ALPINE_RELEASE_FILE:-/etc/alpine-release}" ] || return 0
+  state_home="$(codex_home_dir)"
+  selected="$(codex_daemon_command "$state_home")"
+  [ ! -x "$selected" ] || return 0
+  for marker in "$state_home/packages/app-server-daemon/current" \
+      "$state_home/app-server-daemon/daemon.pid" "$state_home/app-server-daemon/daemon.stderr.log" \
+      "$state_home/app-server-daemon/daemon-updater.pid" "$state_home/app-server-daemon/daemon-updater.stderr.log" \
+      "$state_home/app-server-daemon/app-server.pid" "$state_home/app-server-daemon/app-server.stderr.log" \
+      "$state_home/app-server-daemon/app-server-updater.pid" "$state_home/app-server-daemon/app-server-updater.stderr.log"; do
+    if [ -e "$marker" ] || [ -L "$marker" ]; then
+      codex_repair_missing_daemon "$codex_command"
+      return $?
+    fi
+  done
+  return 0
+}
+
 codex_repair_missing_daemon() (
   local codex_command="$1"
   local codex_state_home=""
@@ -1131,27 +1182,27 @@ codex_repair_missing_daemon() (
   codex_state_home="$(codex_home_dir)"
   CODEX_HOME="$codex_state_home" "$codex_command" app-server daemon pid-update-loop --check-package-ownership >/dev/null 2>&1 || return 0
   # Require the public package-management interface as well as the internal probe.
-  # Older releases must not acquire a daemon installation during a CLI update.
+  # Older releases must not acquire a daemon installation through this repair.
   CODEX_HOME="$codex_state_home" "$codex_command" app-server daemon update --help 2>/dev/null | grep -Fq -- --from-cli || return 0
   selected="$(codex_daemon_command "$codex_state_home")"
   [ ! -x "$selected" ] || return 0
-  printf '%s\n' 'Repairing missing Codex daemon package after CLI update...' >&2
+  printf '%s\n' 'Repairing missing Codex daemon package...' >&2
   installer="$(mktemp)" || return 1
   trap 'rm -f "$installer"' EXIT
   if ! curl -fsSL https://chatgpt.com/codex/install.sh -o "$installer"; then
-    printf '%s\n' 'Error: Codex CLI updated, but daemon installer download failed.' >&2
+    printf '%s\n' 'Error: daemon installer download failed.' >&2
     return 1
   fi
   if ! grep -Fq CODEX_INSTALL_DAEMON_ONLY "$installer" \
       || ! grep -Fq CODEX_INSTALL_IF_CURRENT "$installer"; then
-    printf '%s\n' 'Error: Codex CLI updated, but installer lacks guarded daemon-only support.' >&2
+    printf '%s\n' 'Error: installer lacks guarded daemon-only support.' >&2
     return 1
   fi
   # Reserve a broken selection under the native locks. The installer checks
   # this token under its own install lock, so even an updater which does not
   # take daemon.lock cannot replace a concurrently repaired/pinned package.
   if ! command -v flock >/dev/null 2>&1; then
-    printf '%s\n' 'Error: Codex CLI updated, but daemon repair requires flock for safe coordination.' >&2
+    printf '%s\n' 'Error: daemon repair requires flock for safe coordination.' >&2
     return 1
   fi
   umask 077
@@ -1162,12 +1213,12 @@ codex_repair_missing_daemon() (
   mkdir -p "$codex_state_home/app-server-daemon" "$package_root/releases" || return 1
   exec 8>>"$codex_state_home/app-server-daemon/daemon.lock" || return 1
   if ! flock -x -w 30 8; then
-    printf '%s\n' 'Error: Codex CLI updated, but daemon repair could not acquire its operation lock within 30 seconds; retry the update.' >&2
+    printf '%s\n' 'Error: daemon repair could not acquire its operation lock within 30 seconds; retry the command.' >&2
     return 1
   fi
   exec 9>>"$package_root/install.lock" || return 1
   if ! flock -x -w 30 9; then
-    printf '%s\n' 'Error: Codex CLI updated, but daemon repair could not acquire its install lock within 30 seconds; retry the update.' >&2
+    printf '%s\n' 'Error: daemon repair could not acquire its install lock within 30 seconds; retry the command.' >&2
     return 1
   fi
   selected="$(codex_daemon_command "$codex_state_home")"
@@ -1176,7 +1227,7 @@ codex_repair_missing_daemon() (
       mkdir -p "$codex_state_home/packages/standalone" || return 1
       exec 7>>"$codex_state_home/packages/standalone/install.lock" || return 1
       if ! flock -x -w 30 7; then
-        printf '%s\n' 'Error: Codex CLI updated, but daemon repair could not acquire the legacy install lock; retry the update.' >&2
+        printf '%s\n' 'Error: daemon repair could not acquire the legacy install lock; retry the command.' >&2
         return 1
       fi
       ;;
@@ -1187,7 +1238,7 @@ codex_repair_missing_daemon() (
     original_target="$(readlink "$package_root/current")" || return 1
     had_selection=1
   elif [ -e "$package_root/current" ]; then
-    printf '%s\n' 'Error: Codex CLI updated, but daemon current is not a symlink; repair it manually.' >&2
+    printf '%s\n' 'Error: daemon current is not a symlink; repair it manually.' >&2
     return 1
   fi
   placeholder="$(mktemp -d "$package_root/releases/agentctl-repair.XXXXXX")" || return 1
@@ -1205,7 +1256,7 @@ codex_repair_missing_daemon() (
         rmdir "$placeholder" || return 1
       fi
     else
-      printf '%s\n' 'Warning: could not lock daemon selection for repair cleanup; retry the update.' >&2
+      printf '%s\n' 'Warning: could not lock daemon selection for repair cleanup; retry the command.' >&2
       return 1
     fi
     rm -f "$installer"
@@ -1223,12 +1274,12 @@ codex_repair_missing_daemon() (
       printf '%s\n' 'Codex daemon was repaired concurrently; preserving its selection.' >&2
       return 0
     fi
-    printf '%s\n' 'Error: Codex CLI updated, but daemon repair failed; existing releases were preserved.' >&2
+    printf '%s\n' 'Error: daemon repair failed; existing releases were preserved.' >&2
     return 1
   fi
   if [ ! -x "$codex_state_home/packages/app-server-daemon/current/bin/codex" ] \
       || ! CODEX_HOME="$codex_state_home" "$codex_state_home/packages/app-server-daemon/current/bin/codex" --version >/dev/null 2>&1; then
-    printf '%s\n' 'Error: Codex CLI updated, but repaired daemon executable verification failed.' >&2
+    printf '%s\n' 'Error: repaired daemon executable verification failed.' >&2
     return 1
   fi
   printf '%s\n' 'Repaired Codex daemon package; no running server was restarted.' >&2

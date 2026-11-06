@@ -10933,7 +10933,7 @@ upgrade_cmd() {
   # The ledger is user state, so it is included in both the state archive and
   # the optional backup image.
   if [ "$was_running" -eq 0 ] && [ "$backup_mode" = export ]; then
-    warn "Skipping live recovery-manifest capture because $name cannot be started safely; its backup image remains available for rescue"
+    warn "Skipping live recovery-manifest capture because $name cannot be started safely; continuing with exported user state and previously recorded recovery details"
   else
     recovery_ledger="$(recovery_prepare_upgrade "$name" "$current_image" "$image")"
   fi
@@ -11180,7 +11180,7 @@ upgrade_cmd() {
     fi
   elif [ -z "$recovery_ledger" ]; then
     recovery_completion="; recovery incomplete (ledger unavailable)"
-    warn "No live recovery ledger was captured for $name; use the backup image for this stopped-source recovery"
+    warn "No live recovery ledger was captured for $name; automatic package recovery is unavailable for this stopped source"
   else
     recovery_completion="; recovery incomplete (target inspection failed)"
     warn "Unable to inspect recovery providers in target image $image; saved source ledger remains available in user state"
@@ -11521,6 +11521,11 @@ recovery_plan_json() {
              | if .kind == "os-package" then
                  .status = os_status(.name; .provider)
                  | .default_selected = (.status == "pending")
+               elif .kind == "apk-repository" or .kind == "apt-source" then
+                 .status = (if (.kind == "apk-repository" and $target_pm == "apk")
+                                or (.kind == "apt-source" and $target_pm == "dpkg")
+                            then "requires-confirmation" else "incompatible" end)
+                 | .default_selected = false
                elif .kind == "python-package" and $target.python_environment != null then
                  .default_selected = true | .status = "pending"
                elif .kind == "runtime" then
@@ -11564,11 +11569,11 @@ recovery_plan_json() {
     | [($source_system.apk_repositories // [])[] as $repository
        | select(($target_apk_repositories | index($repository)) == null)
        | {kind:"apk-repository", id:("apk-repository:" + $repository), name:$repository,
-          default_selected:false, status:"requires-confirmation"}] as $apk_repositories
+          default_selected:false, status:(if $target_pm == "apk" then "requires-confirmation" else "incompatible" end)}] as $apk_repositories
     | [($source.apt_sources // [])[] as $source_line
        | select(($target_apt_sources | index($source_line)) == null)
        | {kind:"apt-source", id:("apt-source:" + $source_line), name:$source_line,
-          default_selected:false, status:"requires-confirmation"}] as $apt_sources
+          default_selected:false, status:(if $target_pm == "dpkg" then "requires-confirmation" else "incompatible" end)}] as $apt_sources
     | [($source.capture_limitations // [])[] as $limitation
        | if $limitation == "apt-sources" then
            {kind:"manual-recovery", id:"manual:apt-sources",
@@ -11910,12 +11915,12 @@ recovery_apply_selected() {
       apk-repository)
         local quoted_repository=""
         quoted_repository="$(printf '%s' "$package" | jq -Rr '@sh')"
-        "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "grep -Fxq $quoted_repository /etc/apk/repositories || printf '%s\\n' $quoted_repository >> /etc/apk/repositories" || action_status=1
+        "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "command -v apk >/dev/null 2>&1 && test -f /etc/apk/repositories && { grep -Fxq $quoted_repository /etc/apk/repositories || printf '%s\\n' $quoted_repository >> /etc/apk/repositories; }" || action_status=1
         ;;
       apt-source)
         local quoted_source=""
         quoted_source="$(printf '%s' "$package" | jq -Rr '@sh')"
-        "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "mkdir -p /etc/apt/sources.list.d && grep -Fxq $quoted_source /etc/apt/sources.list.d/agentctl-recovery.list 2>/dev/null || printf '%s\\n' $quoted_source >> /etc/apt/sources.list.d/agentctl-recovery.list" || action_status=1
+        "$CONTAINER_CMD" exec -u 0 "$name" sh -lc "command -v dpkg-query >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1 && { mkdir -p /etc/apt/sources.list.d && { grep -Fxq $quoted_source /etc/apt/sources.list.d/agentctl-recovery.list 2>/dev/null || printf '%s\\n' $quoted_source >> /etc/apt/sources.list.d/agentctl-recovery.list; }; }" || action_status=1
         ;;
       os-package|runtime|feature|python-package|python-lock) continue ;;
       *) action_status=1 ;;
