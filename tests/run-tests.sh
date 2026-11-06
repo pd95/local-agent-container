@@ -1062,6 +1062,46 @@ test_feature_office_install_works_on_agent_python() {
   assert_status 0
 }
 
+test_build_local_dependency_reference() {
+  begin_test "local dependency builds use the current registry-qualified image"
+  local fixture_context base_image child_image name versioned_image
+  fixture_context="$(mktemp -d "${TMPDIR:-/tmp}/agentctl-build-reference.XXXXXX")"
+  register_dir_cleanup "$fixture_context"
+  base_image="agent-$(unique_name build-base)"
+  child_image="agent-$(unique_name build-child)"
+  name="$(unique_name build-reference)"
+  register_image_cleanup "$base_image"
+  register_image_cleanup "$child_image"
+  register_raw_container_cleanup "$name"
+  cp "$AGENTCTL_IMPL" "$fixture_context/agentctl"
+  cp "$TEST_ROOT/VERSION" "$fixture_context/VERSION"
+  mkdir -p "$fixture_context/runtimes.d"
+  cp "$TEST_ROOT/runtimes.d/codex.json" "$fixture_context/runtimes.d/codex.json"
+  printf 'FROM alpine:latest\nRUN printf "parent\\n" >/image-marker\n' >"$fixture_context/DockerFile.${base_image#agent-}"
+  printf 'FROM %s\nRUN test -f /image-marker && printf "child\\n" >>/image-marker\n' "$base_image" >"$fixture_context/DockerFile.${child_image#agent-}"
+
+  # This small context exercises agentctl's actual dependency resolver without
+  # downloading AI runtimes or rebuilding the project's full Python image.
+  run_capture bash "$fixture_context/agentctl" build --image "$child_image" --rebuild
+  while IFS= read -r versioned_image; do
+    [ -z "$versioned_image" ] || register_image_cleanup "$versioned_image"
+  done < <(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^Building image tags: [^,]*, \([^[:space:]]*\)$/\1/p')
+  assert_status 0
+  # An explicit target from the image inventory avoids reproducing the short-name
+  # lookup ambiguity in this test's direct container command.
+  run_capture "$CONTAINER_CMD" image inspect "$child_image"
+  assert_status 0
+  local child_reference
+  child_reference="$(printf '%s' "$RUN_OUTPUT" | jq -er '.[0].configuration.name')"
+  run_capture "$CONTAINER_CMD" create --name "$name" "$child_reference" sh -ec 'sleep infinity'
+  assert_status 0
+  run_capture "$CONTAINER_CMD" start "$name"
+  assert_status 0
+  run_capture "$CONTAINER_CMD" exec "$name" cat /image-marker
+  assert_status 0
+  [ "$RUN_OUTPUT" = $'parent\nchild' ] || fail "Expected derived image to use the built local base"
+}
+
 test_ssh_feature_build_and_forwarding_lifecycle() {
   begin_test "SSH forwarding feature preinstall survives upgrade and can be disabled"
   local name workdir versioned_image
@@ -2187,6 +2227,7 @@ main() {
   run_selected_test test_tool_home_smoke_codex_external_home "tool-home smoke keeps Codex tools outside mounted home" smoke
   run_selected_test test_tool_home_smoke_claude_external_home_when_installed "tool-home smoke keeps Claude tools outside mounted home when installed" smoke
   run_selected_test test_feature_office_install_works_on_agent_python "feature install office works on agent-python" full
+  run_selected_test test_build_local_dependency_reference "local dependency builds use the current registry-qualified image" full
   run_selected_test test_ssh_feature_build_and_forwarding_lifecycle "SSH forwarding feature preinstall survives upgrade and can be disabled" full
   run_selected_test test_host_socket_mount_lifecycle "host Unix socket mount survives restart, upgrade, replacement, copy, and removal" full
   run_selected_test test_managed_mcp_bridge_lifecycle "managed MCP bridge exchanges traffic and survives start, restart, upgrade, and disable" full
