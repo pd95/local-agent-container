@@ -75,8 +75,11 @@ fails the update command even if the CLI update succeeded. Repair requires a
 compatible `flock` command and uses native daemon/install locks plus a guarded
 selection, preserving packages repaired or pinned concurrently. Failed or
 interrupted repairs restore the previous selection only while their own
-reservation remains selected. Ordinary startup,
-refresh, and direct `codex update` do not perform this repair.
+reservation remains selected. Managed interactive startup also repairs a broken daemon selection left by restored
+Codex state, including after an upgrade to a non-Alpine image. A new home without
+native daemon state is left to Codex to initialize. Explicit `--no-daemon` and
+`--remote` launches and CLI utilities skip startup repair. Startup fails if a
+required repair fails. Refresh and direct `codex update` do not perform this repair.
 
 Runtime updates persist in a named container. They do not update the agentctl
 Git checkout or rebuild the container image.

@@ -2016,6 +2016,11 @@ test_bootstrap_works_on_existing_debian_container() {
   # A restored home can retain launch logs while its package cache is excluded.
   run_capture "$AGENTCTL" exec --no-tty --name "$name" -- sh -c 'mkdir -p "$HOME/.codex/app-server-daemon"; touch "$HOME/.codex/app-server-daemon/daemon.stderr.log"'
   assert_status 0
+  # Exercise the same startup preparation used by agent_runtime_run, without
+  # needing an authenticated interactive TUI in this bootstrap fixture.
+  run_capture "$AGENTCTL" exec --no-tty --name "$name" -- bash -c '. /usr/local/lib/agentctl/runtimes/codex.sh; codex_prepare_restored_daemon /opt/agentctl/bin/codex'
+  assert_status 0
+  assert_contains "Repaired Codex daemon package"
   run_capture "$AGENTCTL" runtime --name "$name" update codex
   assert_status 0
   run_capture "$AGENTCTL" exec --no-tty --name "$name" -- /opt/agentctl/bin/codex app-server daemon start
