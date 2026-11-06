@@ -39,19 +39,46 @@ refreshes without changing tracked project files.
    /workdir/.bin/bash3 tests/run-unit-tests.sh
    ```
 
-4. Run the complete host suite on macOS with Apple's supported `container`
-   version:
+4. Run the complete agentctl host integration suite on macOS with Apple's
+   supported `container` version:
 
    ```bash
    bash tests/run-tests.sh --tier full
+   ```
+
+   Decide separately whether a fresh Apple container compatibility run is needed.
+   Run it when the CLI or API server version, macOS version/build, or host
+   architecture changes; when changes affect agentctl's container integration or
+   compatibility contracts/fixtures; or when no applicable passing report exists.
+   Relevant integration changes include container command invocation and output
+   parsing, lifecycle management, image/build/export/recovery operations,
+   streamed transfers and stdio, networking, mounts, sockets, and SSH forwarding.
+
+   ```bash
    bash tests/run-container-compat-tests.sh \
      --assets-dir "$HOME/.cache/agentctl-container-compat/assets-1.3.1"
    ```
 
-   Prepare the compatibility fixture once as described in `TESTING.md`. When
-   changing the supported Apple runtime version, also verify retained containers
-   with the compatibility suite's baseline/candidate upgrade phases. Keep the
-   versioned reports with the release verification evidence.
+   Otherwise, reuse a complete passing compatibility report for the unchanged
+   environment after reviewing the changes since that run. Documentation,
+   version-only, and AI runtime adapter changes do not require a fresh run unless
+   they affect the container integration covered by the contracts. The release
+   number alone does not determine whether a run is needed.
+
+   Record the decision in the release PR or verification notes: the report path,
+   tested source revision (and relevant tracked changes, if any), matching CLI/API
+   server versions, macOS version/build and architecture, and the reason the
+   report still applies. Reused evidence must show `compatible: true`,
+   `exit_code: 0`, `cleanup_passed: true`, and the complete applicable test
+   inventory. Filtered, partial, failed, or interrupted runs cannot be reused as
+   compatibility sign-off. This reuse does not replace the full agentctl host
+   integration suite above.
+
+   Prepare compatibility assets as described in `TESTING.md` when a fresh run is
+   needed. When changing the supported Apple runtime version, also verify
+   retained containers with the baseline/candidate upgrade phases; a passing
+   fresh-only report does not establish upgrade compatibility. Keep the reports
+   with the release verification evidence.
 
 5. Merge the PR through GitHub and update local `main` with `git pull
    --ff-only`.

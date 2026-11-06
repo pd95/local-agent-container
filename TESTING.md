@@ -37,6 +37,13 @@ Run the black-box runtime suite on the macOS host before considering a new
 Apple `container` version supported. It uses the real CLI, including calls
 through agentctl's production functions; it does not mock the runtime.
 The existing agentctl integration suite remains a separate release requirement.
+A fresh compatibility run is required for runtime or host environment changes,
+changes to container integration or compatibility contracts/fixtures, or missing
+applicable evidence. For releases with none of those changes, a complete passing
+report may be reused after reviewing the intervening changes and recording why
+it still applies. Follow the [release checklist](docs/releases.md#release-checklist)
+for the decision and required evidence; this does not waive full agentctl host
+integration testing.
 
 The host needs Bash 3.2 or newer, jq (the version required by agentctl), Node.js,
 and the standard macOS archive, process, checksum, SSH, and `script` tools.
