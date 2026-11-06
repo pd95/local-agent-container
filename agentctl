@@ -4447,7 +4447,13 @@ fi
 rm -rf "$packages_backup"
 ' <"$backup_file"
   fi
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'chown -R coder:coder /home/coder >/dev/null 2>&1 || true'
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc '
+    agents_file="${1:-}/home/coder/.codex/AGENTS.md"
+    if [ -L "$agents_file" ] && [ "$(readlink "$agents_file")" = /etc/codexctl/image.md ]; then
+      ln -sf /etc/agentctl/image.md "$agents_file" || exit 1
+    fi
+    chown -R coder:coder "${1:-}/home/coder" >/dev/null 2>&1 || true
+  '
 }
 
 codex_state_summary_from_tar() {
@@ -6230,6 +6236,29 @@ refresh_cleanup_temporary_start() {
     || warn "Unable to stop managed MCP while cleaning up failed refresh: $name"
 }
 
+# The caller owns locks and container lifecycle. Preserve image provenance and
+# active user configuration; synchronize tooling even when versions match.
+refresh_managed_container_tooling() {
+  local name="$1"
+  refresh_container_file "$name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755" || return 1
+  refresh_container_file "$name" "$SCRIPT_DIR/mcp/host-artifacts-writer.mjs" "/usr/local/lib/agentctl/host-artifacts-writer.mjs" "root:root" "755" || return 1
+  migrate_legacy_runtime_config_files "$name" || return 1
+  refresh_codex_config_files "$name" "/etc/agentctl/codex" "root:root" || return 1
+  refresh_container_file "$name" "$(runtime_default_file claude settings.json)" "/etc/agentctl/claude/settings.json" "root:root" "644" || return 1
+  refresh_optional_runtime_default_files "$name" || return 1
+  refresh_container_file "$name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644" || return 1
+  refresh_container_tree "$name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755" || return 1
+  refresh_container_tree "$name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755" || return 1
+  refresh_container_tree "$name" "$SCRIPT_DIR/features" "/usr/local/lib/agentctl/features" "root:root" "644" "755" || return 1
+  refresh_container_tree "$name" "$SCRIPT_DIR/features.d" "/etc/agentctl/features.d" "root:root" "644" "755" || return 1
+  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'mkdir -p /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude && chown -R coder:coder /opt/agentctl' >/dev/null 2>&1 || true
+  if ! "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh refresh >/dev/null; then
+    warn "Failed to refresh managed runtime launchers in $name"
+    return 1
+  fi
+  refresh_container_file "$name" "$SCRIPT_DIR/VERSION" "/etc/agentctl/tooling-version" "root:root" "644" || return 1
+}
+
 refresh_cmd() {
   local name=""
   local started_for_refresh=0
@@ -6273,23 +6302,7 @@ refresh_cmd() {
     started_for_refresh=1
   fi
 
-  refresh_container_file "$name" "$SCRIPT_DIR/agent.sh" "/usr/local/bin/agent.sh" "root:root" "755"
-  refresh_container_file "$name" "$SCRIPT_DIR/mcp/host-artifacts-writer.mjs" "/usr/local/lib/agentctl/host-artifacts-writer.mjs" "root:root" "755"
-  migrate_legacy_runtime_config_files "$name"
-  refresh_container_file "$name" "$SCRIPT_DIR/VERSION" "/etc/agentctl/tooling-version" "root:root" "644"
-  refresh_codex_config_files "$name" "/etc/agentctl/codex" "root:root"
-  refresh_container_file "$name" "$(runtime_default_file claude settings.json)" "/etc/agentctl/claude/settings.json" "root:root" "644"
-  refresh_optional_runtime_default_files "$name"
-  refresh_container_file "$name" "$SCRIPT_DIR/agentctl-path.sh" "/etc/profile.d/agentctl-path.sh" "root:root" "644"
-  refresh_container_tree "$name" "$SCRIPT_DIR/runtimes" "/usr/local/lib/agentctl/runtimes" "root:root" "644" "755"
-  refresh_container_tree "$name" "$SCRIPT_DIR/runtimes.d" "/etc/agentctl/runtimes.d" "root:root" "644" "755"
-  refresh_container_tree "$name" "$SCRIPT_DIR/features" "/usr/local/lib/agentctl/features" "root:root" "644" "755"
-  refresh_container_tree "$name" "$SCRIPT_DIR/features.d" "/etc/agentctl/features.d" "root:root" "644" "755"
-  "$CONTAINER_CMD" exec -u 0 "$name" sh -lc 'mkdir -p /opt/agentctl/bin /opt/agentctl/codex /opt/agentctl/claude && chown -R coder:coder /opt/agentctl' >/dev/null 2>&1 || true
-  if "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" test -x /usr/local/bin/agent.sh; then
-    "$CONTAINER_CMD" exec "$name" "${SETPRIV_ARGS[@]}" bash /usr/local/bin/agent.sh refresh >/dev/null \
-      || die "Failed to refresh managed runtime launchers in $name"
-  fi
+  refresh_managed_container_tooling "$name" || die "Failed to refresh managed tooling in $name"
   if [ "$reset_config" -eq 1 ]; then
     warn "refresh --reset-config will replace active Codex configuration in ~/.codex with refreshed defaults"
     reset_runtime_config_in_container "$name" codex
@@ -10561,11 +10574,19 @@ upgrade_cmd() {
   local remote_control_quiesced=0
   local remote_control_owner=""
   local upgrade_complete=0
+  local upgrade_source_removed=0
+  local upgrade_state_restored=0
   local mcp_upgrade_relay_started=0
   local mcp_upgrade_relay_name=""
 
   upgrade_cleanup() {
+    if [ "$upgrade_complete" -eq 0 ] && [ "$upgrade_source_removed" -eq 1 ] \
+      && [ "$upgrade_state_restored" -eq 0 ] && [ -s "${state_backup_file:-}" ]; then
+      warn "Upgrade interrupted before state restoration in $target_name. User-state archive retained at: $state_backup_file"
+      warn "Preserve this archive before retrying the upgrade."
+    fi
     if [ "$upgrade_complete" -eq 0 ] && [ "$remote_control_quiesced" -eq 1 ] \
+      && { [ "$upgrade_source_removed" -eq 0 ] || [ "$upgrade_state_restored" -eq 1 ]; } \
       && [ -n "$remote_control_owner" ] && container_exists "$remote_control_owner" \
       && container_running "$remote_control_owner"; then
       if ! ( remote_control_restore_if_desired "$remote_control_owner" ); then
@@ -11062,6 +11083,7 @@ upgrade_cmd() {
   if [ "$copy_mode" -eq 0 ]; then
     echo "Removing container: $name" >&2
     "$CONTAINER_CMD" rm "$name" >/dev/null
+    upgrade_source_removed=1
     echo "Recreating container: $target_name" >&2
   else
     echo "Creating copy: $target_name" >&2
@@ -11118,6 +11140,9 @@ upgrade_cmd() {
 
   echo "Starting container: $target_name" >&2
   "$CONTAINER_CMD" start "$target_name" >/dev/null
+  echo "Refreshing managed tooling in $target_name" >&2
+  refresh_managed_container_tooling "$target_name" \
+    || die "Failed to refresh managed tooling in $target_name; upgrade cannot continue with stale tooling."
   if [ "$target_ssh" = true ]; then configure_container_ssh_socket "$target_name"; fi
   if [ "$mcp_target_enabled" -eq 1 ]; then
     mcp_configure_guest "$target_name"
@@ -11143,6 +11168,7 @@ upgrade_cmd() {
     verify_restored_runtime_inventory "$target_name" "$SOURCE_RUNTIME_STATE_INVENTORY" \
       || die "Restored runtime state verification failed for $target_name; inspect the backup image before continuing."
   fi
+  upgrade_state_restored=1
   local recovery_target_manifest=""
   local recovery_selected=""
   local recovery_completion=""

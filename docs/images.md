@@ -259,6 +259,16 @@ distinguish failed actions from deferred actions. For an unavailable request,
 review the target repositories or explicitly dismiss the item if it is obsolete;
 retrying an unchanged request may fail again.
 
+After starting the replacement container, upgrade synchronizes managed tooling
+and packaged defaults from the host before configuring features or restoring
+state. Active user configuration and the image build-version marker are
+preserved; the tooling-version marker is updated after synchronization succeeds.
+This also applies when the target image was built by an older agentctl version,
+so a separate refresh after upgrade is unnecessary. Synchronization failure
+stops the upgrade before state restoration. If the source was already removed,
+the failure reports the retained user-state archive path. Preserve that archive
+before retrying; Remote Control is not restarted on an unrestored replacement.
+
 Successful container recreation still returns exit status 0 when recovery is
 incomplete, but the final upgrade/copy message explicitly says `recovery
 incomplete` and includes the failed/deferred counts. Standalone `upgrade restore`
