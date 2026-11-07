@@ -10593,7 +10593,8 @@ upgrade_cmd() {
         warn "Failed to restore Remote Control after interrupted upgrade: $remote_control_owner"
       fi
     fi
-    [ "$mcp_upgrade_relay_started" -eq 0 ] || mcp_stop_managed "$mcp_upgrade_relay_name" >/dev/null 2>&1 || true
+    [ "$mcp_upgrade_relay_started" -eq 0 ] || ( mcp_stop_managed "$mcp_upgrade_relay_name" ) >/dev/null 2>&1 || true
+    mcp_release_lease
     mcp_lock_release
     remote_control_lock_release
   }
@@ -10873,6 +10874,7 @@ upgrade_cmd() {
         || die "Unable to start the managed MCP relay required to inspect stopped container $name"
       mcp_upgrade_relay_started=1
       mcp_upgrade_relay_name="$name"
+      mcp_create_lease "$name"
     fi
     collect_upgrade_container_preflight "$name" || true
     if [ "$was_running" -eq 0 ]; then
@@ -11091,6 +11093,7 @@ upgrade_cmd() {
   if [ "$mcp_target_enabled" -eq 1 ]; then
     if [ "$mcp_upgrade_relay_started" -eq 1 ]; then
       mcp_stop_managed "$mcp_upgrade_relay_name"
+      mcp_release_lease
       mcp_upgrade_relay_started=0
       mcp_upgrade_relay_name=""
     elif [ "$target_name" = "$name" ]; then
@@ -11100,8 +11103,11 @@ upgrade_cmd() {
     MCP_PORT="$mcp_target_port"
     MCP_REQUESTED=1
     mcp_start_relay "$target_name"
+    # Credential-bearing relays expire without a live foreground owner.
+    # Hold ownership throughout creation, tooling refresh, and restoration.
     mcp_upgrade_relay_started=1
     mcp_upgrade_relay_name="$target_name"
+    mcp_create_lease "$target_name"
   fi
   local create_cmd=("$CONTAINER_CMD" create -t)
   if [ -n "$cpu" ]; then
@@ -11257,6 +11263,7 @@ upgrade_cmd() {
   mcp_upgrade_relay_started=0
   mcp_upgrade_relay_name=""
   upgrade_complete=1
+  mcp_release_lease
   mcp_lock_release
   remote_control_lock_release
   trap - EXIT

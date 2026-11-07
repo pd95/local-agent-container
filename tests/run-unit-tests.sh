@@ -11982,6 +11982,55 @@ test_upgrade_uses_explicit_resource_overrides() {
   [ "$start_calls" -eq 2 ] || fail "Expected 2 start calls, got: $start_calls"
   [ "$stop_calls" -eq 2 ] || fail "Expected 2 stop calls, got: $stop_calls"
   [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
+  # A credential-bearing relay must remain leased during slow guest setup.
+  local upgrade_lease=0 relay_started=0
+  mcp_start_relay() { relay_started=1; }
+  mcp_stop_managed() { :; }
+  mcp_create_lease() { [ "$relay_started" -eq 1 ] || fail "Lease must follow relay start"; upgrade_lease=1; }
+  mcp_release_lease() { upgrade_lease=0; }
+  mcp_configure_guest() { [ "$upgrade_lease" -eq 1 ] || fail "Guest readiness requires an upgrade lease"; }
+  mcp_persist_registry() { :; }
+  sync_codex_managed_mcp() { :; }
+  refresh_managed_container_tooling() {
+    [ "$upgrade_lease" -eq 1 ] || fail "Tooling refresh requires an upgrade lease"
+  }
+  run_capture upgrade_cmd --name unit-test-container --no-backup --enable-mcp
+  assert_status 0
+  [ "$upgrade_lease" -eq 0 ] || fail "Successful upgrade must release its lease"
+  # Stopped-source preflight and backup also need a lease; release the source
+  # lease before publishing a replacement lease into the shared lease variable.
+  local mcp_fixture lease_events=""
+  mcp_fixture="$(mktemp -d)"
+  register_dir_cleanup "$mcp_fixture"
+  printf '{"schema_version":3,"port":47123,"servers":[]}\n' >"$mcp_fixture/registry.json"
+  chmod 600 "$mcp_fixture/registry.json"
+  mcp_registry_path() { printf '%s\n' "$mcp_fixture/registry.json"; }
+  mcp_load_registry_config() { MCP_CONFIG_JSON='[]'; }
+  container_has_mcp_wiring() { return 0; }
+  mcp_start_from_registry() { relay_started=1; }
+  mcp_create_lease() {
+    [ "$upgrade_lease" -eq 0 ] || fail "Must release source lease before acquiring target lease"
+    upgrade_lease=1
+    lease_events="${lease_events}acquire "
+  }
+  mcp_release_lease() {
+    if [ "$upgrade_lease" -eq 1 ]; then
+      upgrade_lease=0
+      lease_events="${lease_events}release "
+    fi
+  }
+  collect_upgrade_container_preflight() {
+    if ! container_running "$1"; then
+      [ "$upgrade_lease" -eq 1 ] || fail "Stopped-source inspection requires a lease"
+    fi
+    UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":[]}'
+    UPGRADE_PREFLIGHT_BASELINE_MANIFEST=''
+    UPGRADE_PREFLIGHT_SOURCE_SUPPORTS_STATE_CONTRACT=1
+  }
+  backup_codex_config() { [ "$upgrade_lease" -eq 1 ] || fail "Source backup requires a lease"; }
+  run_capture upgrade_cmd --name unit-test-container --no-backup
+  assert_status 0
+  [ "$lease_events" = "acquire release acquire release " ] || fail "Expected both source and target leases to be released: $lease_events"
   refresh_managed_container_tooling() { return 1; }
   persist_container_system_manifest_baseline_from_image() { fail "Must not inspect target after failed tooling refresh"; }
   restore_codex_config() { fail "Must not restore state after failed tooling refresh"; }
@@ -11994,11 +12043,22 @@ test_upgrade_uses_explicit_resource_overrides() {
     # Create a real archive placeholder so EXIT diagnostics can prove it survives.
     backup_codex_config() { printf saved-state >"$2"; }
     refresh_managed_container_tooling() { die "simulated nested refresh failure"; }
-    upgrade_cmd --name unit-test-container --no-backup
+    mcp_stop_managed() {
+      [ "$upgrade_lease" -eq 0 ] || die "simulated relay cleanup failure"
+    }
+    recovery_prepare_upgrade() { :; }
+    repair_state_permissions_for_upgrade() { :; }
+    mcp_release_lease() {
+      [ "$upgrade_lease" -eq 1 ] || fail "Failed upgrade must release its acquired lease"
+      upgrade_lease=0
+      printf '%s\n' upgrade-lease-released
+    }
+    upgrade_cmd --name unit-test-container --no-backup --enable-mcp
   )
   run_capture failed_upgrade
   assert_status 1
   assert_contains "simulated nested refresh failure"
+  assert_contains "upgrade-lease-released"
   assert_not_contains "Must not restart Remote Control before state restoration"
   assert_contains "User-state archive retained at:"
   local retained_archive=""

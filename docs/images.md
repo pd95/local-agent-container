@@ -268,6 +268,10 @@ so a separate refresh after upgrade is unnecessary. Synchronization failure
 stops the upgrade before state restoration. If the source was already removed,
 the failure reports the retained user-state archive path. Preserve that archive
 before retrying; Remote Control is not restarted on an unrestored replacement.
+Managed MCP relays remain leased during stopped-source inspection and backup,
+then throughout replacement setup and restoration, so relays using temporary
+credentials do not expire during tooling synchronization.
+The upgrade releases its lease on completion or failure.
 
 Successful container recreation still returns exit status 0 when recovery is
 incomplete, but the final upgrade/copy message explicitly says `recovery
