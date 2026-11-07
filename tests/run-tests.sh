@@ -475,6 +475,7 @@ test_upgrade_no_backup_preserves_state() {
   local name
   local workdir
   local backup_base
+  local source_image_version expected_dispatcher expected_codex
 
   name="$(unique_name upgrade-no-backup)"
   workdir="$(new_workdir)"
@@ -488,12 +489,18 @@ test_upgrade_no_backup_preserves_state() {
     printf "codex\n" >/home/coder/.config/agentctl/preferred-runtime
     printf "{\"claudeAiOauth\":{\"accessToken\":\"a\",\"refreshToken\":\"should-not-survive\",\"expiresAt\":1}}\n" >/home/coder/.claude/.credentials.json
     printf "{\"hasCompletedOnboarding\":true}\n" >/home/coder/.claude.json
+    cat /etc/agentctl/image-version >/workdir/source-image-version
   '
   assert_status 0
+
+  source_image_version="$(cat "$workdir/source-image-version")"
+  expected_dispatcher="$(cksum "$TEST_ROOT/agent.sh" | awk '{print $1, $2}')"
+  expected_codex="$(cksum "$TEST_ROOT/runtimes/codex.sh" | awk '{print $1, $2}')"
 
   run_capture "$AGENTCTL" upgrade --name "$name" --no-backup
   assert_status 0
   assert_contains "Skipping backup image export for $name"
+  assert_contains "Refreshing managed tooling in $name"
   assert_upgrade_complete "$name (backup skipped)"
 
   if [ -n "$(list_backup_images "$backup_base")" ]; then
@@ -501,7 +508,15 @@ test_upgrade_no_backup_preserves_state() {
     fail "Backup images were created unexpectedly for $name"
   fi
 
+  # run owns startup/stop for this stopped replacement; exec requires it running.
   run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc '
+    set -e
+    printf "tooling-version=%s\n" "$(cat /etc/agentctl/tooling-version)"
+    printf "image-version=%s\n" "$(cat /etc/agentctl/image-version)"
+    printf "dispatcher="
+    cksum /usr/local/bin/agent.sh
+    printf "codex-adapter="
+    cksum /usr/local/lib/agentctl/runtimes/codex.sh
     cat /home/coder/.codex/upgrade-smoke.txt
     jq -er '"'"'.refresh_token == "codex-token"'"'"' /home/coder/.codex/auth.json >/dev/null
     test "$(cat /home/coder/.config/agentctl/preferred-runtime)" = "codex"
@@ -512,6 +527,10 @@ test_upgrade_no_backup_preserves_state() {
   assert_status 0
   assert_contains "upgrade-ok"
   assert_contains "runtime-state-ok"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^tooling-version=//p' | tr -d '\r')" = "$(cat "$TEST_ROOT/VERSION")" ] || fail "Expected host tooling after upgrade"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/^image-version=//p' | tr -d '\r')" = "$source_image_version" ] || fail "Upgrade must preserve image provenance"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | awk '/^dispatcher=/ {sub(/^dispatcher=/, ""); print $1, $2}')" = "$expected_dispatcher" ] || fail "Expected current dispatcher after upgrade"
+  [ "$(printf '%s\n' "$RUN_OUTPUT" | awk '/^codex-adapter=/ {sub(/^codex-adapter=/, ""); print $1, $2}')" = "$expected_codex" ] || fail "Expected current Codex adapter after upgrade"
 }
 
 test_upgrade_restores_tagged_apk_packages_through_recovery() {

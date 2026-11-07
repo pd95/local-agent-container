@@ -11893,8 +11893,16 @@ test_upgrade_uses_explicit_resource_overrides() {
   begin_test "upgrade prefers explicit CPU, memory, and shared-memory overrides"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
+  # These policy tests do not exercise shared lifecycle locks.
+  remote_control_lock_acquire() { :; }
+  remote_control_lock_release() { :; }
+  mcp_lock_acquire() { :; }
+  mcp_lock_release() { :; }
   local create_args=""
+  local tooling_events=""
+  refresh_managed_container_tooling() { tooling_events="${tooling_events}refresh "; }
   local start_calls=0
   local stop_calls=0
   local rm_calls=0
@@ -11911,9 +11919,9 @@ test_upgrade_uses_explicit_resource_overrides() {
   image_exists() { return 0; }
   codex_agents_state() { printf 'missing\n'; }
   backup_codex_config() { :; }
-  restore_codex_config() { :; }
+  restore_codex_config() { tooling_events="${tooling_events}restore "; }
   persist_container_system_manifest_baseline() { :; }
-  persist_container_system_manifest_baseline_from_image() { :; }
+  persist_container_system_manifest_baseline_from_image() { tooling_events="${tooling_events}baseline "; }
   collect_upgrade_container_preflight() {
     UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":[]}'
     UPGRADE_PREFLIGHT_BASELINE_MANIFEST=''
@@ -11960,6 +11968,7 @@ test_upgrade_uses_explicit_resource_overrides() {
 
   run_capture upgrade_cmd --name unit-test-container --cpu 6 --mem 12G --shm-size 2GiB
   assert_status 0
+  [ "$tooling_events" = "refresh baseline restore " ] || fail "Expected tooling refresh before target inspection and restore, got: $tooling_events"
   assert_contains "Upgrade complete; recovery incomplete (ledger unavailable): unit-test-container (backup image: unit-test-container-backup-20260406120000)"
   assert_contains $'Starting container for state backup: unit-test-container\n\nBacking up user state from unit-test-container'
   assert_contains $'Stopping container: unit-test-container\n\nExporting container state to image: unit-test-container-backup-20260406120000'
@@ -11973,6 +11982,89 @@ test_upgrade_uses_explicit_resource_overrides() {
   [ "$start_calls" -eq 2 ] || fail "Expected 2 start calls, got: $start_calls"
   [ "$stop_calls" -eq 2 ] || fail "Expected 2 stop calls, got: $stop_calls"
   [ "$rm_calls" -eq 1 ] || fail "Expected 1 rm call, got: $rm_calls"
+  # A credential-bearing relay must remain leased during slow guest setup.
+  local upgrade_lease=0 relay_started=0
+  mcp_start_relay() { relay_started=1; }
+  mcp_stop_managed() { :; }
+  mcp_create_lease() { [ "$relay_started" -eq 1 ] || fail "Lease must follow relay start"; upgrade_lease=1; }
+  mcp_release_lease() { upgrade_lease=0; }
+  mcp_configure_guest() { [ "$upgrade_lease" -eq 1 ] || fail "Guest readiness requires an upgrade lease"; }
+  mcp_persist_registry() { :; }
+  sync_codex_managed_mcp() { :; }
+  refresh_managed_container_tooling() {
+    [ "$upgrade_lease" -eq 1 ] || fail "Tooling refresh requires an upgrade lease"
+  }
+  run_capture upgrade_cmd --name unit-test-container --no-backup --enable-mcp
+  assert_status 0
+  [ "$upgrade_lease" -eq 0 ] || fail "Successful upgrade must release its lease"
+  # Stopped-source preflight and backup also need a lease; release the source
+  # lease before publishing a replacement lease into the shared lease variable.
+  local mcp_fixture lease_events=""
+  mcp_fixture="$(mktemp -d)"
+  register_dir_cleanup "$mcp_fixture"
+  printf '{"schema_version":3,"port":47123,"servers":[]}\n' >"$mcp_fixture/registry.json"
+  chmod 600 "$mcp_fixture/registry.json"
+  mcp_registry_path() { printf '%s\n' "$mcp_fixture/registry.json"; }
+  mcp_load_registry_config() { MCP_CONFIG_JSON='[]'; }
+  container_has_mcp_wiring() { return 0; }
+  mcp_start_from_registry() { relay_started=1; }
+  mcp_create_lease() {
+    [ "$upgrade_lease" -eq 0 ] || fail "Must release source lease before acquiring target lease"
+    upgrade_lease=1
+    lease_events="${lease_events}acquire "
+  }
+  mcp_release_lease() {
+    if [ "$upgrade_lease" -eq 1 ]; then
+      upgrade_lease=0
+      lease_events="${lease_events}release "
+    fi
+  }
+  collect_upgrade_container_preflight() {
+    if ! container_running "$1"; then
+      [ "$upgrade_lease" -eq 1 ] || fail "Stopped-source inspection requires a lease"
+    fi
+    UPGRADE_PREFLIGHT_CONTAINER_MANIFEST='{"package_manager":"apk","packages":[]}'
+    UPGRADE_PREFLIGHT_BASELINE_MANIFEST=''
+    UPGRADE_PREFLIGHT_SOURCE_SUPPORTS_STATE_CONTRACT=1
+  }
+  backup_codex_config() { [ "$upgrade_lease" -eq 1 ] || fail "Source backup requires a lease"; }
+  run_capture upgrade_cmd --name unit-test-container --no-backup
+  assert_status 0
+  [ "$lease_events" = "acquire release acquire release " ] || fail "Expected both source and target leases to be released: $lease_events"
+  refresh_managed_container_tooling() { return 1; }
+  persist_container_system_manifest_baseline_from_image() { fail "Must not inspect target after failed tooling refresh"; }
+  restore_codex_config() { fail "Must not restore state after failed tooling refresh"; }
+  failed_upgrade() (
+    unset -f trap
+    container_running() { return 0; }
+    remote_control_registry_available() { return 0; }
+    remote_control_quiesce_preserving_desired() { :; }
+    remote_control_restore_if_desired() { fail "Must not restart Remote Control before state restoration"; }
+    # Create a real archive placeholder so EXIT diagnostics can prove it survives.
+    backup_codex_config() { printf saved-state >"$2"; }
+    refresh_managed_container_tooling() { die "simulated nested refresh failure"; }
+    mcp_stop_managed() {
+      [ "$upgrade_lease" -eq 0 ] || die "simulated relay cleanup failure"
+    }
+    recovery_prepare_upgrade() { :; }
+    repair_state_permissions_for_upgrade() { :; }
+    mcp_release_lease() {
+      [ "$upgrade_lease" -eq 1 ] || fail "Failed upgrade must release its acquired lease"
+      upgrade_lease=0
+      printf '%s\n' upgrade-lease-released
+    }
+    upgrade_cmd --name unit-test-container --no-backup --enable-mcp
+  )
+  run_capture failed_upgrade
+  assert_status 1
+  assert_contains "simulated nested refresh failure"
+  assert_contains "upgrade-lease-released"
+  assert_not_contains "Must not restart Remote Control before state restoration"
+  assert_contains "User-state archive retained at:"
+  local retained_archive=""
+  retained_archive="$(printf '%s\n' "$RUN_OUTPUT" | sed -n 's/.*User-state archive retained at: //p')"
+  [ -s "$retained_archive" ] || fail "Expected retained state after failed tooling refresh"
+  register_dir_cleanup "$(dirname "$retained_archive")"
 }
 
 test_upgrade_rejects_invalid_shared_memory_before_container_access() {
@@ -11992,6 +12084,7 @@ test_upgrade_can_rename_container_during_recreation() {
   begin_test "upgrade can recreate the container under a new name"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local create_args=""
   local start_log=""
@@ -12085,6 +12178,7 @@ test_upgrade_export_failure_restarts_running_source() {
   begin_test "upgrade export failure restarts running source"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local start_log=""
   local stop_log=""
@@ -12168,6 +12262,7 @@ test_upgrade_copy_keeps_running_source_container() {
   begin_test "upgrade copy keeps the source container and creates a new target"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local create_args=""
   local start_log=""
@@ -12296,6 +12391,7 @@ test_upgrade_dry_run_reports_plan_without_recreating_container() {
   begin_test "upgrade dry-run reports the plan without recreating the container"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local create_calls=0
   local export_calls=0
@@ -12385,6 +12481,7 @@ test_upgrade_copy_dry_run_reports_copy_plan() {
   begin_test "upgrade copy dry-run reports copy actions without recreating containers"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local create_calls=0
   local export_calls=0
@@ -12590,6 +12687,7 @@ test_upgrade_warns_about_added_packages_missing_from_target_image() {
   begin_test "upgrade warns only for extra packages absent from the target image"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local create_log=""
   local start_calls=0
@@ -12950,6 +13048,7 @@ test_upgrade_reinstalls_added_runtimes_and_features_in_target() {
   begin_test "upgrade defers added runtimes and features to the recovery plan"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local create_log=""
   local start_log=""
@@ -13075,6 +13174,7 @@ test_upgrade_reinstalls_missing_default_runtime_after_restore() {
   begin_test "upgrade defers missing runtime restoration to the recovery plan"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local create_log=""
   local install_log=""
@@ -13160,6 +13260,7 @@ test_upgrade_warns_and_clears_missing_preferred_runtime() {
   begin_test "upgrade warns and clears a preferred runtime that is unavailable in the target"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local cleared_name=""
 
@@ -13231,6 +13332,7 @@ test_upgrade_uses_stored_baseline_when_current_image_is_missing() {
   begin_test "upgrade uses the stored baseline manifest when the current image is unavailable"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local create_log=""
   local start_calls=0
@@ -13337,6 +13439,7 @@ test_upgrade_accepts_workdir_override_when_original_mount_is_missing() {
   begin_test "upgrade can replace a missing workdir mount source"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local create_args=""
   local export_calls=0
@@ -13417,6 +13520,7 @@ test_upgrade_unpublishes_stale_mapping_without_starting_stopped_source() {
   begin_test "upgrade removes stale published mapping from stopped source without starting it"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local stale_host="/missing/private/agentctl-stale.sock"
   local create_args=""
@@ -13476,6 +13580,7 @@ test_upgrade_allows_no_backup_for_modern_export_source() {
   begin_test "upgrade allows --no-backup for a modern export-backed source"
 
   load_agentctl_functions
+  refresh_managed_container_tooling() { :; }
 
   local create_args=""
   local export_calls=0
@@ -13781,6 +13886,81 @@ test_collect_upgrade_container_preflight_starts_stopped_container_once() {
   printf '%s' "$UPGRADE_PREFLIGHT_BASELINE_MANIFEST" | jq -e '.schema_version == 2' >/dev/null 2>&1 || fail "Expected cached baseline manifest, got: $UPGRADE_PREFLIGHT_BASELINE_MANIFEST"
 }
 
+test_restore_normalizes_only_known_legacy_agents_link() {
+  begin_test "state restore normalizes known legacy AGENTS links and preserves custom state"
+  load_agentctl_functions
+  local fixture normalize_script=""
+  fixture="$(mktemp -d)"
+  register_dir_cleanup "$fixture"
+  mkdir -p "$fixture/home/coder/.codex"
+  printf archive >"$fixture/state.tar"
+  target_supports_state_contract() { return 0; }
+  CONTAINER_CMD=container
+  container() {
+    local arg last=""
+    for arg in "$@"; do last="$arg"; done
+    case "$*" in
+      *'agents_file='*) normalize_script="$last"; /bin/sh -c "$last" sh "$fixture" ;;
+      *'exec -i '*) cat >/dev/null ;;
+      *) return 0 ;;
+    esac
+  }
+  ln -s /etc/codexctl/image.md "$fixture/home/coder/.codex/AGENTS.md"
+  run_capture restore_codex_config fixture "$fixture/state.tar"
+  assert_status 0
+  [ "$(readlink "$fixture/home/coder/.codex/AGENTS.md")" = /etc/agentctl/image.md ] || fail "Expected legacy link normalized after import"
+  rm "$fixture/home/coder/.codex/AGENTS.md"
+  ln -s /custom/AGENTS.md "$fixture/home/coder/.codex/AGENTS.md"
+  /bin/sh -c "$normalize_script" sh "$fixture"
+  [ "$(readlink "$fixture/home/coder/.codex/AGENTS.md")" = /custom/AGENTS.md ] || fail "Must preserve custom AGENTS links"
+  rm "$fixture/home/coder/.codex/AGENTS.md"
+  printf custom >"$fixture/home/coder/.codex/AGENTS.md"
+  /bin/sh -c "$normalize_script" sh "$fixture"
+  [ "$(cat "$fixture/home/coder/.codex/AGENTS.md")" = custom ] || fail "Must preserve custom AGENTS content"
+}
+
+test_refresh_managed_tooling_failure_order() {
+  begin_test "managed tooling refresh publishes version only after files and launchers succeed"
+  load_agentctl_functions
+  local events="" fail_path="" fail_launcher=0
+  refresh_container_file() {
+    events="${events}$3"$'\n'
+    [ "$3" != "$fail_path" ]
+  }
+  refresh_container_tree() {
+    events="${events}$3"$'\n'
+    [ "$3" != "$fail_path" ]
+  }
+  migrate_legacy_runtime_config_files() { :; }
+  refresh_codex_config_files() { :; }
+  refresh_optional_runtime_default_files() { :; }
+  CONTAINER_CMD=container
+  container() {
+    case "$*" in
+      *'bash /usr/local/bin/agent.sh refresh')
+        events="${events}launchers"$'\n'
+        [ "$fail_launcher" -eq 0 ]
+        ;;
+      *) return 0 ;;
+    esac
+  }
+  run_capture refresh_managed_container_tooling fixture
+  assert_status 0
+  [ "$(printf '%s' "$events" | tail -2)" = $'launchers\n/etc/agentctl/tooling-version' ] || fail "Expected version marker last: $events"
+  if printf '%s' "$events" | grep -Fq /etc/agentctl/image-version; then fail "Must preserve image provenance"; fi
+  fail_path=/usr/local/lib/agentctl/runtimes
+  events=""
+  run_capture refresh_managed_container_tooling fixture
+  assert_status 1
+  if printf '%s' "$events" | grep -Eq 'launchers|tooling-version'; then fail "Failed copy must stop synchronization"; fi
+  fail_path=""
+  fail_launcher=1
+  events=""
+  run_capture refresh_managed_container_tooling fixture
+  assert_status 1
+  if printf '%s' "$events" | grep -Fq tooling-version; then fail "Failed launcher refresh must not publish version"; fi
+}
+
 test_refresh_updates_managed_files_without_recreate() {
   begin_test "refresh updates managed files and preserves stopped state"
 
@@ -13846,6 +14026,7 @@ test_refresh_updates_managed_files_without_recreate() {
   grep -Fq "/etc/agentctl/codex/config.toml" <<<"$exec_log" || fail "Expected refresh to update /etc/agentctl/codex/config.toml"
   grep -Fq "/etc/agentctl/codex/gpt-oss.config.toml" <<<"$exec_log" || fail "Expected refresh to update /etc/agentctl/codex/gpt-oss.config.toml"
   grep -Fq "/etc/agentctl/tooling-version" <<<"$exec_log" || fail "Expected refresh to update the agentctl tooling version marker"
+  if grep -Fq "/etc/agentctl/image-version" <<<"$exec_log"; then fail "Tooling refresh must preserve image provenance"; fi
   grep -Fq "/etc/codexctl" <<<"$exec_log" || fail "Expected refresh to remove legacy Codex defaults"
   grep -Fq "/usr/local/bin/agent.sh" <<<"$exec_log" || fail "Expected refresh to update agent.sh"
   grep -Fq "/usr/local/lib/agentctl/runtimes" <<<"$exec_log" || fail "Expected refresh to update runtime adapters"
@@ -17506,6 +17687,8 @@ main() {
   run_selected_test test_image_system_manifest_removes_temp_container_after_success "test_image_system_manifest_removes_temp_container_after_success"
   run_selected_test test_image_system_manifest_removes_temp_container_after_exec_failure "test_image_system_manifest_removes_temp_container_after_exec_failure"
   run_selected_test test_collect_upgrade_container_preflight_starts_stopped_container_once "test_collect_upgrade_container_preflight_starts_stopped_container_once"
+  run_selected_test test_restore_normalizes_only_known_legacy_agents_link "restore known legacy AGENTS link"
+  run_selected_test test_refresh_managed_tooling_failure_order "managed tooling refresh failure order"
   run_selected_test test_refresh_updates_managed_files_without_recreate "test_refresh_updates_managed_files_without_recreate"
   run_selected_test test_refresh_restores_managed_mcp_for_stopped_container "test_refresh_restores_managed_mcp_for_stopped_container"
   run_selected_test test_refresh_failure_restores_temporarily_started_container "test_refresh_failure_restores_temporarily_started_container"
