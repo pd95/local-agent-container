@@ -155,3 +155,33 @@ when installing its daemon payload.
 - [local-vs-online.md](local-vs-online.md)
 - [auth.md](auth.md)
 - [images.md](images.md)
+
+## Codex defaults and existing containers
+
+The shipped local model catalog starts with `{"models":[]}`. Managed local
+launches populate the selected model from Ollama before starting Codex. Existing
+catalogs retain other entries and custom fields; online launches skip generation.
+Use `agentctl run` for local metadata preparation before invoking Codex directly.
+
+Run `agentctl refresh` to update the managed scripts and image-owned defaults.
+Refresh preserves active settings and catalogs. No image rebuild or container
+upgrade is required. The selected catalog entry is modernized on the next managed
+local launch; other entries and custom fields are retained.
+
+Alternatively, `agentctl runtime reset-config codex` applies all refreshed
+defaults, replacing custom configuration and the model catalog as described by
+its warning. Host-local `defaults.local/codex/` files replace shipped defaults.
+
+Agentctl leaves Codex's bundled-skill policy at its upstream default. To disable
+bundled system skills as a personal preference, add this to your host-local
+`defaults.local/codex/config.toml` and existing container's active
+`~/.codex/config.toml`, then restart Codex:
+
+```toml
+[skills.bundled]
+enabled = false
+```
+
+This controls loading, not the assets embedded in the CLI. Plugin availability
+is unchanged. Older Codex versions that do not recognize this setting need
+`agentctl runtime update codex` before applying it.

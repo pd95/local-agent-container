@@ -7576,10 +7576,11 @@ EOF
     (.models[] | select(.slug == "gpt-oss:20b")
       | .display_name == "gpt-oss:20b"
       and .context_window == 8192
+      and .shell_type == "unified_exec"
       and .base_instructions == "local instructions"
       and .input_modalities == ["text", "image"]
       and .supports_reasoning_summaries == true
-      and .reasoning_summary_format == "none"
+      and (has("reasoning_summary_format") | not)
       and .default_reasoning_summary == "auto"
       and (.supported_reasoning_levels | length) == 0
       and (has("default_reasoning_level") | not))
@@ -8188,7 +8189,7 @@ EOF
         display_name: "gpt-oss:20b",
         context_window: 4096,
         apply_patch_tool_type: "freeform",
-        shell_type: "default",
+        shell_type: "unified_exec",
         visibility: "list",
         supported_in_api: true,
         priority: 0,

@@ -844,7 +844,7 @@ codex_build_model_entry() {
       display_name: $display_name,
       context_window: $context_window,
       apply_patch_tool_type: "freeform",
-      shell_type: "default",
+      shell_type: "unified_exec",
       visibility: "list",
       supported_in_api: true,
       priority: 0,
@@ -861,7 +861,7 @@ codex_build_model_entry() {
       supported_reasoning_levels: $reasoning_contract.levels,
       experimental_supported_tools: []
     } + (if $reasoning_contract.summaries then
-      {reasoning_summary_format: "none", default_reasoning_summary: "auto"}
+      {default_reasoning_summary: "auto"}
     else {} end)
     + (if $reasoning_contract.default != null then
       {default_reasoning_level: $reasoning_contract.default}
