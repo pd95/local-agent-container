@@ -27,7 +27,8 @@ an existing container without launching an agent session.
 
 ### Codex local mode
 
-Codex local runs use profiles from `config.toml`.
+Codex local runs use separate `~/.codex/<name>.config.toml` profile files,
+with legacy `[profiles.<name>]` entries in `config.toml` also supported.
 
 Examples:
 

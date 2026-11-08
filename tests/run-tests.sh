@@ -831,6 +831,38 @@ test_upgrade_preflight_failure_keeps_container() {
   assert_contains "intact"
 }
 
+test_codex_defaults_cleanup() {
+  begin_test "Codex defaults cleanup preserves active configuration until reset"
+  local name workdir
+  name="$(unique_name codex-defaults)"
+  workdir="$(new_workdir)"
+  register_container_cleanup "$name"
+  mkdir -p "$workdir/codex-defaults"
+  cp "$TEST_ROOT/defaults/codex/"*.toml "$TEST_ROOT/defaults/codex/local_models.json" "$workdir/codex-defaults/"
+  run_capture "$AGENTCTL" run --name "$name" --image agent-plain --workdir "$workdir" --cmd bash -lc 'mkdir -p ~/.codex; printf "# custom config\n" > ~/.codex/config.toml; printf '"'"'{"models":[],"custom":true}\n'"'"' > ~/.codex/local_models.json'
+  assert_status 0
+  run_capture "$AGENTCTL" refresh --name "$name"
+  assert_status 0
+  # Refresh restores the stopped state left by the one-shot setup command.
+  run_capture "$AGENTCTL" start --name "$name"
+  assert_status 0
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- bash -lc 'grep -Fxq "# custom config" ~/.codex/config.toml && jq -e .custom ~/.codex/local_models.json'
+  assert_status 0
+  run_capture "$AGENTCTL" runtime reset-config codex --name "$name"
+  assert_status 0
+  # Local overlays replace the shipped baseline. Reset must copy that effective
+  # baseline; validate the tracked defaults separately in an isolated Codex home.
+  run_capture "$AGENTCTL" exec --name "$name" --no-tty -- bash -lc '
+    set -euxo pipefail
+    cmp /etc/agentctl/codex/config.toml ~/.codex/config.toml
+    cmp /etc/agentctl/codex/local_models.json ~/.codex/local_models.json
+    cp -R /workdir/codex-defaults /tmp/agentctl-codex-defaults
+    jq -e ".models == [] and length == 1" /tmp/agentctl-codex-defaults/local_models.json
+    CODEX_HOME=/tmp/agentctl-codex-defaults codex app-server --print-startup-config --strict-config
+  '
+  assert_status 0
+}
+
 test_run_reset_config_restores_image_defaults() {
   begin_test "run --reset-config restores config, models, and AGENTS symlink"
   local name
@@ -2239,6 +2271,7 @@ main() {
   run_selected_test test_upgrade_with_backup_creates_recovery_image "upgrade creates a backup image by default" full
   run_selected_test test_upgrade_backup_restores_home_and_boots_rescue_image "upgrade backup restores home state and creates a bootable full-rootfs rescue image" full
   run_selected_test test_upgrade_preflight_failure_keeps_container "upgrade preflight failure leaves the original container intact" full
+  run_selected_test test_codex_defaults_cleanup "Codex defaults cleanup preserves active configuration until reset" smoke
   run_selected_test test_run_reset_config_restores_image_defaults "run --reset-config restores config, models, and AGENTS symlink" smoke
   run_selected_test test_refresh_reset_config_restores_defaults_and_stopped_state "refresh --reset-config restores defaults and preserves stopped state" smoke
   run_selected_test test_image_contains_runtime_defaults_and_version_markers "image contains normalized defaults and separate version markers" smoke
